@@ -1,0 +1,87 @@
+### اختبار API الامتحانات المقالية
+
+### 1. تسجيل دخول admin
+POST http://localhost:8000/api/auth/login
+Content-Type: application/json
+
+{
+  "email": "admin@example.com",
+  "password": "admin123"
+}
+
+### 2. إنشاء امتحان مقالي جديد
+POST http://localhost:8000/api/essay-exams/lectures/11/exams
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6MSwiZW1haWwiOiJhZG1pbkBleGFtcGxlLmNvbSIsInJvbGUiOiJhZG1pbiIsImp0aSI6InRlc3QtanRpIiwiaWF0IjoxNzU4NDE1MzAzLCJleHAiOjE3NTkwMjAxMDN9._50-QEZYFqBXQ7uWuE1MMwCFopn9tQDNAEZ8DoB7PwE
+Content-Type: application/json
+
+{
+  "title": "امتحان الوحدة الأولى",
+  "description": "امتحان مقالي حول أساسيات البرمجة",
+  "is_visible": true
+}
+
+### 3. جلب امتحانات محاضرة
+GET http://localhost:8000/api/essay-exams/lectures/11/exams
+Authorization: Bearer {{adminToken}}
+
+### 4. جلب امتحان معين
+GET http://localhost:8000/api/essay-exams/exams/1
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6MSwiZW1haWwiOiJhZG1pbkBleGFtcGxlLmNvbSIsInJvbGUiOiJhZG1pbiIsImp0aSI6InRlc3QtanRpIiwiaWF0IjoxNzU4NDE1MzAzLCJleHAiOjE3NTkwMjAxMDN9._50-QEZYFqBXQ7uWuE1MMwCFopn9tQDNAEZ8DoB7PwE
+
+### 5. إضافة سؤال للامتحان
+POST http://localhost:8000/api/essay-exams/exams/1/questions
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6MSwiZW1haWwiOiJhZG1pbkBleGFtcGxlLmNvbSIsInJvbGUiOiJhZG1pbiIsImp0aSI6InRlc3QtanRpIiwiaWF0IjoxNzU4NDE1MzAzLCJleHAiOjE3NTkwMjAxMDN9._50-QEZYFqBXQ7uWuE1MMwCFopn9tQDNAEZ8DoB7PwE
+Content-Type: application/json
+
+{
+  "question_text": "اشرح مفهوم المتغيرات في البرمجة مع إعطاء أمثلة",
+  "order_index": 0
+}
+
+### 6. إرسال إجابة طالب (اختبار رسالة انتظار التصحيح)
+POST http://localhost:8000/api/essay-exams/exams/1/answers
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6NSwiZW1haWwiOiJzdHVkZW50QGV4YW1wbGUuY29tIiwicm9sZSI6InN0dWRlbnQiLCJqdGkiOiJ0ZXN0LXN0dWRlbnQtanRpIiwiaWF0IjoxNzU4NDIxNDY5LCJleHAiOjE3NTkwMjYyNjl9.xHkbWl1GE4_fojVCSGA0cMNgWDMOZ_EOtPA77de9wYY
+Content-Type: application/json
+
+{
+  "question_id": 1,
+  "answer_text": "المتغيرات في البرمجة هي حاويات لتخزين البيانات..."
+}
+
+### 7. جلب إجابات الطالب (اختبار رسالة انتظار التصحيح)
+GET http://localhost:8000/api/essay-exams/exams/1/my-answers
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6NSwiZW1haWwiOiJzdHVkZW50QGV4YW1wbGUuY29tIiwicm9sZSI6InN0dWRlbnQiLCJqdGkiOiJ0ZXN0LXN0dWRlbnQtanRpIiwiaWF0IjoxNzU4NDIxNDY5LCJleHAiOjE3NTkwMjYyNjl9.xHkbWl1GE4_fojVCSGA0cMNgWDMOZ_EOtPA77de9wYY
+
+### 8. جلب درجات الطالب (اختبار رسالة انتظار التصحيح)
+GET http://localhost:8000/api/essay-exams/exams/1/my-grade
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6NSwiZW1haWwiOiJzdHVkZW50QGV4YW1wbGUuY29tIiwicm9sZSI6InN0dWRlbnQiLCJqdGkiOiJ0ZXN0LXN0dWRlbnQtanRpIiwiaWF0IjoxNzU4NDIxNDY5LCJleHAiOjE3NTkwMjYyNjl9.xHkbWl1GE4_fojVCSGA0cMNgWDMOZ_EOtPA77de9wYY
+
+### 9. جلب أسئلة الامتحان للطالب (اختبار إخفاء الأسئلة بعد الإرسال)
+GET http://localhost:8000/api/essay-exams/exams/1/questions
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6NSwiZW1haWwiOiJzdHVkZW50QGV4YW1wbGUuY29tIiwicm9sZSI6InN0dWRlbnQiLCJqdGkiOiJ0ZXN0LXN0dWRlbnQtanRpIiwiaWF0IjoxNzU4NDIxNDY5LCJleHAiOjE3NTkwMjYyNjl9.xHkbWl1GE4_fojVCSGA0cMNgWDMOZ_EOtPA77de9wYY
+
+### 10. جلب أسئلة الامتحان للمدرس (يجب أن يرى الأسئلة دائماً)
+GET http://localhost:8000/api/essay-exams/exams/1/questions
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6MSwiZW1haWwiOiJhZG1pbkBleGFtcGxlLmNvbSIsInJvbGUiOiJhZG1pbiIsImp0aSI6InRlc3QtanRpIiwiaWF0IjoxNzU4NDIxNDY5LCJleHAiOjE3NTkwMjYyNjl9.NT5BgMf70Bxob-QvQvABnrIOmKKBLPF3Ul8zVTsGIq0
+
+### 11. تصحيح إجابات طالب
+POST http://localhost:8000/api/essay-exams/exams/1/students/5/grade
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6MSwiZW1haWwiOiJhZG1pbkBleGFtcGxlLmNvbSIsInJvbGUiOiJhZG1pbiIsImp0aSI6InRlc3QtanRpIiwiaWF0IjoxNzU4NDIxNDY5LCJleHAiOjE3NTkwMjYyNjl9.NT5BgMf70Bxob-QvQvABnrIOmKKBLPF3Ul8zVTsGIq0
+Content-Type: application/json
+
+{
+  "total_grade": 85,
+  "max_grade": 100,
+  "feedback": "إجابة ممتازة مع أمثلة واضحة، لكن يمكن تحسين الشرح في الجزء الأخير"
+}
+
+### 12. جلب تقرير مفصل للطالب (للمدرس)
+GET http://localhost:8000/api/essay-exams/exams/1/students/5/report
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6MSwiZW1haWwiOiJhZG1pbkBleGFtcGxlLmNvbSIsInJvbGUiOiJhZG1pbiIsImp0aSI6InRlc3QtanRpIiwiaWF0IjoxNzU4NDIxNDY5LCJleHAiOjE3NTkwMjYyNjl9.NT5BgMf70Bxob-QvQvABnrIOmKKBLPF3Ul8zVTsGIq0
+
+### 13. جلب تقرير مفصل للطالب (للطالب نفسه)
+GET http://localhost:8000/api/essay-exams/exams/1/my-report
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6NSwiZW1haWwiOiJzdHVkZW50QGV4YW1wbGUuY29tIiwicm9sZSI6InN0dWRlbnQiLCJqdGkiOiJ0ZXN0LXN0dWRlbnQtanRpIiwiaWF0IjoxNzU4NDIxNDY5LCJleHAiOjE3NTkwMjYyNjl9.xHkbWl1GE4_fojVCSGA0cMNgWDMOZ_EOtPA77de9wYY
+
+### متغيرات البيئة
+# @adminToken = eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6MSwiZW1haWwiOiJhZG1pbkBleGFtcGxlLmNvbSIsInJvbGUiOiJhZG1pbiIsImp0aSI6InRlc3QtanRpIiwiaWF0IjoxNzU4NDE1MzAzLCJleHAiOjE3NTkwMjAxMDN9._50-QEZYFqBXQ7uWuE1MMwCFopn9tQDNAEZ8DoB7PwE

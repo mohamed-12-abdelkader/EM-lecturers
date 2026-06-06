@@ -1,0 +1,48 @@
+### اختبار APIs بنك الأسئلة للطلاب
+
+### 0. API للتحقق من حالة الطالب وصفه (للـ debugging)
+GET http://localhost:8000/api/question-banks/student/debug
+Authorization: Bearer YOUR_STUDENT_TOKEN
+
+### 1. جلب المواد الموجودة في بنك الأسئلة الخاص بصف الطالب
+GET http://localhost:8000/api/question-banks/student/subjects
+Authorization: Bearer YOUR_STUDENT_TOKEN
+
+### 2. جلب الفصول الموجودة في مادة معينة
+GET http://localhost:8000/api/question-banks/student/subjects/1/chapters
+Authorization: Bearer YOUR_STUDENT_TOKEN
+
+### 3. جلب الدروس الموجودة في فصل معين
+GET http://localhost:8000/api/question-banks/student/chapters/1/lessons
+Authorization: Bearer YOUR_STUDENT_TOKEN
+
+### 4. جلب الأسئلة من درس معين (للاستخدام في الألعاب)
+GET http://localhost:8000/api/question-banks/student/lessons/1/questions?count=10
+Authorization: Bearer YOUR_STUDENT_TOKEN
+
+### 5. جلب عدد مختلف من الأسئلة
+GET http://localhost:8000/api/question-banks/student/lessons/1/questions?count=5
+Authorization: Bearer YOUR_STUDENT_TOKEN
+
+### 6. جلب الحد الأقصى من الأسئلة (50)
+GET http://localhost:8000/api/question-banks/student/lessons/1/questions?count=50
+Authorization: Bearer YOUR_STUDENT_TOKEN
+
+### 7. اختبار مع مادة غير موجودة
+GET http://localhost:8000/api/question-banks/student/subjects/999/chapters
+Authorization: Bearer YOUR_STUDENT_TOKEN
+
+### 8. اختبار مع فصل غير موجود
+GET http://localhost:8000/api/question-banks/student/chapters/999/lessons
+Authorization: Bearer YOUR_STUDENT_TOKEN
+
+### 9. اختبار مع درس غير موجود
+GET http://localhost:8000/api/question-banks/student/lessons/999/questions
+Authorization: Bearer YOUR_STUDENT_TOKEN
+
+### 10. اختبار بدون توكن
+GET http://localhost:8000/api/question-banks/student/subjects
+
+### 11. اختبار مع توكن مدرس (يجب أن يفشل)
+GET http://localhost:8000/api/question-banks/student/subjects
+Authorization: Bearer YOUR_TEACHER_TOKEN

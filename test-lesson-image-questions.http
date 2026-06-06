@@ -1,0 +1,94 @@
+### Test Lesson Image Questions API (Question Bank Lessons)
+
+### 1. Add text questions to question bank lesson
+POST http://localhost:8000/api/lesson-questions/lessons/40/questions/text
+Authorization: Bearer YOUR_TOKEN_HERE
+Content-Type: application/json
+
+{
+  "bulk_text": "السؤال الأول؟\nA) الخيار الأول\nB) الخيار الثاني\nC) الخيار الثالث\nD) الخيار الرابع\n\nالسؤال الثاني؟\nA) الخيار الأول\nB) الخيار الثاني\nC) الخيار الثالث\nD) الخيار الرابع"
+}
+
+### 2. Add image questions to question bank lesson
+POST http://localhost:8000/api/lesson-questions/lessons/40/questions/images
+Authorization: Bearer YOUR_TOKEN_HERE
+Content-Type: multipart/form-data
+
+# Upload multiple images (up to 10)
+# In a real request, you would attach image files like this:
+# images: [file1.jpg, file2.jpg, file3.jpg]
+# Note: This works with lessons in the question bank (lessons table), not course lectures
+# Fixed: updated_at column issue resolved
+# Fixed: SQL parameter count mismatch resolved
+# Fixed: 503 error - compatibility with both old and new database schemas
+# Updated: Now returns ALL questions (text and image) from both old and new tables
+# Enhanced: Added comprehensive search across all question sources
+# Now searches: questions (new), lesson_questions, exam_questions, and direct image questions
+# Fixed: Image questions now properly added to lesson and retrieved correctly
+# Added: Comprehensive debugging logs to track question retrieval
+# Fixed: Answer selection now works for both old and new question formats
+# Enhanced: Added specific queries for image questions with lesson_id
+# Fixed: Added priority queries for image questions at the beginning
+# Fixed: Removed general questions queries that were showing unrelated questions
+# Fixed: Removed duplicate queries that were causing image questions to appear 3 times
+
+### 2. Get questions from question bank lesson (new format)
+GET http://localhost:8000/api/lesson-questions/lessons/40/questions
+Authorization: Bearer YOUR_TOKEN_HERE
+
+### 3. Get question choices (for answer selection)
+GET http://localhost:8000/api/lesson-questions/201/choices
+Authorization: Bearer YOUR_TOKEN_HERE
+
+### 4. Set correct answer for question
+POST http://localhost:8000/api/lesson-questions/questions/201/answer
+Authorization: Bearer YOUR_TOKEN_HERE
+Content-Type: application/json
+
+{
+  "correctChoiceId": 0
+}
+
+### 5. Update question
+PUT http://localhost:8000/api/lesson-questions/questions/201
+Authorization: Bearer YOUR_TOKEN_HERE
+Content-Type: application/json
+
+{
+  "text": "السؤال المحدث؟",
+  "options": ["الخيار الأول", "الخيار الثاني", "الخيار الثالث", "الخيار الرابع"],
+  "correct_answer": "الخيار الأول"
+}
+
+### 6. Delete question
+DELETE http://localhost:8000/api/lesson-questions/questions/201
+Authorization: Bearer YOUR_TOKEN_HERE
+
+# This endpoint now works with question bank lessons (lessons table)
+# Structure: Question Bank → Subject → Chapter → Lesson
+
+### 3. Get questions from lesson (old format for comparison)
+GET http://localhost:8000/api/lesson-questions/lecture/39/questions
+Authorization: Bearer YOUR_TOKEN_HERE
+
+### 4. Set correct answer for a question
+PATCH http://localhost:8000/api/lesson-questions/lecture-question/36/answer
+Authorization: Bearer YOUR_TOKEN_HERE
+Content-Type: application/json
+
+{
+  "correct_answer": 1
+}
+
+### 5. Update a question
+PATCH http://localhost:8000/api/lesson-questions/lecture-question/36
+Authorization: Bearer YOUR_TOKEN_HERE
+Content-Type: multipart/form-data
+
+# Optional: question_text: "Updated question text"
+# Optional: grade: 2
+# Optional: image: [new_image_file]
+
+### 6. Delete a question
+DELETE http://localhost:8000/api/lesson-questions/lecture-question/36
+Authorization: Bearer YOUR_TOKEN_HERE

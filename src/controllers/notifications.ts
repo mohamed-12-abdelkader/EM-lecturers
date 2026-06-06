@@ -1,0 +1,195 @@
+import { Router } from 'express';
+import { z } from 'zod';
+import { authMiddleware } from '../middleware/authentication';
+import { asyncWrapper } from '../utils';
+import { NotificationService } from '../services/notifications';
+import { saveExpoPushToken } from '../services/expoPushService';
+
+const router = Router();
+
+// GET /api/notifications - Get user notifications
+router.get(
+  '/',
+  authMiddleware(['student', 'teacher', 'admin']),
+  asyncWrapper(async (req, res) => {
+    const userId = req.user!.id;
+    const userRole = req.user!.role;
+    const limit = req.query.limit ? parseInt(req.query.limit as string) : 20;
+    const offset = req.query.offset ? parseInt(req.query.offset as string) : 0;
+
+    const result = await NotificationService.getUserNotifications(userId, limit, offset, userRole);
+
+    if (!result.success) {
+      return res.status(500).json({ message: result.error || 'Failed to fetch notifications' });
+    }
+
+    res.json({
+      notifications: result.notifications,
+      pagination: {
+        limit,
+        offset,
+        total: result.total || 0,
+        hasMore: (result.total || 0) > offset + limit,
+      },
+    });
+  }),
+);
+
+// GET /api/notifications/messages - إشعارات الرسائل الموحّدة (دعم فني + دردشة مباشرة + جروب) بتنسيق متوافق مع Expo Push
+router.get(
+  '/messages',
+  authMiddleware(['student', 'teacher']),
+  asyncWrapper(async (req, res) => {
+    const userId = req.user!.id;
+    const userRole = req.user!.role as 'student' | 'teacher';
+    const limit = req.query.limit ? parseInt(req.query.limit as string) : 30;
+    const offset = req.query.offset ? parseInt(req.query.offset as string) : 0;
+
+    const result = await NotificationService.getMessageNotificationsUnified(userId, userRole, limit, offset);
+
+    res.json({
+      notifications: result.notifications,
+      pagination: {
+        limit,
+        offset,
+        total: result.total,
+        has_more: result.total > offset + limit,
+      },
+    });
+  }),
+);
+
+// GET /api/notifications/live-stream - إشعارات بدء اللايف فقط
+router.get(
+  '/live-stream',
+  authMiddleware(['student', 'teacher', 'admin']),
+  asyncWrapper(async (req, res) => {
+    const userId = req.user!.id;
+    const userRole = req.user!.role;
+    const limit = req.query.limit ? parseInt(req.query.limit as string) : 20;
+    const offset = req.query.offset ? parseInt(req.query.offset as string) : 0;
+
+    const result = await NotificationService.getLiveStreamNotifications(userId, limit, offset, userRole);
+
+    if (!result.success) {
+      return res.status(500).json({ message: result.error || 'Failed to fetch live stream notifications' });
+    }
+
+    res.json({
+      notifications: result.notifications,
+      pagination: {
+        limit,
+        offset,
+        total: result.total || 0,
+        hasMore: (result.total || 0) > offset + limit,
+      },
+    });
+  }),
+);
+
+// GET /api/notifications/unread-count - Get unread notifications count
+// يجب أن يكون قبل /:notificationId/read لتجنب conflict
+router.get(
+  '/unread-count',
+  authMiddleware(['student', 'teacher', 'admin']),
+  asyncWrapper(async (req, res) => {
+    const userId = req.user!.id;
+
+    const result = await NotificationService.getUnreadCount(userId);
+
+    if (!result.success) {
+      return res.status(500).json({ message: 'Failed to get unread count' });
+    }
+
+    res.json({ count: result.count || 0 });
+  }),
+);
+
+// PUT /api/notifications/read-all - Mark all notifications as read
+// يجب أن يكون قبل /:notificationId/read لتجنب conflict
+router.put(
+  '/read-all',
+  authMiddleware(['student', 'teacher', 'admin']),
+  asyncWrapper(async (req, res) => {
+    const userId = req.user!.id;
+
+    const result = await NotificationService.markAllAsRead(userId);
+
+    if (!result.success) {
+      return res.status(500).json({ message: 'Failed to mark notifications as read' });
+    }
+
+    res.json({ message: 'All notifications marked as read' });
+  }),
+);
+
+// POST /api/notifications/push-token - تسجيل/تحديث Expo Push Token (تطبيق الموبايل)
+router.post(
+  '/push-token',
+  authMiddleware(['student', 'teacher', 'admin']),
+  asyncWrapper(async (req, res) => {
+    const schema = z.object({
+      token: z.string().min(1, 'Token is required'),
+      device_id: z.string().optional(),
+    });
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ message: 'Validation failed', errors: parsed.error.errors });
+    }
+    const userId = req.user!.id;
+    const result = await saveExpoPushToken(userId, parsed.data.token, parsed.data.device_id);
+    if (!result.success) {
+      return res.status(400).json({ message: result.error || 'Failed to save push token' });
+    }
+    res.status(200).json({ message: 'Push token saved successfully' });
+  }),
+);
+
+// PUT /api/notifications/:notificationId/read - Mark notification as read
+// يجب أن يكون بعد routes الثابتة مثل /read-all و /unread-count
+// استخدام regex للتأكد من أن notificationId رقم وليس نص
+router.put(
+  '/:notificationId(\\d+)/read',
+  authMiddleware(['student', 'teacher', 'admin']),
+  asyncWrapper(async (req, res) => {
+    const userId = req.user!.id;
+    const notificationId = parseInt(req.params.notificationId);
+
+    if (isNaN(notificationId)) {
+      return res.status(400).json({ message: 'Invalid notification ID' });
+    }
+
+    const result = await NotificationService.markAsRead(notificationId, userId);
+
+    if (!result.success) {
+      return res.status(404).json({ message: 'Notification not found' });
+    }
+
+    res.json({ message: 'Notification marked as read' });
+  }),
+);
+
+// PUT /api/notifications/notification_:notificationId/read - Mark notification as read (with prefix)
+// للدعم مع format "notification_123"
+router.put(
+  '/notification_:notificationId(\\d+)/read',
+  authMiddleware(['student', 'teacher', 'admin']),
+  asyncWrapper(async (req, res) => {
+    const userId = req.user!.id;
+    const notificationId = parseInt(req.params.notificationId);
+
+    if (isNaN(notificationId)) {
+      return res.status(400).json({ message: 'Invalid notification ID' });
+    }
+
+    const result = await NotificationService.markAsRead(notificationId, userId);
+
+    if (!result.success) {
+      return res.status(404).json({ message: 'Notification not found' });
+    }
+
+    res.json({ message: 'Notification marked as read' });
+  }),
+);
+
+export { router };

@@ -1,0 +1,28 @@
+
+### Login as Teacher
+# @name loginTeacher
+POST http://localhost:8000/api/users/login
+Content-Type: application/json
+
+{
+    "email": "teacher@example.com",
+    "password": "password123"
+}
+
+### Get Contacts (Teacher)
+GET http://localhost:8000/api/chat/contacts
+Authorization: Bearer {{loginTeacher.response.body.token}}
+
+### Login as Student
+# @name loginStudent
+POST http://localhost:8000/api/users/login
+Content-Type: application/json
+
+{
+    "email": "student@example.com",
+    "password": "password123"
+}
+
+### Get Contacts (Student)
+GET http://localhost:8000/api/chat/contacts
+Authorization: Bearer {{loginStudent.response.body.token}}

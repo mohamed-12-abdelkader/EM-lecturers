@@ -1,0 +1,170 @@
+### Test Question Bank System
+
+# Variables
+@admin_token = your_admin_token_here
+@teacher_token = your_teacher_token_here
+@base_url = http://localhost:8000/api
+
+### 1. Create Question Bank
+POST {{base_url}}/question-banks
+Authorization: Bearer {{admin_token}}
+Content-Type: application/json
+
+{
+  "name": "بنك أسئلة الصف الأول",
+  "description": "بنك أسئلة شامل للصف الأول الابتدائي",
+  "image_url": "https://example.com/image.jpg",
+  "grade_id": 1,
+  "is_active": true
+}
+
+### 2. Get All Question Banks
+GET {{base_url}}/question-banks?limit=10&offset=0
+Authorization: Bearer {{admin_token}}
+
+### 3. Get Question Bank by ID
+GET {{base_url}}/question-banks/1
+Authorization: Bearer {{admin_token}}
+
+### 4. Create Subject
+POST {{base_url}}/question-banks/1/subjects
+Authorization: Bearer {{admin_token}}
+Content-Type: application/json
+
+{
+  "name": "الرياضيات",
+  "description": "مادة الرياضيات للصف الأول",
+  "image_url": "https://example.com/math.jpg",
+  "color": "#FF6B6B",
+  "is_active": true
+}
+
+### 5. Get Subjects for Question Bank
+GET {{base_url}}/question-banks/1/subjects
+Authorization: Bearer {{admin_token}}
+
+### 6. Create Chapter
+POST {{base_url}}/question-banks/1/subjects/1/chapters
+Authorization: Bearer {{admin_token}}
+Content-Type: application/json
+
+{
+  "name": "الأعداد من 1 إلى 10",
+  "description": "فصل تعليم الأعداد الأساسية",
+  "image_url": "https://example.com/chapter1.jpg",
+  "order": 1,
+  "is_active": true
+}
+
+### 7. Get Chapters for Subject
+GET {{base_url}}/question-banks/1/subjects/1/chapters
+Authorization: Bearer {{admin_token}}
+
+### 8. Create Lesson
+POST {{base_url}}/question-banks/1/subjects/1/chapters/1/lessons
+Authorization: Bearer {{admin_token}}
+Content-Type: application/json
+
+{
+  "name": "تعلم العدد 1",
+  "description": "درس تعليم العدد واحد",
+  "image_url": "https://example.com/lesson1.jpg",
+  "content": "محتوى الدرس التعليمي...",
+  "order": 1,
+  "is_active": true
+}
+
+### 9. Get Lessons for Chapter
+GET {{base_url}}/question-banks/1/subjects/1/chapters/1/lessons
+Authorization: Bearer {{admin_token}}
+
+### 10. Grant Teacher Permission
+POST {{base_url}}/question-banks/1/subjects/1/teacher-permissions
+Authorization: Bearer {{admin_token}}
+Content-Type: application/json
+
+{
+  "teacher_id": 5,
+  "permissions": ["view_content", "add_questions", "edit_questions"],
+  "expires_at": "2024-12-31T23:59:59Z",
+  "notes": "مدرس متميز في الرياضيات"
+}
+
+### 11. Get Teacher Permissions
+GET {{base_url}}/question-banks/1/subjects/1/teacher-permissions
+Authorization: Bearer {{admin_token}}
+
+### 12. Add Question (Teacher)
+POST {{base_url}}/question-banks/1/subjects/1/chapters/1/lessons/1/questions
+Authorization: Bearer {{teacher_token}}
+Content-Type: application/json
+
+{
+  "question_text": "ما هو ناتج 2 + 3؟",
+  "question_type": "single_choice",
+  "options": {
+    "A": "4",
+    "B": "5",
+    "C": "6",
+    "D": "7"
+  },
+  "correct_answer": "B",
+  "explanation": "2 + 3 = 5",
+  "difficulty_level": "easy",
+  "points": 1
+}
+
+### 13. Get Pending Questions (Admin)
+GET {{base_url}}/questions/pending?limit=10&offset=0
+Authorization: Bearer {{admin_token}}
+
+### 14. Approve Question (Admin)
+PATCH {{base_url}}/questions/1/approve
+Authorization: Bearer {{admin_token}}
+Content-Type: application/json
+
+{
+  "status": "approved",
+  "notes": "سؤال ممتاز ومفيد",
+  "points_adjustment": 1
+}
+
+### 15. Get Questions for Lesson
+GET {{base_url}}/question-banks/1/subjects/1/chapters/1/lessons/1/questions
+Authorization: Bearer {{admin_token}}
+
+### 16. Search Question Banks
+GET {{base_url}}/question-banks/search?q=رياضيات&grade_id=1
+Authorization: Bearer {{admin_token}}
+
+### 17. Get Question Bank Statistics
+GET {{base_url}}/question-banks/1/stats
+Authorization: Bearer {{admin_token}}
+
+### 18. Update Question Bank
+PUT {{base_url}}/question-banks/1
+Authorization: Bearer {{admin_token}}
+Content-Type: application/json
+
+{
+  "name": "بنك أسئلة الصف الأول - محدث",
+  "description": "وصف محدث لبنك الأسئلة",
+  "is_active": true
+}
+
+### 19. Delete Lesson
+DELETE {{base_url}}/question-banks/1/subjects/1/chapters/1/lessons/1
+Authorization: Bearer {{admin_token}}
+
+### 20. Delete Chapter
+DELETE {{base_url}}/question-banks/1/subjects/1/chapters/1
+Authorization: Bearer {{admin_token}}
+
+### 21. Delete Subject
+DELETE {{base_url}}/question-banks/1/subjects/1
+Authorization: Bearer {{admin_token}}
+
+### 22. Delete Question Bank
+DELETE {{base_url}}/question-banks/1
+Authorization: Bearer {{admin_token}}
+

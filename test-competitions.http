@@ -1,0 +1,85 @@
+### اختبار نظام المسابقات
+
+### 1. إنشاء مسابقة جديدة (أدمن فقط)
+POST {{baseUrl}}/competitions
+Authorization: Bearer {{adminToken}}
+Content-Type: multipart/form-data; boundary=----WebKitFormBoundary7MA4YWxkTrZu0gW
+
+------WebKitFormBoundary7MA4YWxkTrZu0gW
+Content-Disposition: form-data; name="title"
+
+مسابقة الرياضيات
+------WebKitFormBoundary7MA4YWxkTrZu0gW
+Content-Disposition: form-data; name="description"
+
+مسابقة في الجبر والهندسة للصف الأول
+------WebKitFormBoundary7MA4YWxkTrZu0gW
+Content-Disposition: form-data; name="duration"
+
+60
+------WebKitFormBoundary7MA4YWxkTrZu0gW
+Content-Disposition: form-data; name="grade_id"
+
+1
+------WebKitFormBoundary7MA4YWxkTrZu0gW
+Content-Disposition: form-data; name="is_visible"
+
+true
+------WebKitFormBoundary7MA4YWxkTrZu0gW
+Content-Disposition: form-data; name="is_active"
+
+true
+------WebKitFormBoundary7MA4YWxkTrZu0gW
+Content-Disposition: form-data; name="image"; filename="math.jpg"
+Content-Type: image/jpeg
+
+< ./math.jpg
+------WebKitFormBoundary7MA4YWxkTrZu0gW--
+
+### 2. الحصول على جميع المسابقات (أدمن فقط)
+GET {{baseUrl}}/competitions/admin
+Authorization: Bearer {{adminToken}}
+
+### 3. الحصول على المسابقات المرئية (للطلاب)
+GET {{baseUrl}}/competitions
+
+### 4. الحصول على مسابقات صف معين
+GET {{baseUrl}}/competitions?grade_id=1
+
+### 5. الحصول على مسابقة محددة
+GET {{baseUrl}}/competitions/1
+
+### 6. تحديث مسابقة (أدمن فقط)
+PUT {{baseUrl}}/competitions/1
+Authorization: Bearer {{adminToken}}
+Content-Type: multipart/form-data; boundary=----WebKitFormBoundary7MA4YWxkTrZu0gW
+
+------WebKitFormBoundary7MA4YWxkTrZu0gW
+Content-Disposition: form-data; name="title"
+
+مسابقة الرياضيات المحدثة
+------WebKitFormBoundary7MA4YWxkTrZu0gW
+Content-Disposition: form-data; name="duration"
+
+90
+------WebKitFormBoundary7MA4YWxkTrZu0gW--
+
+### 7. تغيير حالة الرؤية (أدمن فقط)
+PATCH {{baseUrl}}/competitions/1/toggle-visibility
+Authorization: Bearer {{adminToken}}
+
+### 8. تغيير حالة النشاط (أدمن فقط)
+PATCH {{baseUrl}}/competitions/1/toggle-active
+Authorization: Bearer {{adminToken}}
+
+### 9. حذف مسابقة (أدمن فقط)
+DELETE {{baseUrl}}/competitions/1
+Authorization: Bearer {{adminToken}}
+
+### متغيرات البيئة
+# @baseUrl = http://localhost:3000
+# @adminToken = your_admin_jwt_token_here
+
+
+
+

@@ -1,0 +1,34 @@
+### Authenticate as teacher (Assuming you have a teacher account, otherwise we need to create one or use existing token)
+# @name login
+POST http://localhost:3000/auth/login
+Content-Type: application/json
+
+{
+  "email": "teacher@test.com",
+  "password": "password123"
+}
+
+### Store token
+@token = {{login.response.body.token}}
+
+### Get Teacher Groups to find a valid groupId
+GET http://localhost:3000/study-groups/teacher/my-groups
+Authorization: Bearer {{token}}
+
+### Get Group Students to find a valid studentId (Pick a valid group ID from previous step, e.g. 1)
+@groupId = 1
+GET http://localhost:3000/study-groups/{{groupId}}/students
+Authorization: Bearer {{token}}
+@studentId = 1
+
+### Test 1: Default (Current Month)
+GET http://localhost:3000/study-groups/{{groupId}}/students/{{studentId}}/attendance-details
+Authorization: Bearer {{token}}
+
+### Test 2: All Time
+GET http://localhost:3000/study-groups/{{groupId}}/students/{{studentId}}/attendance-details?all_time=true
+Authorization: Bearer {{token}}
+
+### Test 3: Custom Range
+GET http://localhost:3000/study-groups/{{groupId}}/students/{{studentId}}/attendance-details?start_date=2024-01-01&end_date=2024-12-31
+Authorization: Bearer {{token}}

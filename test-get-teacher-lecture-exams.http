@@ -1,0 +1,22 @@
+### Test Get Teacher Lecture Exams
+
+@baseUrl = http://localhost:8000
+@teacherEmail = teacher@example.com
+@teacherPassword = password123
+
+### 1. Login as Teacher
+# @name login
+POST {{baseUrl}}/api/login
+Content-Type: application/json
+
+{
+  "email": "{{teacherEmail}}",
+  "password": "{{teacherPassword}}"
+}
+
+### Variable for Token
+@token = {{login.response.body.token}}
+
+### 2. Get All Lecture Exams for Teacher
+GET {{baseUrl}}/api/exams/teacher/lecture-exams
+Authorization: Bearer {{token}}

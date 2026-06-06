@@ -1,0 +1,47 @@
+### QR Codes APIs Test
+
+### 1. Get Activation Codes with QR Codes (Teacher)
+GET http://localhost:8000/api/course/my-activation-codes?course_id=8
+Authorization: Bearer YOUR_TEACHER_TOKEN
+
+### 2. Get All Activation Codes with QR Codes (Teacher)
+GET http://localhost:8000/api/course/my-activation-codes
+Authorization: Bearer YOUR_TEACHER_TOKEN
+
+### 3. Scan QR Code and Activate Course (Student)
+POST http://localhost:8000/api/course/scan-qr-activate
+Authorization: Bearer YOUR_STUDENT_TOKEN
+Content-Type: application/json
+
+{
+  "qr_data": "{\"type\":\"activation_code\",\"code\":\"A1B2C3D4\",\"course_id\":8,\"expires_at\":\"2024-12-31T23:59:59Z\",\"created_at\":\"2024-01-15T10:30:00Z\"}"
+}
+
+### 4. Test with Invalid QR Data
+POST http://localhost:8000/api/course/scan-qr-activate
+Authorization: Bearer YOUR_STUDENT_TOKEN
+Content-Type: application/json
+
+{
+  "qr_data": "invalid_qr_data"
+}
+
+### 5. Test with Expired QR Code
+POST http://localhost:8000/api/course/scan-qr-activate
+Authorization: Bearer YOUR_STUDENT_TOKEN
+Content-Type: application/json
+
+{
+  "qr_data": "{\"type\":\"activation_code\",\"code\":\"A1B2C3D4\",\"course_id\":8,\"expires_at\":\"2020-12-31T23:59:59Z\",\"created_at\":\"2020-01-15T10:30:00Z\"}"
+}
+
+### 6. Test with Missing QR Data
+POST http://localhost:8000/api/course/scan-qr-activate
+Authorization: Bearer YOUR_STUDENT_TOKEN
+Content-Type: application/json
+
+{
+  "invalid_field": "test"
+}
+
+

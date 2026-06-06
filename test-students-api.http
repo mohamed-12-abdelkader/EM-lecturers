@@ -1,0 +1,37 @@
+### اختبار API جلب جميع الطلاب (للأدمن)
+
+# جلب جميع الطلاب
+GET {{baseUrl}}/api/student/students-data
+Authorization: Bearer {{adminToken}}
+
+###
+
+# اختبار بدون token (يجب أن يعطي خطأ 401)
+GET {{baseUrl}}/api/student/students-data
+
+###
+
+# اختبار مع token طالب (يجب أن يعطي خطأ 403)
+GET {{baseUrl}}/api/student/students-data
+Authorization: Bearer {{studentToken}}
+
+###
+
+### اختبار API جلب تفاصيل المحاضرات للطالب
+
+# جلب تفاصيل المحاضرات للطالب
+GET {{baseUrl}}/api/student/my-lectures
+Authorization: Bearer {{studentToken}}
+
+###
+
+# اختبار بدون token (يجب أن يعطي خطأ 401)
+GET {{baseUrl}}/api/student/my-lectures
+
+###
+
+# اختبار مع token مدرس (يجب أن يعطي خطأ 403)
+GET {{baseUrl}}/api/student/my-lectures
+Authorization: Bearer {{teacherToken}}
+
+

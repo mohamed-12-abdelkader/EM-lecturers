@@ -1,0 +1,224 @@
+### اختبار إنشاء امتحان محاضرة مع الإعدادات المتقدمة
+POST http://localhost:8000/api/course/lecture/1/exam
+Content-Type: application/json
+Authorization: Bearer YOUR_TEACHER_TOKEN
+
+{
+  "title": "امتحان المحاضرة الأولى",
+  "total_grade": 100,
+  "duration": 60,
+  "is_visible": true,
+  "show_at": "2024-01-20T09:00:00Z",
+  "hide_at": "2024-01-25T23:59:59Z",
+  "lock_next_lectures": true,
+  "show_answers_immediately": false,
+  "show_answers_after_hours": 24
+}
+
+### اختبار تحديث الإعدادات المتقدمة
+PATCH http://localhost:8000/api/course/lecture/exam/1/advanced-settings
+Content-Type: application/json
+Authorization: Bearer YOUR_TEACHER_TOKEN
+
+{
+  "show_at": "2024-01-21T10:00:00Z",
+  "hide_at": "2024-01-26T23:59:59Z",
+  "lock_next_lectures": false,
+  "show_answers_immediately": true,
+  "show_answers_after_hours": 0
+}
+
+### اختبار جلب امتحان المحاضرة (للطالب)
+GET http://localhost:8000/api/course/lecture/1/exam
+Authorization: Bearer YOUR_STUDENT_TOKEN
+
+### اختبار جلب امتحان المحاضرة (للمدرس)
+GET http://localhost:8000/api/course/lecture/1/exam
+Authorization: Bearer YOUR_TEACHER_TOKEN
+
+### اختبار إنشاء امتحان بدون إعدادات متقدمة (للتوافق مع الإصدار القديم)
+POST http://localhost:8000/api/course/lecture/1/exam
+Content-Type: application/json
+Authorization: Bearer YOUR_TEACHER_TOKEN
+
+{
+  "title": "امتحان بسيط",
+  "total_grade": 50,
+  "is_visible": true
+}
+
+### اختبار إنشاء امتحان مخفي مع قفل المحاضرات (المحاضرات التالية ستكون مفتوحة)
+POST http://localhost:8000/api/course/lecture/1/exam
+Content-Type: application/json
+Authorization: Bearer YOUR_TEACHER_TOKEN
+
+{
+  "title": "امتحان مخفي",
+  "total_grade": 100,
+  "is_visible": false,
+  "lock_next_lectures": true
+}
+
+### اختبار إنشاء امتحان مرئي مع قفل المحاضرات (المحاضرات التالية ستكون مقفلة)
+POST http://localhost:8000/api/course/lecture/1/exam
+Content-Type: application/json
+Authorization: Bearer YOUR_TEACHER_TOKEN
+
+{
+  "title": "امتحان مرئي مع قفل",
+  "total_grade": 100,
+  "is_visible": true,
+  "lock_next_lectures": true
+}
+
+### اختبار التحقق من إمكانية الوصول لمحاضرة معينة (للطالب)
+GET http://localhost:8000/api/course/lecture/5/access-check
+Authorization: Bearer YOUR_STUDENT_TOKEN
+
+### اختبار السيناريو: امتحان مخفي مع قفل المحاضرات (المحاضرات التالية يجب أن تكون مفتوحة)
+POST http://localhost:8000/api/course/lecture/1/exam
+Content-Type: application/json
+Authorization: Bearer YOUR_TEACHER_TOKEN
+
+{
+  "title": "امتحان مخفي للاختبار",
+  "total_grade": 100,
+  "is_visible": false,
+  "lock_next_lectures": true
+}
+
+### اختبار التحقق من الوصول بعد إنشاء امتحان مخفي
+GET http://localhost:8000/api/course/lecture/2/access-check
+Authorization: Bearer YOUR_STUDENT_TOKEN
+
+### اختبار السيناريو: إظهار الامتحان المخفي
+PATCH http://localhost:8000/api/course/lecture/exam/1/visibility
+Content-Type: application/json
+Authorization: Bearer YOUR_TEACHER_TOKEN
+
+{
+  "is_visible": true
+}
+
+### اختبار Debug - فحص حالة الامتحانات المانعة للوصول
+GET http://localhost:8000/api/course/lecture/2/debug-access
+Authorization: Bearer YOUR_STUDENT_TOKEN
+
+### اختبار سريع - إنشاء امتحان مخفي مع قفل المحاضرات
+POST http://localhost:8000/api/course/lecture/1/exam
+Content-Type: application/json
+Authorization: Bearer YOUR_TEACHER_TOKEN
+
+{
+  "title": "امتحان مخفي للاختبار السريع",
+  "total_grade": 100,
+  "is_visible": false,
+  "lock_next_lectures": true
+}
+
+### اختبار Debug - فحص حالة الامتحانات بعد إنشاء امتحان مخفي
+GET http://localhost:8000/api/course/lecture/2/debug-access
+Authorization: Bearer YOUR_STUDENT_TOKEN
+
+### اختبار السيناريو: طالب لم يخضع للامتحان بعد (يجب أن تكون المحاضرات مفتوحة)
+GET http://localhost:8000/api/course/lecture/2/debug-access
+Authorization: Bearer YOUR_STUDENT_TOKEN
+
+### اختبار السيناريو: طالب لم يخضع للامتحان بعد (يجب أن تكون المحاضرات مقفلة)
+GET http://localhost:8000/api/course/lecture/2/debug-access
+Authorization: Bearer YOUR_STUDENT_TOKEN
+
+### اختبار السيناريو: طالب فشل في الامتحان (يجب أن تكون المحاضرات مقفلة)
+GET http://localhost:8000/api/course/lecture/2/debug-access
+Authorization: Bearer YOUR_STUDENT_TOKEN
+
+### اختبار السيناريو: طالب نجح في الامتحان (يجب أن تكون المحاضرات مفتوحة)
+GET http://localhost:8000/api/course/lecture/2/debug-access
+Authorization: Bearer YOUR_STUDENT_TOKEN
+
+###
+### واجهات الامتحان الجديدة (محاولات + وقت)
+###
+
+### إنشاء امتحان مع جميع الإعدادات الجديدة
+POST http://localhost:8000/api/exams
+Authorization: Bearer YOUR_TEACHER_TOKEN
+Content-Type: application/json
+
+{
+  "lectureId": 1,
+  "title": "Physics Midterm",
+  "totalGrade": 20,
+  "isVisible": true,
+  "showAnswersImmediately": false,
+  "showAnswersLater": true,
+  "answersReleaseDate": "2025-01-12T10:00:00Z",
+  "allowMultipleAttempts": false,
+  "timeLimitEnabled": true,
+  "timeLimitMinutes": 30,
+  "startWindow": "2025-01-10T17:00:00Z",
+  "endWindow": "2025-01-10T19:00:00Z"
+}
+
+### جلب تفاصيل الامتحان للطالب (قبل البدء)
+GET http://localhost:8000/api/exams/EXAM_ID
+Authorization: Bearer YOUR_STUDENT_TOKEN
+
+### بدء محاولة للطالب
+POST http://localhost:8000/api/exams/EXAM_ID/start
+Authorization: Bearer YOUR_STUDENT_TOKEN
+
+### تسليم المحاولة (إظهار فوري لإعداد showAnswersImmediately = true)
+POST http://localhost:8000/api/exams/EXAM_ID/submit
+Authorization: Bearer YOUR_STUDENT_TOKEN
+Content-Type: application/json
+
+{
+  "attemptId": ATTEMPT_ID,
+  "answers": [
+    { "questionId": QUESTION_ID_1, "choiceId": CHOICE_ID_1 },
+    { "questionId": QUESTION_ID_2, "choiceId": CHOICE_ID_2 }
+  ]
+}
+
+### جلب تفاصيل المحاولة للطالب (بعد موعد الإفراج عن الإجابات)
+GET http://localhost:8000/api/exams/EXAM_ID/attempts/ATTEMPT_ID
+Authorization: Bearer YOUR_STUDENT_TOKEN
+
+### اختبار السماح بمحاولات متعددة + رصد التأخير
+POST http://localhost:8000/api/exams
+Authorization: Bearer YOUR_TEACHER_TOKEN
+Content-Type: application/json
+
+{
+  "lectureId": 1,
+  "title": "Unlimited Practice Quiz",
+  "allowMultipleAttempts": true,
+  "showAnswersImmediately": true,
+  "timeLimitEnabled": false,
+  "isVisible": true
+}
+
+### بدء محاولة أولى
+POST http://localhost:8000/api/exams/PRACTICE_EXAM_ID/start
+Authorization: Bearer YOUR_STUDENT_TOKEN
+
+### تسليم المحاولة الأولى (يعرض التصحيح فوراً)
+POST http://localhost:8000/api/exams/PRACTICE_EXAM_ID/submit
+Authorization: Bearer YOUR_STUDENT_TOKEN
+Content-Type: application/json
+
+{
+  "answers": [
+    { "questionId": PRACTICE_Q1, "choiceId": PRACTICE_CHOICE_A },
+    { "questionId": PRACTICE_Q2, "choiceId": PRACTICE_CHOICE_B }
+  ]
+}
+
+### بدء محاولة ثانية بعد انتهاء الأولى (يسمح بها لأن allowMultipleAttempts = true)
+POST http://localhost:8000/api/exams/PRACTICE_EXAM_ID/start
+Authorization: Bearer YOUR_STUDENT_TOKEN
+
+### اختبار جلب الامتحان بعد انتهاء نافذة الوقت (status: closed)
+GET http://localhost:8000/api/exams/EXPIRED_EXAM_ID
+Authorization: Bearer YOUR_STUDENT_TOKEN

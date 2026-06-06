@@ -1,0 +1,7 @@
+-- Up Migration
+ALTER TABLE users ADD COLUMN IF NOT EXISTS description TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS subject TEXT;
+
+-- Down Migration
+ALTER TABLE users DROP COLUMN IF EXISTS description;
+ALTER TABLE users DROP COLUMN IF EXISTS subject; 

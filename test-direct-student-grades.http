@@ -1,0 +1,53 @@
+### اختبار إضافة درجة مباشرة للطالب (الطريقة الجديدة)
+POST http://localhost:8000/api/student-grades/direct
+Content-Type: application/json
+Authorization: Bearer your-token-here
+
+{
+  "group_id": 5,
+  "student_id": 123,
+  "exam_name": "ملاحظة أداء الطالب",
+  "grade": 85.5,
+  "notes": "أداء ممتاز في المشاركة",
+  "total_grade": 100
+}
+
+### اختبار إضافة درجات متعددة مباشرة
+POST http://localhost:8000/api/student-grades/direct/bulk
+Content-Type: application/json
+Authorization: Bearer your-token-here
+
+{
+  "group_id": 5,
+  "exam_name": "تقييم أداء الطلاب",
+  "total_grade": 100,
+  "grades": [
+    {
+      "student_id": 123,
+      "grade": 85.5,
+      "notes": "أداء ممتاز"
+    },
+    {
+      "student_id": 124,
+      "grade": 92.0,
+      "notes": "أداء رائع"
+    },
+    {
+      "student_id": 125,
+      "grade": 78.5,
+      "notes": "أداء جيد"
+    }
+  ]
+}
+
+### اختبار جلب درجات طالب في مجموعة معينة
+GET http://localhost:8000/api/student-grades/group/5/student/123
+Authorization: Bearer your-token-here
+
+### اختبار جلب قائمة الطلاب في المجموعة
+GET http://localhost:8000/api/student-grades/group/5/students
+Authorization: Bearer your-token-here
+
+### اختبار تقرير درجات المجموعة
+GET http://localhost:8000/api/student-grades/group/5/report
+Authorization: Bearer your-token-here

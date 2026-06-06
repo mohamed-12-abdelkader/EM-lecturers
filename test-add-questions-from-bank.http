@@ -1,0 +1,51 @@
+### Test Add Questions From Bank to Exam API
+
+@baseUrl = http://localhost:8000
+@teacherEmail = teacher@example.com
+@teacherPassword = password123
+# Note: You may need to update the token or login credentials
+
+### 1. Login as Teacher (Optional - to get token)
+# @name login
+POST {{baseUrl}}/api/login
+Content-Type: application/json
+
+{
+  "email": "{{teacherEmail}}",
+  "password": "{{teacherPassword}}"
+}
+
+### Variable for Token
+@token = {{login.response.body.token}}
+
+### 2. Create a Lecture Exam (if needed)
+# Assumes lectureId 1 exists and belongs to teacher
+POST {{baseUrl}}/api/exams
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "lectureId": 1,
+  "title": "Test Exam with Bank Questions",
+  "totalGrade": 100,
+  "duration": 60,
+  "isVisible": true
+}
+
+### Variable for Exam ID
+@examId = 1
+# Update locally if needed, or use {{createExam.response.body.exam.id}} if supported by your runner
+
+### 3. Add Questions from Bank
+# Assumes question IDs 1 and 2 exist in the question bank
+POST {{baseUrl}}/api/exams/{{examId}}/questions/from-bank
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "questionIds": [1, 2]
+}
+
+### 4. Verify Questions Added
+GET {{baseUrl}}/api/exams/{{examId}}/questions
+Authorization: Bearer {{token}}

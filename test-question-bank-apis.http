@@ -1,0 +1,84 @@
+### Test Question Bank APIs
+
+@baseUrl = http://localhost:8000
+@adminToken = YOUR_ADMIN_TOKEN_HERE
+
+### 1. Create Question Bank
+POST {{baseUrl}}/api/question-banks
+Authorization: Bearer {{adminToken}}
+Content-Type: application/json
+
+{
+  "name": "بنك أسئلة الصف الأول الثانوي",
+  "description": "أسئلة شاملة للصف الأول الثانوي",
+  "grade_id": 1,
+  "is_active": true,
+  "price": 100
+}
+
+### 2. Create Question Bank (Minimal Data)
+POST {{baseUrl}}/api/question-banks
+Authorization: Bearer {{adminToken}}
+Content-Type: application/json
+
+{
+  "name": "بنك أسئلة تجريبي",
+  "grade_id": 1
+}
+
+### 3. Get All Question Banks
+GET {{baseUrl}}/api/question-banks
+Authorization: Bearer {{adminToken}}
+
+### 4. Get Question Bank by ID
+GET {{baseUrl}}/api/question-banks/1
+Authorization: Bearer {{adminToken}}
+
+### 5. Update Question Bank
+PUT {{baseUrl}}/api/question-banks/1
+Authorization: Bearer {{adminToken}}
+Content-Type: application/json
+
+{
+  "name": "اسم محدث",
+  "description": "وصف محدث",
+  "is_active": false
+}
+
+### 6. Delete Question Bank
+DELETE {{baseUrl}}/api/question-banks/1
+Authorization: Bearer {{adminToken}}
+
+### 7. Test with Invalid Data (Should Fail)
+POST {{baseUrl}}/api/question-banks
+Authorization: Bearer {{adminToken}}
+Content-Type: application/json
+
+{
+  "description": "وصف بدون اسم",
+  "grade_id": "invalid"
+}
+
+### 8. Test with Missing Required Fields (Should Fail)
+POST {{baseUrl}}/api/question-banks
+Authorization: Bearer {{adminToken}}
+Content-Type: application/json
+
+{
+  "description": "وصف فقط"
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

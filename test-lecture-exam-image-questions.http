@@ -1,0 +1,60 @@
+### اختبار APIs أسئلة امتحان المحاضرة بالصور (Cloudinary)
+
+### 1. إضافة أسئلة بالصور لامتحان المحاضرة
+POST http://localhost:8000/api/questions/lecture-exam-question/
+Authorization: Bearer YOUR_TOKEN_HERE
+Content-Type: multipart/form-data
+
+--boundary
+Content-Disposition: form-data; name="exam_id"
+
+1
+--boundary
+Content-Disposition: form-data; name="images"; filename="question1.png"
+Content-Type: image/png
+
+< ./question1.png
+--boundary
+Content-Disposition: form-data; name="images"; filename="question2.png"
+Content-Type: image/png
+
+< ./question2.png
+--boundary--
+
+### 1.1 إضافة أسئلة بالصور بدون ربط بامتحان (لإنشاء أسئلة عامة)
+POST http://localhost:8000/api/questions/lecture-exam-question/
+Authorization: Bearer YOUR_TOKEN_HERE
+Content-Type: multipart/form-data
+
+--boundary
+Content-Disposition: form-data; name="images"; filename="question1.png"
+Content-Type: image/png
+
+< ./question1.png
+--boundary
+Content-Disposition: form-data; name="images"; filename="question2.png"
+Content-Type: image/png
+
+< ./question2.png
+--boundary--
+
+### 2. تحديد الإجابة الصحيحة لسؤال
+PATCH http://localhost:8000/api/questions/lecture-exam-question/1/answer
+Authorization: Bearer YOUR_TOKEN_HERE
+Content-Type: application/json
+
+{
+  "correct_answer": 1
+}
+
+### 3. جلب تفاصيل امتحان المحاضرة (مع الأسئلة بالصور)
+GET http://localhost:8000/api/questions/lecture-exam/1/details
+Authorization: Bearer YOUR_TOKEN_HERE
+
+### 4. حذف سؤال
+DELETE http://localhost:8000/api/questions/lecture-exam-question/1
+Authorization: Bearer YOUR_TOKEN_HERE
+
+### 5. جلب أسئلة امتحان محاضرة معين
+GET http://localhost:8000/api/questions/lecture-exam/1/questions
+Authorization: Bearer YOUR_TOKEN_HERE

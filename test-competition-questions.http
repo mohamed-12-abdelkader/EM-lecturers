@@ -1,0 +1,160 @@
+### اختبار نظام أسئلة المسابقات
+
+### 1. إنشاء سؤال واحد (أدمن فقط)
+POST {{baseUrl}}/competition-questions
+Authorization: Bearer {{adminToken}}
+Content-Type: application/json
+
+{
+  "competition_id": 1,
+  "question_text": "Due to strong winds, the boat kept __________ in circles.",
+  "option_a": "swimming",
+  "option_b": "spinning",
+  "option_c": "surrounding",
+  "option_d": "span",
+  "correct_answer": "B",
+  "points": 1,
+  "question_order": 0,
+  "is_active": true
+}
+
+### 2. إنشاء مجموعة أسئلة دفعة واحدة (أدمن فقط)
+POST {{baseUrl}}/competition-questions/bulk
+Authorization: Bearer {{adminToken}}
+Content-Type: application/json
+
+{
+  "competition_id": 1,
+  "questions": [
+    {
+      "question_text": "Due to strong winds, the boat kept __________ in circles.",
+      "option_a": "swimming",
+      "option_b": "spinning",
+      "option_c": "surrounding",
+      "option_d": "span",
+      "correct_answer": "B",
+      "points": 1,
+      "question_order": 0
+    },
+    {
+      "question_text": "Publishers suffer significant losses as a result of book __________.",
+      "option_a": "literacy",
+      "option_b": "punishment",
+      "option_c": "piracy",
+      "option_d": "privacy",
+      "correct_answer": "C",
+      "points": 1,
+      "question_order": 1
+    },
+    {
+      "question_text": "It is cruel to __________ children by making them go hungry.",
+      "option_a": "publication",
+      "option_b": "publish",
+      "option_c": "punish",
+      "option_d": "compensate",
+      "correct_answer": "C",
+      "points": 1,
+      "question_order": 2
+    },
+    {
+      "question_text": "The show's success made her an overnight __________.",
+      "option_a": "celebrate",
+      "option_b": "celebrity",
+      "option_c": "celebration",
+      "option_d": "deliberate",
+      "correct_answer": "B",
+      "points": 1,
+      "question_order": 3
+    }
+  ]
+}
+
+### 2.5. إنشاء أسئلة من نص بسيط (أدمن فقط)
+POST {{baseUrl}}/competition-questions/text
+Authorization: Bearer {{adminToken}}
+Content-Type: application/json
+
+{
+  "competition_id": 1,
+  "questions_text": "Due to strong winds, the boat kept __________ in circles.\nA) swimming\nB) spinning\nC) surrounding\nD) span\n\nPublishers suffer significant losses as a result of book __________.\nA) literacy\nB) punishment\nC) piracy\nD) privacy\n\nIt is cruel to __________ children by making them go hungry.\nA) publication\nB) publish\nC) punish\nD) compensate\n\nThe show's success made her an overnight __________.\nA) celebrate\nB) celebrity\nC) celebration\nD) deliberate"
+}
+
+# ملاحظة: الأسئلة يتم إنشاؤها بدون تحديد الإجابة الصحيحة
+# يجب تحديد الإجابة الصحيحة لاحقاً باستخدام API تحديث الإجابة الصحيحة
+
+### 3. الحصول على جميع أسئلة مسابقة معينة
+GET {{baseUrl}}/competition-questions/competition/1
+
+### 4. الحصول على أسئلة مسابقة مع تفاصيل إضافية (أدمن فقط)
+GET {{baseUrl}}/competition-questions/competition/1/details
+Authorization: Bearer {{adminToken}}
+
+### 5. الحصول على سؤال بواسطة المعرف
+GET {{baseUrl}}/competition-questions/1
+
+### 6. تحديث سؤال (أدمن فقط)
+PUT {{baseUrl}}/competition-questions/1
+Authorization: Bearer {{adminToken}}
+Content-Type: application/json
+
+{
+  "question_text": "Due to strong winds, the boat kept __________ in circles. (Updated)",
+  "correct_answer": "B",
+  "points": 2
+}
+
+### 6.5. تحديد الإجابة الصحيحة للسؤال (أدمن فقط)
+PATCH {{baseUrl}}/competition-questions/1/correct-answer
+Authorization: Bearer {{adminToken}}
+Content-Type: application/json
+
+{
+  "correct_answer": "C"
+}
+
+### 7. تغيير حالة النشاط (أدمن فقط)
+PATCH {{baseUrl}}/competition-questions/1/toggle-active
+Authorization: Bearer {{adminToken}}
+
+### 8. تغيير ترتيب الأسئلة (أدمن فقط)
+PATCH {{baseUrl}}/competition-questions/reorder/1
+Authorization: Bearer {{adminToken}}
+Content-Type: application/json
+
+{
+  "questionOrders": [
+    { "id": 1, "order": 3 },
+    { "id": 2, "order": 0 },
+    { "id": 3, "order": 1 },
+    { "id": 4, "order": 2 }
+  ]
+}
+
+### 9. الحصول على إحصائيات الأسئلة (أدمن فقط)
+GET {{baseUrl}}/competition-questions/stats/1
+Authorization: Bearer {{adminToken}}
+
+### 10. حذف سؤال (أدمن فقط)
+DELETE {{baseUrl}}/competition-questions/1
+Authorization: Bearer {{adminToken}}
+
+### متغيرات البيئة
+# @baseUrl = http://localhost:3000
+# @adminToken = your_admin_jwt_token_here
+
+### ===== اختبارات واجهات الطالب =====
+
+### 1. جلب مسابقات الطالب حسب صفوفه (طالب فقط)
+GET {{baseUrl}}/competitions/student
+Authorization: Bearer {{studentToken}}
+
+### 2. اشتراك الطالب في مسابقة (طالب فقط)
+POST {{baseUrl}}/competitions/1/join
+Authorization: Bearer {{studentToken}}
+
+### 3. تفاصيل المسابقة للطالب (بعد الاشتراك)
+GET {{baseUrl}}/competitions/1/student-details
+Authorization: Bearer {{studentToken}}
+
+### متغيرات البيئة للطالب
+# @studentToken = your_student_jwt_token_here

@@ -1,0 +1,41 @@
+### اختبار API ترتيب أوائل مسابقة معينة (للطالب والأدمن)
+
+# اختبار للطالب - معرف مسابقة صحيح
+GET {{baseUrl}}/api/competitions/6/leaderboard
+Authorization: Bearer {{studentToken}}
+
+###
+
+# اختبار للأدمن - معرف مسابقة صحيح
+GET {{baseUrl}}/api/competitions/6/leaderboard
+Authorization: Bearer {{adminToken}}
+
+###
+
+# اختبار للأدمن مع تصفية حسب الصف
+GET {{baseUrl}}/api/competitions/6/leaderboard?grade_id=1
+Authorization: Bearer {{adminToken}}
+
+###
+
+# اختبار للأدمن مع صفحات
+GET {{baseUrl}}/api/competitions/6/leaderboard?limit=5&offset=0
+Authorization: Bearer {{adminToken}}
+
+###
+
+# اختبار للطالب مع صفحات
+GET {{baseUrl}}/api/competitions/6/leaderboard?limit=10&offset=0
+Authorization: Bearer {{studentToken}}
+
+###
+
+# اختبار مع معرف مسابقة غير صحيح
+GET {{baseUrl}}/api/competitions/abc/leaderboard
+Authorization: Bearer {{adminToken}}
+
+###
+
+# اختبار بدون معرف مسابقة (يجب أن يعطي خطأ 404)
+GET {{baseUrl}}/api/competitions//leaderboard
+Authorization: Bearer {{adminToken}}

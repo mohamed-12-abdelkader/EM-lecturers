@@ -1,0 +1,189 @@
+### اختبار نظام اللعبة التفاعلية
+
+### 1. إرسال دعوة لعبة
+POST http://localhost:8000/api/game/invite
+Authorization: Bearer YOUR_STUDENT_TOKEN
+Content-Type: application/json
+
+{
+  "inviteeId": 58,
+  "lessonIds": [1, 2, 3],
+  "questionsCount": 10
+}
+
+### 2. جلب الدعوات الواردة
+GET http://localhost:8000/api/game/invitations/incoming
+Authorization: Bearer YOUR_STUDENT_TOKEN
+
+### 3. جلب الدعوات الصادرة
+GET http://localhost:8000/api/game/invitations/outgoing
+Authorization: Bearer YOUR_STUDENT_TOKEN
+
+### 4. قبول الدعوة
+POST http://localhost:8000/api/game/accept/1
+Authorization: Bearer YOUR_STUDENT_TOKEN
+
+### 5. رفض الدعوة
+POST http://localhost:8000/api/game/reject/1
+Authorization: Bearer YOUR_STUDENT_TOKEN
+
+### 6. جلب تفاصيل الغرفة
+GET http://localhost:8000/api/game/room/1
+Authorization: Bearer YOUR_STUDENT_TOKEN
+
+### 7. جلب أسئلة الغرفة
+GET http://localhost:8000/api/game/room/1/questions
+Authorization: Bearer YOUR_STUDENT_TOKEN
+
+### 8. تسجيل إجابة اللاعب
+POST http://localhost:8000/api/game/room/1/answer
+Authorization: Bearer YOUR_STUDENT_TOKEN
+Content-Type: application/json
+
+{
+  "questionId": 1,
+  "answer": "أ",
+  "timeTaken": 45
+}
+
+### 9. جلب نتيجة اللعبة
+GET http://localhost:8000/api/game/room/1/result
+Authorization: Bearer YOUR_STUDENT_TOKEN
+
+### 10. جلب إحصائيات اللاعب
+GET http://localhost:8000/api/game/stats
+Authorization: Bearer YOUR_STUDENT_TOKEN
+
+### 11. تنظيف الدعوات المنتهية الصلاحية (للمدير فقط)
+POST http://localhost:8000/api/game/cleanup
+Authorization: Bearer YOUR_ADMIN_TOKEN
+
+### اختبار WebSocket Events
+
+### 12. تسجيل دخول المستخدم
+WebSocket Event: user:join
+{
+  "userId": 58,
+  "name": "اسم الطالب"
+}
+
+### 13. إرسال دعوة عبر WebSocket
+WebSocket Event: game:send_invitation
+{
+  "inviteeId": 59,
+  "lessonIds": [1, 2, 3],
+  "questionsCount": 10
+}
+
+### 14. قبول الدعوة عبر WebSocket
+WebSocket Event: game:accept_invitation
+{
+  "invitationId": 1
+}
+
+### 15. رفض الدعوة عبر WebSocket
+WebSocket Event: game:reject_invitation
+{
+  "invitationId": 1
+}
+
+### 16. بدء اللعبة
+WebSocket Event: game:start
+{
+  "roomId": 1
+}
+
+### 17. إرسال إجابة عبر WebSocket
+WebSocket Event: game:submit_answer
+{
+  "roomId": 1,
+  "questionId": 1,
+  "answer": "أ",
+  "timeTaken": 45
+}
+
+### 18. طلب السؤال التالي
+WebSocket Event: game:next_question
+{
+  "roomId": 1,
+  "currentQuestionOrder": 1
+}
+
+### سيناريو كامل للاختبار:
+
+### الخطوة 1: الطالب الأول يرسل دعوة
+POST http://localhost:8000/api/game/invite
+Authorization: Bearer STUDENT1_TOKEN
+Content-Type: application/json
+
+{
+  "inviteeId": 59,
+  "lessonIds": [1, 2, 3],
+  "questionsCount": 5
+}
+
+### الخطوة 2: الطالب الثاني يتحقق من الدعوات الواردة
+GET http://localhost:8000/api/game/invitations/incoming
+Authorization: Bearer STUDENT2_TOKEN
+
+### الخطوة 3: الطالب الثاني يقبل الدعوة
+POST http://localhost:8000/api/game/accept/1
+Authorization: Bearer STUDENT2_TOKEN
+
+### الخطوة 4: الطالبان يتحققان من تفاصيل الغرفة
+GET http://localhost:8000/api/game/room/1
+Authorization: Bearer STUDENT1_TOKEN
+
+GET http://localhost:8000/api/game/room/1
+Authorization: Bearer STUDENT2_TOKEN
+
+### الخطوة 5: الطالبان يبدآن اللعبة عبر WebSocket
+WebSocket Event: game:start
+{
+  "roomId": 1
+}
+
+### الخطوة 6: الطالبان يجيبان على الأسئلة
+WebSocket Event: game:submit_answer
+{
+  "roomId": 1,
+  "questionId": 1,
+  "answer": "أ",
+  "timeTaken": 30
+}
+
+### الخطوة 7: الطلب السؤال التالي
+WebSocket Event: game:next_question
+{
+  "roomId": 1,
+  "currentQuestionOrder": 1
+}
+
+### الخطوة 8: الطالبان يتحققان من النتيجة النهائية
+GET http://localhost:8000/api/game/room/1/result
+Authorization: Bearer STUDENT1_TOKEN
+
+GET http://localhost:8000/api/game/room/1/result
+Authorization: Bearer STUDENT2_TOKEN
+
+### الخطوة 9: الطالبان يتحققان من إحصائياتهم
+GET http://localhost:8000/api/game/stats
+Authorization: Bearer STUDENT1_TOKEN
+
+GET http://localhost:8000/api/game/stats
+Authorization: Bearer STUDENT2_TOKEN
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
