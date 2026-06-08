@@ -152,6 +152,11 @@ exports.config = (0, envalid_1.cleanEnv)(process.env, {
     DEEPSEEK_API_URL: (0, envalid_1.str)({ default: 'https://api.deepseek.com' }),
     // Gemini
     GEMINI_API_KEY: (0, envalid_1.str)({ default: '' }),
+    // Mistral OCR / question extraction
+    MISTRAL_API_KEY: (0, envalid_1.str)({ default: '' }),
+    MISTRAL_OCR_MODEL: (0, envalid_1.str)({ default: 'mistral-ocr-latest' }),
+    MISTRAL_CHAT_MODEL: (0, envalid_1.str)({ default: 'mistral-large-latest' }),
+    MISTRAL_API_BASE_URL: (0, envalid_1.str)({ default: 'https://api.mistral.ai/v1' }),
     // Teacher creative chatbot
     OPENAI_API_KEY: (0, envalid_1.str)({ default: '' }),
     OPENAI_IMAGE_MODEL: (0, envalid_1.str)({ default: 'gpt-image-1' }),

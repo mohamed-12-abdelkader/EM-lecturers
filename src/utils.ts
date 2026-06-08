@@ -129,6 +129,12 @@ export const config = cleanEnv(process.env, {
   // Gemini
   GEMINI_API_KEY: str({ default: '' }),
 
+  // Mistral OCR / question extraction
+  MISTRAL_API_KEY: str({ default: '' }),
+  MISTRAL_OCR_MODEL: str({ default: 'mistral-ocr-latest' }),
+  MISTRAL_CHAT_MODEL: str({ default: 'mistral-large-latest' }),
+  MISTRAL_API_BASE_URL: str({ default: 'https://api.mistral.ai/v1' }),
+
   // Teacher creative chatbot
   OPENAI_API_KEY: str({ default: '' }),
   OPENAI_IMAGE_MODEL: str({ default: 'gpt-image-1' }),
@@ -150,7 +156,11 @@ export type GenerateTokenOptions = {
   sessionTenantId?: number | null;
 };
 
-export async function generateToken(user: User, pool: Pool, opts?: GenerateTokenOptions): Promise<string> {
+export async function generateToken(
+  user: User,
+  pool: Pool,
+  opts?: GenerateTokenOptions,
+): Promise<string> {
   const jti = crypto.randomUUID();
 
   // لا نحدث JTI في قاعدة البيانات للطلاب (يسمح بتسجيل الدخول من أجهزة متعددة)

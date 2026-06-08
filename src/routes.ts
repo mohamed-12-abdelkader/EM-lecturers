@@ -65,6 +65,7 @@ import { router as adminTeachersRouter } from './controllers/adminTeachers';
 import { router as analyticsRouter } from './controllers/analytics';
 import { router as analyticsTrackingRouter } from './controllers/analyticsTracking';
 import { router as teacherCreativeChatbotRouter } from './controllers/teacherCreativeChatbot';
+import { router as mistralOcrRouter } from './controllers/mistralOcr';
 
 export const router = Router();
 
@@ -87,6 +88,7 @@ router.use('/analytics', analyticsRouter);
 router.use('/analytics/tracking', analyticsTrackingRouter);
 router.use('/notifications', notificationsRouter);
 router.use('/teacher/creative-chatbot', teacherCreativeChatbotRouter);
+router.use('/ocr', mistralOcrRouter);
 router.use('/teacher/questions', teacherQuestionsRouter);
 router.use('/questions', questionsManagementRouter);
 router.use('/packages', packagesRouter);
