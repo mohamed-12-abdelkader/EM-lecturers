@@ -64,6 +64,7 @@ import { router as customSheetsRouter } from './controllers/customSheets';
 import { router as adminTeachersRouter } from './controllers/adminTeachers';
 import { router as analyticsRouter } from './controllers/analytics';
 import { router as analyticsTrackingRouter } from './controllers/analyticsTracking';
+import { router as teacherCreativeChatbotRouter } from './controllers/teacherCreativeChatbot';
 
 export const router = Router();
 
@@ -85,6 +86,7 @@ router.use('/admin/teachers', adminTeachersRouter);
 router.use('/analytics', analyticsRouter);
 router.use('/analytics/tracking', analyticsTrackingRouter);
 router.use('/notifications', notificationsRouter);
+router.use('/teacher/creative-chatbot', teacherCreativeChatbotRouter);
 router.use('/teacher/questions', teacherQuestionsRouter);
 router.use('/questions', questionsManagementRouter);
 router.use('/packages', packagesRouter);

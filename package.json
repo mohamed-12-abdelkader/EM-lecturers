@@ -11,7 +11,8 @@
     "lint": "eslint . --max-warnings 0",
     "lint:fix": "npm run lint -- --fix",
     "test": "vitest",
-    "migrate": "node-pg-migrate"
+    "migrate": "node-pg-migrate",
+    "teacher:token": "cross-env NODE_ENV=development tsx src/scripts/generate_teacher_token.ts"
   },
   "dependencies": {
     "@google/genai": "^1.35.0",

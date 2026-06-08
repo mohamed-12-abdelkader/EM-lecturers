@@ -152,6 +152,10 @@ exports.config = (0, envalid_1.cleanEnv)(process.env, {
     DEEPSEEK_API_URL: (0, envalid_1.str)({ default: 'https://api.deepseek.com' }),
     // Gemini
     GEMINI_API_KEY: (0, envalid_1.str)({ default: '' }),
+    // Teacher creative chatbot
+    OPENAI_API_KEY: (0, envalid_1.str)({ default: '' }),
+    OPENAI_IMAGE_MODEL: (0, envalid_1.str)({ default: 'gpt-image-1' }),
+    TEACHER_CREATIVE_LOGO_PATH: (0, envalid_1.str)({ default: '' }),
     // Ollama
     OLLAMA_API_URL: (0, envalid_1.str)({ default: 'http://ollama.next-edu.online' }),
     OLLAMA_EMBEDDING_MODEL: (0, envalid_1.str)({ default: 'embeddinggemma:300m' }),

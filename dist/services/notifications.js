@@ -280,6 +280,52 @@ class NotificationService {
         }
     }
     /**
+     * تذكير يومي للمدرسين لاستخدام مساعد توليد المنشورات والتصميمات.
+     */
+    static async notifyTeacherCreativeReminder(userId) {
+        const title = 'مساعد السوشيال ميديا جاهز لك';
+        const message = 'ابدأ يومك بفكرة منشور أو تصميم جديد لطلابك. افتح مساعد المدرسين الإبداعي واكتب المطلوب بالعربي.';
+        const description = 'تذكير يومي لاستخدام مساعد توليد المنشورات والتصميمات للمدرسين';
+        const metadata = {
+            target: 'teacher_creative_chatbot',
+            route: '/teacher/creative-chatbot',
+            actions: ['post', 'image'],
+        };
+        try {
+            const result = await pool_1.default.query(`INSERT INTO notifications (user_id, title, message, description, type, metadata)
+         VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+         RETURNING *`, [
+                userId,
+                title,
+                message,
+                description,
+                'teacher_creative_reminder',
+                JSON.stringify(metadata),
+            ]);
+            const notification = result.rows[0];
+            broadcastNotification(userId, {
+                id: `notification_${notification.id}`,
+                type: 'notification',
+                notification_type: 'teacher_creative_reminder',
+                title: notification.title,
+                message: notification.message,
+                description: notification.description,
+                metadata: notification.metadata,
+                is_read: notification.is_read,
+                created_at: notification.created_at,
+            });
+            ExpoPushService.sendPushNotification(userId, title, message, {
+                type: 'teacher_creative_reminder',
+                ...metadata,
+            }).catch((e) => console.error('❌ [Notification] Expo push error (teacher creative):', e));
+            return { success: true, notification };
+        }
+        catch (error) {
+            console.error('خطأ في إرسال تذكير مساعد المدرسين الإبداعي:', error);
+            return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+        }
+    }
+    /**
      * إرسال إشعار عند إضافة محاضرة جديدة
      */
     static async notifyLectureAdded(courseId, lectureId, lectureTitle, courseTitle) {

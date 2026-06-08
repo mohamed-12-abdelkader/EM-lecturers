@@ -772,6 +772,20 @@ const startServer = async () => {
       }
     }, 60 * 1000);
 
+    // يومياً 8 صباحاً: تذكير المدرسين باستخدام مساعد توليد المنشورات والتصميمات
+    setInterval(async () => {
+      try {
+        const { runTeacherCreativeReminderJob, isTeacherCreativeReminderTime } = await import(
+          './services/teacherCreativeReminderJob.js'
+        );
+        if (isTeacherCreativeReminderTime()) {
+          await runTeacherCreativeReminderJob();
+        }
+      } catch (err) {
+        logger.error('Teacher creative reminder job error:', err);
+      }
+    }, 60 * 1000);
+
     // حذف الاستوريات المنتهية (بعد 24 ساعة) عند التشغيل ثم كل ساعة
     (async () => {
       try {

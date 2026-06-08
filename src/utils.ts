@@ -129,6 +129,11 @@ export const config = cleanEnv(process.env, {
   // Gemini
   GEMINI_API_KEY: str({ default: '' }),
 
+  // Teacher creative chatbot
+  OPENAI_API_KEY: str({ default: '' }),
+  OPENAI_IMAGE_MODEL: str({ default: 'gpt-image-1' }),
+  TEACHER_CREATIVE_LOGO_PATH: str({ default: '' }),
+
   // Ollama
   OLLAMA_API_URL: str({ default: 'http://ollama.next-edu.online' }),
   OLLAMA_EMBEDDING_MODEL: str({ default: 'embeddinggemma:300m' }),
