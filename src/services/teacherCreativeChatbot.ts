@@ -4,16 +4,12 @@ import { Blob } from 'node:buffer';
 import pool from '../db/pool';
 import { config, logger, uploadBufferToCloudinary, uploadToCloudinary } from '../utils';
 import {
-  buildTeacherImageCopySystemPrompt,
-  buildTeacherImageCopyUserPrompt,
-  buildTeacherImagePrompt,
   buildTeacherPostSystemPrompt,
   buildTeacherPostUserPrompt,
   normalizeTeacherCreativeAspectRatio,
   normalizeTeacherCreativePlatform,
   normalizeTeacherCreativeTone,
   type TeacherCreativeAspectRatio,
-  type TeacherCreativeImageCopy,
   type TeacherCreativePlatform,
   type TeacherCreativeTone,
 } from './teacherCreative.prompts';
@@ -46,30 +42,6 @@ function normalizePrompt(prompt: string): string {
   if (!value) throw new Error('البرومبت مطلوب');
   if (value.length > 3000) throw new Error('البرومبت طويل جداً');
   return value;
-}
-
-function compactText(value?: string, maxLength = 80): string {
-  const text = String(value || '')
-    .replace(/\s+/g, ' ')
-    .trim();
-  if (text.length <= maxLength) return text;
-  return `${text.slice(0, Math.max(0, maxLength - 1)).trim()}...`;
-}
-
-function normalizeImageCopy(copy: TeacherCreativeImageCopy): TeacherCreativeImageCopy {
-  return {
-    headline: compactText(copy.headline, 42),
-    subheadline: compactText(copy.subheadline, 70),
-    cta: compactText(copy.cta, 28),
-  };
-}
-
-function buildFallbackImageCopy(prompt: string): TeacherCreativeImageCopy {
-  return {
-    headline: compactText(prompt, 42) || 'ابدأ رحلتك التعليمية',
-    subheadline: 'تعلم بخطوات واضحة ومتابعة مستمرة',
-    cta: 'ابدأ الآن',
-  };
 }
 
 function resolveLogoPath(): string {
@@ -270,11 +242,14 @@ export class TeacherCreativeChatbotService {
     }
   }
 
-  static async callDeepSeekForImageCopy(input: {
+  /**
+   * Uses DeepSeek to enhance the user's prompt with visual details for image generation.
+   * Keeps the original idea intact but adds descriptive visual elements (colors, mood, composition, lighting).
+   */
+  static async callDeepSeekForPromptEnhancement(input: {
     prompt: string;
-    platform: TeacherCreativePlatform;
     aspectRatio: TeacherCreativeAspectRatio;
-  }): Promise<{ copy: TeacherCreativeImageCopy; response: Record<string, unknown> }> {
+  }): Promise<string> {
     if (!config.DEEPSEEK_API_KEY) throw new Error('DEEPSEEK_API_KEY is required');
 
     const response = await fetch(`${config.DEEPSEEK_API_URL}/v1/chat/completions`, {
@@ -286,40 +261,42 @@ export class TeacherCreativeChatbotService {
       body: JSON.stringify({
         model: 'deepseek-chat',
         messages: [
-          { role: 'system', content: buildTeacherImageCopySystemPrompt() },
-          { role: 'user', content: buildTeacherImageCopyUserPrompt(input) },
+          {
+            role: 'system',
+            content: `You are an assistant that enhances user prompts for AI image generation.
+
+Rules:
+- Keep the original idea intact — do NOT change the core message or topic.
+- Add visual details: colors, lighting, composition, mood, atmosphere.
+- Make the prompt vivid and descriptive, suitable for an image generation model.
+- Write the enhanced prompt in English.
+- Output ONLY the enhanced prompt text — no explanations, no introductions, no markdown.
+- Keep it concise but rich (2-4 sentences).`,
+          },
+          {
+            role: 'user',
+            content: `Enhance this prompt for image generation:\n\n${input.prompt}`,
+          },
         ],
-        temperature: 0.45,
-        max_tokens: 250,
+        temperature: 0.6,
+        max_tokens: 500,
       }),
     });
 
     if (!response.ok) {
-      throw new Error(`DeepSeek image copy failed: ${response.status} ${await response.text()}`);
+      const errBody = await response.text();
+      console.error('[TeacherCreativeChatbot] DeepSeek enhancement failed:', errBody);
+      return input.prompt;
     }
 
     const payload = (await response.json()) as any;
-    const content = payload.choices?.[0]?.message?.content?.trim();
-    if (!content) throw new Error('DeepSeek returned empty image copy');
+    const enhanced = payload.choices?.[0]?.message?.content?.trim();
+    if (!enhanced) {
+      console.error('[TeacherCreativeChatbot] DeepSeek returned empty enhancement');
+      return input.prompt;
+    }
 
-    const jsonMatch = content.match(/\{[\s\S]*\}/);
-    const parsed = JSON.parse(
-      jsonMatch ? jsonMatch[0] : content,
-    ) as Partial<TeacherCreativeImageCopy>;
-
-    return {
-      copy: normalizeImageCopy({
-        headline: parsed.headline || buildFallbackImageCopy(input.prompt).headline,
-        subheadline: parsed.subheadline || '',
-        cta: parsed.cta || '',
-      }),
-      response: {
-        id: payload.id,
-        model: payload.model,
-        usage: payload.usage,
-        raw_content: content,
-      },
-    };
+    return enhanced;
   }
 
   static async callOpenAIImageGeneration(input: {
@@ -330,7 +307,7 @@ export class TeacherCreativeChatbotService {
   }): Promise<{ buffer: Buffer; model: string; response: Record<string, unknown> }> {
     if (!config.OPENAI_API_KEY) throw new Error('OPENAI_API_KEY is required');
 
-    const model = config.OPENAI_IMAGE_MODEL || 'gpt-image-1';
+    const model = config.OPENAI_IMAGE_MODEL || 'gpt-image-2';
     const formData = new FormData();
     formData.append('model', model);
     formData.append('prompt', input.prompt);
@@ -443,25 +420,9 @@ export class TeacherCreativeChatbotService {
     });
 
     try {
-      const imageCopyResult = await this.callDeepSeekForImageCopy({
+      const enhancedPrompt = await this.callDeepSeekForPromptEnhancement({
         prompt,
-        platform,
         aspectRatio,
-      }).catch((error) => ({
-        copy: buildFallbackImageCopy(prompt),
-        response: {
-          fallback: true,
-          error: error instanceof Error ? error.message : String(error),
-        },
-      }));
-
-      const imagePrompt = buildTeacherImagePrompt({
-        prompt,
-        platform,
-        aspectRatio,
-        referenceCount: referenceFiles.length,
-        logoAttached: true,
-        imageCopy: imageCopyResult.copy,
       });
 
       if (config.NODE_ENV !== 'production') {
@@ -469,16 +430,16 @@ export class TeacherCreativeChatbotService {
           {
             generation_id: generation.id,
             teacher_id: teacherId,
-            prompt: imagePrompt,
-            ai_rendered_copy: imageCopyResult.copy,
+            original_prompt: prompt,
+            enhanced_prompt: enhancedPrompt,
             logo_path: logoPath,
           },
-          '[TeacherCreativeChatbot] Final image generation prompt',
+          '[TeacherCreativeChatbot] Enhanced prompt for image generation',
         );
       }
 
       const openAIImage = await this.callOpenAIImageGeneration({
-        prompt: imagePrompt,
+        prompt: enhancedPrompt,
         logoPath,
         referenceFiles,
         aspectRatio,
@@ -492,19 +453,12 @@ export class TeacherCreativeChatbotService {
       const references = await this.uploadReferenceFiles(generation.id, teacherId, referenceFiles);
 
       const completed = await this.completeGeneration(generation.id, {
-        generatedText: [
-          imageCopyResult.copy.headline,
-          imageCopyResult.copy.subheadline,
-          imageCopyResult.copy.cta,
-        ]
-          .filter(Boolean)
-          .join('\n'),
+        generatedText: prompt,
         generatedImageUrl: uploaded.secure_url,
         providerResponse: {
           model: openAIImage.model,
           response: openAIImage.response,
-          image_copy: imageCopyResult.copy,
-          image_copy_response: imageCopyResult.response,
+          enhanced_prompt: enhancedPrompt,
           logo_attached: true,
           references_count: references.length,
         },

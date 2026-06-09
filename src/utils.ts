@@ -137,7 +137,7 @@ export const config = cleanEnv(process.env, {
 
   // Teacher creative chatbot
   OPENAI_API_KEY: str({ default: '' }),
-  OPENAI_IMAGE_MODEL: str({ default: 'gpt-image-1' }),
+  OPENAI_IMAGE_MODEL: str({ default: 'gpt-image-2' }),
   TEACHER_CREATIVE_LOGO_PATH: str({ default: '' }),
 
   // Ollama
