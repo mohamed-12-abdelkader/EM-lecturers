@@ -52,6 +52,12 @@ friendly | professional | motivational | promotional
 1:1 | 4:5 | 9:16 | 16:9
 ```
 
+### Image Languages
+
+```txt
+arabic | english | mixed
+```
+
 ## Endpoints
 
 ```http
@@ -66,7 +72,7 @@ GET  /generations/:id
 
 ## 1. Get Options
 
-Returns supported request types, platforms, tones, aspect ratios, and upload limits.
+Returns supported request types, platforms, tones, aspect ratios, image languages, and upload limits.
 
 ```http
 GET /options
@@ -142,6 +148,24 @@ curl "http://localhost:8000/api/teacher/creative-chatbot/options" \
       "description_ar": "مناسب للغلاف أو العرض."
     }
   ],
+  "languages": [
+    {
+      "value": "arabic",
+      "label_ar": "عربي",
+      "description_ar": "اكتب النصوص داخل التصميم بالعربية."
+    },
+    {
+      "value": "english",
+      "label_ar": "إنجليزي",
+      "description_ar": "اكتب النصوص داخل التصميم بالإنجليزية."
+    },
+    {
+      "value": "mixed",
+      "label_ar": "مختلط",
+      "description_ar": "استخدم العربية والإنجليزية عند الحاجة."
+    }
+  ],
+  "default_language": "arabic",
   "uploads": {
     "field_name": "references",
     "max_files": 4,
@@ -240,6 +264,9 @@ Content-Type: multipart/form-data
 | `prompt` | string | yes | Teacher design request in Arabic. Maximum `3000` characters. |
 | `platform` | string | no | One of `facebook`, `instagram`, `whatsapp`, `tiktok`, `general`. Defaults to `general`. |
 | `aspect_ratio` | string | no | One of `1:1`, `4:5`, `9:16`, `16:9`. Defaults to `1:1`. |
+| `language_mode` | string | no | One of `arabic`, `english`, `mixed`. Defaults to `arabic`. |
+| `language` | string | no | Alias for `language_mode`. |
+| `edit_last_design` | boolean | no | If true, edits the latest completed teacher design instead of starting fresh. Common Arabic/English edit phrases are also auto-detected. |
 | `references` | file[] | no | Optional reference images. Repeat the same field for multiple files. |
 
 ### Upload Rules
@@ -258,7 +285,8 @@ curl -X POST "http://localhost:8000/api/teacher/creative-chatbot/images" \
   -H "Authorization: Bearer $TOKEN" \
   -F "prompt=صمم بوست جذاب للإعلان عن بداية كورس فيزياء للصف الثالث الثانوي" \
   -F "platform=facebook" \
-  -F "aspect_ratio=1:1"
+-F "aspect_ratio=1:1" \
+-F "language_mode=arabic"
 ```
 
 ### Example With References
@@ -270,6 +298,15 @@ curl -X POST "http://localhost:8000/api/teacher/creative-chatbot/images" \
   -F "platform=instagram" \
   -F "aspect_ratio=4:5" \
   -F "references=@/home/user/Pictures/sample-design.png"
+```
+
+### Example Edit Latest Design
+
+```bash
+curl -X POST "http://localhost:8000/api/teacher/creative-chatbot/images" \
+  -H "Authorization: Bearer $TOKEN" \
+  -F "prompt=عدّل التصميم السابق وخلي العنوان أكبر" \
+  -F "edit_last_design=true"
 ```
 
 ### Response
@@ -286,6 +323,8 @@ curl -X POST "http://localhost:8000/api/teacher/creative-chatbot/images" \
     "platform": "instagram",
     "tone": null,
     "aspect_ratio": "4:5",
+    "language_mode": "arabic",
+    "edited_generation_id": null,
     "status": "completed",
     "generated_text": "مراجعة نهائية في الرياضيات\nشرح منظم وتدريب مكثف\nاحجز مكانك",
     "generated_image_url": "https://res.cloudinary.com/.../image.png",
@@ -490,6 +529,7 @@ export type TeacherCreativeTone =
   | 'promotional';
 
 export type TeacherCreativeAspectRatio = '1:1' | '4:5' | '9:16' | '16:9';
+export type TeacherCreativeLanguageMode = 'arabic' | 'english' | 'mixed';
 
 export async function getTeacherCreativeOptions(token: string) {
   const res = await fetch(`${API_BASE}/teacher/creative-chatbot/options`, {
@@ -529,6 +569,8 @@ export async function generateTeacherCreativeImage(
     prompt: string;
     platform?: TeacherCreativePlatform;
     aspectRatio?: TeacherCreativeAspectRatio;
+    languageMode?: TeacherCreativeLanguageMode;
+    editLastDesign?: boolean;
     references?: File[];
   },
 ) {
@@ -537,6 +579,10 @@ export async function generateTeacherCreativeImage(
 
   if (data.platform) form.append('platform', data.platform);
   if (data.aspectRatio) form.append('aspect_ratio', data.aspectRatio);
+  if (data.languageMode) form.append('language_mode', data.languageMode);
+  if (data.editLastDesign !== undefined) {
+    form.append('edit_last_design', String(data.editLastDesign));
+  }
 
   for (const file of data.references || []) {
     form.append('references', file);

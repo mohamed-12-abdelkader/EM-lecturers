@@ -1,11 +1,20 @@
 export type TeacherCreativePlatform = 'facebook' | 'instagram' | 'whatsapp' | 'tiktok' | 'general';
 export type TeacherCreativeTone = 'friendly' | 'professional' | 'motivational' | 'promotional';
 export type TeacherCreativeAspectRatio = '1:1' | '4:5' | '9:16' | '16:9';
+export type TeacherCreativeLanguageMode = 'arabic' | 'english' | 'mixed';
 
 export interface TeacherCreativeImageCopy {
   headline: string;
   subheadline?: string;
   cta?: string;
+}
+
+export interface TeacherCreativeImageContext {
+  teacherName?: string | null;
+  profileSubject?: string | null;
+  assignedSubjects?: string[];
+  avatarAttached?: boolean;
+  subjectImageUrls?: string[];
 }
 
 export const TEACHER_CREATIVE_PLATFORMS = [
@@ -45,6 +54,14 @@ export const TEACHER_CREATIVE_ASPECT_RATIOS = [
   { value: '9:16', label_ar: 'ستوري/ريلز', description_ar: 'مناسب للقصص والفيديوهات القصيرة.' },
   { value: '16:9', label_ar: 'أفقي', description_ar: 'مناسب للغلاف أو العرض.' },
 ] as const;
+
+export const TEACHER_CREATIVE_LANGUAGES = [
+  { value: 'arabic', label_ar: 'عربي', description_ar: 'اكتب النصوص داخل التصميم بالعربية.' },
+  { value: 'english', label_ar: 'إنجليزي', description_ar: 'اكتب النصوص داخل التصميم بالإنجليزية.' },
+  { value: 'mixed', label_ar: 'مختلط', description_ar: 'استخدم العربية والإنجليزية عند الحاجة.' },
+] as const;
+
+export const DEFAULT_TEACHER_CREATIVE_LANGUAGE: TeacherCreativeLanguageMode = 'arabic';
 
 const PLATFORM_GUIDANCE: Record<TeacherCreativePlatform, string> = {
   facebook: 'اكتب منشور فيسبوك متوسط الطول، بفقرات قصيرة، ودعوة واضحة للتفاعل أو الحجز.',
@@ -86,6 +103,15 @@ export function normalizeTeacherCreativeAspectRatio(
   return ['1:1', '4:5', '9:16', '16:9'].includes(value)
     ? (value as TeacherCreativeAspectRatio)
     : '1:1';
+}
+
+export function normalizeTeacherCreativeLanguageMode(language?: string): TeacherCreativeLanguageMode {
+  const value = String(language || '')
+    .trim()
+    .toLowerCase();
+  return ['arabic', 'english', 'mixed'].includes(value)
+    ? (value as TeacherCreativeLanguageMode)
+    : DEFAULT_TEACHER_CREATIVE_LANGUAGE;
 }
 
 export function buildTeacherPostSystemPrompt(): string {
@@ -167,27 +193,55 @@ export function buildTeacherImagePrompt(input: {
   referenceCount?: number;
   logoAttached?: boolean;
   imageCopy?: TeacherCreativeImageCopy;
+  languageMode?: string;
+  teacherContext?: TeacherCreativeImageContext;
+  editBaseAttached?: boolean;
 }): string {
   const platform = normalizeTeacherCreativePlatform(input.platform);
   const aspectRatio = normalizeTeacherCreativeAspectRatio(input.aspectRatio);
+  const languageMode = normalizeTeacherCreativeLanguageMode(input.languageMode);
   const referenceCount = Math.max(0, Number(input.referenceCount || 0));
   const copyLines = [
     input.imageCopy?.headline,
     input.imageCopy?.subheadline,
     input.imageCopy?.cta,
   ].filter(Boolean);
+  const teacherName = input.teacherContext?.teacherName?.trim();
+  const profileSubject = input.teacherContext?.profileSubject?.trim();
+  const assignedSubjects = (input.teacherContext?.assignedSubjects || [])
+    .map((subject) => subject.trim())
+    .filter(Boolean);
+  const subjectNames = Array.from(
+    new Set([profileSubject, ...assignedSubjects].filter(Boolean) as string[]),
+  );
+  const primarySubject = subjectNames[0] || 'المادة التعليمية';
+  const languageGuidance: Record<TeacherCreativeLanguageMode, string> = {
+    arabic: 'اكتب كل النصوص الظاهرة داخل التصميم بالعربية فقط.',
+    english: 'Write all visible text inside the design in clear English only.',
+    mixed:
+      'استخدم العربية كلغة أساسية، ويمكن إضافة كلمات إنجليزية قصيرة فقط إذا كانت مناسبة للتصميم.',
+  };
 
-  return `صمم صورة تسويقية عربية كاملة لمدرس، وتشمل النص العربي واللوجو داخل التصميم نفسه.
+  return `صمم صورة تسويقية تعليمية كاملة لمدرس، وتشمل النص واللوجو داخل التصميم نفسه.
 
 طلب المدرس:
 ${input.prompt.trim()}
 
+بيانات المدرس من قاعدة البيانات:
+- اسم المدرس: ${teacherName || 'غير متوفر'}.
+- مادة البروفايل: ${profileSubject || 'غير متوفرة'}.
+- المواد المخصصة: ${assignedSubjects.length ? assignedSubjects.join('، ') : 'غير متوفرة'}.
+
 قواعد التصميم:
 - المقاس المطلوب: ${aspectRatio}.
 - المنصة المستهدفة: ${platform}.
+- وضع اللغة: ${languageMode}.
+- ${languageGuidance[languageMode]}
+- أضف اسم المدرس داخل التصميم بوضوح${teacherName ? ` كما هو: ${teacherName}` : ''}.
+- استخدم خلفية مرتبطة بالمادة الأساسية (${primarySubject})، مثل رموز أو ألوان أو عناصر تعليمية مناسبة للمادة بدون ازدحام.
 - اجعل التصميم واضحاً، عصرياً، مناسباً للتعليم.
-- اكتب النص العربي داخل الصورة نفسها بخط واضح وكبير وقابل للقراءة.
-- لا تستخدم حروفاً عربية مكسورة أو رموزاً تشبه العربية. يجب أن تكون الكلمات العربية صحيحة ومقروءة.
+- اكتب النص داخل الصورة نفسها بخط واضح وكبير وقابل للقراءة.
+- لا تستخدم حروفاً عربية مكسورة أو رموزاً تشبه العربية عند استخدام العربية. يجب أن تكون الكلمات صحيحة ومقروءة.
 - استخدم نصاً قليلاً فقط حتى لا يزدحم التصميم.
 - ضع لوجو المنصة داخل التصميم نفسه كعلامة/شعار واضح.
 - لا تضف شعاراً وهمياً أو علامة تجارية غير معروفة غير اللوجو المرفق.
@@ -196,9 +250,9 @@ ${input.prompt.trim()}
 
 ${
   copyLines.length
-    ? `النص العربي المطلوب كتابته داخل الصورة كما هو:
+    ? `النص المطلوب كتابته داخل الصورة كما هو:
 ${copyLines.map((line, index) => `${index + 1}. ${line}`).join('\n')}`
-    : 'استخرج من طلب المدرس نصاً عربياً قصيراً ومقروءاً وضعه داخل التصميم.'
+    : 'استخرج من طلب المدرس نصاً قصيراً ومقروءاً وضعه داخل التصميم مع الالتزام بوضع اللغة المطلوب.'
 }
 
 قواعد العلامة التجارية:
@@ -212,6 +266,16 @@ ${copyLines.map((line, index) => `${index + 1}. ${line}`).join('\n')}`
     input.logoAttached
       ? 'ضع اللوجو في زاوية (أعلى اليسار، أعلى اليمين، أو الأسفل) بحجم صغير، مع خلفية دائرية أو مدورة خفيفة خلفه ليظهر بوضوح عن خلفية الصورة الأصلية.'
       : 'ضع اللوجو في زاوية مناسبة أو ضمن مساحة العلامة التجارية بشكل واضح واحترافي.'
+  }
+- ${
+    input.teacherContext?.avatarAttached
+      ? 'يوجد أفتار/صورة المدرس مرفقة كمرجع بصري. استخدمها كمرجع لهوية المدرس أو أدرجها داخل التصميم إذا كان ذلك مناسباً بدون تشويه.'
+      : 'لا توجد صورة مدرس مرفقة.'
+  }
+- ${
+    input.editBaseAttached
+      ? 'يوجد التصميم السابق مرفق كصورة أساسية. عدّل هذا التصميم نفسه حسب طلب المدرس وحافظ على روحه وتنسيقه العام ما لم يطلب المدرس تغييرهما.'
+      : 'ابدأ تصميماً جديداً من الصفر حسب الطلب.'
   }
 
 ${

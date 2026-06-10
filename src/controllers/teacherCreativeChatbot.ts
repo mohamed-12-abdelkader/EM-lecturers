@@ -7,7 +7,9 @@ import { authMiddleware } from '../middleware/authentication';
 import { asyncWrapper } from '../utils';
 import { TeacherCreativeChatbotService } from '../services/teacherCreativeChatbot';
 import {
+  DEFAULT_TEACHER_CREATIVE_LANGUAGE,
   TEACHER_CREATIVE_ASPECT_RATIOS,
+  TEACHER_CREATIVE_LANGUAGES,
   TEACHER_CREATIVE_PLATFORMS,
   TEACHER_CREATIVE_TONES,
 } from '../services/teacherCreative.prompts';
@@ -45,6 +47,16 @@ const ImageSchema = z.object({
   prompt: z.string().min(1).max(3000),
   platform: z.string().optional(),
   aspect_ratio: z.string().optional(),
+  language_mode: z.string().optional(),
+  language: z.string().optional(),
+  edit_last_design: z.preprocess((value) => {
+    if (value === undefined || value === null || value === '') return undefined;
+    if (typeof value === 'boolean') return value;
+    if (typeof value === 'string') {
+      return ['1', 'true', 'yes', 'y', 'on'].includes(value.trim().toLowerCase());
+    }
+    return value;
+  }, z.boolean().optional()),
 });
 
 async function cleanupUploadedFiles(files: Express.Multer.File[]): Promise<void> {
@@ -63,6 +75,8 @@ router.get(
       platforms: TEACHER_CREATIVE_PLATFORMS,
       tones: TEACHER_CREATIVE_TONES,
       aspect_ratios: TEACHER_CREATIVE_ASPECT_RATIOS,
+      languages: TEACHER_CREATIVE_LANGUAGES,
+      default_language: DEFAULT_TEACHER_CREATIVE_LANGUAGE,
       uploads: {
         field_name: 'references',
         max_files: TeacherCreativeChatbotService.MAX_REFERENCE_FILES,
