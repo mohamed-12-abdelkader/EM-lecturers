@@ -7,6 +7,7 @@ import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
 import { parseNumberInput } from '../utils/requestParsers';
+import { MistralOcrService } from '../services/mistralOcr';
 
 const router = Router();
 
@@ -41,11 +42,12 @@ const upload = multer({
     if (
       allowedMimes.includes(file.mimetype) ||
       file.originalname.endsWith('.txt') ||
-      file.originalname.endsWith('.md')
+      file.originalname.endsWith('.md') ||
+      file.originalname.toLowerCase().endsWith('.pdf')
     ) {
       cb(null, true);
     } else {
-      cb(new Error('Only text files (.txt, .md) are allowed'));
+      cb(new Error('Only text and PDF files (.txt, .md, .pdf) are allowed'));
     }
   },
 });
@@ -79,9 +81,280 @@ const uploadChat = multer({
   },
 });
 
+async function readUploadedContent(file: Express.Multer.File): Promise<string> {
+  return fs.promises.readFile(file.path, 'utf-8');
+}
+
+async function cleanupUploadedFile(file?: Express.Multer.File): Promise<void> {
+  if (file?.path) {
+    await fs.promises.unlink(file.path).catch(() => {});
+  }
+}
+
+async function cleanupChatFiles(files: Express.Multer.File[] | undefined): Promise<void> {
+  if (files && Array.isArray(files)) {
+    for (const file of files) {
+      await fs.promises.unlink(file.path).catch(() => {});
+    }
+  }
+}
+
+function getChatImagePaths(files: Express.Multer.File[] | undefined): string[] {
+  if (!files || !Array.isArray(files)) return [];
+  return files.map((file) => file.path.replace(/\\/g, '/'));
+}
+
+function getTeacherScopeId(req: Request): number | null {
+  const user = (req as any).user;
+  if (user.role === 'teacher') return user.id;
+
+  return (
+    parseNumberInput(req.body?.teacher_id) ??
+    parseNumberInput(req.body?.teacherId) ??
+    parseNumberInput(req.query.teacher_id as string | undefined) ??
+    parseNumberInput(req.query.teacherId as string | undefined) ??
+    null
+  );
+}
+
+/**
+ * Upload teacher-level content file (Teacher/Admin)
+ * POST /files
+ */
+router.post(
+  '/files',
+  authMiddleware(['teacher', 'admin']),
+  upload.single('file'),
+  async (req: Request, res: Response) => {
+    try {
+      const teacherId = getTeacherScopeId(req);
+
+      if (!teacherId) {
+        await cleanupUploadedFile(req.file);
+        return res.status(400).json({ error: 'teacher_id is required for admin uploads' });
+      }
+
+      if (!req.file) {
+        return res.status(400).json({ error: 'No file uploaded' });
+      }
+
+      const hasCourses = await ScientificChatbotService.teacherHasAnyCourse(teacherId);
+      if (!hasCourses) {
+        await cleanupUploadedFile(req.file);
+        return res.status(400).json({ error: 'Teacher does not have any courses' });
+      }
+
+      let contentText: string;
+      try {
+        if (req.file.mimetype === 'application/pdf') {
+          const ocrResult = await MistralOcrService.extractTextFromFile(req.file);
+          contentText = ocrResult.text;
+        } else {
+          contentText = await readUploadedContent(req.file);
+        }
+      } catch (readError: any) {
+        await cleanupUploadedFile(req.file);
+        return res.status(400).json({ error: readError.message || 'Could not read file content' });
+      }
+
+      const result = await ScientificChatbotService.uploadTeacherFile(
+        teacherId,
+        req.file.originalname,
+        req.file.path,
+        req.file.size,
+        req.file.mimetype,
+        contentText,
+      );
+
+      const { embeddingUnavailable, ...file } = result;
+
+      res.status(201).json({
+        message: embeddingUnavailable
+          ? 'File saved. Embeddings could not be generated (embedding service unavailable). Use "Reset embeddings" when the service is back.'
+          : 'File uploaded and processed successfully',
+        file,
+        ...(embeddingUnavailable && {
+          warning:
+            'Embedding service (OpenAI) was unavailable. File is stored; run "Reset embeddings" when the service is available.',
+        }),
+      });
+    } catch (error: any) {
+      logger.error('Error uploading teacher-level file:', error);
+      await cleanupUploadedFile(req.file);
+      res.status(500).json({ error: error.message || 'Error uploading file' });
+    }
+  },
+);
+
+/**
+ * List teacher-level content files (Teacher/Admin)
+ * GET /files
+ */
+router.get('/files', authMiddleware(['teacher', 'admin']), async (req: Request, res: Response) => {
+  try {
+    const teacherId = getTeacherScopeId(req);
+
+    if (!teacherId) {
+      return res.status(400).json({ error: 'teacher_id is required for admin requests' });
+    }
+
+    const files = await ScientificChatbotService.listTeacherFiles(teacherId);
+    res.json({ files });
+  } catch (error: any) {
+    logger.error('Error listing teacher files:', error);
+    res.status(500).json({ error: error.message || 'Error listing files' });
+  }
+});
+
+/**
+ * Reset teacher-level embeddings (Teacher/Admin)
+ * POST /reset-embeddings
+ */
+router.post(
+  '/reset-embeddings',
+  authMiddleware(['teacher', 'admin']),
+  async (req: Request, res: Response) => {
+    try {
+      const teacherId = getTeacherScopeId(req);
+
+      if (!teacherId) {
+        return res.status(400).json({ error: 'teacher_id is required for admin requests' });
+      }
+
+      await ScientificChatbotService.resetTeacherEmbeddings(teacherId);
+
+      res.json({
+        message: 'Embeddings reset successfully',
+      });
+    } catch (error: any) {
+      logger.error('Error resetting teacher embeddings:', error);
+      res.status(500).json({ error: error.message || 'Error resetting embeddings' });
+    }
+  },
+);
+
+/**
+ * Ask a question across all content uploaded by a teacher (Student only)
+ * POST /teachers/:teacherId/ask
+ */
+router.post(
+  '/teachers/:teacherId/ask',
+  authMiddleware(['student']),
+  uploadChat.array('images', 5),
+  async (req: Request, res: Response) => {
+    try {
+      const teacherId = parseNumberInput(req.params.teacherId);
+      const studentId = (req as any).user.id;
+      const { question } = req.body;
+
+      if (!teacherId) {
+        await cleanupChatFiles(req.files as Express.Multer.File[] | undefined);
+        return res.status(400).json({ error: 'Invalid teacher id' });
+      }
+
+      if (!question || typeof question !== 'string' || question.trim().length === 0) {
+        await cleanupChatFiles(req.files as Express.Multer.File[] | undefined);
+        return res.status(400).json({ error: 'Question is required' });
+      }
+
+      const hasSubscription = await ScientificChatbotService.studentHasTeacherSubscription(
+        studentId,
+        teacherId,
+      );
+      if (!hasSubscription) {
+        await cleanupChatFiles(req.files as Express.Multer.File[] | undefined);
+        return res.status(403).json({
+          error: 'You must be subscribed to at least one course with this teacher.',
+        });
+      }
+
+      const hasContent = await ScientificChatbotService.teacherHasContent(teacherId);
+      if (!hasContent) {
+        await cleanupChatFiles(req.files as Express.Multer.File[] | undefined);
+        return res.status(404).json({
+          error:
+            'This teacher does not have uploaded content yet. Please ask your teacher to upload course materials.',
+        });
+      }
+
+      const result = await ScientificChatbotService.answerTeacherQuestion(
+        studentId,
+        teacherId,
+        question.trim(),
+        getChatImagePaths(req.files as Express.Multer.File[] | undefined),
+      );
+
+      res.json({
+        answer: result.answer,
+        retrieved_chunks: result.retrievedChunks,
+      });
+    } catch (error: any) {
+      logger.error('Error answering teacher question:', error);
+      await cleanupChatFiles(req.files as Express.Multer.File[] | undefined);
+      const msg = error?.message ?? '';
+      const isServiceUnavailable =
+        msg.includes('OpenAI Embedding API error') ||
+        msg.includes('OPENAI_API_KEY') ||
+        msg.includes('502') ||
+        msg.includes('503') ||
+        msg.includes('Bad Gateway') ||
+        msg.includes('UNAVAILABLE');
+      if (isServiceUnavailable) {
+        return res.status(503).json({
+          error: 'Answer service is temporarily unavailable. Please try again later.',
+        });
+      }
+      res.status(500).json({ error: error.message || 'Error answering question' });
+    }
+  },
+);
+
+/**
+ * Get teacher-scoped chat history (Student only)
+ * GET /teachers/:teacherId/history
+ */
+router.get(
+  '/teachers/:teacherId/history',
+  authMiddleware(['student']),
+  async (req: Request, res: Response) => {
+    try {
+      const teacherId = parseNumberInput(req.params.teacherId);
+      const studentId = (req as any).user.id;
+      const limit = req.query.limit ? parseInt(req.query.limit as string) : 50;
+      const beforeId = req.query.beforeId ? parseInt(req.query.beforeId as string) : undefined;
+
+      if (!teacherId) {
+        return res.status(400).json({ error: 'Invalid teacher id' });
+      }
+
+      const hasSubscription = await ScientificChatbotService.studentHasTeacherSubscription(
+        studentId,
+        teacherId,
+      );
+      if (!hasSubscription) {
+        return res.status(403).json({
+          error: 'You must be subscribed to at least one course with this teacher.',
+        });
+      }
+
+      const history = await ScientificChatbotService.getTeacherChatHistory(
+        studentId,
+        teacherId,
+        limit,
+        beforeId,
+      );
+
+      res.json({ history });
+    } catch (error: any) {
+      logger.error('Error getting teacher chat history:', error);
+      res.status(500).json({ error: error.message || 'Error getting chat history' });
+    }
+  },
+);
+
 /**
  * Upload course content file (Teacher only)
- * POST /scientific-chatbot/courses/:courseId/files
+ * POST /courses/:courseId/files
  */
 router.post(
   '/courses/:courseId/files',
@@ -102,7 +375,7 @@ router.post(
       if (courseResult.rows.length === 0) {
         // Clean up uploaded file
         if (req.file?.path) {
-          await fs.promises.unlink(req.file.path).catch(() => { });
+          await fs.promises.unlink(req.file.path).catch(() => {});
         }
         return res.status(404).json({ error: 'Course not found' });
       }
@@ -113,7 +386,7 @@ router.post(
       if (userRole === 'teacher') {
         if (course.teacher_id !== teacherId) {
           // Clean up uploaded file
-          await fs.promises.unlink(req.file.path).catch(() => { });
+          await fs.promises.unlink(req.file.path).catch(() => {});
           return res
             .status(403)
             .json({ error: 'You do not have permission to upload files for this course' });
@@ -124,15 +397,14 @@ router.post(
       let contentText: string;
       try {
         if (req.file.mimetype === 'application/pdf') {
-          // For PDF, you would need pdf-parse library
-          // For now, we'll just read as text (won't work well for PDF)
-          contentText = await fs.promises.readFile(req.file.path, 'utf-8');
+          const ocrResult = await MistralOcrService.extractTextFromFile(req.file);
+          contentText = ocrResult.text;
         } else {
           contentText = await fs.promises.readFile(req.file.path, 'utf-8');
         }
-      } catch (_readError) {
-        await fs.promises.unlink(req.file.path).catch(() => { });
-        return res.status(400).json({ error: 'Could not read file content' });
+      } catch (readError: any) {
+        await fs.promises.unlink(req.file.path).catch(() => {});
+        return res.status(400).json({ error: readError.message || 'Could not read file content' });
       }
 
       // Upload and process
@@ -153,13 +425,16 @@ router.post(
           ? 'File saved. Embeddings could not be generated (embedding service unavailable). Use "Reset embeddings" for this course when the service is back.'
           : 'File uploaded and processed successfully',
         file,
-        ...(embeddingUnavailable && { warning: 'Embedding service (Ollama) was unavailable. File is stored; run "Reset embeddings" when the service is available.' }),
+        ...(embeddingUnavailable && {
+          warning:
+            'Embedding service (OpenAI) was unavailable. File is stored; run "Reset embeddings" when the service is available.',
+        }),
       });
     } catch (error: any) {
       logger.error('Error uploading course file:', error);
       // Clean up file if it exists
       if (req.file?.path) {
-        await fs.promises.unlink(req.file.path).catch(() => { });
+        await fs.promises.unlink(req.file.path).catch(() => {});
       }
       res.status(500).json({ error: error.message || 'Error uploading file' });
     }
@@ -168,7 +443,7 @@ router.post(
 
 /**
  * List course content files (Teacher only)
- * GET /scientific-chatbot/courses/:courseId/files
+ * GET /courses/:courseId/files
  */
 router.get(
   '/courses/:courseId/files',
@@ -211,7 +486,7 @@ router.get(
 
 /**
  * Reset course embeddings (delete and regenerate)
- * POST /scientific-chatbot/courses/:courseId/reset-embeddings
+ * POST /courses/:courseId/reset-embeddings
  */
 router.post(
   '/courses/:courseId/reset-embeddings',
@@ -253,7 +528,7 @@ router.post(
 
 /**
  * Delete course content file
- * DELETE /scientific-chatbot/files/:fileId
+ * DELETE /files/:fileId
  */
 router.delete(
   '/files/:fileId',
@@ -281,7 +556,7 @@ router.delete(
 
 /**
  * Ask a question (Student only)
- * POST /scientific-chatbot/courses/:courseId/ask
+ * POST /courses/:courseId/ask
  */
 router.post(
   '/courses/:courseId/ask',
@@ -298,12 +573,27 @@ router.post(
         return res.status(400).json({ error: 'Question is required' });
       }
 
+      const enrollmentResult = await pool.query(
+        `SELECT 1 FROM enrollments WHERE user_id = $1 AND course_id = $2 LIMIT 1`,
+        [studentId, courseId],
+      );
+      if ((enrollmentResult.rowCount ?? 0) === 0) {
+        if (req.files && Array.isArray(req.files)) {
+          for (const file of req.files) {
+            await fs.promises.unlink(file.path).catch(() => {});
+          }
+        }
+        return res.status(403).json({
+          error: 'You must be subscribed to this course to ask about its content.',
+        });
+      }
+
       // Check if course has content
       const hasContent = await ScientificChatbotService.courseHasContent(courseId);
       if (!hasContent) {
         if (req.files && Array.isArray(req.files)) {
           for (const file of req.files) {
-            await fs.promises.unlink(file.path).catch(() => { });
+            await fs.promises.unlink(file.path).catch(() => {});
           }
         }
         return res.status(404).json({
@@ -324,7 +614,7 @@ router.post(
         studentId,
         courseId,
         question.trim(),
-        images
+        images,
       );
 
       res.json({
@@ -335,12 +625,13 @@ router.post(
       logger.error('Error answering question:', error);
       if (req.files && Array.isArray(req.files)) {
         for (const file of req.files) {
-          await fs.promises.unlink(file.path).catch(() => { });
+          await fs.promises.unlink(file.path).catch(() => {});
         }
       }
       const msg = error?.message ?? '';
       const isServiceUnavailable =
-        msg.includes('Ollama API error') ||
+        msg.includes('OpenAI Embedding API error') ||
+        msg.includes('OPENAI_API_KEY') ||
         msg.includes('502') ||
         msg.includes('503') ||
         msg.includes('Bad Gateway') ||
@@ -357,7 +648,7 @@ router.post(
 
 /**
  * Get chat history (Student only)
- * GET /scientific-chatbot/courses/:courseId/history
+ * GET /courses/:courseId/history
  */
 router.get(
   '/courses/:courseId/history',

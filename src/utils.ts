@@ -139,6 +139,8 @@ export const config = cleanEnv(process.env, {
   OPENAI_API_KEY: str({ default: '' }),
   OPENAI_IMAGE_MODEL: str({ default: 'gpt-image-2' }),
   TEACHER_CREATIVE_LOGO_PATH: str({ default: '' }),
+  OPENAI_EMBEDDING_MODEL: str({ default: 'text-embedding-3-small' }),
+  OPENAI_EMBEDDING_DIMENSIONS: num({ default: 1536 }),
 
   // Ollama
   OLLAMA_API_URL: str({ default: 'http://ollama.next-edu.online' }),

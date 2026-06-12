@@ -267,6 +267,121 @@ export class MilvusService {
   }
 
   /**
+   * Search for similar chunks by teacher across all their content
+   */
+  static async searchSimilarChunksByTeacher(
+    collectionName: string,
+    queryVector: number[],
+    teacherId: number,
+    limit: number = 3,
+  ): Promise<
+    Array<{
+      score: number;
+      chunk_text: string;
+      teacher_id: number;
+      course_id: number;
+      file_id: number;
+      chunk_index: number;
+    }>
+  > {
+    const client = await this.getClient();
+
+    try {
+      const results = await client.search({
+        collection_name: collectionName,
+        data: [queryVector],
+        limit,
+        filter: `teacher_id == ${teacherId}`,
+        output_fields: ['chunk_text', 'teacher_id', 'course_id', 'file_id', 'chunk_index'],
+        params: { ef: 64 },
+      });
+
+      console.log('results', results);
+
+      if (!results.results || results.status.error_code !== "Success" || results.results.length === 0) {
+        return [];
+      }
+
+      return results.results.map((result: any) => ({
+        score: result.score,
+        chunk_text: result.chunk_text,
+        teacher_id: result.teacher_id,
+        course_id: result.course_id,
+        file_id: result.file_id,
+        chunk_index: result.chunk_index,
+      }));
+    } catch (error: any) {
+      logger.error(`Error searching chunks by teacher:`, error.message);
+      throw error;
+    }
+  }
+
+  /**
+   * Delete all chunks for a specific teacher
+   */
+  static async deleteTeacherChunks(
+    collectionName: string,
+    teacherId: number,
+  ): Promise<void> {
+    const client = await this.getClient();
+
+    try {
+      const searchResults = await client.query({
+        collection_name: collectionName,
+        filter: `teacher_id == ${teacherId}`,
+        output_fields: ['id'],
+      });
+
+      if (searchResults.data && searchResults.data.length > 0) {
+        const ids = searchResults.data.map((item: any) => item.id);
+
+        await client.delete({
+          collection_name: collectionName,
+          ids: ids,
+        });
+
+        logger.info(`✅ Deleted ${ids.length} chunks for teacher ${teacherId}`);
+      }
+    } catch (error: any) {
+      logger.error(`Error deleting teacher chunks:`, error.message);
+      throw error;
+    }
+  }
+
+  /**
+   * Delete chunks for a specific file
+   */
+  static async deleteFileChunks(
+    collectionName: string,
+    teacherId: number,
+    fileId: number,
+  ): Promise<void> {
+    const client = await this.getClient();
+
+    try {
+      const searchResults = await client.query({
+        collection_name: collectionName,
+        filter: `teacher_id == ${teacherId} && file_id == ${fileId}`,
+        output_fields: ['id'],
+      });
+
+      if (searchResults.data && searchResults.data.length > 0) {
+        const ids = searchResults.data.map((item: any) => item.id);
+
+        await client.delete({
+          collection_name: collectionName,
+          ids: ids,
+        });
+
+        logger.info(`✅ Deleted ${ids.length} chunks for file ${fileId}`);
+      }
+    } catch (error: any) {
+      logger.error(`Error deleting file chunks:`, error.message);
+      throw error;
+    }
+  }
+
+  /**
    * Check if collection exists
    */
   static async collectionExists(collectionName: string): Promise<boolean> {
