@@ -88,7 +88,7 @@ export const config = cleanEnv(process.env, {
   NGROK_DOMAIN: str({ default: '' }),
   NGROK_RELAX_CORS: bool({ default: true }),
   /** e.g. next-edu.online — used to parse {sub}.root from Host. Empty = always default tenant unless X-Tenant-Subdomain. */
-  TENANT_ROOT_DOMAIN: str({ default: '' }),
+  TENANT_ROOT_DOMAIN: str({ default: 'em-online.online' }),
   SECRET_KEY: str({ devDefault: testOnly(crypto.randomBytes(32).toString('hex')) }),
   ACCESS_TOKEN_EXPIRE_MINUTES: num({ default: 60 * 24 * 8 }), // 8 days
   COMMON_TOKEN_EXPIRE_HOURS: num({ default: 8 }),

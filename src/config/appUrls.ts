@@ -65,6 +65,22 @@ export function getApiUrl(): string {
   return `${getBaseUrl()}/api`;
 }
 
+export function isAllowedSubdomain(origin: string): boolean {
+  const root = config.TENANT_ROOT_DOMAIN?.trim().toLowerCase();
+  if (!root) return false;
+
+  try {
+    const { hostname } = new URL(origin);
+
+    return (
+      hostname === root ||
+      hostname.endsWith(`.${root}`)
+    );
+  } catch {
+    return false;
+  }
+}
+
 /** wss://xxxx.ngrok-free.app for Socket.IO */
 export function getSocketUrl(): string {
   return getBaseUrl().replace(/^https:/i, 'wss:').replace(/^http:/i, 'ws:');
@@ -131,13 +147,29 @@ export function getAllowedCorsOrigins(): string[] {
 
 export function isCorsOriginAllowed(origin: string | undefined): boolean {
   const allowed = getAllowedCorsOrigins();
-  if (allowed.includes('*')) return true;
-  if (!origin) return config.NGROK_RELAX_CORS && config.NODE_ENV === 'development';
 
-  if (allowed.includes(origin)) return true;
-  if (config.NODE_ENV === 'development' && config.NGROK_RELAX_CORS) {
-    if (isExpoOrigin(origin) || isNgrokOrigin(origin)) return true;
+  if (allowed.includes("*")) return true;
+
+  if (!origin) {
+    return config.NGROK_RELAX_CORS && config.NODE_ENV === "development";
   }
+
+  // Exact origins
+  if (allowed.includes(origin)) {
+    return true;
+  }
+
+  // Any *.next-edu.online
+  if (isAllowedSubdomain(origin)) {
+    return true;
+  }
+
+  if (config.NODE_ENV === "development" && config.NGROK_RELAX_CORS) {
+    if (isExpoOrigin(origin) || isNgrokOrigin(origin)) {
+      return true;
+    }
+  }
+
   return false;
 }
 
