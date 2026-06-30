@@ -1,27 +1,31 @@
 # APIs بنك الأسئلة للطلاب
 
 ## نظرة عامة
-APIs تسمح للطلاب بالوصول إلى المواد والفصول والدروس الموجودة في بنك الأسئلة الخاص بصفهم، بالإضافة إلى جلب الأسئلة للاستخدام في الألعاب.
+
+APIs للوصول إلى محتوى بنك الأسئلة حسب صف الطالب.
+
+**المسار:** `/api/question-banks/student/*`
+
+**الهيكل:**
+
+```
+مواد → كتب → فصول → دروس → أسئلة
+```
 
 ## المتطلبات
-- يجب أن يكون المستخدم مسجل كطالب (`role = 'student'`)
-- يجب أن يكون للطالب صف محدد (`grade_id`)
-- يجب أن يكون هناك بنك أسئلة مرتبط بصف الطالب
 
-## APIs
+- دور `student`
+- `grade_id` محدد للطالب
+- بنك أسئلة مرتبط بالصف
 
-### 1. جلب المواد الموجودة في بنك الأسئلة
+**Headers:** `Authorization: Bearer <student_token>`
 
-**Endpoint:** `GET /api/question-banks/student/subjects`
+---
 
-**الوصف:** يعرض جميع المواد الموجودة في بنك الأسئلة الخاص بصف الطالب.
+## 1. جلب المواد
 
-**Headers:**
-```
-Authorization: Bearer <student_token>
-```
+**`GET /api/question-banks/student/subjects`**
 
-**Response:**
 ```json
 {
   "success": true,
@@ -29,81 +33,86 @@ Authorization: Bearer <student_token>
     {
       "id": 1,
       "name": "الرياضيات",
-      "description": "مادة الرياضيات للصف الأول الثانوي",
-      "image_url": "https://example.com/math.jpg",
+      "description": "...",
+      "image_url": "https://...",
       "color": "#FF6B6B",
+      "books_count": 2,
       "chapters_count": 5,
       "lessons_count": 25,
       "questions_count": 150
-    },
-    {
-      "id": 2,
-      "name": "الفيزياء",
-      "description": "مادة الفيزياء للصف الأول الثانوي",
-      "image_url": "https://example.com/physics.jpg",
-      "color": "#4ECDC4",
-      "chapters_count": 4,
-      "lessons_count": 20,
-      "questions_count": 120
     }
   ]
 }
 ```
 
-### 2. جلب الفصول الموجودة في مادة معينة
+---
 
-**Endpoint:** `GET /api/question-banks/student/subjects/:subjectId/chapters`
+## 2. جلب كتب المادة (جديد)
 
-**الوصف:** يعرض جميع الفصول الموجودة في مادة معينة.
+**`GET /api/question-banks/student/subjects/:subjectId/books`**
 
-**Parameters:**
-- `subjectId` (number): معرف المادة
-
-**Headers:**
+```json
+{
+  "success": true,
+  "data": [
+    {
+      "id": 3,
+      "name": "كتاب الامتحان",
+      "description": "...",
+      "image_url": null,
+      "order_num": 1,
+      "chapters_count": 3,
+      "lessons_count": 12,
+      "questions_count": 80
+    },
+    {
+      "id": 4,
+      "name": "كتاب نيوتن",
+      "order_num": 2,
+      "chapters_count": 2,
+      "lessons_count": 8,
+      "questions_count": 40
+    }
+  ]
+}
 ```
-Authorization: Bearer <student_token>
-```
 
-**Response:**
+---
+
+## 3. جلب فصول الكتاب (جديد — المفضّل)
+
+**`GET /api/question-banks/student/books/:bookId/chapters`**
+
 ```json
 {
   "success": true,
   "data": [
     {
       "id": 1,
-      "name": "الجبر",
-      "description": "فصل الجبر في الرياضيات",
-      "image_url": "https://example.com/algebra.jpg",
-      "lessons_count": 8,
-      "questions_count": 60
-    },
-    {
-      "id": 2,
-      "name": "الهندسة",
-      "description": "فصل الهندسة في الرياضيات",
-      "image_url": "https://example.com/geometry.jpg",
-      "lessons_count": 7,
-      "questions_count": 50
+      "name": "الفصل الأول",
+      "description": "...",
+      "image_url": null,
+      "lessons_count": 4,
+      "questions_count": 20
     }
   ]
 }
 ```
 
-### 3. جلب الدروس الموجودة في فصل معين
+---
 
-**Endpoint:** `GET /api/question-banks/student/chapters/:chapterId/lessons`
+## 4. جلب كل فصول المادة (Legacy)
 
-**الوصف:** يعرض جميع الدروس الموجودة في فصل معين.
+**`GET /api/question-banks/student/subjects/:subjectId/chapters`**
 
-**Parameters:**
-- `chapterId` (number): معرف الفصل
+يعرض فصول **جميع الكتب** في المادة كقائمة مسطّحة (بدون تجميع حسب الكتاب).
 
-**Headers:**
-```
-Authorization: Bearer <student_token>
-```
+---
 
-**Response:**
+## 5. جلب دروس الفصل
+
+**`GET /api/question-banks/student/chapters/:chapterId/lessons`**
+
 ```json
 {
   "success": true,
@@ -111,41 +120,24 @@ Authorization: Bearer <student_token>
     {
       "id": 1,
       "name": "المعادلات الخطية",
-      "description": "درس المعادلات الخطية",
-      "image_url": "https://example.com/linear-equations.jpg",
+      "description": "...",
+      "image_url": null,
       "order_num": 1,
       "questions_count": 15
-    },
-    {
-      "id": 2,
-      "name": "المعادلات التربيعية",
-      "description": "درس المعادلات التربيعية",
-      "image_url": "https://example.com/quadratic-equations.jpg",
-      "order_num": 2,
-      "questions_count": 20
     }
   ]
 }
 ```
 
-### 4. جلب الأسئلة من درس معين
+---
 
-**Endpoint:** `GET /api/question-banks/student/lessons/:lessonId/questions`
+## 6. جلب أسئلة الدرس (للألعاب)
 
-**الوصف:** يعرض أسئلة عشوائية من درس معين للاستخدام في الألعاب.
+**`GET /api/question-banks/student/lessons/:lessonId/questions?count=10`**
 
-**Parameters:**
-- `lessonId` (number): معرف الدرس
+- `count`: 1–50 (افتراضي 10)
+- أسئلة عشوائية من جدول `questions`
 
-**Query Parameters:**
-- `count` (number, optional): عدد الأسئلة المطلوبة (افتراضي: 10، الحد الأقصى: 50)
-
-**Headers:**
-```
-Authorization: Bearer <student_token>
-```
-
-**Response:**
 ```json
 {
   "success": true,
@@ -154,98 +146,61 @@ Authorization: Bearer <student_token>
       "id": 1,
       "text": "ما هو ناتج 2 + 2؟",
       "options": ["3", "4", "5", "6"],
-      "image": null,
       "correct_answer": "4",
       "difficulty_level": "easy",
       "points": 1
-    },
-    {
-      "id": 2,
-      "text": null,
-      "options": ["أ", "ب", "ج", "د"],
-      "image": "https://example.com/question-image.jpg",
-      "correct_answer": "ب",
-      "difficulty_level": "medium",
-      "points": 2
     }
   ]
 }
 ```
 
-## رسائل الخطأ
+---
 
-### 404 - Not Found
-```json
-{
-  "message": "Student not found"
-}
+## مسار التصفح الموصى به (Frontend)
+
+```
+GET /student/subjects
+  → GET /student/subjects/:id/books
+    → GET /student/books/:bookId/chapters
+      → GET /student/chapters/:chapterId/lessons
+        → GET /student/lessons/:lessonId/questions
 ```
 
-### 400 - Bad Request
-```json
-{
-  "message": "Student grade not assigned"
-}
-```
+---
 
-```json
-{
-  "message": "Invalid subject ID"
-}
-```
+## رسائل الخطأ الشائعة
 
-```json
-{
-  "message": "Subject not found or not accessible"
-}
-```
+| Code | Message |
+|------|---------|
+| 400 | `Student grade not assigned` |
+| 400 | `Invalid subject ID` / `Invalid book ID` |
+| 404 | `Subject not found or not accessible` |
+| 404 | `Book not found or not accessible` |
+| 403 | `Forbidden: insufficient role` |
 
-### 403 - Forbidden
-```json
-{
-  "message": "Forbidden: insufficient role"
-}
-```
+---
 
-## ملاحظات مهمة
+## أمثلة cURL
 
-1. **الأمان:** جميع الـ APIs تتطلب توكن طالب صالح
-2. **الوصول:** الطالب يمكنه الوصول فقط للمواد الموجودة في بنك الأسئلة الخاص بصفه
-3. **الأسئلة:** الأسئلة تُرجع عشوائياً لضمان التنوع في الألعاب
-4. **الحدود:** عدد الأسئلة محدود بين 1 و 50 سؤال
-5. **العد:** جميع العدود تُرجع كأرقام صحيحة
-
-## أمثلة الاستخدام
-
-### جلب جميع المواد
 ```bash
-curl -X GET "http://localhost:8000/api/question-banks/student/subjects" \
-  -H "Authorization: Bearer YOUR_STUDENT_TOKEN"
+# المواد
+curl -H "Authorization: Bearer TOKEN" \
+  http://localhost:8000/api/question-banks/student/subjects
+
+# كتب المادة
+curl -H "Authorization: Bearer TOKEN" \
+  http://localhost:8000/api/question-banks/student/subjects/1/books
+
+# فصول الكتاب
+curl -H "Authorization: Bearer TOKEN" \
+  http://localhost:8000/api/question-banks/student/books/3/chapters
 ```
 
-### جلب فصول مادة معينة
-```bash
-curl -X GET "http://localhost:8000/api/question-banks/student/subjects/1/chapters" \
-  -H "Authorization: Bearer YOUR_STUDENT_TOKEN"
-```
+---
 
-### جلب أسئلة للعبة
-```bash
-curl -X GET "http://localhost:8000/api/question-banks/student/lessons/1/questions?count=15" \
-  -H "Authorization: Bearer YOUR_STUDENT_TOKEN"
-```
+## ملاحظات
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+1. الطالب يرى فقط محتوى بنك أسئلة **صفه**
+2. `books_count` جديد في قائمة المواد
+3. للواجهات الجديدة: تصفّح عبر **الكتب** وليس الفصول مباشرة من المادة
+4. مسار `/subjects/:id/chapters` ما زال يعمل للتوافق

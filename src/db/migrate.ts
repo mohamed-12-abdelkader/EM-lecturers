@@ -4,29 +4,76 @@ import { config } from '../utils';
 import pool from './pool';
 import bcrypt from 'bcrypt';
 
+function buildMigrationDbConfig(databaseUrl: string) {
+  const connectionString = databaseUrl.includes('?')
+    ? databaseUrl.split('?')[0]
+    : databaseUrl;
+  return {
+    connectionString,
+    ssl: { rejectUnauthorized: false },
+  };
+}
+
+function isDbConnectionError(error: unknown): boolean {
+  const err = error as { message?: string; code?: string };
+  const message = err?.message || '';
+  const code = err?.code || '';
+  return (
+    code === 'ENOTFOUND' ||
+    code === 'ETIMEDOUT' ||
+    code === 'ECONNREFUSED' ||
+    message.includes('ENOTFOUND') ||
+    message.includes('ETIMEDOUT') ||
+    message.includes('getaddrinfo') ||
+    message.includes('ECONNREFUSED') ||
+    message.includes('connect') ||
+    message.includes('SELF_SIGNED_CERT')
+  );
+}
+
+function logDbConnectionHelp(databaseUrl: string) {
+  console.error('❌ Cannot connect to database. Please check:');
+  console.error('  1. Internet connection is active');
+  console.error('  2. DATABASE_URL in .env.development is correct');
+  console.error('  3. Aiven database service is running (not paused/deleted)');
+  console.error('  4. DNS resolves (try: nslookup your-db-host.aivencloud.com)');
+  console.error('  5. Firewall/VPN is not blocking outbound port 22237');
+  const maskedUrl = databaseUrl?.replace(/:[^:@]+@/, ':****@');
+  console.error(`  6. Current DATABASE_URL: ${maskedUrl}`);
+}
+
 export async function applyMigrations(databaseUrl: string, direction: 'up' | 'down') {
-  try {
-    await runner({
-      count: Number.POSITIVE_INFINITY,
-      databaseUrl: databaseUrl,
-      dir: path.resolve(__dirname, '../../migrations'),
-      direction,
-      migrationsTable: 'migrations',
-      verbose: false,
-    });
-  } catch (error: any) {
-    console.error('Migration error:', error.message);
-    if (error.message?.includes('ETIMEDOUT') || error.message?.includes('connect')) {
-      console.error('❌ Cannot connect to database. Please check:');
-      console.error('  1. Database server is running');
-      console.error('  2. DATABASE_URL in .env file is correct');
-      console.error('  3. Network connection is available');
-      console.error('  4. Firewall allows connection to database port');
-      const maskedUrl = databaseUrl?.replace(/:[^:@]+@/, ':****@');
-      console.error(`  5. Current DATABASE_URL: ${maskedUrl}`);
+  const maxAttempts = 3;
+  let lastError: unknown;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      await runner({
+        count: Number.POSITIVE_INFINITY,
+        databaseUrl: buildMigrationDbConfig(databaseUrl),
+        dir: path.resolve(__dirname, '../../migrations'),
+        direction,
+        migrationsTable: 'migrations',
+        verbose: false,
+      });
+      lastError = undefined;
+      break;
+    } catch (error: any) {
+      lastError = error;
+      console.error('Migration error:', error.message);
+      if (isDbConnectionError(error)) {
+        logDbConnectionHelp(databaseUrl);
+        if (attempt < maxAttempts) {
+          console.warn(`⏳ Retrying migrations (${attempt}/${maxAttempts}) in 2s...`);
+          await new Promise((resolve) => setTimeout(resolve, 2000));
+          continue;
+        }
+      }
+      throw error;
     }
-    throw error;
   }
+
+  if (lastError) throw lastError;
 
   if (direction !== 'up') return;
 

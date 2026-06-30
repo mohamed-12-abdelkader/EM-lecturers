@@ -4,8 +4,13 @@ import { Router } from 'express';
 import multer from 'multer';
 import { z } from 'zod';
 import { authMiddleware } from '../middleware/authentication';
+import { requireTeacherPlanFeature } from '../middleware/teacherPlanGate';
 import { asyncWrapper } from '../utils';
 import { TeacherCreativeChatbotService } from '../services/teacherCreativeChatbot';
+import {
+  buildPlanFeatureAccess,
+  getTeacherPackage,
+} from '../services/teacherPlanPolicy';
 import {
   DEFAULT_TEACHER_CREATIVE_LANGUAGE,
   TEACHER_CREATIVE_ASPECT_RATIOS,
@@ -15,6 +20,8 @@ import {
 } from '../services/teacherCreative.prompts';
 
 export const router = Router();
+
+const planGateCreative = requireTeacherPlanFeature('creative_social');
 
 const uploadDir = path.join(process.cwd(), 'uploads/teacher-creative-references');
 fs.mkdirSync(uploadDir, { recursive: true });
@@ -66,7 +73,8 @@ async function cleanupUploadedFiles(files: Express.Multer.File[]): Promise<void>
 router.get(
   '/options',
   authMiddleware(['teacher']),
-  asyncWrapper(async (_req, res) => {
+  asyncWrapper(async (req, res) => {
+    const pkg = await getTeacherPackage(req.user!.id);
     res.json({
       request_types: [
         { value: 'post', label_ar: 'منشور نصي' },
@@ -83,6 +91,7 @@ router.get(
         max_file_size_mb: 8,
         allowed_types: ['image/*'],
       },
+      plan_access: buildPlanFeatureAccess(req.user!.id, pkg, 'creative_social'),
     });
   }),
 );
@@ -90,6 +99,7 @@ router.get(
 router.post(
   '/posts',
   authMiddleware(['teacher']),
+  planGateCreative,
   asyncWrapper(async (req, res) => {
     const parsed = PostSchema.safeParse(req.body);
     if (!parsed.success) {
@@ -108,6 +118,7 @@ router.post(
 router.post(
   '/images',
   authMiddleware(['teacher']),
+  planGateCreative,
   referenceUpload.array('references', TeacherCreativeChatbotService.MAX_REFERENCE_FILES),
   asyncWrapper(async (req, res) => {
     const files = ((req.files || []) as Express.Multer.File[]) || [];

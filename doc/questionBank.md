@@ -1,10 +1,35 @@
-## Question Bank API
+## Question Bank API — التوثيق الرئيسي
+
+> **آخر تحديث:** يشمل طبقة **الكتب** بين المادة والفصول.
+
+### ملفات توثيق مرتبطة
+
+| الملف | المحتوى |
+|-------|---------|
+| [`question-bank-student-api.md`](./question-bank-student-api.md) | APIs الطالب |
+| [`question-bank-v2-api.md`](./question-bank-v2-api.md) | أسئلة V2 — `/api/question-bank-v2` |
+| [`question-bank-books-api.md`](./question-bank-books-api.md) | تفاصيل طبقة الكتب |
+| [`question-bank-subject-management.md`](./question-bank-subject-management.md) | **إدارة محتوى المادة** (كتب → فصول → دروس → أسئلة) |
+| [`question_bank_admin_change_requests_api.md`](./question_bank_admin_change_requests_api.md) | طلبات موافقة الموظف |
+| [`teacher-question-library-system.md`](./teacher-question-library-system.md) | مكتبة المدرّس الخاصة (نظام منفصل) |
+
+### الهيكل الحالي
+
+```
+بنك الأسئلة → مادة → كتاب → فصل → درس → أسئلة
+```
+
+**Migration:** `1772700000000_question_bank_subject_books.sql` — الفصول القديمة → كتاب **«كتاب عام»** لكل مادة.
 
 ### نظرة عامة
 - **المسار الأساسي**: `/api/question-banks`
-- **المصادقة**: جميع النقاط محمية بـ JWT ويتطلب دور `admin`
-- **الهيدر المطلوب**: `Authorization: Bearer <ADMIN_JWT>`
-- **رفع الصور**: يدعم `multipart/form-data` للحقل `image` (اختياري). في حال عدم رفع ملف، يمكن تمرير `image_url` كنص.
+- **المصادقة**: JWT — `admin`، `employee` (+ `question_bank_management`)، `teacher`، `student` (مسارات `/student/*`)
+- **الهيدر**: `Authorization: Bearer <JWT>`
+- **رفع الصور**: `multipart/form-data` للحقل `image`، أو `image_url` كنص
+
+### سير العمل (Admin)
+
+1. بنك → 2. مادة → 3. **كتاب** → 4. فصل → 5. درس → 6. أسئلة (V2 أو legacy)
 
 ### تنسيق الاستجابة العام
 جميع الاستجابات تتبع الصيغة:
@@ -31,7 +56,22 @@
 ---
 
 ### 1) إنشاء بنك أسئلة
-- 
+- **Endpoint**: `POST /api/question-banks`
+- **Auth**: Admin أو Employee (صلاحية `question_bank_management`)
+- **Request**: `multipart/form-data`
+  - `name` (مطلوب), `description`, `grade_id`, `price`, `is_active`
+  - `image` (file) أو `image_url`
+
+```http
+POST {{base_url}}/question-banks
+Authorization: Bearer {{admin_token}}
+Content-Type: multipart/form-data
+
+name: بنك أسئلة الصف الأول
+grade_id: 1
+description: ...
+```
+
 ---
 
 ### 2) جلب كل بنوك الأسئلة (مع ترقيم صفحات وفلاتر)
@@ -178,43 +218,61 @@ image: @/path/to/new-image.jpg
 
 ---
 
-### 5.1) جلب بنك أسئلة + المواد التابعة له
+### 5.1) جلب بنك أسئلة + المواد + الكتب + الفصول + الدروس
 - **Endpoint**: `GET /api/question-banks/:id/with-subjects`
-- **Auth**: Admin فقط
+- **Auth**: Admin / Employee
 
-استجابة ناجحة (مثال):
+كل مادة تُرجع:
+- `books[]` — كل كتاب يحتوي `chapters[]` وكل فصل يحتوي `lessons[]`
+- `chapters[]` — قائمة مسطّحة لجميع الفصول (legacy / توافق)
+
+استجابة ناجحة (مختصر):
 
 ```json
 {
   "success": true,
   "data": {
-    "question_bank": {
-      "id": 1,
-      "name": "بنك أسئلة الصف الأول",
-      "description": "...",
-      "image_url": "https://...",
-      "grade_id": 1,
-      "is_active": true,
-      "created_by": 10,
-      "created_at": "2024-01-01T10:00:00.000Z",
-      "updated_at": "2024-01-01T10:00:00.000Z"
-    },
+    "question_bank": { "id": 1, "name": "بنك أسئلة الصف الأول", "grade_id": 1 },
     "subjects": [
       {
         "id": 10,
-        "name": "Physics Basics",
-        "description": "Intro module",
-        "image_url": "https://res.cloudinary.com/...",
+        "name": "فيزياء",
         "question_bank_id": 1,
-        "is_active": true,
-        "created_by": 1,
-        "created_at": "2024-01-01T10:00:00.000Z",
-        "updated_at": "2024-01-01T10:00:00.000Z"
+        "books": [
+          {
+            "id": 3,
+            "subject_id": 10,
+            "name": "كتاب الامتحان",
+            "order_num": 1,
+            "chapters": [
+              {
+                "id": 12,
+                "book_id": 3,
+                "subject_id": 10,
+                "name": "الفصل الأول",
+                "lessons": [{ "id": 15, "name": "درس 1" }]
+              }
+            ]
+          },
+          {
+            "id": 4,
+            "name": "كتاب نيوتن",
+            "chapters": []
+          }
+        ],
+        "chapters": [
+          { "id": 12, "book_id": 3, "name": "الفصل الأول", "lessons": [] }
+        ]
       }
     ]
   }
 }
 ```
+
+**بدائل لجلب شجرة مادة واحدة:**
+- `GET /api/subjects/:id/with-books` — مادة + كتب + فصول + دروس
+- `GET /api/subjects/:id/with-chapters` — مادة + فصول مسطّحة (legacy)
+- `GET /api/books/:id/with-chapters` — كتاب واحد + فصول + دروس
 
 ---
 
@@ -252,6 +310,7 @@ Authorization: Bearer {{admin_token}}
     "grade": { "name": "الصف الأول الابتدائي", "level": null },
     "statistics": {
       "subjects": 3,
+      "books": 8,
       "chapters": 10,
       "lessons": 50,
       "questions": 400,
@@ -276,29 +335,30 @@ Authorization: Bearer {{admin_token}}
 
 ---
 
-### واجهات الفصول (Chapters) - Admin Only
+### واجهات الكتب (Books) — Admin / Employee
 
-- جميع النقاط التالية محمية بـ JWT ودور `admin`.
-- رفع الصورة اختياري عبر `multipart/form-data` بالحقل `image`. يتم تخزين رابط الصورة فقط (`image_url`).
-- الاسم فريد داخل نفس المادة: `(subject_id, LOWER(name))`.
+- جدول DB: `subject_books`
+- الاسم فريد داخل المادة: `(subject_id, LOWER(name))`
+- حذف الكتاب يحذف فصوله تلقائياً (CASCADE)
 
-#### 1) إنشاء فصل داخل مادة
-- Endpoint: `POST /api/subjects/:subjectId/chapters`
-- Auth: Admin فقط
-- Request: `multipart/form-data`
-  - fields: `name` (مطلوب), `description` (اختياري)
-  - file: `image` (اختياري)
+#### 1) قائمة كتب المادة
+- **Endpoint**: `GET /api/subjects/:subjectId/books`
+- **Auth**: Admin / Employee / Teacher (مواده) / Student
 
-مثال (HTTP):
+#### 2) إنشاء كتاب
+- **Endpoint**: `POST /api/subjects/:subjectId/books`
+- **Auth**: Admin / Employee (`question_bank_management`)
+- **Request**: `multipart/form-data`
+  - `name` (مطلوب), `description`, `order_num`, `image`
 
 ```http
-POST {{base_url}}/subjects/5/chapters
+POST {{base_url}}/subjects/5/books
 Authorization: Bearer {{admin_token}}
 Content-Type: multipart/form-data
 
-name: Chapter One
-description: Basics of the subject
-image: @/path/to/file.png
+name: كتاب الامتحان
+description: أسئلة امتحانات الترم
+order_num: 1
 ```
 
 استجابة (201):
@@ -306,35 +366,69 @@ image: @/path/to/file.png
 ```json
 {
   "success": true,
-  "message": "تم إنشاء الفصل بنجاح",
+  "message": "تم إنشاء الكتاب بنجاح",
   "data": {
-    "id": 12,
+    "id": 3,
     "subject_id": 5,
-    "name": "Chapter One",
-    "description": "Basics of the subject",
-    "image_url": "https://res.cloudinary.com/...",
-    "created_by": 1,
-    "created_at": "2024-01-01T10:00:00.000Z",
-    "updated_at": "2024-01-01T10:00:00.000Z"
+    "name": "كتاب الامتحان",
+    "description": "أسئلة امتحانات الترم",
+    "image_url": null,
+    "order_num": 1,
+    "is_active": true,
+    "created_at": "...",
+    "updated_at": "..."
   }
 }
 ```
 
-مثال cURL:
+#### 3) تعديل كتاب
+- **Endpoint**: `PUT /api/books/:id`
+- **Auth**: Admin / Employee — الموظف يرسل طلب موافقة (`202`)
 
-```bash
-curl -X POST http://localhost:8000/api/subjects/5/chapters \
-  -H "Authorization: Bearer <TOKEN>" \
-  -F "name=Chapter One" \
-  -F "description=Basics of the subject" \
-  -F "image=@/path/to/file.png"
+#### 4) حذف كتاب
+- **Endpoint**: `DELETE /api/books/:id`
+
+#### 5) كتاب + فصول + دروس
+- **Endpoint**: `GET /api/books/:id/with-chapters`
+
+---
+
+### واجهات الفصول (Chapters) — Admin / Employee
+
+- جميع النقاط محمية بـ JWT ودور `admin` أو `employee` (للتعديل).
+- رفع الصورة اختياري عبر `multipart/form-data` بالحقل `image`.
+- **الاسم فريد داخل نفس الكتاب**: `(book_id, LOWER(name))` — لم يعد فريداً على مستوى المادة فقط.
+
+#### 1) إنشاء فصل داخل كتاب (الطريقة المفضلة)
+- **Endpoint**: `POST /api/books/:bookId/chapters`
+- **Auth**: Admin / Employee
+- **Request**: `multipart/form-data`
+  - fields: `name` (مطلوب), `description` (اختياري)
+  - file: `image` (اختياري)
+
+```http
+POST {{base_url}}/books/3/chapters
+Authorization: Bearer {{admin_token}}
+Content-Type: multipart/form-data
+
+name: الفصل الأول
+description: مقدمة
 ```
 
-أخطاء شائعة:
-- `404` المادة غير موجودة
-- `409` يوجد فصل بنفس الاسم داخل نفس المادة
+#### 2) إنشاء فصل عبر المادة (Legacy)
+- **Endpoint**: `POST /api/subjects/:subjectId/chapters`
+- يتطلب `book_id` في الـ body، أو يستخدم **أول كتاب** في المادة إن وُجد
+- إن لم يوجد أي كتاب: `400` — «يجب إنشاء كتاب للمادة أولاً»
 
-#### 2) تعديل فصل
+```http
+POST {{base_url}}/subjects/5/chapters
+Content-Type: multipart/form-data
+
+book_id: 3
+name: الفصل الأول
+```
+
+#### 3) تعديل فصل
 - Endpoint: `PUT /api/chapters/:id`
 - Auth: Admin فقط
 - Request: `multipart/form-data`
@@ -360,6 +454,7 @@ name: Updated Chapter Title
   "data": {
     "id": 12,
     "subject_id": 5,
+    "book_id": 3,
     "name": "Updated Chapter Title",
     "description": "Basics of the subject",
     "image_url": "https://res.cloudinary.com/...",
@@ -380,7 +475,7 @@ curl -X PUT http://localhost:8000/api/chapters/12 \
 
 أخطاء شائعة:
 - `404` الفصل غير موجود
-- `409` يوجد فصل بنفس الاسم داخل نفس المادة
+- `409` يوجد فصل بنفس الاسم داخل نفس **الكتاب**
 - `400` لا توجد بيانات للتحديث
 
 #### 3) حذف فصل
@@ -546,9 +641,25 @@ curl -X DELETE http://localhost:8000/api/subjects/10 \
 
 أخطاء شائعة:
 - `404` المادة غير موجودة
-- `409` لا يمكن الحذف لوجود علاقات تابعة (إن وُجدت لاحقًا)
+- `409` لا يمكن الحذف لوجود كتب أو فصول أو دروس أو أسئلة مرتبطة
 
 
+
+---
+
+### واجهات المدرّس (Teacher)
+
+- **Auth**: `teacher` — المواد المعيّنة فقط (`teacher_subjects`)
+
+| Endpoint | الوصف |
+|----------|--------|
+| `GET /api/teacher/subjects` | مواد المدرّس + `books[]` (فصول + دروس) + `chapters[]` flat |
+| `GET /api/teacher/subjects/:id/content` | `books`, `chapters`, `lessons`, `questions` (approved) |
+| `GET /api/subjects/:id/with-books` | نفس الشجرة — Admin/Teacher/Employee |
+| `GET /api/books/:id/with-chapters` | كتاب + فصول + دروس |
+| `POST /api/teacher/lessons/:id/questions` | إضافة سؤال pending |
+
+> **ملاحظة:** مكتبة أسئلة المدرّس **الخاصة** (`/api/teacher/questions`) نظام منفصل — [`teacher-question-library-system.md`](./teacher-question-library-system.md)
 
 ---
 

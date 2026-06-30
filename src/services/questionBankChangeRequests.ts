@@ -1,6 +1,6 @@
 import pool from '../db/pool';
 
-export type QbEntityType = 'question_bank' | 'subject' | 'chapter' | 'lesson';
+export type QbEntityType = 'question_bank' | 'subject' | 'book' | 'chapter' | 'lesson';
 export type QbAction = 'update' | 'delete';
 
 export async function createQuestionBankChangeRequest(params: {

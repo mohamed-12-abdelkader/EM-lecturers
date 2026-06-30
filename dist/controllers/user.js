@@ -13,6 +13,7 @@ const express_1 = require("express");
 const auth_modules_1 = require("./auth.modules");
 const utils_1 = require("../utils");
 const studentPoints_1 = require("../services/studentPoints");
+const teacherManagedStudents_1 = require("../services/teacherManagedStudents");
 const multer_1 = __importDefault(require("multer"));
 const path_1 = __importDefault(require("path"));
 const fs_1 = __importDefault(require("fs"));
@@ -71,6 +72,14 @@ exports.router.post('/register', (0, validateReq_1.validate)(auth_modules_1.Regi
             });
         }
         tenantId = tRes.rows[0].id;
+    }
+    const selfRegistrationAllowed = await teacherManagedStudents_1.TeacherManagedStudentsService.isSelfRegistrationAllowed(tenantId);
+    if (!selfRegistrationAllowed) {
+        return res.status(403).json({
+            success: false,
+            code: 'SELF_REGISTRATION_DISABLED',
+            message: 'يتم إنشاء الحسابات بواسطة المدرس. يرجى التواصل مع مدرسك للحصول على بيانات تسجيل الدخول.',
+        });
     }
     const existing = await pool_1.default.query('SELECT id FROM users WHERE phone = $1 AND tenant_id = $2', [
         phone,
@@ -171,6 +180,7 @@ uploadAvatar.single('avatar'), (0, utils_1.asyncWrapper)(async (req, res) => {
         const hashed = await bcrypt_1.default.hash(password, 10);
         updates.push(`password = $${paramIndex++}`);
         values.push(hashed);
+        updates.push(`must_change_password = FALSE`);
     }
     // رفع صورة البروفايل إذا تم إرسالها
     if (file) {
@@ -316,14 +326,16 @@ exports.router.get('/teachers', (0, authentication_1.authMiddleware)(['admin']),
         users.tiktok_url,
         users.whatsapp_number,
         users.created_at,
+        t.subdomain,
         COUNT(DISTINCT c.id) as courses_count,
         COUNT(DISTINCT e.user_id) as students_count
       FROM users
       ${joinClause}
+      LEFT JOIN tenants t ON t.id = users.tenant_id
       LEFT JOIN courses c ON users.id = c.teacher_id
       LEFT JOIN enrollments e ON c.id = e.course_id
       WHERE ${whereClause}
-      GROUP BY users.id, users.name, users.email, users.phone, users.avatar, users.description, users.subject, users.facebook_url, users.youtube_url, users.tiktok_url, users.whatsapp_number, users.created_at
+      GROUP BY users.id, users.name, users.email, users.phone, users.avatar, users.description, users.subject, users.facebook_url, users.youtube_url, users.tiktok_url, users.whatsapp_number, users.created_at, t.subdomain
       ORDER BY users.created_at DESC
       ${limitSQL}
       ${offsetSQL}

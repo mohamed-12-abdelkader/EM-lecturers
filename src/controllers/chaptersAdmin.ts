@@ -3,10 +3,9 @@ import multer from 'multer';
 import * as fs from 'node:fs';
 import { authMiddleware } from '../middleware/authentication';
 import { checkPermission } from '../middleware/permissions';
-import { teacherHasSubjectAccess, getSubjectIdByChapterId } from '../services/teacherAccess';
 import { uploadToCloudinary } from '../utils';
 import { ChapterService } from '../services/chapters';
-import { ChapterService as SimpleChapterService } from '../services/chapters';
+import { teacherHasSubjectAccess, getSubjectIdByChapterId } from '../services/teacherAccess';
 import { AdminLessonService } from '../services/lessonsAdmin';
 import { createQuestionBankChangeRequest } from '../services/questionBankChangeRequests';
 
@@ -42,7 +41,7 @@ router.get(
           return res.status(403).json({ success: false, message: 'غير مصرح لك بهذه المادة' });
       }
 
-      const chapter = await SimpleChapterService.getById(id);
+      const chapter = await ChapterService.getById(id);
       if (!chapter) return res.status(404).json({ success: false, message: 'الفصل غير موجود' });
 
       const lessons = await AdminLessonService.getByChapterId(id);
@@ -55,19 +54,22 @@ router.get(
   },
 );
 
-// POST /api/subjects/:subjectId/chapters
+// POST /api/books/:bookId/chapters
 router.post(
-  '/subjects/:subjectId/chapters',
-  authMiddleware(['admin', 'employee']), checkPermission('question_bank_management'),
+  '/books/:bookId/chapters',
+  authMiddleware(['admin', 'employee']),
+  checkPermission('question_bank_management'),
   upload.single('image'),
   async (req: Request, res: Response) => {
     try {
-      const subjectId = Number(req.params.subjectId);
-      if (Number.isNaN(subjectId))
-        return res.status(400).json({ success: false, message: 'معرف المادة غير صحيح' });
+      const bookId = Number(req.params.bookId);
+      if (Number.isNaN(bookId)) {
+        return res.status(400).json({ success: false, message: 'معرف الكتاب غير صحيح' });
+      }
 
-      if (!req.body.name)
+      if (!req.body.name) {
         return res.status(400).json({ success: false, message: 'حقل الاسم مطلوب' });
+      }
 
       let image_url: string | undefined;
       const file = (req as any).file as Express.Multer.File | undefined;
@@ -75,23 +77,67 @@ router.post(
 
       const adminId = req.user?.id as number;
       const chapter = await ChapterService.create(
-        subjectId,
+        bookId,
         { name: req.body.name, description: req.body.description, image_url },
         adminId,
       );
-      return res
-        .status(201)
-        .json({ success: true, message: 'تم إنشاء الفصل بنجاح', data: chapter });
+      return res.status(201).json({ success: true, message: 'تم إنشاء الفصل بنجاح', data: chapter });
     } catch (error: any) {
-      if (error.message === 'المادة غير موجودة')
+      if (error.message === 'الكتاب غير موجود') {
         return res.status(404).json({ success: false, message: error.message });
-      if (error.code === '23505' || error.message?.includes('باسم موجود'))
-        return res
-          .status(409)
-          .json({ success: false, message: 'يوجد فصل بنفس الاسم داخل نفس المادة' });
-      return res
-        .status(500)
-        .json({ success: false, message: 'خطأ في إنشاء الفصل', error: error.message });
+      }
+      if (error.code === '23505' || error.message?.includes('باسم موجود')) {
+        return res.status(409).json({ success: false, message: 'يوجد فصل بنفس الاسم داخل نفس الكتاب' });
+      }
+      return res.status(500).json({ success: false, message: 'خطأ في إنشاء الفصل', error: error.message });
+    }
+  },
+);
+
+// POST /api/subjects/:subjectId/chapters (legacy — requires book_id or uses first book)
+router.post(
+  '/subjects/:subjectId/chapters',
+  authMiddleware(['admin', 'employee']),
+  checkPermission('question_bank_management'),
+  upload.single('image'),
+  async (req: Request, res: Response) => {
+    try {
+      const subjectId = Number(req.params.subjectId);
+      if (Number.isNaN(subjectId)) {
+        return res.status(400).json({ success: false, message: 'معرف المادة غير صحيح' });
+      }
+
+      if (!req.body.name) {
+        return res.status(400).json({ success: false, message: 'حقل الاسم مطلوب' });
+      }
+
+      let image_url: string | undefined;
+      const file = (req as any).file as Express.Multer.File | undefined;
+      if (file) image_url = (await uploadToCloudinary(file.path)).secure_url;
+
+      const adminId = req.user?.id as number;
+      const chapter = await ChapterService.createUnderSubject(
+        subjectId,
+        {
+          name: req.body.name,
+          description: req.body.description,
+          image_url,
+          book_id: req.body.book_id ? Number(req.body.book_id) : undefined,
+        },
+        adminId,
+      );
+      return res.status(201).json({ success: true, message: 'تم إنشاء الفصل بنجاح', data: chapter });
+    } catch (error: any) {
+      if (error.message === 'المادة غير موجودة') {
+        return res.status(404).json({ success: false, message: error.message });
+      }
+      if (error.message?.includes('يجب إنشاء كتاب')) {
+        return res.status(400).json({ success: false, message: error.message });
+      }
+      if (error.code === '23505' || error.message?.includes('باسم موجود')) {
+        return res.status(409).json({ success: false, message: 'يوجد فصل بنفس الاسم داخل نفس الكتاب' });
+      }
+      return res.status(500).json({ success: false, message: 'خطأ في إنشاء الفصل', error: error.message });
     }
   },
 );

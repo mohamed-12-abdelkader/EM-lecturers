@@ -1,4 +1,5 @@
 import pool from '../db/pool';
+import { getCourseAverageWatchPercentage } from './watchProgress';
 import { HttpError } from '../utils';
 
 export interface DailyCourseReportCourse {
@@ -277,13 +278,7 @@ export class TeacherDailyCourseReportService {
       last_lecture_watchers_count = parseInt(watchersRes.rows[0]?.cnt || '0', 10);
     }
 
-    const avgWatchRes = await pool.query(
-      `SELECT COALESCE(AVG(completion_percentage), 0) as avg_pct
-       FROM video_views WHERE course_id = $1`,
-      [courseId],
-    );
-    const average_watch_percentage =
-      Math.round(Number(avgWatchRes.rows[0]?.avg_pct || 0) * 100) / 100;
+    const average_watch_percentage = await getCourseAverageWatchPercentage(courseId);
 
     const lecture_stats: DailyCourseReportLectureStats = {
       last_lecture_watchers_count,
@@ -315,9 +310,10 @@ export class TeacherDailyCourseReportService {
         const subRes = await pool.query(
           `SELECT COUNT(*) as total,
                   COUNT(*) FILTER (WHERE passed = true) as passed,
-                  COUNT(*) FILTER (WHERE total_grade > 0 AND (obtained_grade::float / total_grade) > 0.85) as excellence
-           FROM exam_submissions
-           WHERE exam_id = $1 AND status IN ('submitted', 'late', 'expired')`,
+                  COUNT(*) FILTER (WHERE e.total_grade > 0 AND (es.total_grade::float / e.total_grade) > 0.85) as excellence
+           FROM exam_submissions es
+           JOIN exams e ON e.id = es.exam_id
+           WHERE es.exam_id = $1 AND es.status IN ('submitted', 'late', 'expired')`,
           [examId],
         );
         const total = parseInt(subRes.rows[0]?.total || '0', 10);

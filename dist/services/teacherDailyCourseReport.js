@@ -5,6 +5,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.TeacherDailyCourseReportService = void 0;
 const pool_1 = __importDefault(require("../db/pool"));
+const watchProgress_1 = require("./watchProgress");
 const utils_1 = require("../utils");
 /**
  * تقرير يومي للمدرس عن آخر كورس أنشأه أو له نشاط حديث.
@@ -175,9 +176,7 @@ class TeacherDailyCourseReportService {
            AND (e.is_blocked_by_teacher IS NULL OR e.is_blocked_by_teacher = false)`, [last_lecture_id, courseId]);
             last_lecture_watchers_count = parseInt(watchersRes.rows[0]?.cnt || '0', 10);
         }
-        const avgWatchRes = await pool_1.default.query(`SELECT COALESCE(AVG(completion_percentage), 0) as avg_pct
-       FROM video_views WHERE course_id = $1`, [courseId]);
-        const average_watch_percentage = Math.round(Number(avgWatchRes.rows[0]?.avg_pct || 0) * 100) / 100;
+        const average_watch_percentage = await (0, watchProgress_1.getCourseAverageWatchPercentage)(courseId);
         const lecture_stats = {
             last_lecture_watchers_count,
             average_watch_percentage,
@@ -201,9 +200,10 @@ class TeacherDailyCourseReportService {
             if (examType === 'lecture') {
                 const subRes = await pool_1.default.query(`SELECT COUNT(*) as total,
                   COUNT(*) FILTER (WHERE passed = true) as passed,
-                  COUNT(*) FILTER (WHERE total_grade > 0 AND (obtained_grade::float / total_grade) > 0.85) as excellence
-           FROM exam_submissions
-           WHERE exam_id = $1 AND status IN ('submitted', 'late', 'expired')`, [examId]);
+                  COUNT(*) FILTER (WHERE e.total_grade > 0 AND (es.total_grade::float / e.total_grade) > 0.85) as excellence
+           FROM exam_submissions es
+           JOIN exams e ON e.id = es.exam_id
+           WHERE es.exam_id = $1 AND es.status IN ('submitted', 'late', 'expired')`, [examId]);
                 const total = parseInt(subRes.rows[0]?.total || '0', 10);
                 const passed = parseInt(subRes.rows[0]?.passed || '0', 10);
                 const excellence = parseInt(subRes.rows[0]?.excellence || '0', 10);

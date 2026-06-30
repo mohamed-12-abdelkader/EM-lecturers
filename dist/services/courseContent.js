@@ -7,11 +7,15 @@ exports.CourseContentService = void 0;
 const pool_1 = __importDefault(require("../db/pool"));
 const subjectCourses_1 = require("./subjectCourses");
 const lectureExam_1 = require("./lectureExam");
+const courseAccess_1 = require("./courseAccess");
 class CourseContentService {
     // ===== إدارة المحاضرات =====
     // التحقق من صلاحية الطالب للوصول لمحتوى الكورس
     // يدعم الكورسات العادية (courses)
     static async canStudentAccessCourseContent(courseId, studentId) {
+        if (await courseAccess_1.CourseAccessService.isFreePublicCourse(courseId)) {
+            return true;
+        }
         // التحقق من الكورسات العادية
         const enrollmentCheck = await pool_1.default.query('SELECT 1 FROM enrollments WHERE course_id = $1 AND user_id = $2', [courseId, studentId]);
         return (enrollmentCheck.rowCount ?? 0) > 0;

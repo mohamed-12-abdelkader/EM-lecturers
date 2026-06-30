@@ -5,6 +5,8 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.AdminLessonService = void 0;
 const pool_1 = __importDefault(require("../db/pool"));
+const crypto_1 = require("crypto");
+const subjectBookStructure_1 = require("./subjectBookStructure");
 class AdminLessonService {
     static async ensureChapterExists(chapterId) {
         const r = await pool_1.default.query(`SELECT id FROM chapters WHERE id = $1`, [chapterId]);
@@ -20,8 +22,8 @@ class AdminLessonService {
             throw e;
         }
         const q = `
-      INSERT INTO lessons (chapter_id, name, description, image_url, created_by)
-      VALUES ($1, $2, $3, $4, $5)
+      INSERT INTO lessons (chapter_id, name, description, image_url, created_by, mirror_key)
+      VALUES ($1, $2, $3, $4, $5, $6)
       RETURNING *
     `;
         const v = [
@@ -30,9 +32,11 @@ class AdminLessonService {
             data.description ?? null,
             data.image_url ?? null,
             createdBy ?? null,
+            (0, crypto_1.randomUUID)(),
         ];
         const r = await pool_1.default.query(q, v);
         const row = r.rows[0];
+        await subjectBookStructure_1.SubjectBookStructureService.mirrorLessonToOtherBooks(row.id, createdBy);
         return { ...row, created_at: new Date(row.created_at), updated_at: new Date(row.updated_at) };
     }
     static async getById(id) {
@@ -79,15 +83,14 @@ class AdminLessonService {
         const q = `UPDATE lessons SET ${fields.join(', ')} WHERE id = $${idx} RETURNING *`;
         const r = await pool_1.default.query(q, values);
         const row = r.rows[0];
+        await subjectBookStructure_1.SubjectBookStructureService.syncLessonMirrors(id, data);
         return { ...row, created_at: new Date(row.created_at), updated_at: new Date(row.updated_at) };
     }
     static async delete(id) {
         const existing = await this.getById(id);
         if (!existing)
             throw new Error('الدرس غير موجود');
-        const r = await pool_1.default.query(`DELETE FROM lessons WHERE id = $1`, [id]);
-        if (r.rowCount === 0)
-            throw new Error('فشل في حذف الدرس');
+        await subjectBookStructure_1.SubjectBookStructureService.deleteLessonMirrors(id);
     }
     static async getByChapterId(chapterId) {
         await this.ensureChapterExists(chapterId);

@@ -1,4 +1,6 @@
 import pool from '../db/pool';
+import { randomUUID } from 'crypto';
+import { SubjectBookStructureService } from './subjectBookStructure';
 
 export interface AdminLesson {
   id: number;
@@ -35,8 +37,8 @@ export class AdminLessonService {
     }
 
     const q = `
-      INSERT INTO lessons (chapter_id, name, description, image_url, created_by)
-      VALUES ($1, $2, $3, $4, $5)
+      INSERT INTO lessons (chapter_id, name, description, image_url, created_by, mirror_key)
+      VALUES ($1, $2, $3, $4, $5, $6)
       RETURNING *
     `;
     const v = [
@@ -45,9 +47,13 @@ export class AdminLessonService {
       data.description ?? null,
       data.image_url ?? null,
       createdBy ?? null,
+      randomUUID(),
     ];
     const r = await pool.query(q, v);
     const row = r.rows[0];
+
+    await SubjectBookStructureService.mirrorLessonToOtherBooks(row.id, createdBy);
+
     return { ...row, created_at: new Date(row.created_at), updated_at: new Date(row.updated_at) };
   }
 
@@ -105,14 +111,16 @@ export class AdminLessonService {
     const q = `UPDATE lessons SET ${fields.join(', ')} WHERE id = $${idx} RETURNING *`;
     const r = await pool.query(q, values);
     const row = r.rows[0];
+
+    await SubjectBookStructureService.syncLessonMirrors(id, data);
+
     return { ...row, created_at: new Date(row.created_at), updated_at: new Date(row.updated_at) };
   }
 
   static async delete(id: number): Promise<void> {
     const existing = await this.getById(id);
     if (!existing) throw new Error('الدرس غير موجود');
-    const r = await pool.query(`DELETE FROM lessons WHERE id = $1`, [id]);
-    if (r.rowCount === 0) throw new Error('فشل في حذف الدرس');
+    await SubjectBookStructureService.deleteLessonMirrors(id);
   }
 
   static async getByChapterId(chapterId: number): Promise<AdminLesson[]> {

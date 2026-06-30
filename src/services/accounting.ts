@@ -49,6 +49,30 @@ export class AccountingService {
     return result.rows[0];
   }
 
+  static async addIncomeWithClient(
+    client: import('pg').PoolClient,
+    incomeData: IncomeData,
+    createdBy: number,
+  ) {
+    const result = await client.query(
+      `INSERT INTO platform_income 
+       (title, description, amount, source_type, source_id, payment_method, transaction_date, created_by)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       RETURNING *`,
+      [
+        incomeData.title,
+        incomeData.description,
+        incomeData.amount,
+        incomeData.source_type,
+        incomeData.source_id,
+        incomeData.payment_method,
+        incomeData.transaction_date,
+        createdBy,
+      ],
+    );
+    return result.rows[0];
+  }
+
   // إضافة مصروف جديد
   static async addExpense(expenseData: ExpenseData, createdBy: number) {
     const result = await pool.query(

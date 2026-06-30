@@ -123,7 +123,7 @@ class ChapterController {
             }
             const validatedData = questionBank_1.UpdateChapterSchema.parse(req.body);
             // eslint-disable-next-line @typescript-eslint/ban-ts-comment
-            const chapter = await chapters_1.ChapterService.update(questionBankId, subjectId, chapterId, validatedData);
+            const chapter = await chapters_1.ChapterService.update(chapterId, validatedData);
             res.status(200).json({
                 success: true,
                 message: 'تم تحديث الفصل بنجاح',

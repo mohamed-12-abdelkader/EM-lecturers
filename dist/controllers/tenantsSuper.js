@@ -8,6 +8,7 @@ const tenantContext_1 = require("../middleware/tenantContext");
 const validateReq_1 = require("../middleware/validateReq");
 const utils_1 = require("../utils");
 const tenants_1 = require("../services/tenants");
+const tenantFormPayload_1 = require("../utils/tenantFormPayload");
 exports.router = (0, express_1.Router)();
 exports.router.use((0, tenantContext_1.requireDefaultTenantMiddleware)());
 exports.router.use((0, authentication_1.authMiddleware)(['admin']));
@@ -227,37 +228,19 @@ const uploadTenantCreateFiles = utils_1.uploadTeacherAvatar.fields([
     { name: 'og_image', maxCount: 1 },
     { name: 'hero_image', maxCount: 1 },
 ]);
-const PatchTenantBody = zod_1.z.object({
-    subdomain: zod_1.z
-        .string()
-        .min(2)
-        .max(63)
-        .regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/)
-        .optional(),
-    display_name: zod_1.z.string().min(1).optional(),
-    specialty: zod_1.z.string().optional().nullable(),
-    bio: zod_1.z.string().optional().nullable(),
-    avatar_url: zod_1.z.string().optional().nullable(),
-    is_active: zod_1.z.boolean().optional(),
-    seo_title: zod_1.z.string().optional().nullable(),
-    seo_meta_description: zod_1.z.string().optional().nullable(),
-    favicon_url: zod_1.z.string().optional().nullable(),
-    og_image_url: zod_1.z.string().optional().nullable(),
-    settings: zod_1.z.record(zod_1.z.string(), zod_1.z.any()).optional(),
-    landing: zod_1.z.record(zod_1.z.string(), zod_1.z.any()).optional(),
-    owner: zod_1.z
-        .object({
-        name: zod_1.z.string().min(1).optional(),
-        email: zod_1.z.string().email().optional(),
-        password: zod_1.z.string().min(6).optional(),
-        description: zod_1.z.string().optional().nullable(),
-        subject: zod_1.z.string().optional().nullable(),
-        grade_ids: zod_1.z.array(zod_1.z.number().int().positive()).optional(),
-    })
-        .optional(),
-});
-exports.router.get('/', (0, utils_1.asyncWrapper)(async (_req, res) => {
-    const rows = await tenants_1.TenantService.listAll(200, 0);
+exports.router.get('/', (0, utils_1.asyncWrapper)(async (req, res) => {
+    const limit = Number(req.query.limit ?? 200);
+    const offset = Number(req.query.offset ?? 0);
+    const detailed = req.query.detailed === 'true' || req.query.detailed === '1';
+    if (detailed) {
+        const { tenants, total } = await tenants_1.TenantService.listTeacherTenantsForAdmin({
+            limit: Number.isFinite(limit) ? limit : 200,
+            offset: Number.isFinite(offset) ? offset : 0,
+            includeDefault: req.query.include_default === 'true',
+        });
+        return res.json({ success: true, tenants, total });
+    }
+    const rows = await tenants_1.TenantService.listAll(Number.isFinite(limit) ? limit : 200, Number.isFinite(offset) ? offset : 0);
     res.json({ success: true, tenants: rows });
 }));
 exports.router.post('/', (req, res, next) => {
@@ -294,10 +277,43 @@ exports.router.post('/', (req, res, next) => {
         throw e;
     }
 }));
-exports.router.patch('/:id', (0, validateReq_1.validate)(PatchTenantBody), (0, utils_1.asyncWrapper)(async (req, res) => {
+exports.router.patch('/:id', (req, res, next) => {
+    if ((0, tenantFormPayload_1.isMultipartRequest)(req)) {
+        return (0, tenantFormPayload_1.uploadTenantFiles)(req, res, next);
+    }
+    next();
+}, (req, res, next) => {
+    if (!(0, tenantFormPayload_1.isMultipartRequest)(req)) {
+        return (0, validateReq_1.validate)(tenantFormPayload_1.PatchTenantBodySchema)(req, res, next);
+    }
+    next();
+}, (0, utils_1.asyncWrapper)(async (req, res) => {
     const id = Number(req.params.id);
     if (!id || Number.isNaN(id))
         return res.status(400).json({ message: 'Invalid id' });
-    await tenants_1.TenantService.patchTenant(id, req.body);
-    res.json({ success: true });
+    let payload;
+    if ((0, tenantFormPayload_1.isMultipartRequest)(req)) {
+        const built = await (0, tenantFormPayload_1.buildPatchTenantFromMultipart)(req);
+        if ('error' in built) {
+            return res.status(400).json({ success: false, message: built.error });
+        }
+        payload = built.data;
+    }
+    else {
+        payload = req.body;
+    }
+    try {
+        const tenant = await tenants_1.TenantService.patchTenant(id, payload);
+        res.json({ success: true, tenant });
+    }
+    catch (e) {
+        const err = e;
+        if (err.code === '23505') {
+            return res.status(409).json({ success: false, message: 'Subdomain already taken' });
+        }
+        if (err.message === 'Tenant not found') {
+            throw new utils_1.HttpError(404, 'Tenant not found');
+        }
+        throw e;
+    }
 }));

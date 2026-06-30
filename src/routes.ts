@@ -9,6 +9,11 @@ import { router as studentRouter } from './controllers/student';
 import { router as utilsRouter } from './controllers/utils';
 import { router as coursesRouter } from './controllers/courses';
 import { router as teacherQuestionsRouter } from './controllers/teacherQuestions';
+import {
+  publicRouter as teacherFreeLecturesPublicRouter,
+  teacherRouter as teacherFreeLecturesRouter,
+} from './controllers/teacherFreeLectures';
+import { router as publicTeacherPlatformRouter } from './controllers/publicTeacherPlatform';
 import { router as questionsManagementRouter } from './controllers/questionsManagement';
 import { router as packagesRouter } from './controllers/packages';
 import { router as subjectsRouter } from './controllers/subjects';
@@ -24,6 +29,8 @@ import { router as studyGroupsRouter } from './controllers/studyGroups';
 import { router as centerGroupsRouter } from './controllers/centerGroups';
 import groupExamsRouter from './controllers/groupExams';
 import { router as accountingRouter } from './controllers/accounting';
+import { router as financeRouter } from './controllers/finance';
+import { router as teacherSubscriptionRouter } from './controllers/teacherSubscription';
 import { router as employeesRouter } from './controllers/employees';
 import { router as tasksRouter } from './controllers/tasks';
 import { router as studentGradesRouter } from './controllers/studentGrades';
@@ -37,6 +44,7 @@ import { router as questionBankSubjectsAdminRouter } from './controllers/questio
 import { router as questionBankV2Router } from './controllers/questionBankV2';
 import { router as subjectsAdminRouter } from './controllers/subjectsAdmin';
 import { router as chaptersAdminRouter } from './controllers/chaptersAdmin';
+import { router as booksAdminRouter } from './controllers/booksAdmin';
 import { router as lessonsAdminRouter } from './controllers/lessonsAdmin';
 import { router as lectureCommentsRouter } from './controllers/lectureComments';
 import { router as chatRouter } from './controllers/chat';
@@ -62,14 +70,21 @@ import { router as packageSubjectVideosRouter } from './controllers/packageSubje
 import { router as notificationsRouter } from './controllers/notifications';
 import { router as customSheetsRouter } from './controllers/customSheets';
 import { router as adminTeachersRouter } from './controllers/adminTeachers';
+import { router as adminTenantsRouter } from './controllers/adminTenants';
+import { router as seoPublicRouter } from './controllers/seoPublic';
 import { router as analyticsRouter } from './controllers/analytics';
 import { router as analyticsTrackingRouter } from './controllers/analyticsTracking';
 import { router as teacherCreativeChatbotRouter } from './controllers/teacherCreativeChatbot';
+import { router as dataAnalystChatbotRouter } from './controllers/dataAnalystChatbot';
 import { router as mistralOcrRouter } from './controllers/mistralOcr';
+import { router as examBuilderChatbotRouter } from './controllers/examBuilderChatbot';
+import { router as teacherStudentsRouter } from './controllers/teacherStudents';
+import { teacherFilesRouter, teacherFileCategoriesRouter } from './modules/myFiles/controllers/teacherMyFiles.controller';
 
 export const router = Router();
 
 router.use('/tenants/public', tenantsPublicRouter);
+router.use('/seo', seoPublicRouter);
 router.use('/super/tenants', tenantsSuperRouter);
 router.use('/', authRouter);
 router.use('/users', userRouter);
@@ -84,12 +99,21 @@ router.use('/social', socialRouter);
 // دعم المسار /api/v1/social المستخدم من التطبيق (نفس راوتر السوشيال)
 router.use('/v1/social', socialRouter);
 router.use('/admin/teachers', adminTeachersRouter);
+router.use('/admin/tenants', adminTenantsRouter);
 router.use('/analytics', analyticsRouter);
 router.use('/analytics/tracking', analyticsTrackingRouter);
 router.use('/notifications', notificationsRouter);
 router.use('/teacher/creative-chatbot', teacherCreativeChatbotRouter);
+router.use('/teacher/data-analyst', dataAnalystChatbotRouter);
+router.use('/teacher/exam-builder', examBuilderChatbotRouter);
+router.use('/teacher/students', teacherStudentsRouter);
+router.use('/teacher/files', teacherFilesRouter);
+router.use('/teacher/file-categories', teacherFileCategoriesRouter);
 router.use('/ocr', mistralOcrRouter);
 router.use('/teacher/questions', teacherQuestionsRouter);
+router.use('/teacher/free-lectures', teacherFreeLecturesRouter);
+router.use('/public/free-lectures', teacherFreeLecturesPublicRouter);
+router.use('/public/platform', publicTeacherPlatformRouter);
 router.use('/questions', questionsManagementRouter);
 router.use('/packages', packagesRouter);
 router.use('/package-subjects', packageSubjectItemsRouter);
@@ -111,6 +135,8 @@ router.use('/study-groups', studyGroupsRouter);
 router.use('/center-groups', centerGroupsRouter);
 router.use('/group-exams', groupExamsRouter);
 router.use('/accounting', accountingRouter);
+router.use('/teacher/subscription', teacherSubscriptionRouter);
+router.use('/finance', financeRouter);
 router.use('/employees', employeesRouter);
 router.use('/admin/employees', employeesRouter);
 router.use('/tasks', tasksRouter);
@@ -123,6 +149,7 @@ router.use('/leagues', leaguesRouter);
 // --- Question Bank Administration (Moved up to avoid interception) ---
 router.use('/subjects', subjectsAdminRouter);
 router.use('/', chaptersAdminRouter);
+router.use('/', booksAdminRouter);
 router.use('/', lessonsAdminRouter);
 // ----------------------------------------------------------------------
 

@@ -1,5 +1,6 @@
 import pool from '../db/pool';
 import { HttpError } from '../utils';
+import { getStudentCourseWatchPercentage } from './watchProgress';
 
 export class TeacherReportsService {
   /**
@@ -148,18 +149,17 @@ export class TeacherReportsService {
           );
           const allLectures = allLecturesRes.rows;
 
-          // Get video views count + نسبة المشاهدة (متوسط completion_percentage)
+          // Get video views count
           const videoViewsRes = await pool.query(
             `SELECT COUNT(DISTINCT vv.video_id) as watched_videos_count,
-                  COUNT(*) as total_video_views,
-                  COALESCE(AVG(vv.completion_percentage), 0)::float as avg_completion_pct
+                  COUNT(*) as total_video_views
            FROM video_views vv
            WHERE vv.course_id = $1 AND vv.user_id = $2`,
             [courseId, studentId],
           );
           const watchedVideosCount = Number(videoViewsRes.rows[0]?.watched_videos_count || 0);
           const totalVideoViews = Number(videoViewsRes.rows[0]?.total_video_views || 0);
-          const watch_percentage = Math.round(Number(videoViewsRes.rows[0]?.avg_completion_pct || 0) * 100) / 100;
+          const watch_percentage = await getStudentCourseWatchPercentage(studentId, courseId);
 
           // Get lecture exams (exams table)
           const lectureExamsRes = await pool.query(
@@ -174,7 +174,7 @@ export class TeacherReportsService {
 
           // Get lecture exam submissions
           const lectureExamSubmissionsRes = await pool.query(
-            `SELECT es.exam_id, es.total_grade, es.obtained_grade, es.passed, es.submitted_at,
+            `SELECT es.exam_id, e.total_grade, es.total_grade AS obtained_grade, es.passed, es.submitted_at,
                   e.title as exam_title, l.title as lecture_title
            FROM exam_submissions es
            JOIN exams e ON es.exam_id = e.id

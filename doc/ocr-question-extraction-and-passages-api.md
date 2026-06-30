@@ -65,7 +65,10 @@ BUNNY_MEDIA_PATH=
 POST /api/ocr/extract-text
 POST /api/ocr/extract-questions
 POST /api/ocr/import-question-bank-v2
+POST /api/question-bank-v2/lesson/:lessonId/import-extraction
 ```
+
+The lesson import endpoint accepts the same extraction payload shapes as `/api/ocr/import-question-bank-v2`, but `lessonId` comes from the URL instead of the body.
 
 ---
 
@@ -222,6 +225,7 @@ curl -X POST "http://localhost:8000/api/ocr/extract-questions" \
 
 - `passages[].passage_id` is a temporary string ID, not a database ID.
 - `questions[].passage_id` links the question to a temporary extracted passage.
+- **أسئلة متعددة النقاط** (مثل سؤال 2 فيه (1) و(2) باختيارات منفصلة): يُستخرج كل نقطة كسؤال مستقل، و`question_text` يجمع التمهيد + نص النقطة في سؤال واحد مكتمل (`source_number` مثل `2-1`, `2-2`). لا يُستخدم `passage` للتمهيد في هذه الحالة.
 - `correct_answer_index` is zero-based:
 
 ```txt
@@ -252,6 +256,47 @@ Content-Type: application/json
 ```
 
 ### Request Body
+
+يدعم أحد الأشكال التالية:
+
+**أ) ناتج `extract-questions` كامل (موصى به):**
+
+```json
+{
+  "lesson_id": 101,
+  "success": true,
+  "data": {
+    "filename": "questions.pdf",
+    "passages": [
+      {
+        "passage_id": "passage_1",
+        "title": "نص القراءة",
+        "content": "النص الكامل للقطعة..."
+      }
+    ],
+    "questions": [
+      {
+        "number": 1,
+        "source_number": "1",
+        "passage_id": "passage_1",
+        "question_text": "ما الفكرة الرئيسية؟",
+        "options": [
+          { "label": "أ", "text": "الخيار الأول" },
+          { "label": "ب", "text": "الخيار الثاني" },
+          { "label": "ج", "text": "الخيار الثالث" },
+          { "label": "د", "text": "الخيار الرابع" }
+        ],
+        "question_images": [],
+        "correct_answer": "ب",
+        "correct_answer_index": 1,
+        "correct_answer_inferred": true
+      }
+    ]
+  }
+}
+```
+
+**ب) الصيغة القديمة:**
 
 ```json
 {
@@ -420,12 +465,10 @@ points
 ### Relationship
 
 ```txt
-teacher_question_chapters
-  └── teacher_question_lessons
-        └── teacher_question_parts
-              ├── teacher_question_passages
-              │     └── teacher_questions
-              └── teacher_questions without passage
+teacher_question_lessons (teacher_id)
+  ├── teacher_question_passages
+  │     └── teacher_questions
+  └── teacher_questions without passage
 ```
 
 ---
@@ -434,7 +477,7 @@ teacher_question_chapters
 
 ```http
 POST /api/teacher/questions/passage
-GET  /api/teacher/questions/passages/:part_id
+GET  /api/teacher/questions/passages/:lesson_id
 GET  /api/teacher/questions/passage/:id
 POST /api/teacher/questions/question
 ```
@@ -454,7 +497,7 @@ Content-Type: application/json
 
 ```json
 {
-  "part_id": 3,
+  "lesson_id": 3,
   "title": "قطعة عن الطاقة",
   "content": "النص الكامل للقطعة...",
   "questions": [
@@ -480,7 +523,7 @@ Content-Type: application/json
   "success": true,
   "passage": {
     "id": 10,
-    "part_id": 3,
+    "lesson_id": 3,
     "title": "قطعة عن الطاقة",
     "content": "النص الكامل للقطعة...",
     "order_index": 0
@@ -488,7 +531,7 @@ Content-Type: application/json
   "questions": [
     {
       "id": 99,
-      "part_id": 3,
+      "lesson_id": 3,
       "passage_id": 10,
       "question_text": "ما المقصود بالطاقة؟",
       "image_url": "https://cdn.example.com/question-image.png"
@@ -499,10 +542,10 @@ Content-Type: application/json
 
 ---
 
-## 5. List Teacher Passages By Part
+## 5. List Teacher Passages By Lesson
 
 ```http
-GET /api/teacher/questions/passages/:part_id
+GET /api/teacher/questions/passages/:lesson_id
 ```
 
 ### Example
@@ -519,7 +562,7 @@ curl "http://localhost:8000/api/teacher/questions/passages/3" \
   "passages": [
     {
       "id": 10,
-      "part_id": 3,
+      "lesson_id": 3,
       "title": "قطعة عن الطاقة",
       "content": "النص الكامل للقطعة...",
       "questions": [
@@ -548,7 +591,7 @@ GET /api/teacher/questions/passage/:id
 {
   "passage": {
     "id": 10,
-    "part_id": 3,
+    "lesson_id": 3,
     "title": "قطعة عن الطاقة",
     "content": "النص الكامل للقطعة...",
     "questions": [
@@ -577,7 +620,7 @@ Content-Type: application/json
 
 ```json
 {
-  "part_id": 3,
+  "lesson_id": 3,
   "passage_id": 10,
   "question_text": "ما الفكرة الرئيسية؟",
   "question_type": "choice",
@@ -594,7 +637,7 @@ Content-Type: application/json
 ### Notes
 
 - `passage_id` is optional.
-- If `passage_id` is provided, it must belong to the same teacher and same `part_id`.
+- If `passage_id` is provided, it must belong to the same teacher and same `lesson_id`.
 - `image_url` is optional and can be a CDN URL from OCR extraction.
 
 ---
@@ -632,7 +675,7 @@ for (const passage of extracted.passages) {
   );
 
   await api.post('/api/teacher/questions/passage', {
-    part_id,
+    lesson_id,
     title: passage.title,
     content: passage.content,
     questions: linkedQuestions.map((q) => ({

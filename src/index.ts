@@ -3,6 +3,7 @@ import { app, server } from './app';
 import { Server as SocketIOServer } from 'socket.io';
 import * as jwt from 'jsonwebtoken';
 import { config, logger } from './utils';
+import { getServerInfo, isCorsOriginAllowed } from './config/appUrls';
 import pool from './db/pool';
 import { ChatService } from './services/chat';
 import { SupportChatService } from './services/supportChat';
@@ -31,10 +32,13 @@ const startServer = async () => {
       logger.info('✅ Migrations completed successfully');
     } catch (migrationError: any) {
       logger.error('❌ Migration failed:', migrationError.message);
-      if (
+      const connectionIssue =
         migrationError.message?.includes('ETIMEDOUT') ||
-        migrationError.message?.includes('connect')
-      ) {
+        migrationError.message?.includes('ENOTFOUND') ||
+        migrationError.message?.includes('getaddrinfo') ||
+        migrationError.message?.includes('ECONNREFUSED') ||
+        migrationError.message?.includes('connect');
+      if (connectionIssue) {
         logger.error('⚠️  Skipping migrations due to database connection issue');
         logger.error(
           '   Server will start but database operations will fail until connection is restored',
@@ -76,12 +80,48 @@ const startServer = async () => {
     }
 
     server.listen(PORT, '0.0.0.0', () => {
+      const info = getServerInfo();
       logger.info(`🚀 Server is running on port ${PORT}`);
+      logger.info(`   Local:  ${info.local_url}`);
+      if (info.use_ngrok && info.ngrok_url) {
+        logger.info(`   Public: ${info.base_url}`);
+        logger.info(`   API:    ${info.api_url}`);
+        logger.info(`   Socket: ${info.socket_url}`);
+        logger.warn(
+          '   Ngrok URL is from .env.ngrok.local — the tunnel is NOT started by `npm run dev`. Run `npm run dev:expo` or `npm run ngrok` in another terminal.',
+        );
+
+        void (async () => {
+          await new Promise((r) => setTimeout(r, 1500));
+          try {
+            const res = await fetch(`${info.api_url}/server-info`, {
+              headers: { 'ngrok-skip-browser-warning': 'true' },
+              signal: AbortSignal.timeout(8000),
+            });
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            logger.info('   ✅ Ngrok tunnel is online — external API requests will reach this server');
+          } catch {
+            logger.error(
+              '   ❌ Ngrok tunnel is OFFLINE — requests to the Public/API URL will NOT reach this server',
+            );
+            logger.error('   Fix: npm run dev:expo   OR   npm run ngrok (2nd terminal, keep open)');
+          }
+        })();
+      }
     });
 
     // Socket.IO setup for both Chat and Game systems
     const io = new SocketIOServer(server, {
-      cors: { origin: config.CORS_ORIGIN.split(',').map((o) => o.trim()), credentials: true },
+      cors: {
+        origin: (origin, callback) => {
+          if (!origin || isCorsOriginAllowed(origin)) {
+            callback(null, true);
+          } else {
+            callback(new Error('CORS not allowed'));
+          }
+        },
+        credentials: true,
+      },
     });
 
     // Store io instance globally for use in controllers
@@ -91,6 +131,12 @@ const startServer = async () => {
     // Set IO getter for NotificationService
     const { setIOGetter } = await import('./services/notifications.js');
     setIOGetter(() => globalIO);
+
+    const { setNotificationDispatchIO } = await import('./services/notificationDispatchService.js');
+    setNotificationDispatchIO(() => globalIO);
+
+    const { startNotificationPushWorker } = await import('./workers/notificationPushWorker.js');
+    startNotificationPushWorker();
 
     io.use(async (socket, next) => {
       try {
@@ -819,6 +865,18 @@ const startServer = async () => {
       }
     }, 60 * 60 * 1000);
 
+    // اشتراكات المدرسين: انتهاء الباقة → فترة سماح → إيقاف المنصة
+    setInterval(async () => {
+      try {
+        const { TeacherPlatformSubscriptionsService } = await import(
+          './services/teacherPlatformSubscriptions.js'
+        );
+        await TeacherPlatformSubscriptionsService.syncSubscriptionLifecycle();
+      } catch (err) {
+        logger.error('Teacher subscription lifecycle sync error:', err);
+      }
+    }, 60 * 60 * 1000);
+
     // Broadcast helper when permissions change
     (app as any).emitChatPermission = (groupId: number, allow: boolean) => {
       io.to(`group:${groupId}`).emit('chat:permission-changed', {
@@ -1150,7 +1208,6 @@ const startServer = async () => {
     process.on('SIGINT', shutdown);
     process.on('SIGTERM', shutdown);
   } catch (error) {
-    console.log("err", error)
     logger.error('❌ Failed to start server:', error);
     process.exit(1);
   }

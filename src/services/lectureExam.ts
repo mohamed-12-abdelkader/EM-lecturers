@@ -52,6 +52,7 @@ export class LectureExamService {
     totalGrade: number,
     createdBy: number,
     options?: {
+      type?: string;
       duration?: number;
       isVisible?: boolean;
       showAt?: Date | null;
@@ -62,6 +63,7 @@ export class LectureExamService {
     },
   ): Promise<LectureExam> {
     const {
+      type = 'exam',
       duration = null,
       isVisible = false,
       showAt = null,
@@ -71,15 +73,21 @@ export class LectureExamService {
       showAnswersAfterHours = 0,
     } = options || {};
 
+    const examType =
+      typeof type === 'string' && type.trim().toLowerCase() === 'assignment'
+        ? 'assignment'
+        : 'exam';
+
     const result = await pool.query(
       `INSERT INTO exams (
         lecture_id, type, total_grade, created_by, title, duration, is_visible,
         show_at, hide_at, lock_next_lectures, 
         show_answers_immediately, show_answers_after_hours
       )
-       VALUES ($1, 'exam', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *`,
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING *`,
       [
         lectureId,
+        examType,
         totalGrade,
         createdBy,
         title,

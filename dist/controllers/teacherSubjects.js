@@ -7,8 +7,7 @@ exports.router = void 0;
 const express_1 = require("express");
 const authentication_1 = require("../middleware/authentication");
 const pool_1 = __importDefault(require("../db/pool"));
-const chapters_1 = require("../services/chapters");
-const lessonsAdmin_1 = require("../services/lessonsAdmin");
+const questionBankHierarchy_1 = require("../services/questionBankHierarchy");
 const packageSubjectGroups_1 = require("../services/packageSubjectGroups");
 const router = (0, express_1.Router)();
 exports.router = router;
@@ -73,47 +72,28 @@ router.get('/teacher/subjects', async (req, res) => {
        WHERE ts.teacher_id = $1
        ORDER BY s.id`, [teacherId]);
         const subjects = result.rows;
-        // جلب الفصول والدروس لكل مادة
-        const subjectsWithChaptersAndLessons = await Promise.all(subjects.map(async (subject) => {
+        // جلب الكتب والفصول والدروس لكل مادة
+        const subjectsWithBooks = await Promise.all(subjects.map(async (subject) => {
             try {
-                // جلب الفصول للمادة
-                const chapters = await chapters_1.ChapterService.getBySubjectId(subject.id);
-                // جلب الدروس لكل فصل
-                const chaptersWithLessons = await Promise.all(chapters.map(async (chapter) => {
-                    try {
-                        // استخدام AdminLessonService للحصول على الدروس بالفصل
-                        const lessons = await lessonsAdmin_1.AdminLessonService.getByChapterId(chapter.id);
-                        return {
-                            ...chapter,
-                            lessons: lessons
-                        };
-                    }
-                    catch (error) {
-                        // إذا فشل جلب الدروس، نرجع الفصل بدون دروس
-                        console.error(`Error fetching lessons for chapter ${chapter.id}:`, error);
-                        return {
-                            ...chapter,
-                            lessons: []
-                        };
-                    }
-                }));
+                const books = await (0, questionBankHierarchy_1.getSubjectBooksWithChaptersAndLessons)(subject.id);
                 return {
                     ...subject,
-                    chapters: chaptersWithLessons
+                    books,
+                    chapters: books.flatMap((b) => b.chapters),
                 };
             }
             catch (error) {
-                // إذا فشل جلب الفصول، نرجع المادة بدون فصول
-                console.error(`Error fetching chapters for subject ${subject.id}:`, error);
+                console.error(`Error fetching books for subject ${subject.id}:`, error);
                 return {
                     ...subject,
-                    chapters: []
+                    books: [],
+                    chapters: [],
                 };
             }
         }));
         return res.status(200).json({
             success: true,
-            data: subjectsWithChaptersAndLessons
+            data: subjectsWithBooks,
         });
     }
     catch (error) {
@@ -136,8 +116,14 @@ router.get('/teacher/subjects/:id/content', async (req, res) => {
         if (!assigned.rowCount)
             return res.status(403).json({ success: false, message: 'غير مصرح لك بهذه المادة' });
         // fetch hierarchy: classes, lessons, questions (approved only)
-        const classesRes = await pool_1.default.query(`SELECT * FROM chapters WHERE subject_id = $1 ORDER BY order_num`, [subjectId]);
+        const classesRes = await pool_1.default.query(`SELECT c.*, sb.name AS book_name, sb.id AS book_id
+       FROM chapters c
+       LEFT JOIN subject_books sb ON sb.id = c.book_id
+       WHERE c.subject_id = $1
+       ORDER BY sb.order_num ASC, c.order_num ASC`, [subjectId]);
         const chapters = classesRes.rows;
+        const booksRes = await pool_1.default.query(`SELECT * FROM subject_books WHERE subject_id = $1 ORDER BY order_num ASC, id ASC`, [subjectId]);
+        const books = booksRes.rows;
         const lessonsRes = await pool_1.default.query(`SELECT l.* FROM lessons l JOIN chapters c ON l.chapter_id = c.id WHERE c.subject_id = $1 ORDER BY l.order_num`, [subjectId]);
         const lessons = lessonsRes.rows;
         const questionsRes = await pool_1.default.query(`SELECT q.* FROM questions q
@@ -145,7 +131,7 @@ router.get('/teacher/subjects/:id/content', async (req, res) => {
        JOIN chapters c ON l.chapter_id = c.id
        WHERE c.subject_id = $1 AND q.status = 'approved'`, [subjectId]);
         const questions = questionsRes.rows;
-        return res.status(200).json({ success: true, data: { chapters, lessons, questions } });
+        return res.status(200).json({ success: true, data: { books, chapters, lessons, questions } });
     }
     catch (error) {
         return res

@@ -5,6 +5,7 @@ import crypto from 'node:crypto';
 import { asyncWrapper, config, generateToken, sendEmail } from '../utils';
 import { validate } from '../middleware/validateReq';
 import { ForgotPassword, Login, ResetPassword, RegisterAdminOrTeacher } from './auth.modules';
+import { TeacherManagedStudentsService } from '../services/teacherManagedStudents';
 
 export const router = Router();
 
@@ -12,24 +13,96 @@ router.post(
   '/login',
   validate(Login),
   asyncWrapper(async (req, res) => {
-    const { email, phone, password, device_ip } = req.body;
-    const tenantId = req.tenant!.id;
+    const { email, phone, student_code, password, device_ip } = req.body;
+    let effectiveTenantId = req.tenant!.id;
 
-    let userQuery;
-    if (email) {
-      const emailNorm = String(email).trim().toLowerCase();
-      userQuery = await pool.query(
-        `SELECT * FROM users WHERE lower(trim(email)) = $1 AND tenant_id = $2`,
-        [emailNorm, tenantId],
-      );
-    } else {
-      userQuery = await pool.query('SELECT * FROM users WHERE phone = $1 AND tenant_id = $2', [
-        phone,
-        tenantId,
-      ]);
+    const staffRoles = ['teacher', 'admin', 'employee'];
+
+    if (student_code && !email && !phone) {
+      const explicitSlug = (req.body.subdomain ?? req.body.tenant_subdomain) as
+        | string
+        | undefined;
+      if (effectiveTenantId === 1 && explicitSlug) {
+        const tRes = await pool.query<{ id: number }>(
+          `SELECT id FROM tenants WHERE subdomain = $1 AND is_active = TRUE LIMIT 1`,
+          [String(explicitSlug).trim().toLowerCase()],
+        );
+        if (!tRes.rowCount) {
+          return res.status(400).json({
+            message: 'المنصة غير موجودة أو غير مفعّلة لهذا الـ subdomain',
+            code: 'TENANT_NOT_FOUND',
+          });
+        }
+        effectiveTenantId = tRes.rows[0].id;
+      }
+      if (effectiveTenantId === 1) {
+        return res.status(400).json({
+          message: 'يرجى إرسال subdomain المنصة مع رقم الطالب',
+          code: 'SUBDOMAIN_REQUIRED',
+        });
+      }
     }
 
-    if (!userQuery.rowCount && tenantId === 1) {
+    const queryUserByTenant = async (tenantId: number) => {
+      if (student_code) {
+        const user = await TeacherManagedStudentsService.findStudentByCode(
+          student_code,
+          tenantId,
+        );
+        return { rowCount: user ? 1 : 0, rows: user ? [user] : [] };
+      }
+      if (email) {
+        const emailNorm = String(email).trim().toLowerCase();
+        return pool.query(`SELECT * FROM users WHERE lower(trim(email)) = $1 AND tenant_id = $2`, [
+          emailNorm,
+          tenantId,
+        ]);
+      }
+      return pool.query('SELECT * FROM users WHERE phone = $1 AND tenant_id = $2', [phone, tenantId]);
+    };
+
+    let userQuery = await queryUserByTenant(effectiveTenantId);
+
+    // المدرس/الأدمن/الموظف: يُحدَّد الـ tenant تلقائياً من البريد أو الهاتف (بدون subdomain)
+    if (!userQuery.rowCount && (email || phone)) {
+      let globalStaffQuery;
+      if (email) {
+        const emailNorm = String(email).trim().toLowerCase();
+        globalStaffQuery = await pool.query(
+          `SELECT u.*, t.subdomain AS tenant_subdomain
+           FROM users u
+           JOIN tenants t ON t.id = u.tenant_id AND t.is_active = true
+           WHERE lower(trim(u.email)) = $1 AND u.role::text = ANY($2::text[])`,
+          [emailNorm, staffRoles],
+        );
+      } else {
+        globalStaffQuery = await pool.query(
+          `SELECT u.*, t.subdomain AS tenant_subdomain
+           FROM users u
+           JOIN tenants t ON t.id = u.tenant_id AND t.is_active = true
+           WHERE u.phone = $1 AND u.role::text = ANY($2::text[])`,
+          [phone, staffRoles],
+        );
+      }
+
+      if (globalStaffQuery.rowCount && globalStaffQuery.rowCount > 1) {
+        return res.status(409).json({
+          message: 'يوجد أكثر من حساب بهذا البريد أو الهاتف. أرسل subdomain المنصة.',
+          code: 'MULTIPLE_STAFF_ACCOUNTS',
+          accounts: globalStaffQuery.rows.map((row) => ({
+            role: row.role,
+            subdomain: row.tenant_subdomain,
+          })),
+        });
+      }
+
+      if (globalStaffQuery.rowCount === 1) {
+        userQuery = globalStaffQuery;
+        effectiveTenantId = globalStaffQuery.rows[0].tenant_id;
+      }
+    }
+
+    if (!userQuery.rowCount && effectiveTenantId === 1) {
       // Backward compatibility: some legacy root accounts may still have tenant_id = NULL.
       if (email) {
         const emailNorm = String(email).trim().toLowerCase();
@@ -53,8 +126,8 @@ router.post(
     }
 
     if (!userQuery.rowCount) {
-      // Better diagnostics on default host: account may exist under another tenant.
-      if (tenantId === 1 && email) {
+      // للطالب فقط: تلميح بوجود الحساب على منصة أخرى
+      if (effectiveTenantId === 1 && email) {
         const emailNorm = String(email).trim().toLowerCase();
         const crossTenant = await pool.query(
           `SELECT u.id, u.role, u.tenant_id, t.subdomain
@@ -65,8 +138,12 @@ router.post(
           [emailNorm],
         );
         if (crossTenant.rowCount) {
-          const row = crossTenant.rows[0] as { tenant_id: number | null; subdomain: string | null };
-          if (row.tenant_id && row.tenant_id !== 1) {
+          const row = crossTenant.rows[0] as {
+            tenant_id: number | null;
+            subdomain: string | null;
+            role: string;
+          };
+          if (row.role === 'student' && row.tenant_id && row.tenant_id !== 1) {
             return res.status(400).json({
               message: 'Account belongs to another tenant',
               code: 'TENANT_LOGIN_MISMATCH',
@@ -85,9 +162,35 @@ router.post(
         code: 'TEACHER_ACCOUNT_INACTIVE',
       });
     }
-    const validPassword = await bcrypt.compare(password, user.password);
-    if (!validPassword) {
-      return res.status(400).json({ message: 'Invalid credentials' });
+    if (user.role === 'student' && user.account_status && user.account_status !== 'active') {
+      return res.status(403).json({
+        message: 'حساب الطالب موقوف أو غير نشط',
+        code: 'STUDENT_ACCOUNT_INACTIVE',
+      });
+    }
+
+    const registrationSettings =
+      await TeacherManagedStudentsService.getRegistrationSettings(effectiveTenantId);
+    const studentCodeOnlyLogin =
+      user.role === 'student' &&
+      !!student_code &&
+      !email &&
+      !phone &&
+      registrationSettings.registration_mode === 'teacher_registration';
+
+    if (!studentCodeOnlyLogin) {
+      if (!password) {
+        return res.status(400).json({ message: 'password is required' });
+      }
+      const validPassword = await bcrypt.compare(password, user.password);
+      if (!validPassword) {
+        return res.status(400).json({ message: 'Invalid credentials' });
+      }
+    } else if (password) {
+      const validPassword = await bcrypt.compare(password, user.password);
+      if (!validPassword) {
+        return res.status(400).json({ message: 'Invalid credentials' });
+      }
     }
 
     // Device IP binding logic for students only
@@ -120,7 +223,13 @@ router.post(
       }
     }
 
-    const token = await generateToken(user, pool, { sessionTenantId: tenantId });
+    const token = await generateToken(user, pool, { sessionTenantId: effectiveTenantId });
+
+    const tenantResult = await pool.query(
+      `SELECT id, subdomain, display_name FROM tenants WHERE id = $1 LIMIT 1`,
+      [effectiveTenantId],
+    );
+    const tenant = tenantResult.rowCount ? tenantResult.rows[0] : null;
 
     // جلب صلاحيات الموظف إذا كان admin
     let employeePermissions = null;
@@ -145,10 +254,13 @@ router.post(
         name: user.name,
         email: user.email,
         phone: user.phone,
+        student_code: user.student_code ?? null,
         role: user.role,
         avatar: user.avatar,
+        must_change_password: user.must_change_password === true,
       },
       token,
+      tenant,
       employee_permissions: employeePermissions,
       employee_data: employeeData,
     });

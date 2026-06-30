@@ -5,6 +5,46 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.TenantService = void 0;
 const pool_1 = __importDefault(require("../db/pool"));
+const teacherPlanPolicy_1 = require("./teacherPlanPolicy");
+const hooks_1 = require("./seo/hooks");
+function resolveOwnerSubscriptionFields(row) {
+    const pkg = (row.owner_billing_plan_code ??
+        row.owner_subscription_package ??
+        'bronze');
+    return {
+        subscription_package: pkg,
+        subscription_package_assigned_at: row.owner_billing_starts_at ??
+            row.owner_subscription_package_assigned_at ??
+            null,
+        subscription_plan_name: row.owner_billing_plan_name ?? null,
+        subscription_status: row.owner_billing_status ?? null,
+        subscription_ends_at: row.owner_billing_ends_at ?? null,
+        subscription_number: row.owner_billing_number ?? null,
+        subscription_id: row.owner_billing_subscription_id
+            ? Number(row.owner_billing_subscription_id)
+            : null,
+    };
+}
+function mergeJsonObjects(existing, patch) {
+    const out = { ...existing };
+    for (const [key, value] of Object.entries(patch)) {
+        if (value &&
+            typeof value === 'object' &&
+            !Array.isArray(value) &&
+            existing[key] &&
+            typeof existing[key] === 'object' &&
+            !Array.isArray(existing[key])) {
+            out[key] = {
+                ...existing[key],
+                ...value,
+            };
+        }
+        else {
+            out[key] = value;
+        }
+    }
+    return out;
+}
 function normalizeSubdomain(raw) {
     return raw.trim().toLowerCase();
 }
@@ -16,6 +56,14 @@ class TenantService {
               created_at, updated_at
        FROM tenants WHERE subdomain = $1`, [sub]);
         return r.rows[0] ?? null;
+    }
+    /** Active teacher platforms for public sitemap (excludes `default`). */
+    static async listActivePublicTenants() {
+        const r = await pool_1.default.query(`SELECT subdomain, updated_at
+       FROM tenants
+       WHERE is_active = true AND subdomain <> 'default'
+       ORDER BY updated_at DESC`);
+        return r.rows;
     }
     static async getPublicBundle(subdomain) {
         const tenant = await this.getBySubdomain(subdomain);
@@ -39,7 +87,7 @@ class TenantService {
              ORDER BY g.id`, [ownerId])
                 : Promise.resolve({ rows: [] }),
             ownerId
-                ? pool_1.default.query(`SELECT c.id, c.title, c.description, c.price, c.avatar, c.grade_id, c.created_at,
+                ? pool_1.default.query(`SELECT c.id, c.title, c.description, c.price, c.avatar, c.grade_id, c.created_at, c.slug,
                     g.name AS grade_name, g.slug AS grade_slug
              FROM courses c
              LEFT JOIN grades g ON g.id = c.grade_id
@@ -65,6 +113,7 @@ class TenantService {
         const latest_courses = latestCoursesRes.rows.map((c) => ({
             id: c.id,
             title: c.title,
+            slug: c.slug,
             description: c.description,
             price: c.price,
             avatar: c.avatar,
@@ -196,6 +245,228 @@ class TenantService {
        LIMIT $1 OFFSET $2`, [limit, offset]);
         return r.rows;
     }
+    static async listTeacherTenantsForAdmin(options = {}) {
+        const limit = Math.min(Math.max(options.limit ?? 50, 1), 200);
+        const offset = Math.max(options.offset ?? 0, 0);
+        const includeDefault = options.includeDefault ?? false;
+        const search = options.search?.trim() || null;
+        const isActive = options.isActive ?? null;
+        const conditions = [];
+        const values = [];
+        let i = 1;
+        if (!includeDefault) {
+            conditions.push(`t.subdomain <> 'default'`);
+        }
+        if (isActive !== null) {
+            conditions.push(`t.is_active = $${i++}`);
+            values.push(isActive);
+        }
+        if (search) {
+            conditions.push(`(t.subdomain ILIKE $${i} OR t.display_name ILIKE $${i} OR owner.name ILIKE $${i} OR owner.email ILIKE $${i})`);
+            values.push(`%${search}%`);
+            i++;
+        }
+        const whereClause = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+        const countResult = await pool_1.default.query(`SELECT COUNT(*)::text AS total
+       FROM tenants t
+       LEFT JOIN users owner ON owner.id = t.owner_user_id AND owner.tenant_id = t.id
+       ${whereClause}`, values);
+        const total = Number(countResult.rows[0]?.total ?? 0);
+        const listValues = [...values, limit, offset];
+        const result = await pool_1.default.query(`SELECT
+         t.id,
+         t.subdomain,
+         t.display_name,
+         t.specialty,
+         t.bio,
+         t.avatar_url,
+         t.is_active,
+         t.seo_title,
+         t.seo_meta_description,
+         t.favicon_url,
+         t.og_image_url,
+         t.owner_user_id,
+         t.created_at,
+         t.updated_at,
+         owner.id AS owner_id,
+         owner.name AS owner_name,
+         owner.email AS owner_email,
+         owner.phone AS owner_phone,
+         owner.subject AS owner_subject,
+         owner.avatar AS owner_avatar,
+         owner.account_status AS owner_account_status,
+         owner.subscription_package AS owner_subscription_package,
+         owner.subscription_package_assigned_at AS owner_subscription_package_assigned_at,
+         owner.created_at AS owner_created_at,
+         ${teacherPlanPolicy_1.OWNER_BILLING_SUBSCRIPTION_SELECT},
+         (
+           SELECT COUNT(*)::int
+           FROM users u
+           WHERE u.tenant_id = t.id AND u.role = 'teacher'
+         ) AS teachers_count,
+         (
+           SELECT COUNT(*)::int
+           FROM courses c
+           JOIN users teacher ON teacher.id = c.teacher_id
+           WHERE teacher.tenant_id = t.id
+         ) AS courses_count,
+         (
+           SELECT COUNT(DISTINCT e.user_id)::int
+           FROM enrollments e
+           JOIN courses c ON c.id = e.course_id
+           JOIN users teacher ON teacher.id = c.teacher_id
+           WHERE teacher.tenant_id = t.id
+         ) AS students_count
+       FROM tenants t
+       LEFT JOIN users owner ON owner.id = t.owner_user_id AND owner.tenant_id = t.id
+       ${teacherPlanPolicy_1.OWNER_BILLING_SUBSCRIPTION_JOIN}
+       ${whereClause}
+       ORDER BY t.created_at DESC, t.id DESC
+       LIMIT $${i++} OFFSET $${i}`, listValues);
+        const tenants = result.rows.map((row) => ({
+            id: row.id,
+            subdomain: row.subdomain,
+            display_name: row.display_name,
+            specialty: row.specialty,
+            bio: row.bio,
+            avatar_url: row.avatar_url,
+            is_active: row.is_active,
+            seo_title: row.seo_title,
+            seo_meta_description: row.seo_meta_description,
+            favicon_url: row.favicon_url,
+            og_image_url: row.og_image_url,
+            owner_user_id: row.owner_user_id,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+            owner: row.owner_id
+                ? {
+                    id: row.owner_id,
+                    name: row.owner_name,
+                    email: row.owner_email,
+                    phone: row.owner_phone,
+                    subject: row.owner_subject,
+                    avatar: row.owner_avatar,
+                    account_status: row.owner_account_status,
+                    ...resolveOwnerSubscriptionFields(row),
+                    created_at: row.owner_created_at,
+                }
+                : null,
+            stats: {
+                teachers_count: Number(row.teachers_count ?? 0),
+                courses_count: Number(row.courses_count ?? 0),
+                students_count: Number(row.students_count ?? 0),
+            },
+        }));
+        return { tenants, total };
+    }
+    static async getTenantForAdmin(id) {
+        const result = await pool_1.default.query(`SELECT
+         t.id,
+         t.subdomain,
+         t.display_name,
+         t.specialty,
+         t.bio,
+         t.avatar_url,
+         t.is_active,
+         t.seo_title,
+         t.seo_meta_description,
+         t.favicon_url,
+         t.og_image_url,
+         t.owner_user_id,
+         t.created_at,
+         t.updated_at,
+         owner.id AS owner_id,
+         owner.name AS owner_name,
+         owner.email AS owner_email,
+         owner.phone AS owner_phone,
+         owner.subject AS owner_subject,
+         owner.avatar AS owner_avatar,
+         owner.description AS owner_description,
+         owner.facebook_url AS owner_facebook_url,
+         owner.youtube_url AS owner_youtube_url,
+         owner.tiktok_url AS owner_tiktok_url,
+         owner.whatsapp_number AS owner_whatsapp_number,
+         owner.account_status AS owner_account_status,
+         owner.subscription_package AS owner_subscription_package,
+         owner.subscription_package_assigned_at AS owner_subscription_package_assigned_at,
+         owner.created_at AS owner_created_at,
+         ${teacherPlanPolicy_1.OWNER_BILLING_SUBSCRIPTION_SELECT},
+         (
+           SELECT COUNT(*)::int
+           FROM users u
+           WHERE u.tenant_id = t.id AND u.role = 'teacher'
+         ) AS teachers_count,
+         (
+           SELECT COUNT(*)::int
+           FROM courses c
+           JOIN users teacher ON teacher.id = c.teacher_id
+           WHERE teacher.tenant_id = t.id
+         ) AS courses_count,
+         (
+           SELECT COUNT(DISTINCT e.user_id)::int
+           FROM enrollments e
+           JOIN courses c ON c.id = e.course_id
+           JOIN users teacher ON teacher.id = c.teacher_id
+           WHERE teacher.tenant_id = t.id
+         ) AS students_count
+       FROM tenants t
+       LEFT JOIN users owner ON owner.id = t.owner_user_id AND owner.tenant_id = t.id
+       ${teacherPlanPolicy_1.OWNER_BILLING_SUBSCRIPTION_JOIN}
+       WHERE t.id = $1
+       LIMIT 1`, [id]);
+        if (!result.rowCount)
+            return null;
+        const row = result.rows[0];
+        const [settingsRes, landingRes, gradesRes] = await Promise.all([
+            pool_1.default.query(`SELECT data FROM tenant_settings WHERE tenant_id = $1`, [id]),
+            pool_1.default.query(`SELECT page FROM tenant_landing_pages WHERE tenant_id = $1`, [id]),
+            row.owner_id
+                ? pool_1.default.query(`SELECT grade_id FROM teacher_grades WHERE teacher_id = $1 ORDER BY grade_id`, [row.owner_id])
+                : Promise.resolve({ rows: [] }),
+        ]);
+        return {
+            id: row.id,
+            subdomain: row.subdomain,
+            display_name: row.display_name,
+            specialty: row.specialty,
+            bio: row.bio,
+            avatar_url: row.avatar_url,
+            is_active: row.is_active,
+            seo_title: row.seo_title,
+            seo_meta_description: row.seo_meta_description,
+            favicon_url: row.favicon_url,
+            og_image_url: row.og_image_url,
+            owner_user_id: row.owner_user_id,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+            settings: settingsRes.rows[0]?.data ?? {},
+            landing: landingRes.rows[0]?.page ?? {},
+            owner: row.owner_id
+                ? {
+                    id: row.owner_id,
+                    name: row.owner_name,
+                    email: row.owner_email,
+                    phone: row.owner_phone,
+                    subject: row.owner_subject,
+                    avatar: row.owner_avatar,
+                    account_status: row.owner_account_status,
+                    ...resolveOwnerSubscriptionFields(row),
+                    created_at: row.owner_created_at,
+                    description: row.owner_description,
+                    facebook_url: row.owner_facebook_url,
+                    youtube_url: row.owner_youtube_url,
+                    tiktok_url: row.owner_tiktok_url,
+                    whatsapp_number: row.owner_whatsapp_number,
+                    grade_ids: gradesRes.rows.map((g) => g.grade_id),
+                }
+                : null,
+            stats: {
+                teachers_count: Number(row.teachers_count ?? 0),
+                courses_count: Number(row.courses_count ?? 0),
+                students_count: Number(row.students_count ?? 0),
+            },
+        };
+    }
     static async patchTenant(id, patch) {
         const client = await pool_1.default.connect();
         try {
@@ -236,12 +507,26 @@ class TenantService {
                 await client.query(`UPDATE tenants SET ${fields.join(', ')}, updated_at = NOW() WHERE id = $${i}`, vals);
             }
             if (patch.settings) {
+                const mergeSettings = patch.merge_settings !== false;
+                let settingsPayload = patch.settings;
+                if (mergeSettings) {
+                    const existing = await client.query(`SELECT data FROM tenant_settings WHERE tenant_id = $1`, [id]);
+                    const current = existing.rows[0]?.data ?? {};
+                    settingsPayload = mergeJsonObjects(current, patch.settings);
+                }
                 await client.query(`INSERT INTO tenant_settings (tenant_id, data) VALUES ($1, $2::JSONB)
-           ON CONFLICT (tenant_id) DO UPDATE SET data = EXCLUDED.data, updated_at = NOW()`, [id, JSON.stringify(patch.settings)]);
+           ON CONFLICT (tenant_id) DO UPDATE SET data = EXCLUDED.data, updated_at = NOW()`, [id, JSON.stringify(settingsPayload)]);
             }
             if (patch.landing) {
+                const mergeLanding = patch.merge_landing !== false;
+                let landingPayload = patch.landing;
+                if (mergeLanding) {
+                    const existing = await client.query(`SELECT page FROM tenant_landing_pages WHERE tenant_id = $1`, [id]);
+                    const current = existing.rows[0]?.page ?? {};
+                    landingPayload = mergeJsonObjects(current, patch.landing);
+                }
                 await client.query(`INSERT INTO tenant_landing_pages (tenant_id, page) VALUES ($1, $2::JSONB)
-           ON CONFLICT (tenant_id) DO UPDATE SET page = EXCLUDED.page, updated_at = NOW()`, [id, JSON.stringify(patch.landing)]);
+           ON CONFLICT (tenant_id) DO UPDATE SET page = EXCLUDED.page, updated_at = NOW()`, [id, JSON.stringify(landingPayload)]);
             }
             if (patch.owner) {
                 let ownerId = tenant.owner_user_id;
@@ -281,6 +566,20 @@ class TenantService {
                         addOwner('description', patch.owner.description ?? '');
                     if (patch.owner.subject !== undefined)
                         addOwner('subject', patch.owner.subject ?? '');
+                    if (patch.owner.phone !== undefined)
+                        addOwner('phone', patch.owner.phone);
+                    if (patch.owner.facebook_url !== undefined)
+                        addOwner('facebook_url', patch.owner.facebook_url);
+                    if (patch.owner.youtube_url !== undefined)
+                        addOwner('youtube_url', patch.owner.youtube_url);
+                    if (patch.owner.tiktok_url !== undefined)
+                        addOwner('tiktok_url', patch.owner.tiktok_url);
+                    if (patch.owner.whatsapp_number !== undefined) {
+                        addOwner('whatsapp_number', patch.owner.whatsapp_number);
+                    }
+                    if (patch.owner.account_status !== undefined) {
+                        addOwner('account_status', patch.owner.account_status);
+                    }
                     if (patch.owner.password !== undefined) {
                         const bcrypt = await import('bcrypt');
                         const hashed = await bcrypt.hash(patch.owner.password, 10);
@@ -314,6 +613,16 @@ class TenantService {
                 }
             }
             await client.query('COMMIT');
+            try {
+                await hooks_1.SeoHooks.onTenantProfileChanged(id);
+            }
+            catch (seoErr) {
+                console.error('SEO sync after tenant patch:', seoErr);
+            }
+            const updated = await this.getTenantForAdmin(id);
+            if (!updated)
+                throw new Error('Tenant not found after update');
+            return updated;
         }
         catch (e) {
             await client.query('ROLLBACK');

@@ -144,7 +144,7 @@ class QuestionsManagementService {
         const examCheck = await pool_1.default.query(`SELECT e.id, c.teacher_id FROM exams e
        JOIN lectures l ON e.lecture_id = l.id
        JOIN courses c ON l.course_id = c.id
-       WHERE e.id = $1 AND e.type = 'exam'`, [examId]);
+       WHERE e.id = $1 AND e.type IN ('exam', 'assignment')`, [examId]);
         if (!examCheck.rowCount) {
             throw new Error('امتحان المحاضرة غير موجود');
         }

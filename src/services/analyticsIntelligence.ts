@@ -39,31 +39,63 @@ export class AnalyticsIntelligenceService {
         avg_completion: string | null;
         completed_sessions: string | null;
       }>(
-        `SELECT
-           COALESCE(AVG(vv.watch_duration), 0)::text AS avg_watch_seconds,
-           COALESCE(SUM(vv.watch_duration), 0)::text AS total_watch_seconds,
-           COALESCE(AVG(vv.completion_percentage), 0)::text AS avg_completion,
-           COALESCE(SUM(CASE WHEN vv.is_completed THEN 1 ELSE 0 END), 0)::text AS completed_sessions
-         FROM video_views vv
-         JOIN users u ON u.id = vv.user_id
-         WHERE vv.course_id = $1
-           AND u.tenant_id = $2
-           AND vv.updated_at BETWEEN $3 AND $4`,
+        `WITH per_student AS (
+           SELECT
+             e.user_id,
+             CASE WHEN COUNT(DISTINCT l.id) = 0 THEN 0
+             ELSE ROUND(
+               COUNT(DISTINCT CASE
+                 WHEN lv.lecture_id IS NOT NULL OR vv.lecture_id IS NOT NULL THEN l.id
+               END)::numeric / COUNT(DISTINCT l.id) * 100,
+               2
+             )
+             END AS watch_percentage,
+             COALESCE(SUM(vv.watch_duration), 0) AS watch_seconds
+           FROM enrollments e
+           JOIN users u ON u.id = e.user_id
+           JOIN lectures l ON l.course_id = e.course_id
+           LEFT JOIN lecture_views lv ON lv.lecture_id = l.id AND lv.user_id = e.user_id
+             AND lv.viewed_at BETWEEN $3 AND $4
+           LEFT JOIN video_views vv ON vv.lecture_id = l.id AND vv.user_id = e.user_id AND vv.course_id = e.course_id
+             AND vv.updated_at BETWEEN $3 AND $4
+           WHERE e.course_id = $1
+             AND u.role = 'student'
+             AND u.tenant_id = $2
+           GROUP BY e.user_id
+         )
+         SELECT
+           COALESCE(AVG(watch_seconds), 0)::text AS avg_watch_seconds,
+           COALESCE(SUM(watch_seconds), 0)::text AS total_watch_seconds,
+           COALESCE(AVG(watch_percentage), 0)::text AS avg_completion,
+           '0'::text AS completed_sessions
+         FROM per_student`,
         [courseId, scope.tenantId, from, to],
       ),
       pool.query<{ completion_rate: string | null }>(
         `WITH per_student AS (
            SELECT
-             vv.user_id,
-             AVG(vv.completion_percentage) AS avg_completion
-           FROM video_views vv
-           JOIN users u ON u.id = vv.user_id
-           WHERE vv.course_id = $1
-             AND u.tenant_id = $2
+             e.user_id,
+             CASE WHEN COUNT(DISTINCT l.id) = 0 THEN 0
+             ELSE ROUND(
+               COUNT(DISTINCT CASE
+                 WHEN lv.lecture_id IS NOT NULL OR vv.lecture_id IS NOT NULL THEN l.id
+               END)::numeric / COUNT(DISTINCT l.id) * 100,
+               2
+             )
+             END AS watch_percentage
+           FROM enrollments e
+           JOIN users u ON u.id = e.user_id
+           JOIN lectures l ON l.course_id = e.course_id
+           LEFT JOIN lecture_views lv ON lv.lecture_id = l.id AND lv.user_id = e.user_id
+             AND lv.viewed_at BETWEEN $3 AND $4
+           LEFT JOIN video_views vv ON vv.lecture_id = l.id AND vv.user_id = e.user_id AND vv.course_id = e.course_id
              AND vv.updated_at BETWEEN $3 AND $4
-           GROUP BY vv.user_id
+           WHERE e.course_id = $1
+             AND u.role = 'student'
+             AND u.tenant_id = $2
+           GROUP BY e.user_id
          )
-         SELECT COALESCE(AVG(CASE WHEN avg_completion >= 80 THEN 100 ELSE 0 END), 0)::text AS completion_rate
+         SELECT COALESCE(AVG(CASE WHEN watch_percentage >= 80 THEN 100 ELSE 0 END), 0)::text AS completion_rate
          FROM per_student`,
         [courseId, scope.tenantId, from, to],
       ),
@@ -75,14 +107,22 @@ export class AnalyticsIntelligenceService {
         `SELECT
            l.id AS lecture_id,
            l.title AS lecture_title,
-           COALESCE(AVG(vv.completion_percentage), 0)::text AS avg_completion
+           CASE WHEN COUNT(DISTINCT e.user_id) = 0 THEN 0
+           ELSE ROUND(
+             COUNT(DISTINCT CASE
+               WHEN lv.lecture_id IS NOT NULL OR vv.lecture_id IS NOT NULL THEN e.user_id
+             END)::numeric / COUNT(DISTINCT e.user_id) * 100,
+             2
+           )
+           END::text AS avg_completion
          FROM lectures l
-         LEFT JOIN lecture_videos lv ON lv.lecture_id = l.id
-         LEFT JOIN video_views vv ON vv.video_id = lv.id
-         LEFT JOIN users u ON u.id = vv.user_id
+         JOIN enrollments e ON e.course_id = l.course_id
+         JOIN users u ON u.id = e.user_id AND u.role = 'student' AND u.tenant_id = $2
+         LEFT JOIN lecture_views lv ON lv.lecture_id = l.id AND lv.user_id = e.user_id
+           AND lv.viewed_at BETWEEN $3 AND $4
+         LEFT JOIN video_views vv ON vv.lecture_id = l.id AND vv.user_id = e.user_id AND vv.course_id = l.course_id
+           AND vv.updated_at BETWEEN $3 AND $4
          WHERE l.course_id = $1
-           AND (u.id IS NULL OR u.tenant_id = $2)
-           AND (vv.id IS NULL OR vv.updated_at BETWEEN $3 AND $4)
          GROUP BY l.id, l.title
          ORDER BY l.position ASC, l.id ASC`,
         [courseId, scope.tenantId, from, to],
@@ -97,16 +137,33 @@ export class AnalyticsIntelligenceService {
            u.id AS student_id,
            u.name AS student_name,
            COALESCE(SUM(vv.watch_duration), 0)::text AS study_seconds,
-           COALESCE(AVG(vv.completion_percentage), 0)::text AS avg_completion
+           CASE WHEN COUNT(DISTINCT l.id) = 0 THEN '0'
+           ELSE ROUND(
+             COUNT(DISTINCT CASE
+               WHEN lv.lecture_id IS NOT NULL OR vv2.lecture_id IS NOT NULL THEN l.id
+             END)::numeric / COUNT(DISTINCT l.id) * 100,
+             2
+           )::text
+           END AS avg_completion
          FROM enrollments e
          JOIN users u ON u.id = e.user_id
+         JOIN lectures l ON l.course_id = e.course_id
+         LEFT JOIN lecture_views lv ON lv.lecture_id = l.id AND lv.user_id = e.user_id
+           AND lv.viewed_at BETWEEN $3 AND $4
          LEFT JOIN video_views vv ON vv.user_id = u.id AND vv.course_id = e.course_id
+           AND vv.updated_at BETWEEN $3 AND $4
+         LEFT JOIN video_views vv2 ON vv2.lecture_id = l.id AND vv2.user_id = e.user_id
+           AND vv2.updated_at BETWEEN $3 AND $4
          WHERE e.course_id = $1
            AND u.role = 'student'
            AND u.tenant_id = $2
-           AND (vv.id IS NULL OR vv.updated_at BETWEEN $3 AND $4)
          GROUP BY u.id, u.name
-         ORDER BY COALESCE(SUM(vv.watch_duration), 0) DESC, COALESCE(AVG(vv.completion_percentage), 0) DESC
+         ORDER BY COALESCE(SUM(vv.watch_duration), 0) DESC,
+                  CASE WHEN COUNT(DISTINCT l.id) = 0 THEN 0
+                  ELSE COUNT(DISTINCT CASE
+                    WHEN lv.lecture_id IS NOT NULL OR vv2.lecture_id IS NOT NULL THEN l.id
+                  END)::numeric / COUNT(DISTINCT l.id) * 100
+                  END DESC
          LIMIT 20`,
         [courseId, scope.tenantId, from, to],
       ),
@@ -158,9 +215,30 @@ export class AnalyticsIntelligenceService {
            COALESCE(COUNT(vv.id), 0)::text AS total_views,
            COALESCE(COUNT(DISTINCT vv.user_id), 0)::text AS unique_views,
            COALESCE(AVG(vv.watch_duration), 0)::text AS avg_watch_seconds,
-           COALESCE(AVG(vv.completion_percentage), 0)::text AS completion_percentage
+           COALESCE((
+             SELECT AVG(per_user.watch_pct)
+             FROM (
+               SELECT
+                 CASE WHEN lecture_total.total_videos = 0 THEN 0
+                 ELSE ROUND(
+                   COUNT(DISTINCT vv2.video_id)::numeric / lecture_total.total_videos * 100,
+                   2
+                 )
+                 END AS watch_pct
+               FROM video_views vv2
+               CROSS JOIN (
+                 SELECT COUNT(*)::numeric AS total_videos
+                 FROM lecture_videos
+                 WHERE lecture_id = l.id
+               ) lecture_total
+               WHERE vv2.lecture_id = l.id
+                 AND vv2.updated_at BETWEEN $2 AND $3
+               GROUP BY vv2.user_id, lecture_total.total_videos
+             ) per_user
+           ), 0)::text AS completion_percentage
          FROM lectures l
-         LEFT JOIN video_views vv ON vv.lecture_id = l.id AND vv.updated_at BETWEEN $2 AND $3
+         LEFT JOIN video_views vv ON vv.lecture_id = l.id
+           AND vv.updated_at BETWEEN $2 AND $3
          LEFT JOIN users u ON u.id = vv.user_id
          WHERE l.id = $1
            AND (u.id IS NULL OR u.tenant_id = $4)

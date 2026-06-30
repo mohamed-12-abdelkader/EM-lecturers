@@ -8,6 +8,7 @@ import { ChangePassword, RegisterStudent } from './auth.modules';
 import { asyncWrapper, generateToken, uploadToCloudinary } from '../utils';
 import { studentOnlyMiddleware } from '../middleware/authentication';
 import { StudentPointsService } from '../services/studentPoints';
+import { TeacherManagedStudentsService } from '../services/teacherManagedStudents';
 import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
@@ -87,6 +88,17 @@ router.post(
         });
       }
       tenantId = tRes.rows[0].id;
+    }
+
+    const selfRegistrationAllowed =
+      await TeacherManagedStudentsService.isSelfRegistrationAllowed(tenantId);
+    if (!selfRegistrationAllowed) {
+      return res.status(403).json({
+        success: false,
+        code: 'SELF_REGISTRATION_DISABLED',
+        message:
+          'يتم إنشاء الحسابات بواسطة المدرس. يرجى التواصل مع مدرسك للحصول على بيانات تسجيل الدخول.',
+      });
     }
 
     const existing = await pool.query('SELECT id FROM users WHERE phone = $1 AND tenant_id = $2', [
@@ -224,6 +236,7 @@ router.put(
       const hashed = await bcrypt.hash(password, 10);
       updates.push(`password = $${paramIndex++}`);
       values.push(hashed);
+      updates.push(`must_change_password = FALSE`);
     }
 
     // رفع صورة البروفايل إذا تم إرسالها
@@ -417,14 +430,16 @@ router.get(
         users.tiktok_url,
         users.whatsapp_number,
         users.created_at,
+        t.subdomain,
         COUNT(DISTINCT c.id) as courses_count,
         COUNT(DISTINCT e.user_id) as students_count
       FROM users
       ${joinClause}
+      LEFT JOIN tenants t ON t.id = users.tenant_id
       LEFT JOIN courses c ON users.id = c.teacher_id
       LEFT JOIN enrollments e ON c.id = e.course_id
       WHERE ${whereClause}
-      GROUP BY users.id, users.name, users.email, users.phone, users.avatar, users.description, users.subject, users.facebook_url, users.youtube_url, users.tiktok_url, users.whatsapp_number, users.created_at
+      GROUP BY users.id, users.name, users.email, users.phone, users.avatar, users.description, users.subject, users.facebook_url, users.youtube_url, users.tiktok_url, users.whatsapp_number, users.created_at, t.subdomain
       ORDER BY users.created_at DESC
       ${limitSQL}
       ${offsetSQL}

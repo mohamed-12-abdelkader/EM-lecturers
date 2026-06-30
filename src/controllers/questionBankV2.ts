@@ -10,6 +10,12 @@ import {
   UpdateCorrectAnswerSchema,
   CreatePassageWithQuestionsSchema
 } from '../db/types/questionBankV2';
+import { QuestionExtractionImportService, buildImportExtractionResponse } from '../services/questionExtractionImport';
+import {
+  MistralQuestionExtractionSchema,
+  parseQuestionExtractionImportPayload,
+} from '../types/mistralQuestionExtraction';
+import { z } from 'zod';
 import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
@@ -338,6 +344,55 @@ router.post(
       data: result,
     });
   })
+);
+
+// ============================================
+// 4b. استيراد أسئلة مستخرجة بالـ AI (OCR) إلى الدرس
+// ============================================
+router.post(
+  '/lesson/:lessonId/import-extraction',
+  authMiddleware(['teacher', 'admin', 'employee']),
+  checkPermission('question_bank_management'),
+  asyncWrapper(async (req: Request, res: Response) => {
+    const lessonId = parseInt(req.params.lessonId);
+    if (isNaN(lessonId) || lessonId <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'معرف الدرس غير صحيح',
+      });
+    }
+
+    let payload;
+    try {
+      payload = parseQuestionExtractionImportPayload(req.body);
+      MistralQuestionExtractionSchema.parse(payload.extraction);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({
+          success: false,
+          message: 'Validation failed',
+          errors: error.errors,
+        });
+      }
+      return res.status(400).json({
+        success: false,
+        message: 'صيغة بيانات الاستخراج غير صحيحة — أرسل ناتج extract-questions كما هو (data) أو { extraction: ... }',
+      });
+    }
+
+    const result = await QuestionExtractionImportService.importToQuestionBankV2({
+      lessonId,
+      teacherId: (req as any).user.id,
+      userRole: (req as any).user.role,
+      extraction: payload.extraction,
+    });
+
+    return res.status(201).json({
+      success: true,
+      message: `تم استيراد ${result.questions.length} سؤال`,
+      data: buildImportExtractionResponse(payload.meta, result),
+    });
+  }),
 );
 
 // ============================================

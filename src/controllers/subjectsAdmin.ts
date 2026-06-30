@@ -7,7 +7,7 @@ import { uploadToCloudinary } from '../utils';
 import { UpdateSubjectSchema } from '../db/types/questionBank';
 import { SubjectService } from '../services/subjects';
 import { ChapterService } from '../services/chapters';
-import { TeacherSubjectService } from '../services/teacherSubjects';
+import { getSubjectBooksWithChaptersAndLessons } from '../services/questionBankHierarchy';
 import pool from '../db/pool';
 import { createQuestionBankChangeRequest } from '../services/questionBankChangeRequests';
 
@@ -116,20 +116,62 @@ router.delete('/:id', authMiddleware(['admin', 'employee']), checkPermission('qu
 
 export { router };
 
-// Extra: GET /api/subjects/:id/with-chapters (admin or assigned teacher)
+// Extra: GET /api/subjects/:id/with-books (admin or assigned teacher)
+router.get(
+  '/:id/with-books',
+  authMiddleware(['admin', 'teacher', 'employee']),
+  async (req: Request, res: Response) => {
+    try {
+      const subjectId = Number(req.params.id);
+      if (Number.isNaN(subjectId)) {
+        return res.status(400).json({ success: false, message: 'معرف المادة غير صحيح' });
+      }
+
+      const subject = await SubjectService.getById(subjectId);
+      if (!subject) return res.status(404).json({ success: false, message: 'المادة غير موجودة' });
+
+      const user = req.user!;
+      if (user.role === 'teacher') {
+        const assigned = await pool.query(
+          'SELECT 1 FROM teacher_subjects WHERE teacher_id = $1 AND subject_id = $2',
+          [user.id, subjectId],
+        );
+        if (!assigned.rowCount) {
+          return res.status(403).json({ success: false, message: 'غير مصرح لك بهذه المادة' });
+        }
+      }
+
+      const books = await getSubjectBooksWithChaptersAndLessons(subjectId);
+      return res.status(200).json({
+        success: true,
+        data: {
+          subject,
+          books,
+          chapters: books.flatMap((b) => b.chapters),
+        },
+      });
+    } catch (error: any) {
+      return res
+        .status(500)
+        .json({ success: false, message: 'خطأ في جلب المادة والكتب', error: error.message });
+    }
+  },
+);
+
+// Extra: GET /api/subjects/:id/with-chapters (legacy flat view)
 router.get(
   '/:id/with-chapters',
   authMiddleware(['admin', 'teacher', 'employee']),
   async (req: Request, res: Response) => {
     try {
       const subjectId = Number(req.params.id);
-      if (Number.isNaN(subjectId))
+      if (Number.isNaN(subjectId)) {
         return res.status(400).json({ success: false, message: 'معرف المادة غير صحيح' });
+      }
 
       const subject = await SubjectService.getById(subjectId);
       if (!subject) return res.status(404).json({ success: false, message: 'المادة غير موجودة' });
 
-      // If user is a teacher, ensure he is assigned to this subject
       const user = req.user!;
       if (user.role === 'teacher') {
         const assigned = await pool.query(

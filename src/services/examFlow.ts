@@ -21,8 +21,11 @@ interface AnswerPayload {
   choiceId?: number | null;
 }
 
+type LectureExamRecordType = 'exam' | 'assignment';
+
 interface CreateExamPayload {
   lectureId: number;
+  type?: string;
   title?: string;
   totalGrade?: number;
   duration?: number | null;
@@ -102,8 +105,23 @@ interface ExamQuestion {
   choices: {
     id: number;
     text: string;
+    image?: string | null;
     isCorrect: boolean;
   }[];
+}
+
+function normalizeChoiceContent(
+  text: string | null | undefined,
+  imageUrl?: string | null,
+): { text: string; image: string | null } {
+  if (imageUrl?.trim()) {
+    return { text: text?.trim() || '', image: imageUrl.trim() };
+  }
+  const value = text?.trim() ?? '';
+  if (/^https?:\/\//i.test(value)) {
+    return { text: '', image: value };
+  }
+  return { text: value, image: null };
 }
 
 interface QuestionEvaluation extends WrongQuestion {
@@ -130,6 +148,24 @@ interface QuestionReportEntry {
   incorrectCount: number;
   correctStudents: QuestionReportStudent[];
   incorrectStudents: QuestionReportStudent[];
+}
+
+function normalizeLectureExamType(
+  value: unknown,
+  fallback: LectureExamRecordType = 'exam',
+): LectureExamRecordType {
+  if (typeof value !== 'string') return fallback;
+  const raw = value.trim().toLowerCase();
+  if (raw === 'assignment' || raw === 'homework' || raw === 'task') return 'assignment';
+  if (raw === 'exam' || raw === 'quiz' || raw === 'test') return 'exam';
+  return fallback;
+}
+
+function parseLectureExamTypeFilter(value?: string): LectureExamRecordType | 'all' | null {
+  if (!value?.trim()) return null;
+  const raw = value.trim().toLowerCase();
+  if (raw === 'all' || raw === 'any' || raw === '*') return 'all';
+  return normalizeLectureExamType(raw, 'exam');
 }
 
 export class ExamFlowService {
@@ -236,6 +272,7 @@ export class ExamFlowService {
   static async createExam(teacherId: number, payload: CreateExamPayload) {
     const {
       lectureId,
+      type,
       title,
       totalGrade,
       duration,
@@ -334,6 +371,7 @@ export class ExamFlowService {
 
     const normalizedShowAt = showAt ? new Date(showAt) : null;
     const normalizedHideAt = hideAt ? new Date(hideAt) : null;
+    const examType = normalizeLectureExamType(type, 'exam');
 
     const result = await pool.query(
       `INSERT INTO exams (
@@ -343,17 +381,18 @@ export class ExamFlowService {
         allow_multiple_attempts, show_answers_later, answers_release_date,
         time_limit_enabled, time_limit_minutes, start_window, end_window
       ) VALUES (
-        $1, 'exam', $2, $3, $4, $5, $6,
-        $7, $8, $9,
-        $10, $11,
-        $12, $13, $14,
-        $15, $16, $17, $18
+        $1, $2, $3, $4, $5, $6, $7,
+        $8, $9, $10,
+        $11, $12,
+        $13, $14, $15,
+        $16, $17, $18, $19
       ) RETURNING *`,
       [
         lectureId,
+        examType,
         totalGrade ?? 100,
         teacherId,
-        title?.trim() || 'Lecture Exam',
+        title?.trim() || (examType === 'assignment' ? 'Lecture Assignment' : 'Lecture Exam'),
         duration ?? null,
         isVisible ?? false,
         normalizedShowAt,
@@ -837,26 +876,75 @@ export class ExamFlowService {
     }
   }
 
-  static async getExamsByTeacher(teacherId: number) {
-    const result = await pool.query(
-      `SELECT 
-         e.*, 
-         l.title as lecture_title, 
-         c.title as course_title,
-         c.id as course_id
-       FROM exams e
-       JOIN lectures l ON e.lecture_id = l.id
-       JOIN courses c ON l.course_id = c.id
-       WHERE e.created_by = $1
-       ORDER BY e.created_at DESC`,
-      [teacherId],
-    );
+  static async getExamsByTeacher(
+    teacherId: number,
+    filters?: { courseId?: number; lectureId?: number; type?: string },
+  ) {
+    let typeFilter = parseLectureExamTypeFilter(filters?.type);
 
-    return result.rows.map(row => ({
+    if (typeFilter === 'assignment') {
+      const assignmentCountRes = await pool.query<{ c: number }>(
+        `SELECT COUNT(*)::int AS c
+         FROM exams e
+         INNER JOIN lectures l ON e.lecture_id = l.id
+         INNER JOIN courses c ON l.course_id = c.id
+         WHERE c.teacher_id = $1 AND e.type = 'assignment'`,
+        [teacherId],
+      );
+      if ((assignmentCountRes.rows[0]?.c ?? 0) === 0) {
+        // سجلات قديمة: كانت تُحفظ دائماً كـ exam رغم إنشائها كواجب
+        typeFilter = 'exam';
+      }
+    }
+
+    const params: unknown[] = [teacherId];
+    let query = `
+      SELECT
+        e.*,
+        l.title AS lecture_title,
+        c.title AS course_title,
+        c.id AS course_id,
+        COUNT(DISTINCT eq.id)::int AS questions_count,
+        COUNT(DISTINCT es.id)::int AS submissions_count
+      FROM exams e
+      INNER JOIN lectures l ON e.lecture_id = l.id
+      INNER JOIN courses c ON l.course_id = c.id
+      LEFT JOIN exam_questions eq ON eq.exam_id = e.id
+      LEFT JOIN exam_submissions es ON es.exam_id = e.id
+      WHERE c.teacher_id = $1
+    `;
+
+    if (typeFilter && typeFilter !== 'all') {
+      params.push(typeFilter);
+      query += ` AND e.type = $${params.length}`;
+    }
+
+    if (filters?.courseId) {
+      params.push(filters.courseId);
+      query += ` AND c.id = $${params.length}`;
+    }
+    if (filters?.lectureId) {
+      params.push(filters.lectureId);
+      query += ` AND l.id = $${params.length}`;
+    }
+
+    query += `
+      GROUP BY e.id, l.title, c.title, c.id
+      ORDER BY e.created_at DESC
+    `;
+
+    const result = await pool.query(query, params);
+
+    return result.rows.map((row) => ({
       ...this.mapExamRow(row),
+      type: row.type,
       lectureTitle: row.lecture_title,
+      lectureName: row.lecture_title,
       courseTitle: row.course_title,
+      courseName: row.course_title,
       courseId: row.course_id,
+      questionsCount: row.questions_count,
+      submissionsCount: row.submissions_count,
     }));
   }
 
@@ -1637,17 +1725,15 @@ export class ExamFlowService {
         const effectiveCorrect = overrideIndex ?? bankCorrectIndex;
         const isCorrect =
           effectiveCorrect !== null && choiceIndex !== null && choiceIndex === effectiveCorrect;
-        // Use text_content, fallback to '[Image]' if it's an image-only option (or handle image display in frontend if strictly supported)
-        // Since the interface expects 'text', we should ideally provide text.
-        // If it's an image option, text_content might be null.
-        let choiceText = row.choice_text_v2;
-        if (!choiceText && row.choice_image_v2) {
-          choiceText = 'Image Option'; // Placeholder or we need to update interface to support image options
-        }
+        const { text: choiceText, image: choiceImage } = normalizeChoiceContent(
+          row.choice_text_v2,
+          row.choice_image_v2,
+        );
 
         question.choices.push({
           id: row.choice_id_v2,
-          text: choiceText || '',
+          text: choiceText,
+          image: choiceImage,
           isCorrect,
         });
       }
@@ -1683,11 +1769,15 @@ export class ExamFlowService {
             question.correct_answer_index_override ?? question.correct_answer_index ?? null;
           question.choices = opts
             .sort((a, b) => a.option_index - b.option_index)
-            .map((o, i) => ({
-              id: -(examQuestionId * 10 + i + 1),
-              text: o.text_content ?? '',
-              isCorrect: effectiveCorrect !== null && i === effectiveCorrect,
-            }));
+            .map((o, i) => {
+              const { text, image } = normalizeChoiceContent(o.text_content);
+              return {
+                id: -(examQuestionId * 10 + i + 1),
+                text,
+                image,
+                isCorrect: effectiveCorrect !== null && i === effectiveCorrect,
+              };
+            });
         });
       } catch {
         // جدول exam_question_options قد يكون غير موجود قبل تشغيل migration
@@ -1754,6 +1844,7 @@ export class ExamFlowService {
       choices: question.choices.map((choice) => ({
         id: choice.id,
         text: choice.text,
+        ...(choice.image ? { image: choice.image } : {}),
         ...(includeCorrect ? { is_correct: choice.isCorrect } : {}),
       })),
     };

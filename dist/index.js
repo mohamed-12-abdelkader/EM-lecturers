@@ -41,6 +41,7 @@ const app_1 = require("./app");
 const socket_io_1 = require("socket.io");
 const jwt = __importStar(require("jsonwebtoken"));
 const utils_1 = require("./utils");
+const appUrls_1 = require("./config/appUrls");
 const pool_1 = __importDefault(require("./db/pool"));
 const chat_1 = require("./services/chat");
 const supportChat_1 = require("./services/supportChat");
@@ -66,8 +67,12 @@ const startServer = async () => {
         }
         catch (migrationError) {
             utils_1.logger.error('❌ Migration failed:', migrationError.message);
-            if (migrationError.message?.includes('ETIMEDOUT') ||
-                migrationError.message?.includes('connect')) {
+            const connectionIssue = migrationError.message?.includes('ETIMEDOUT') ||
+                migrationError.message?.includes('ENOTFOUND') ||
+                migrationError.message?.includes('getaddrinfo') ||
+                migrationError.message?.includes('ECONNREFUSED') ||
+                migrationError.message?.includes('connect');
+            if (connectionIssue) {
                 utils_1.logger.error('⚠️  Skipping migrations due to database connection issue');
                 utils_1.logger.error('   Server will start but database operations will fail until connection is restored');
             }
@@ -104,11 +109,45 @@ const startServer = async () => {
             // Don't throw - allow server to start without Milvus
         }
         app_1.server.listen(PORT, '0.0.0.0', () => {
+            const info = (0, appUrls_1.getServerInfo)();
             utils_1.logger.info(`🚀 Server is running on port ${PORT}`);
+            utils_1.logger.info(`   Local:  ${info.local_url}`);
+            if (info.use_ngrok && info.ngrok_url) {
+                utils_1.logger.info(`   Public: ${info.base_url}`);
+                utils_1.logger.info(`   API:    ${info.api_url}`);
+                utils_1.logger.info(`   Socket: ${info.socket_url}`);
+                utils_1.logger.warn('   Ngrok URL is from .env.ngrok.local — the tunnel is NOT started by `npm run dev`. Run `npm run dev:expo` or `npm run ngrok` in another terminal.');
+                void (async () => {
+                    await new Promise((r) => setTimeout(r, 1500));
+                    try {
+                        const res = await fetch(`${info.api_url}/server-info`, {
+                            headers: { 'ngrok-skip-browser-warning': 'true' },
+                            signal: AbortSignal.timeout(8000),
+                        });
+                        if (!res.ok)
+                            throw new Error(`HTTP ${res.status}`);
+                        utils_1.logger.info('   ✅ Ngrok tunnel is online — external API requests will reach this server');
+                    }
+                    catch {
+                        utils_1.logger.error('   ❌ Ngrok tunnel is OFFLINE — requests to the Public/API URL will NOT reach this server');
+                        utils_1.logger.error('   Fix: npm run dev:expo   OR   npm run ngrok (2nd terminal, keep open)');
+                    }
+                })();
+            }
         });
         // Socket.IO setup for both Chat and Game systems
         const io = new socket_io_1.Server(app_1.server, {
-            cors: { origin: utils_1.config.CORS_ORIGIN.split(',').map((o) => o.trim()), credentials: true },
+            cors: {
+                origin: (origin, callback) => {
+                    if (!origin || (0, appUrls_1.isCorsOriginAllowed)(origin)) {
+                        callback(null, true);
+                    }
+                    else {
+                        callback(new Error('CORS not allowed'));
+                    }
+                },
+                credentials: true,
+            },
         });
         // Store io instance globally for use in controllers
         globalIO = io;
@@ -116,6 +155,10 @@ const startServer = async () => {
         // Set IO getter for NotificationService
         const { setIOGetter } = await import('./services/notifications.js');
         setIOGetter(() => globalIO);
+        const { setNotificationDispatchIO } = await import('./services/notificationDispatchService.js');
+        setNotificationDispatchIO(() => globalIO);
+        const { startNotificationPushWorker } = await import('./workers/notificationPushWorker.js');
+        startNotificationPushWorker();
         io.use(async (socket, next) => {
             try {
                 const token = socket.handshake.auth?.token ||
@@ -749,6 +792,16 @@ const startServer = async () => {
                 utils_1.logger.error('Task deadline / overdue job error:', err);
             }
         }, 60 * 60 * 1000);
+        // اشتراكات المدرسين: انتهاء الباقة → فترة سماح → إيقاف المنصة
+        setInterval(async () => {
+            try {
+                const { TeacherPlatformSubscriptionsService } = await import('./services/teacherPlatformSubscriptions.js');
+                await TeacherPlatformSubscriptionsService.syncSubscriptionLifecycle();
+            }
+            catch (err) {
+                utils_1.logger.error('Teacher subscription lifecycle sync error:', err);
+            }
+        }, 60 * 60 * 1000);
         // Broadcast helper when permissions change
         app_1.app.emitChatPermission = (groupId, allow) => {
             io.to(`group:${groupId}`).emit('chat:permission-changed', {
@@ -1032,7 +1085,6 @@ const startServer = async () => {
         process.on('SIGTERM', shutdown);
     }
     catch (error) {
-        console.log("err", error);
         utils_1.logger.error('❌ Failed to start server:', error);
         process.exit(1);
     }

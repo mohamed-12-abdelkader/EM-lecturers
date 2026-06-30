@@ -15,7 +15,59 @@ const teacherActivities_1 = require("../services/teacherActivities");
 const teacherActivityLog_1 = require("../services/teacherActivityLog");
 const teacherDailyCourseReport_1 = require("../services/teacherDailyCourseReport");
 const users_1 = require("../services/users");
+const examFlow_1 = require("../services/examFlow");
+const courseLevelExams_1 = require("../services/courseLevelExams");
+const requestParsers_1 = require("../utils/requestParsers");
 exports.router = (0, express_1.Router)();
+function resolveTeacherIdForQuery(req) {
+    const user = req.user;
+    if (user.role === 'admin') {
+        const fromQuery = (0, requestParsers_1.parseNumberInput)(req.query.teacher_id);
+        if (fromQuery)
+            return fromQuery;
+    }
+    return user.id;
+}
+// جلب كل امتحانات المحاضرات للمدرس مع اسم المحاضرة والكورس
+exports.router.get('/lecture-exams', (0, authentication_1.authMiddleware)(['teacher', 'admin']), (0, utils_1.asyncWrapper)(async (req, res) => {
+    const teacherId = resolveTeacherIdForQuery(req);
+    const courseId = (0, requestParsers_1.parseNumberInput)(req.query.course_id);
+    const lectureId = (0, requestParsers_1.parseNumberInput)(req.query.lecture_id);
+    const type = typeof req.query.type === 'string' ? req.query.type : undefined;
+    const exams = await examFlow_1.ExamFlowService.getExamsByTeacher(teacherId, {
+        courseId: courseId ?? undefined,
+        lectureId: lectureId ?? undefined,
+        type,
+    });
+    res.json({
+        success: true,
+        total: exams.length,
+        exams,
+        filters: {
+            teacherId,
+            courseId: courseId ?? null,
+            lectureId: lectureId ?? null,
+            type: type ?? 'all',
+        },
+    });
+}));
+// جلب كل امتحانات الكورس العامة (course_level_exams) للمدرس مع اسم الكورس
+exports.router.get('/course-exams', (0, authentication_1.authMiddleware)(['teacher', 'admin']), (0, utils_1.asyncWrapper)(async (req, res) => {
+    const teacherId = resolveTeacherIdForQuery(req);
+    const courseId = (0, requestParsers_1.parseNumberInput)(req.query.course_id);
+    const exams = await courseLevelExams_1.CourseLevelExamsService.getExamsByTeacher(teacherId, {
+        courseId: courseId ?? undefined,
+    });
+    res.json({
+        success: true,
+        total: exams.length,
+        exams,
+        filters: {
+            teacherId,
+            courseId: courseId ?? null,
+        },
+    });
+}));
 // جلب كل الطلاب المسجلين في منصة المدرّس (نفس tenant)
 exports.router.get('/platform-students', (0, authentication_1.authMiddleware)(['teacher']), (0, utils_1.asyncWrapper)(async (req, res) => {
     const tenantId = req.tenant.id;
@@ -372,12 +424,10 @@ exports.router.get('/stats', (0, authentication_1.authMiddleware)(['teacher']), 
           WHERE c.teacher_id = $1`, [teacher_id]);
         const studentsCount = parseInt(studentsRes.rows[0].count);
         // عدد الأسئلة في مكتبة الأسئلة
-        const questionsRes = await pool_1.default.query(`SELECT COUNT(*) as count 
+        const questionsRes = await pool_1.default.query(`SELECT COUNT(*) as count
          FROM teacher_questions q
-         JOIN teacher_question_parts p ON q.part_id = p.id
-         JOIN teacher_question_lessons l ON p.lesson_id = l.id
-         JOIN teacher_question_chapters c ON l.chapter_id = c.id
-         WHERE c.teacher_id = $1`, [teacher_id]);
+         JOIN teacher_question_lessons l ON q.lesson_id = l.id
+         WHERE l.teacher_id = $1`, [teacher_id]);
         const questionsCount = parseInt(questionsRes.rows[0].count);
         // إحصائيات إضافية - عدد الكورسات التي لها طلاب مشتركين
         const coursesWithStudentsRes = await pool_1.default.query(`SELECT COUNT(DISTINCT c.id) as count 

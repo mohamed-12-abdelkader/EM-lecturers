@@ -2,6 +2,7 @@ import pool from '../db/pool';
 import { sendPushNotification } from '../utils';
 import { Server as SocketIOServer } from 'socket.io';
 import * as ExpoPushService from './expoPushService';
+import { scheduleWebPushForUser } from './webPushSender';
 
 // Function to get Socket.IO instance
 let getIOInstance: (() => SocketIOServer | null) | null = null;
@@ -12,6 +13,17 @@ export function setIOGetter(getter: () => SocketIOServer | null) {
 
 function getIO(): SocketIOServer | null {
   return getIOInstance ? getIOInstance() : null;
+}
+
+function enqueueWebPush(
+  userId: number,
+  title: string,
+  message: string,
+  type: string,
+  notificationId?: number,
+  data?: Record<string, unknown>,
+) {
+  scheduleWebPushForUser(userId, { title, body: message, type, notification_id: notificationId, data });
 }
 
 /** إرسال حدث لتحديث قفل المحاضرات للطالب (بعد ظهور نتيجة امتحان محاضرة) */
@@ -77,7 +89,19 @@ export interface NotificationData {
   | 'task_deadline_reminder'
   | 'task_rejected'
   | 'task_approved'
-  | 'teacher_creative_reminder';
+  | 'teacher_creative_reminder'
+  | 'course'
+  | 'lesson'
+  | 'exam'
+  | 'announcement'
+  | 'course_purchase'
+  | 'course_opened'
+  | 'payment_confirmed'
+  | 'coupon_generated'
+  | 'cashback_added'
+  | 'assignment_deadline'
+  | 'custom'
+  | 'broadcast';
   task_id?: number;
   course_id?: number;
   general_course_id?: number;
@@ -190,6 +214,19 @@ export class NotificationService {
           if (notificationData.meeting_id) broadcastPayload.meeting_id = notificationData.meeting_id;
           broadcastNotification(notification.user_id, broadcastPayload);
 
+          enqueueWebPush(
+            notification.user_id,
+            insertedNotification.title,
+            insertedNotification.message,
+            notification.type,
+            insertedNotification.id,
+            {
+              course_id: insertedNotification.course_id,
+              lecture_id: insertedNotification.lecture_id,
+              exam_id: insertedNotification.exam_id,
+            },
+          );
+
           insertedCount++;
         } catch (insertError) {
           console.error(`❌ [Notification] Failed to insert notification for user ${notification.user_id}:`, insertError);
@@ -294,6 +331,12 @@ export class NotificationService {
         created_at: notification.created_at,
       });
 
+      enqueueWebPush(userId, title, message, type, notification.id, {
+        course_id: courseId,
+        general_course_id: generalCourseId,
+        lecture_id: lectureId,
+      });
+
       // Expo Push للموبايل (إضافة فقط)
       ExpoPushService.sendPushNotification(userId, title, message, {
         type,
@@ -344,6 +387,8 @@ export class NotificationService {
         is_read: notification.is_read,
         created_at: notification.created_at,
       });
+
+      enqueueWebPush(userId, title, message, type, notification.id, { task_id: taskId });
 
       ExpoPushService.sendPushNotification(userId, title, message, {
         type,
@@ -398,6 +443,8 @@ export class NotificationService {
         is_read: notification.is_read,
         created_at: notification.created_at,
       });
+
+      enqueueWebPush(userId, title, message, 'teacher_creative_reminder', notification.id, metadata);
 
       ExpoPushService.sendPushNotification(userId, title, message, {
         type: 'teacher_creative_reminder',
@@ -530,6 +577,12 @@ export class NotificationService {
          VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
         [userId, title, message, type, postId, commentId, senderId],
       );
+
+      enqueueWebPush(userId, title, message, type, result.rows[0].id, {
+        post_id: postId,
+        comment_id: commentId,
+        sender_id: senderId,
+      });
 
       await sendPushNotification([userId], title, message, {
         type,
@@ -1433,6 +1486,12 @@ export class NotificationService {
             video_id: insertedNotification.video_id,
             is_read: insertedNotification.is_read,
             created_at: insertedNotification.created_at,
+          });
+
+          enqueueWebPush(studentId, insertedNotification.title, insertedNotification.message, notificationData.type, insertedNotification.id, {
+            package_id: packageId,
+            subject_id: notificationData.subject_id,
+            lesson_id: notificationData.lesson_id,
           });
         } catch (insertError) {
           console.error(`❌ خطأ في إدخال إشعار للطالب ${studentId}:`, insertError);

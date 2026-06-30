@@ -1,6 +1,6 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.QuestionBankListResponse = exports.CreateTeacherPermissionSchema = exports.TeacherPermissionSchema = exports.UpdateQuestionStatusSchema = exports.CreateQuestionSchema = exports.QuestionSchema = exports.UpdateLessonSchema = exports.CreateLessonSchema = exports.LessonSchema = exports.UpdateChapterSchema = exports.CreateChapterSchema = exports.ChapterSchema = exports.UpdateSubjectSchema = exports.CreateSubjectSchema = exports.SubjectSchema = exports.UpdateQuestionBankSchema = exports.CreateQuestionBankSchema = exports.QuestionBankSchema = void 0;
+exports.QuestionBankListResponse = exports.CreateTeacherPermissionSchema = exports.TeacherPermissionSchema = exports.UpdateQuestionStatusSchema = exports.CreateQuestionSchema = exports.QuestionSchema = exports.UpdateLessonSchema = exports.CreateLessonSchema = exports.LessonSchema = exports.UpdateChapterSchema = exports.CreateChapterSchema = exports.ChapterSchema = exports.UpdateSubjectBookSchema = exports.CreateSubjectBookSchema = exports.SubjectBookSchema = exports.UpdateSubjectSchema = exports.CreateSubjectSchema = exports.SubjectSchema = exports.UpdateQuestionBankSchema = exports.CreateQuestionBankSchema = exports.QuestionBankSchema = void 0;
 const zod_1 = require("zod");
 // Helpers to coerce common multipart/form-data values
 const CoercedBoolean = zod_1.z.preprocess((val) => {
@@ -85,12 +85,39 @@ exports.UpdateSubjectSchema = zod_1.z.object({
         .optional(),
     is_active: zod_1.z.boolean().optional(),
 });
+// Subject Book Schema
+exports.SubjectBookSchema = zod_1.z.object({
+    id: zod_1.z.number(),
+    subject_id: zod_1.z.number(),
+    name: zod_1.z.string().min(1, 'اسم الكتاب مطلوب'),
+    description: zod_1.z.string().optional(),
+    image_url: zod_1.z.string().optional(),
+    order_num: zod_1.z.number().min(1).default(1),
+    is_active: zod_1.z.boolean().default(true),
+    created_at: zod_1.z.date(),
+    updated_at: zod_1.z.date(),
+});
+exports.CreateSubjectBookSchema = zod_1.z.object({
+    name: zod_1.z.string().min(1, 'اسم الكتاب مطلوب'),
+    description: zod_1.z.string().optional(),
+    image_url: zod_1.z.string().optional(),
+    order_num: zod_1.z.coerce.number().min(1).optional(),
+    is_active: zod_1.z.boolean().default(true),
+});
+exports.UpdateSubjectBookSchema = zod_1.z.object({
+    name: zod_1.z.string().min(1, 'اسم الكتاب مطلوب').optional(),
+    description: zod_1.z.string().optional(),
+    image_url: zod_1.z.string().optional(),
+    order_num: zod_1.z.coerce.number().min(1).optional(),
+    is_active: zod_1.z.boolean().optional(),
+});
 // Chapter Schema
 exports.ChapterSchema = zod_1.z.object({
     id: zod_1.z.number(),
     name: zod_1.z.string().min(1, 'اسم الفصل مطلوب'),
     description: zod_1.z.string().optional(),
     subject_id: zod_1.z.number(),
+    book_id: zod_1.z.number().optional(),
     question_bank_id: zod_1.z.number(),
     order: zod_1.z.number().min(1, 'ترتيب الفصل مطلوب'),
     is_active: zod_1.z.boolean().default(true),

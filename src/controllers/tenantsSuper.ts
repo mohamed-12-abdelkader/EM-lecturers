@@ -3,8 +3,14 @@ import { z } from 'zod';
 import { authMiddleware } from '../middleware/authentication';
 import { requireDefaultTenantMiddleware } from '../middleware/tenantContext';
 import { validate } from '../middleware/validateReq';
-import { asyncWrapper, uploadTeacherAvatar, uploadToCloudinary } from '../utils';
+import { asyncWrapper, HttpError, uploadTeacherAvatar, uploadToCloudinary } from '../utils';
 import { TenantService, type CreateTenantInput } from '../services/tenants';
+import {
+  buildPatchTenantFromMultipart,
+  isMultipartRequest,
+  PatchTenantBodySchema,
+  uploadTenantFiles,
+} from '../utils/tenantFormPayload';
 
 export const router = Router();
 
@@ -236,40 +242,26 @@ const uploadTenantCreateFiles = uploadTeacherAvatar.fields([
   { name: 'hero_image', maxCount: 1 },
 ]);
 
-const PatchTenantBody = z.object({
-  subdomain: z
-    .string()
-    .min(2)
-    .max(63)
-    .regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/)
-    .optional(),
-  display_name: z.string().min(1).optional(),
-  specialty: z.string().optional().nullable(),
-  bio: z.string().optional().nullable(),
-  avatar_url: z.string().optional().nullable(),
-  is_active: z.boolean().optional(),
-  seo_title: z.string().optional().nullable(),
-  seo_meta_description: z.string().optional().nullable(),
-  favicon_url: z.string().optional().nullable(),
-  og_image_url: z.string().optional().nullable(),
-  settings: z.record(z.string(), z.any()).optional(),
-  landing: z.record(z.string(), z.any()).optional(),
-  owner: z
-    .object({
-      name: z.string().min(1).optional(),
-      email: z.string().email().optional(),
-      password: z.string().min(6).optional(),
-      description: z.string().optional().nullable(),
-      subject: z.string().optional().nullable(),
-      grade_ids: z.array(z.number().int().positive()).optional(),
-    })
-    .optional(),
-});
-
 router.get(
   '/',
-  asyncWrapper(async (_req, res) => {
-    const rows = await TenantService.listAll(200, 0);
+  asyncWrapper(async (req, res) => {
+    const limit = Number(req.query.limit ?? 200);
+    const offset = Number(req.query.offset ?? 0);
+    const detailed = req.query.detailed === 'true' || req.query.detailed === '1';
+
+    if (detailed) {
+      const { tenants, total } = await TenantService.listTeacherTenantsForAdmin({
+        limit: Number.isFinite(limit) ? limit : 200,
+        offset: Number.isFinite(offset) ? offset : 0,
+        includeDefault: req.query.include_default === 'true',
+      });
+      return res.json({ success: true, tenants, total });
+    }
+
+    const rows = await TenantService.listAll(
+      Number.isFinite(limit) ? limit : 200,
+      Number.isFinite(offset) ? offset : 0,
+    );
     res.json({ success: true, tenants: rows });
   }),
 );
@@ -314,11 +306,45 @@ router.post(
 
 router.patch(
   '/:id',
-  validate(PatchTenantBody),
+  (req, res, next) => {
+    if (isMultipartRequest(req)) {
+      return uploadTenantFiles(req, res, next);
+    }
+    next();
+  },
+  (req, res, next) => {
+    if (!isMultipartRequest(req)) {
+      return validate(PatchTenantBodySchema)(req, res, next);
+    }
+    next();
+  },
   asyncWrapper(async (req, res) => {
     const id = Number(req.params.id);
     if (!id || Number.isNaN(id)) return res.status(400).json({ message: 'Invalid id' });
-    await TenantService.patchTenant(id, req.body);
-    res.json({ success: true });
+
+    let payload;
+    if (isMultipartRequest(req)) {
+      const built = await buildPatchTenantFromMultipart(req);
+      if ('error' in built) {
+        return res.status(400).json({ success: false, message: built.error });
+      }
+      payload = built.data;
+    } else {
+      payload = req.body;
+    }
+
+    try {
+      const tenant = await TenantService.patchTenant(id, payload);
+      res.json({ success: true, tenant });
+    } catch (e: unknown) {
+      const err = e as { code?: string; message?: string };
+      if (err.code === '23505') {
+        return res.status(409).json({ success: false, message: 'Subdomain already taken' });
+      }
+      if (err.message === 'Tenant not found') {
+        throw new HttpError(404, 'Tenant not found');
+      }
+      throw e;
+    }
   }),
 );

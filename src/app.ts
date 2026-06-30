@@ -1,18 +1,12 @@
-import express, { Request } from 'express';
+import express from 'express';
 import { createServer } from 'http';
 import { config, loggerMiddleware } from './utils';
 import { errorHandlerMiddleware } from './middleware/errorHandler';
-import cors, { CorsOptionsDelegate } from 'cors';
+import { absoluteUrlResponseMiddleware } from './middleware/absoluteUrlResponse';
+import cors from 'cors';
+import { getCorsOriginDelegate, getServerInfo } from './config/appUrls';
 import { router } from './routes';
 import { tenantContextMiddleware } from './middleware/tenantContext';
-
-const allowedOrigins = config.CORS_ORIGIN.split(',').map((origin) => origin.trim());
-
-const corsOptionsDelegate: CorsOptionsDelegate<Request> = (req, callback) =>
-  callback(null, {
-    origin: allowedOrigins.includes(req.header('Origin') || ''),
-    credentials: true,
-  });
 
 export const app = express();
 export const server = createServer(app);
@@ -20,7 +14,7 @@ export const server = createServer(app);
 // Parse JSON bodies; include text/plain because some clients (e.g. Postman "raw" default) send JSON with Content-Type: text/plain
 app.use(express.json({ type: ['application/json', 'text/plain'] }));
 app.use(express.urlencoded({ extended: true }));
-app.use(cors(corsOptionsDelegate));
+app.use(cors(getCorsOriginDelegate()));
 // Expose refreshed token header to the browser
 app.use((req, res, next) => {
   const existing = res.getHeader('Access-Control-Expose-Headers');
@@ -35,6 +29,12 @@ app.use((req, res, next) => {
 });
 app.use(express.raw({ type: 'application/webhook+json' }));
 app.use(loggerMiddleware);
+app.use(absoluteUrlResponseMiddleware);
+
+// Public server info (for Expo Go / mobile clients)
+app.get('/api/server-info', (_req, res) => {
+  res.json(getServerInfo());
+});
 
 // Routes
 app.use('/api', tenantContextMiddleware);

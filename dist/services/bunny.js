@@ -57,9 +57,9 @@ async function retryRequest(fn, maxAttempts, delay) {
 async function uploadToBunnyStorage(file, maxAttempts = 2, retryDelay = 0) {
     const hash = generateHash(16) + '.' + file.ext;
     const url = `https://storage.bunnycdn.com/${STORAGE_ZONE_NAME}/${MEDIA_PATH}/${hash}`;
-    const fileStream = fs_1.default.createReadStream(file.path);
     try {
         await retryRequest(async () => {
+            const fileStream = fs_1.default.createReadStream(file.path);
             return axios_1.default.put(url, fileStream, {
                 headers: {
                     AccessKey: BUNNY_ACCESS_KEY,
@@ -73,10 +73,13 @@ async function uploadToBunnyStorage(file, maxAttempts = 2, retryDelay = 0) {
         return `https://${PUBLIC_HOSTNAME}/${MEDIA_PATH}/${hash}`;
     }
     catch (error) {
-        throw new Error(`Failed to upload to Bunny.net: ${error.message}`);
+        const detail = error?.response?.status != null
+            ? `HTTP ${error.response.status}`
+            : error?.message || 'unknown error';
+        throw new Error(`Failed to upload to Bunny.net: ${detail}`);
     }
     finally {
-        if (file && file.path) {
+        if (file?.path) {
             fs_1.default.unlinkSync(file.path);
         }
     }

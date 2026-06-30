@@ -68,13 +68,53 @@ class CourseLevelExamsService {
        ORDER BY created_at DESC`, [courseId]);
         return result.rows;
     }
-    static async getExamsByTeacher(teacherId) {
-        const result = await pool_1.default.query(`SELECT e.*, c.title as course_title 
-       FROM course_level_exams e
-       JOIN courses c ON e.course_id = c.id
-       WHERE c.teacher_id = $1
-       ORDER BY e.created_at DESC`, [teacherId]);
-        return result.rows;
+    static async getExamsByTeacher(teacherId, filters) {
+        const params = [teacherId];
+        let query = `
+      SELECT
+        e.*,
+        c.title AS course_title,
+        c.id AS course_id,
+        COUNT(DISTINCT q.id)::int AS actual_questions_count,
+        COUNT(DISTINCT a.id) FILTER (WHERE a.status = 'submitted')::int AS submissions_count
+      FROM course_level_exams e
+      INNER JOIN courses c ON e.course_id = c.id
+      LEFT JOIN course_level_exam_questions q ON q.exam_id = e.id
+      LEFT JOIN course_level_exam_attempts a ON a.exam_id = e.id
+      WHERE c.teacher_id = $1
+    `;
+        if (filters?.courseId) {
+            params.push(filters.courseId);
+            query += ` AND c.id = $${params.length}`;
+        }
+        query += `
+      GROUP BY e.id, c.title, c.id
+      ORDER BY e.created_at DESC
+    `;
+        const result = await pool_1.default.query(query, params);
+        return result.rows.map((row) => this.serializeTeacherCourseExam(row));
+    }
+    static serializeTeacherCourseExam(row) {
+        return {
+            id: row.id,
+            title: row.title,
+            courseId: row.course_id,
+            courseTitle: row.course_title,
+            courseName: row.course_title,
+            durationMinutes: row.duration_minutes,
+            questionsCount: row.actual_questions_count ?? row.questions_count,
+            configuredQuestionsCount: row.questions_count,
+            isVisibleToStudents: row.is_visible_to_students,
+            visibilityEndDate: row.visibility_end_date,
+            showAnswersImmediately: row.show_answers_immediately,
+            answersVisibleAt: row.answers_visible_at,
+            isActive: row.is_active,
+            attemptLimit: row.attempt_limit,
+            submissionsCount: row.submissions_count,
+            createdAt: row.created_at,
+            updatedAt: row.updated_at,
+            examKind: 'course_level',
+        };
     }
     static async getExamById(examId, requester) {
         const examRes = await pool_1.default.query(`SELECT e.*, c.teacher_id, c.title as course_title 
@@ -890,6 +930,67 @@ class CourseLevelExamsService {
         };
     }
     /**
+     * Verify that all question IDs exist in the question bank (V2 or legacy V1).
+     */
+    static courseExamBankLinkColumns = null;
+    static async getCourseExamBankLinkColumns() {
+        if (this.courseExamBankLinkColumns)
+            return this.courseExamBankLinkColumns;
+        const res = await pool_1.default.query(`SELECT column_name
+       FROM information_schema.columns
+       WHERE table_schema = 'public'
+         AND table_name = 'course_level_exam_questions'
+         AND column_name IN ('question_id', 'question_id_v2')`);
+        const cols = new Set(res.rows.map((row) => row.column_name));
+        this.courseExamBankLinkColumns = {
+            question_id: cols.has('question_id'),
+            question_id_v2: cols.has('question_id_v2'),
+        };
+        return this.courseExamBankLinkColumns;
+    }
+    /** Ensures migration 1700000007004 columns exist (idempotent). */
+    static async ensureCourseExamBankLinkColumns() {
+        let cols = await this.getCourseExamBankLinkColumns();
+        if (cols.question_id && cols.question_id_v2)
+            return cols;
+        if (!cols.question_id_v2) {
+            await pool_1.default.query(`
+        ALTER TABLE course_level_exam_questions
+        ADD COLUMN IF NOT EXISTS question_id_v2 INTEGER NULL REFERENCES questions_v2(id) ON DELETE SET NULL
+      `);
+        }
+        if (!cols.question_id) {
+            const legacyTable = await pool_1.default.query(`SELECT 1
+         FROM information_schema.tables
+         WHERE table_schema = 'public' AND table_name = 'questions'
+         LIMIT 1`);
+            if ((legacyTable.rowCount ?? 0) > 0) {
+                await pool_1.default.query(`
+          ALTER TABLE course_level_exam_questions
+          ADD COLUMN IF NOT EXISTS question_id INTEGER NULL REFERENCES questions(id) ON DELETE SET NULL
+        `);
+            }
+        }
+        this.courseExamBankLinkColumns = null;
+        return this.getCourseExamBankLinkColumns();
+    }
+    static async validateQuestionIdsInBank(questionIds) {
+        if (!questionIds?.length) {
+            return { missing: [] };
+        }
+        const uniqueIds = [...new Set(questionIds)];
+        const v2Res = await pool_1.default.query(`SELECT id FROM questions_v2 WHERE id = ANY($1::int[])`, [uniqueIds]);
+        const found = new Set(v2Res.rows.map((row) => row.id));
+        const notInV2 = uniqueIds.filter((id) => !found.has(id));
+        if (notInV2.length > 0) {
+            const v1Res = await pool_1.default.query(`SELECT id FROM questions WHERE id = ANY($1::int[])`, [notInV2]);
+            for (const row of v1Res.rows) {
+                found.add(row.id);
+            }
+        }
+        return { missing: uniqueIds.filter((id) => !found.has(id)) };
+    }
+    /**
      * Add questions from question bank to course-level exam
      */
     static async addQuestionsFromBank(requester, examId, questionIds) {
@@ -919,12 +1020,32 @@ class CourseLevelExamsService {
             return 0;
         }
         try {
+            const bankCols = await this.ensureCourseExamBankLinkColumns();
             // Filter unique IDs from input
             const inputIds = [...new Set(questionIds)];
             // Get existing questions in this exam to prevent duplicates
-            const existingQsRes = await pool_1.default.query(`SELECT question_id, question_id_v2 FROM course_level_exam_questions WHERE exam_id = $1`, [examId]);
-            const existingV1Ids = new Set(existingQsRes.rows.map((r) => r.question_id).filter((id) => id !== null));
-            const existingV2Ids = new Set(existingQsRes.rows.map((r) => r.question_id_v2).filter((id) => id !== null));
+            const selectParts = [];
+            if (bankCols.question_id)
+                selectParts.push('question_id');
+            if (bankCols.question_id_v2)
+                selectParts.push('question_id_v2');
+            const existingV1Ids = new Set();
+            const existingV2Ids = new Set();
+            if (selectParts.length > 0) {
+                const existingQsRes = await pool_1.default.query(`SELECT ${selectParts.join(', ')} FROM course_level_exam_questions WHERE exam_id = $1`, [examId]);
+                if (bankCols.question_id) {
+                    for (const row of existingQsRes.rows) {
+                        if (row.question_id != null)
+                            existingV1Ids.add(row.question_id);
+                    }
+                }
+                if (bankCols.question_id_v2) {
+                    for (const row of existingQsRes.rows) {
+                        if (row.question_id_v2 != null)
+                            existingV2Ids.add(row.question_id_v2);
+                    }
+                }
+            }
             // Determine which IDs to actually process
             const uniqueIds = inputIds.filter((id) => !existingV1Ids.has(id) && !existingV2Ids.has(id));
             if (uniqueIds.length === 0) {
@@ -991,12 +1112,19 @@ class CourseLevelExamsService {
                         questionText = null;
                     }
                     try {
-                        const result = await pool_1.default.query(`INSERT INTO course_level_exam_questions (
-                exam_id, type, question_text, question_image,
-                option_a, option_b, option_c, option_d,
-                correct_answer, created_by, question_id_v2
-              ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-              RETURNING *`, [
+                        const insertCols = [
+                            'exam_id',
+                            'type',
+                            'question_text',
+                            'question_image',
+                            'option_a',
+                            'option_b',
+                            'option_c',
+                            'option_d',
+                            'correct_answer',
+                            'created_by',
+                        ];
+                        const insertVals = [
                             examId,
                             questionType,
                             questionText,
@@ -1007,8 +1135,15 @@ class CourseLevelExamsService {
                             optionD,
                             correctAnswer,
                             requester.id,
-                            question.id,
-                        ]);
+                        ];
+                        if (bankCols.question_id_v2) {
+                            insertCols.push('question_id_v2');
+                            insertVals.push(question.id);
+                        }
+                        const placeholders = insertVals.map((_, index) => `$${index + 1}`).join(', ');
+                        const result = await pool_1.default.query(`INSERT INTO course_level_exam_questions (${insertCols.join(', ')})
+               VALUES (${placeholders})
+               RETURNING *`, insertVals);
                         // eslint-disable-next-line @typescript-eslint/ban-ts-comment
                         // @ts-ignore
                         if (result.rowCount > 0) {
@@ -1022,7 +1157,7 @@ class CourseLevelExamsService {
                 }
             }
             // 2. Identify remaining IDs from V1
-            const addedV2Ids = v2Questions.rows.map((r) => r.id);
+            const addedV2Ids = (v2Questions?.rows ?? []).map((r) => r.id);
             const remainingIds = uniqueIds.filter((id) => !addedV2Ids.includes(id));
             if (remainingIds.length > 0) {
                 let v1Questions;
@@ -1078,12 +1213,19 @@ class CourseLevelExamsService {
                         questionText = null;
                     }
                     try {
-                        const result = await pool_1.default.query(`INSERT INTO course_level_exam_questions (
-                exam_id, type, question_text, question_image,
-                option_a, option_b, option_c, option_d,
-                correct_answer, created_by, question_id
-              ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-              RETURNING *`, [
+                        const insertCols = [
+                            'exam_id',
+                            'type',
+                            'question_text',
+                            'question_image',
+                            'option_a',
+                            'option_b',
+                            'option_c',
+                            'option_d',
+                            'correct_answer',
+                            'created_by',
+                        ];
+                        const insertVals = [
                             examId,
                             questionType,
                             questionText,
@@ -1094,8 +1236,15 @@ class CourseLevelExamsService {
                             optionD,
                             correctAnswer,
                             requester.id,
-                            question.id,
-                        ]);
+                        ];
+                        if (bankCols.question_id) {
+                            insertCols.push('question_id');
+                            insertVals.push(question.id);
+                        }
+                        const placeholders = insertVals.map((_, index) => `$${index + 1}`).join(', ');
+                        const result = await pool_1.default.query(`INSERT INTO course_level_exam_questions (${insertCols.join(', ')})
+               VALUES (${placeholders})
+               RETURNING *`, insertVals);
                         // eslint-disable-next-line @typescript-eslint/ban-ts-comment
                         // @ts-ignore
                         if (result.rowCount > 0) {

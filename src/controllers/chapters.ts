@@ -137,12 +137,7 @@ export class ChapterController {
 
       const validatedData = UpdateChapterSchema.parse(req.body);
       // eslint-disable-next-line @typescript-eslint/ban-ts-comment
-      const chapter = await ChapterService.update(
-        questionBankId,
-        subjectId,
-        chapterId,
-        validatedData,
-      );
+      const chapter = await ChapterService.update(chapterId, validatedData);
 
       res.status(200).json({
         success: true,

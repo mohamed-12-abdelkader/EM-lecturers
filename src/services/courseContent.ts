@@ -1,6 +1,7 @@
 import pool from '../db/pool';
 import { SubjectCourseService } from './subjectCourses';
 import { LectureExamService } from './lectureExam';
+import { CourseAccessService } from './courseAccess';
 
 export interface LectureData {
   course_id: number;
@@ -22,6 +23,10 @@ export class CourseContentService {
     courseId: number,
     studentId: number,
   ): Promise<boolean> {
+    if (await CourseAccessService.isFreePublicCourse(courseId)) {
+      return true;
+    }
+
     // التحقق من الكورسات العادية
     const enrollmentCheck = await pool.query(
       'SELECT 1 FROM enrollments WHERE course_id = $1 AND user_id = $2',

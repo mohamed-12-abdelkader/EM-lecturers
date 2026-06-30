@@ -28,10 +28,23 @@ export interface AccessCheckResult {
  * Service للتحكم في الوصول إلى محتوى المقرر الدراسي
  */
 export class CourseAccessService {
+  /** كورس مجاني — المحتوى متاح لأي طالب مسجّل دخول بدون enrollment */
+  static async isFreePublicCourse(courseId: number): Promise<boolean> {
+    const result = await pool.query(
+      `SELECT COALESCE(is_free, FALSE) AS is_free FROM courses WHERE id = $1 LIMIT 1`,
+      [courseId],
+    );
+    return result.rowCount ? result.rows[0].is_free === true : false;
+  }
+
   /**
    * التحقق من صلاحية الطالب للوصول إلى محتوى المقرر
    */
   static async checkStudentAccess(studentId: number, courseId: number): Promise<AccessCheckResult> {
+    if (await this.isFreePublicCourse(courseId)) {
+      return { hasAccess: true };
+    }
+
     // جلب معلومات التسجيل
     const enrollmentResult = await pool.query<EnrollmentAccess>(
       `SELECT 

@@ -42,10 +42,9 @@ const multer_1 = __importDefault(require("multer"));
 const fs = __importStar(require("node:fs"));
 const authentication_1 = require("../middleware/authentication");
 const permissions_1 = require("../middleware/permissions");
-const teacherAccess_1 = require("../services/teacherAccess");
 const utils_1 = require("../utils");
 const chapters_1 = require("../services/chapters");
-const chapters_2 = require("../services/chapters");
+const teacherAccess_1 = require("../services/teacherAccess");
 const lessonsAdmin_1 = require("../services/lessonsAdmin");
 const questionBankChangeRequests_1 = require("../services/questionBankChangeRequests");
 const storage = multer_1.default.diskStorage({
@@ -75,7 +74,7 @@ router.get('/chapters/:id/with-lessons', (0, authentication_1.authMiddleware)(['
             if (!allowed)
                 return res.status(403).json({ success: false, message: 'غير مصرح لك بهذه المادة' });
         }
-        const chapter = await chapters_2.ChapterService.getById(id);
+        const chapter = await chapters_1.ChapterService.getById(id);
         if (!chapter)
             return res.status(404).json({ success: false, message: 'الفصل غير موجود' });
         const lessons = await lessonsAdmin_1.AdminLessonService.getByChapterId(id);
@@ -87,34 +86,68 @@ router.get('/chapters/:id/with-lessons', (0, authentication_1.authMiddleware)(['
             .json({ success: false, message: 'خطأ في جلب الفصل والدروس', error: error.message });
     }
 });
-// POST /api/subjects/:subjectId/chapters
-router.post('/subjects/:subjectId/chapters', (0, authentication_1.authMiddleware)(['admin', 'employee']), (0, permissions_1.checkPermission)('question_bank_management'), upload.single('image'), async (req, res) => {
+// POST /api/books/:bookId/chapters
+router.post('/books/:bookId/chapters', (0, authentication_1.authMiddleware)(['admin', 'employee']), (0, permissions_1.checkPermission)('question_bank_management'), upload.single('image'), async (req, res) => {
     try {
-        const subjectId = Number(req.params.subjectId);
-        if (Number.isNaN(subjectId))
-            return res.status(400).json({ success: false, message: 'معرف المادة غير صحيح' });
-        if (!req.body.name)
+        const bookId = Number(req.params.bookId);
+        if (Number.isNaN(bookId)) {
+            return res.status(400).json({ success: false, message: 'معرف الكتاب غير صحيح' });
+        }
+        if (!req.body.name) {
             return res.status(400).json({ success: false, message: 'حقل الاسم مطلوب' });
+        }
         let image_url;
         const file = req.file;
         if (file)
             image_url = (await (0, utils_1.uploadToCloudinary)(file.path)).secure_url;
         const adminId = req.user?.id;
-        const chapter = await chapters_1.ChapterService.create(subjectId, { name: req.body.name, description: req.body.description, image_url }, adminId);
-        return res
-            .status(201)
-            .json({ success: true, message: 'تم إنشاء الفصل بنجاح', data: chapter });
+        const chapter = await chapters_1.ChapterService.create(bookId, { name: req.body.name, description: req.body.description, image_url }, adminId);
+        return res.status(201).json({ success: true, message: 'تم إنشاء الفصل بنجاح', data: chapter });
     }
     catch (error) {
-        if (error.message === 'المادة غير موجودة')
+        if (error.message === 'الكتاب غير موجود') {
             return res.status(404).json({ success: false, message: error.message });
-        if (error.code === '23505' || error.message?.includes('باسم موجود'))
-            return res
-                .status(409)
-                .json({ success: false, message: 'يوجد فصل بنفس الاسم داخل نفس المادة' });
-        return res
-            .status(500)
-            .json({ success: false, message: 'خطأ في إنشاء الفصل', error: error.message });
+        }
+        if (error.code === '23505' || error.message?.includes('باسم موجود')) {
+            return res.status(409).json({ success: false, message: 'يوجد فصل بنفس الاسم داخل نفس الكتاب' });
+        }
+        return res.status(500).json({ success: false, message: 'خطأ في إنشاء الفصل', error: error.message });
+    }
+});
+// POST /api/subjects/:subjectId/chapters (legacy — requires book_id or uses first book)
+router.post('/subjects/:subjectId/chapters', (0, authentication_1.authMiddleware)(['admin', 'employee']), (0, permissions_1.checkPermission)('question_bank_management'), upload.single('image'), async (req, res) => {
+    try {
+        const subjectId = Number(req.params.subjectId);
+        if (Number.isNaN(subjectId)) {
+            return res.status(400).json({ success: false, message: 'معرف المادة غير صحيح' });
+        }
+        if (!req.body.name) {
+            return res.status(400).json({ success: false, message: 'حقل الاسم مطلوب' });
+        }
+        let image_url;
+        const file = req.file;
+        if (file)
+            image_url = (await (0, utils_1.uploadToCloudinary)(file.path)).secure_url;
+        const adminId = req.user?.id;
+        const chapter = await chapters_1.ChapterService.createUnderSubject(subjectId, {
+            name: req.body.name,
+            description: req.body.description,
+            image_url,
+            book_id: req.body.book_id ? Number(req.body.book_id) : undefined,
+        }, adminId);
+        return res.status(201).json({ success: true, message: 'تم إنشاء الفصل بنجاح', data: chapter });
+    }
+    catch (error) {
+        if (error.message === 'المادة غير موجودة') {
+            return res.status(404).json({ success: false, message: error.message });
+        }
+        if (error.message?.includes('يجب إنشاء كتاب')) {
+            return res.status(400).json({ success: false, message: error.message });
+        }
+        if (error.code === '23505' || error.message?.includes('باسم موجود')) {
+            return res.status(409).json({ success: false, message: 'يوجد فصل بنفس الاسم داخل نفس الكتاب' });
+        }
+        return res.status(500).json({ success: false, message: 'خطأ في إنشاء الفصل', error: error.message });
     }
 });
 // PUT /api/chapters/:id

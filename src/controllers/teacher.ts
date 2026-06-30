@@ -1,4 +1,4 @@
-import { Router } from 'express';
+import { Router, Request } from 'express';
 import { authMiddleware } from '../middleware/authentication';
 import { validate } from '../middleware/validateReq';
 import { asyncWrapper, HttpError, upload, uploadTeacherAvatar, uploadToCloudinary } from '../utils';
@@ -9,8 +9,74 @@ import { TeacherActivityService } from '../services/teacherActivities';
 import { TeacherActivityLogService } from '../services/teacherActivityLog';
 import { TeacherDailyCourseReportService } from '../services/teacherDailyCourseReport';
 import { TeacherGradesService } from '../services/users';
+import { ExamFlowService } from '../services/examFlow';
+import { CourseLevelExamsService } from '../services/courseLevelExams';
+import { parseNumberInput } from '../utils/requestParsers';
 
 export const router = Router();
+
+function resolveTeacherIdForQuery(req: Request): number {
+  const user = req.user!;
+  if (user.role === 'admin') {
+    const fromQuery = parseNumberInput(req.query.teacher_id as string | undefined);
+    if (fromQuery) return fromQuery;
+  }
+  return user.id;
+}
+
+// جلب كل امتحانات المحاضرات للمدرس مع اسم المحاضرة والكورس
+router.get(
+  '/lecture-exams',
+  authMiddleware(['teacher', 'admin']),
+  asyncWrapper(async (req, res) => {
+    const teacherId = resolveTeacherIdForQuery(req);
+    const courseId = parseNumberInput(req.query.course_id as string | undefined);
+    const lectureId = parseNumberInput(req.query.lecture_id as string | undefined);
+    const type = typeof req.query.type === 'string' ? req.query.type : undefined;
+
+    const exams = await ExamFlowService.getExamsByTeacher(teacherId, {
+      courseId: courseId ?? undefined,
+      lectureId: lectureId ?? undefined,
+      type,
+    });
+
+    res.json({
+      success: true,
+      total: exams.length,
+      exams,
+      filters: {
+        teacherId,
+        courseId: courseId ?? null,
+        lectureId: lectureId ?? null,
+        type: type ?? 'all',
+      },
+    });
+  }),
+);
+
+// جلب كل امتحانات الكورس العامة (course_level_exams) للمدرس مع اسم الكورس
+router.get(
+  '/course-exams',
+  authMiddleware(['teacher', 'admin']),
+  asyncWrapper(async (req, res) => {
+    const teacherId = resolveTeacherIdForQuery(req);
+    const courseId = parseNumberInput(req.query.course_id as string | undefined);
+
+    const exams = await CourseLevelExamsService.getExamsByTeacher(teacherId, {
+      courseId: courseId ?? undefined,
+    });
+
+    res.json({
+      success: true,
+      total: exams.length,
+      exams,
+      filters: {
+        teacherId,
+        courseId: courseId ?? null,
+      },
+    });
+  }),
+);
 
 // جلب كل الطلاب المسجلين في منصة المدرّس (نفس tenant)
 router.get(
@@ -505,12 +571,10 @@ router.get(
 
       // عدد الأسئلة في مكتبة الأسئلة
       const questionsRes = await pool.query(
-        `SELECT COUNT(*) as count 
+        `SELECT COUNT(*) as count
          FROM teacher_questions q
-         JOIN teacher_question_parts p ON q.part_id = p.id
-         JOIN teacher_question_lessons l ON p.lesson_id = l.id
-         JOIN teacher_question_chapters c ON l.chapter_id = c.id
-         WHERE c.teacher_id = $1`,
+         JOIN teacher_question_lessons l ON q.lesson_id = l.id
+         WHERE l.teacher_id = $1`,
         [teacher_id],
       );
       const questionsCount = parseInt(questionsRes.rows[0].count);

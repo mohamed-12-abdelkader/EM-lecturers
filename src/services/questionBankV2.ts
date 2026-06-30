@@ -770,7 +770,7 @@ export class QuestionBankV2Service {
   // ============================================
   // Helper Methods
   // ============================================
-  private static async verifyLessonAccess(lessonId: number, userId: number, userRole?: string): Promise<void> {
+  static async verifyLessonAccess(lessonId: number, userId: number, userRole?: string): Promise<void> {
     // التحقق من وجود الدرس
     const lessonResult = await pool.query(
       `SELECT l.id, c.subject_id, s.question_bank_id

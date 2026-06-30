@@ -226,6 +226,34 @@ export const tenantContextMiddleware: RequestHandler = async (req, res, next) =>
     }
 
     const tenant = result.rows[0];
+
+    if (tenant.subdomain !== 'default' && tenant.owner_user_id) {
+      const { TeacherPlatformSubscriptionsService } = await import(
+        '../services/teacherPlatformSubscriptions.js'
+      );
+      await TeacherPlatformSubscriptionsService.syncSubscriptionLifecycle();
+      const access = await TeacherPlatformSubscriptionsService.getPlatformAccessState(
+        tenant.owner_user_id,
+      );
+
+      if (!access.allowed) {
+        return res.status(403).json({
+          success: false,
+          code: 'PLATFORM_SUBSCRIPTION_SUSPENDED',
+          message:
+            'تم إيقاف هذه المنصة لعدم تجديد اشتراك المدرس. يرجى التواصل مع إدارة المنصة.',
+        });
+      }
+
+      if (!tenant.is_active && access.phase === 'grace') {
+        await pool.query(
+          `UPDATE tenants SET is_active = true, updated_at = NOW() WHERE id = $1`,
+          [tenant.id],
+        );
+        tenant.is_active = true;
+      }
+    }
+
     if (!tenant.is_active) {
       return res.status(403).json({
         success: false,

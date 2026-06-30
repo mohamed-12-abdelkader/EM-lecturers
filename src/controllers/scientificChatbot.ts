@@ -2,14 +2,36 @@ import { Router, Request, Response } from 'express';
 import { authMiddleware } from '../middleware/authentication';
 import { ScientificChatbotService } from '../services/scientificChatbot';
 import pool from '../db/pool';
-import { logger } from '../utils';
+import { logger, HttpError } from '../utils';
 import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
 import { parseNumberInput } from '../utils/requestParsers';
 import { MistralOcrService } from '../services/mistralOcr';
+import { enforcePlanFeature } from '../services/teacherPlanPolicy';
 
 const router = Router();
+
+async function assertTeacherScientificSupportForStudent(
+  res: Response,
+  teacherId: number,
+): Promise<boolean> {
+  try {
+    await enforcePlanFeature(teacherId, 'scientific_support');
+    return true;
+  } catch (error) {
+    if (error instanceof HttpError) {
+      res.status(403).json({
+        error: error.message,
+        success: false,
+        code: 'PLAN_FEATURE_NOT_AVAILABLE',
+        ...(error.details ?? {}),
+      });
+      return false;
+    }
+    throw error;
+  }
+}
 
 // Configure multer for course content files
 const storage = multer.diskStorage({
@@ -115,6 +137,13 @@ function getTeacherScopeId(req: Request): number | null {
     parseNumberInput(req.query.teacherId as string | undefined) ??
     null
   );
+}
+
+function parseCourseScopeFilter(req: Request): number | null | undefined {
+  const scope = req.query.scope as string | undefined;
+  if (scope === 'teacher') return null;
+  const courseId = parseNumberInput(req.query.courseId as string | undefined);
+  return courseId ?? undefined;
 }
 
 /**
@@ -234,6 +263,84 @@ router.post(
 );
 
 /**
+ * List student AI chat threads for teacher review
+ * GET /teacher/student-chats
+ */
+router.get(
+  '/teacher/student-chats',
+  authMiddleware(['teacher', 'admin']),
+  async (req: Request, res: Response) => {
+    try {
+      const teacherId = getTeacherScopeId(req);
+      if (!teacherId) {
+        return res.status(400).json({ error: 'teacher_id is required for admin requests' });
+      }
+
+      const courseScope = parseCourseScopeFilter(req);
+      const studentId = parseNumberInput(req.query.studentId as string | undefined) ?? undefined;
+      const limit = req.query.limit ? parseInt(req.query.limit as string) : 30;
+      const offset = req.query.offset ? parseInt(req.query.offset as string) : 0;
+
+      const chats = await ScientificChatbotService.listTeacherStudentChats(teacherId, {
+        courseId: courseScope,
+        studentId,
+        limit,
+        offset,
+      });
+
+      res.json({ chats });
+    } catch (error: any) {
+      logger.error('Error listing teacher student chats:', error);
+      res.status(500).json({ error: error.message || 'Error listing student chats' });
+    }
+  },
+);
+
+/**
+ * Get student AI chat messages for teacher review
+ * GET /teacher/student-chats/:studentId/messages
+ */
+router.get(
+  '/teacher/student-chats/:studentId/messages',
+  authMiddleware(['teacher', 'admin']),
+  async (req: Request, res: Response) => {
+    try {
+      const teacherId = getTeacherScopeId(req);
+      const studentId = parseNumberInput(req.params.studentId);
+
+      if (!teacherId) {
+        return res.status(400).json({ error: 'teacher_id is required for admin requests' });
+      }
+      if (!studentId) {
+        return res.status(400).json({ error: 'Invalid student id' });
+      }
+
+      const courseScope = parseCourseScopeFilter(req);
+      const limit = req.query.limit ? parseInt(req.query.limit as string) : 50;
+      const beforeId = req.query.beforeId ? parseInt(req.query.beforeId as string) : undefined;
+
+      const messages = await ScientificChatbotService.getTeacherViewStudentChatHistory(
+        teacherId,
+        studentId,
+        {
+          courseId: courseScope,
+          limit,
+          beforeId,
+        },
+      );
+
+      res.json({ messages });
+    } catch (error: any) {
+      logger.error('Error getting teacher student chat messages:', error);
+      if (error.message === 'Access denied') {
+        return res.status(403).json({ error: 'Access denied' });
+      }
+      res.status(500).json({ error: error.message || 'Error getting student chat messages' });
+    }
+  },
+);
+
+/**
  * Ask a question across all content uploaded by a teacher (Student only)
  * POST /teachers/:teacherId/ask
  */
@@ -266,6 +373,11 @@ router.post(
         return res.status(403).json({
           error: 'You must be subscribed to at least one course with this teacher.',
         });
+      }
+
+      if (!(await assertTeacherScientificSupportForStudent(res, teacherId))) {
+        await cleanupChatFiles(req.files as Express.Multer.File[] | undefined);
+        return;
       }
 
       const hasContent = await ScientificChatbotService.teacherHasContent(teacherId);
@@ -335,6 +447,10 @@ router.get(
         return res.status(403).json({
           error: 'You must be subscribed to at least one course with this teacher.',
         });
+      }
+
+      if (!(await assertTeacherScientificSupportForStudent(res, teacherId))) {
+        return;
       }
 
       const history = await ScientificChatbotService.getTeacherChatHistory(
@@ -588,6 +704,23 @@ router.post(
         });
       }
 
+      const courseTeacherRes = await pool.query<{ teacher_id: number }>(
+        `SELECT teacher_id FROM courses WHERE id = $1 LIMIT 1`,
+        [courseId],
+      );
+      const courseTeacherId = courseTeacherRes.rows[0]?.teacher_id;
+      if (
+        courseTeacherId &&
+        !(await assertTeacherScientificSupportForStudent(res, courseTeacherId))
+      ) {
+        if (req.files && Array.isArray(req.files)) {
+          for (const file of req.files) {
+            await fs.promises.unlink(file.path).catch(() => {});
+          }
+        }
+        return;
+      }
+
       // Check if course has content
       const hasContent = await ScientificChatbotService.courseHasContent(courseId);
       if (!hasContent) {
@@ -598,7 +731,7 @@ router.post(
         }
         return res.status(404).json({
           error:
-            'This course does not have uploaded content yet. Please ask your teacher to upload course materials.',
+            'This course does not have uploaded content yet. Please ask your teacher to upload materials in the scientific chatbot.',
         });
       }
 
@@ -659,6 +792,18 @@ router.get(
       const studentId = (req as any).user.id;
       const limit = req.query.limit ? parseInt(req.query.limit as string) : 50;
       const beforeId = req.query.beforeId ? parseInt(req.query.beforeId as string) : undefined;
+
+      const courseTeacherRes = await pool.query<{ teacher_id: number }>(
+        `SELECT teacher_id FROM courses WHERE id = $1 LIMIT 1`,
+        [courseId],
+      );
+      const courseTeacherId = courseTeacherRes.rows[0]?.teacher_id;
+      if (
+        courseTeacherId &&
+        !(await assertTeacherScientificSupportForStudent(res, courseTeacherId))
+      ) {
+        return;
+      }
 
       const history = await ScientificChatbotService.getChatHistory(
         studentId,

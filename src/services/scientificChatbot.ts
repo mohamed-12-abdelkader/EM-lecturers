@@ -33,6 +33,24 @@ export interface ChatMessage {
   created_at: Date;
 }
 
+export interface TeacherStudentChatSummary {
+  student_id: number;
+  student_name: string;
+  student_avatar: string | null;
+  course_id: number | null;
+  course_name: string | null;
+  message_count: number;
+  last_question: string;
+  last_answer: string;
+  last_at: Date;
+}
+
+export interface TeacherStudentChatMessage extends ChatMessage {
+  student_name: string;
+  student_avatar: string | null;
+  course_name: string | null;
+}
+
 export class ScientificChatbotService {
   static readonly COLLECTION_NAME = 'course_content_vectors';
   private static readonly TEACHER_CONTENT_COURSE_ID = 0;
@@ -682,11 +700,195 @@ ${rewrittenQuestion}`;
     }
   }
 
+  /**
+   * List student ↔ AI chat threads for a teacher (summary for review dashboard).
+   */
+  static async listTeacherStudentChats(
+    teacherId: number,
+    options: {
+      courseId?: number | null;
+      studentId?: number;
+      limit?: number;
+      offset?: number;
+    } = {},
+  ): Promise<TeacherStudentChatSummary[]> {
+    const { courseId, studentId, limit = 30, offset = 0 } = options;
+
+    try {
+      const params: any[] = [teacherId];
+      let scopeFilter = `((c.teacher_id = $1) OR (h.course_id IS NULL AND h.teacher_id = $1))`;
+
+      if (studentId) {
+        params.push(studentId);
+        scopeFilter += ` AND h.student_id = $${params.length}`;
+      }
+
+      if (courseId === null) {
+        scopeFilter += ` AND h.course_id IS NULL`;
+      } else if (courseId !== undefined) {
+        params.push(courseId);
+        scopeFilter += ` AND h.course_id = $${params.length}`;
+      }
+
+      params.push(limit, offset);
+
+      const result = await pool.query<TeacherStudentChatSummary>(
+        `WITH scoped AS (
+           SELECT
+             h.*,
+             u.name AS student_name,
+             u.avatar AS student_avatar,
+             c.title AS course_name
+           FROM scientific_chat_history h
+           JOIN users u ON u.id = h.student_id
+           LEFT JOIN courses c ON c.id = h.course_id
+           WHERE ${scopeFilter}
+         ),
+         with_stats AS (
+           SELECT
+             s.*,
+             COUNT(*) OVER (PARTITION BY s.student_id, COALESCE(s.course_id, -1)) AS message_count,
+             ROW_NUMBER() OVER (
+               PARTITION BY s.student_id, COALESCE(s.course_id, -1)
+               ORDER BY s.created_at DESC
+             ) AS rn
+           FROM scoped s
+         )
+         SELECT
+           student_id,
+           student_name,
+           student_avatar,
+           course_id,
+           course_name,
+           question AS last_question,
+           answer AS last_answer,
+           created_at AS last_at,
+           message_count::int AS message_count
+         FROM with_stats
+         WHERE rn = 1
+         ORDER BY created_at DESC
+         LIMIT $${params.length - 1} OFFSET $${params.length}`,
+        params,
+      );
+
+      return result.rows;
+    } catch (error: any) {
+      logger.error('Error listing teacher student chats:', error.message);
+      throw error;
+    }
+  }
+
+  /**
+   * Get full Q&A history for a student thread visible to the teacher.
+   * courseId omitted = all threads with this teacher; null = teacher-level scope only.
+   */
+  static async getTeacherViewStudentChatHistory(
+    teacherId: number,
+    studentId: number,
+    options: {
+      courseId?: number | null;
+      limit?: number;
+      beforeId?: number;
+    } = {},
+  ): Promise<TeacherStudentChatMessage[]> {
+    const { courseId, limit = 50, beforeId } = options;
+
+    const allowed = await this.teacherCanViewStudentChat(teacherId, studentId, courseId);
+    if (!allowed) {
+      throw new Error('Access denied');
+    }
+
+    try {
+      const params: any[] = [studentId, teacherId];
+      let query = `
+        SELECT
+          h.*,
+          u.name AS student_name,
+          u.avatar AS student_avatar,
+          c.title AS course_name
+        FROM scientific_chat_history h
+        JOIN users u ON u.id = h.student_id
+        LEFT JOIN courses c ON c.id = h.course_id
+        WHERE h.student_id = $1
+          AND ((c.teacher_id = $2) OR (h.course_id IS NULL AND h.teacher_id = $2))
+      `;
+
+      if (courseId === null) {
+        query += ` AND h.course_id IS NULL`;
+      } else if (courseId !== undefined) {
+        params.push(courseId);
+        query += ` AND h.course_id = $${params.length}`;
+      }
+
+      params.push(limit);
+      if (beforeId) {
+        params.push(beforeId);
+        query += ` AND h.id < $${params.length}`;
+      }
+
+      query += ` ORDER BY h.id DESC LIMIT $${params.length - (beforeId ? 1 : 0)}`;
+
+      const result = await pool.query<TeacherStudentChatMessage>(query, params);
+      return result.rows.reverse();
+    } catch (error: any) {
+      logger.error('Error getting teacher view student chat history:', error.message);
+      throw error;
+    }
+  }
+
+  private static async teacherCanViewStudentChat(
+    teacherId: number,
+    studentId: number,
+    courseId?: number | null,
+  ): Promise<boolean> {
+    try {
+      if (typeof courseId === 'number') {
+        const courseResult = await pool.query(
+          `SELECT 1 FROM courses WHERE id = $1 AND teacher_id = $2 LIMIT 1`,
+          [courseId, teacherId],
+        );
+        if ((courseResult.rowCount ?? 0) === 0) return false;
+      }
+
+      const params: any[] = [studentId, teacherId];
+      let query = `
+        SELECT 1
+        FROM scientific_chat_history h
+        LEFT JOIN courses c ON c.id = h.course_id
+        WHERE h.student_id = $1
+          AND ((c.teacher_id = $2) OR (h.course_id IS NULL AND h.teacher_id = $2))
+      `;
+
+      if (courseId === null) {
+        query += ` AND h.course_id IS NULL`;
+      } else if (typeof courseId === 'number') {
+        params.push(courseId);
+        query += ` AND h.course_id = $${params.length}`;
+      }
+
+      query += ` LIMIT 1`;
+      const result = await pool.query(query, params);
+      return (result.rowCount ?? 0) > 0;
+    } catch (error: any) {
+      logger.error('Error checking teacher chat access:', error.message);
+      return false;
+    }
+  }
+
   static async courseHasContent(courseId: number): Promise<boolean> {
     try {
-      const result = await pool.query(`SELECT COUNT(*) as count FROM course_content_files WHERE course_id = $1`, [courseId]);
+      const result = await pool.query(
+        `SELECT COUNT(*) as count
+         FROM course_content_files f
+         JOIN courses c ON c.id = $1
+         WHERE f.teacher_id = c.teacher_id
+           AND (f.course_id = $1 OR f.course_id IS NULL)`,
+        [courseId],
+      );
       return parseInt(result.rows[0].count) > 0;
-    } catch (error: any) { return false; }
+    } catch (error: any) {
+      return false;
+    }
   }
 
   static async teacherHasContent(teacherId: number): Promise<boolean> {

@@ -207,14 +207,12 @@ export class MilvusService {
         collection_name: collectionName,
         data: [queryVector],
         limit,
-        filter: `teacher_id == ${teacherId} && course_id == ${courseId}`,
+        filter: `teacher_id == ${teacherId} && (course_id == ${courseId} || course_id == 0)`,
         output_fields: ['chunk_text', 'teacher_id', 'course_id', 'file_id', 'chunk_index'],
         params: { ef: 64 },
       });
 
-      console.log('results', results);
-
-      if (!results.results || results.status.error_code !== "Success" || results.results.length === 0) {
+      if (!results.results || results.status.error_code !== 'Success' || results.results.length === 0) {
         return [];
       }
 

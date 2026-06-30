@@ -1,12 +1,7 @@
-import fs from 'node:fs/promises';
-import path from 'node:path';
-import { config } from '../utils';
-import { buildImageAnnotationFormat } from '../prompts/mistralQuestionExtraction.prompt';
-import type {
-  MistralOcrImage,
-  MistralOcrPage,
-  MistralOcrResult,
-} from '../types/mistralQuestionExtraction';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import { assertMistralConfigured, getMistralConfig } from '../config/mistral';
+import { HttpError } from '../utils';
 
 const PDF_MIMES = new Set(['application/pdf']);
 const IMAGE_MIMES = new Set([
@@ -20,29 +15,139 @@ const IMAGE_MIMES = new Set([
   'image/tiff',
 ]);
 
-function assertMistralConfigured(): void {
-  if (!config.MISTRAL_API_KEY) {
-    throw new Error('MISTRAL_API_KEY is required');
+const EXT_MIME: Record<string, string> = {
+  '.pdf': 'application/pdf',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.webp': 'image/webp',
+  '.gif': 'image/gif',
+  '.avif': 'image/avif',
+  '.bmp': 'image/bmp',
+  '.tif': 'image/tiff',
+  '.tiff': 'image/tiff',
+};
+
+export type MistralOcrImageAnnotation = {
+  image_type?: string;
+  short_description?: string;
+  summary?: string;
+  educational_relevance?: string;
+  contains_text?: boolean;
+  extracted_text?: string | null;
+};
+
+export type MistralOcrImage = {
+  id: string;
+  page_index: number;
+  top_left_x?: number;
+  top_left_y?: number;
+  bottom_right_x?: number;
+  bottom_right_y?: number;
+  image_base64?: string;
+  annotation?: MistralOcrImageAnnotation | null;
+};
+
+export type MistralOcrPage = {
+  index: number;
+  markdown: string;
+  images: MistralOcrImage[];
+  dimensions?: {
+    dpi?: number;
+    height?: number;
+    width?: number;
+  } | null;
+};
+
+export type MistralOcrResult = {
+  filename: string;
+  mime_type: string;
+  document_type: 'pdf' | 'image';
+  model: string;
+  page_count: number;
+  text: string;
+  pages: MistralOcrPage[];
+  usage_info?: {
+    pages_processed?: number;
+    doc_size_bytes?: number | null;
+  };
+};
+
+type MistralOcrApiResponse = {
+  model?: string;
+  pages?: Array<{
+    index?: number;
+    markdown?: string;
+    images?: Array<{
+      id?: string;
+      top_left_x?: number;
+      top_left_y?: number;
+      bottom_right_x?: number;
+      bottom_right_y?: number;
+      image_base64?: string;
+      annotation?: unknown;
+      image_annotation?: unknown;
+      bbox_annotation?: unknown;
+    }>;
+    dimensions?: MistralOcrPage['dimensions'];
+  }>;
+  usage_info?: MistralOcrResult['usage_info'];
+};
+
+type MistralOcrOptions = {
+  includeImageBase64?: boolean;
+  annotateImages?: boolean;
+  ocrModel?: string;
+  /** Mistral OCR page indices (0-based). */
+  pages?: number[];
+};
+
+/** Build 0-based Mistral page indices from 1-based inclusive user range. */
+export function parsePdfPageRange(
+  startPage?: unknown,
+  endPage?: unknown,
+): number[] | undefined {
+  const startRaw = startPage != null && startPage !== '' ? Number(startPage) : undefined;
+  const endRaw = endPage != null && endPage !== '' ? Number(endPage) : undefined;
+
+  if (startRaw == null && endRaw == null) return undefined;
+
+  const start = Math.max(1, Number.isFinite(startRaw) ? Math.trunc(startRaw!) : 1);
+  const end = Math.max(
+    start,
+    Number.isFinite(endRaw) ? Math.trunc(endRaw!) : start,
+  );
+
+  if (!Number.isFinite(start) || !Number.isFinite(end) || start < 1 || end < 1) {
+    throw new HttpError(400, 'أرقام الصفحات غير صحيحة');
   }
+
+  const maxPagesPerRequest = 50;
+  if (end - start + 1 > maxPagesPerRequest) {
+    throw new HttpError(
+      400,
+      `الحد الأقصى ${maxPagesPerRequest} صفحة في الطلب الواحد`,
+    );
+  }
+
+  return Array.from({ length: end - start + 1 }, (_, i) => start - 1 + i);
 }
 
-function normalizeMime(file: Express.Multer.File): string {
-  const mime = (file.mimetype || '').toLowerCase();
-  if (mime) return mime;
-  const ext = path.extname(file.originalname || file.path).toLowerCase();
-  if (ext === '.pdf') return 'application/pdf';
-  if (ext === '.png') return 'image/png';
-  if (ext === '.jpg' || ext === '.jpeg') return 'image/jpeg';
-  if (ext === '.webp') return 'image/webp';
-  return 'application/octet-stream';
+function resolveMimeType(file: Express.Multer.File): string {
+  const fromMulter = (file.mimetype || '').toLowerCase();
+  if (fromMulter && fromMulter !== 'application/octet-stream') {
+    return fromMulter;
+  }
+  const ext = path.extname(file.originalname || file.path || '').toLowerCase();
+  return EXT_MIME[ext] ?? fromMulter;
 }
 
 function isPdfMime(mime: string): boolean {
-  return PDF_MIMES.has(mime);
+  return PDF_MIMES.has(mime) || mime.endsWith('/pdf');
 }
 
-function isSupportedMime(mime: string): boolean {
-  return PDF_MIMES.has(mime) || IMAGE_MIMES.has(mime);
+function isImageMime(mime: string): boolean {
+  return IMAGE_MIMES.has(mime) || mime.startsWith('image/');
 }
 
 function buildDataUri(mime: string, buffer: Buffer): string {
@@ -56,61 +161,130 @@ function buildDocumentPayload(mime: string, dataUri: string): Record<string, str
   return { type: 'image_url', image_url: dataUri };
 }
 
-function parseAnnotation(annotation: unknown): MistralOcrImage['annotation'] {
-  if (!annotation) return undefined;
-  if (typeof annotation === 'string') {
-    try {
-      return JSON.parse(annotation) as MistralOcrImage['annotation'];
-    } catch {
-      return { short_description: annotation };
-    }
-  }
-  if (typeof annotation === 'object') return annotation as MistralOcrImage['annotation'];
-  return undefined;
+function buildImageAnnotationFormat() {
+  return {
+    type: 'json_schema',
+    json_schema: {
+      name: 'question_image_annotation',
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          image_type: {
+            type: 'string',
+            description: 'Type of visual content, e.g. diagram, chart, table, graph, formula, map.',
+          },
+          short_description: {
+            type: 'string',
+            description: 'Short Arabic description of the visual content.',
+          },
+          summary: {
+            type: 'string',
+            description:
+              'Detailed Arabic summary explaining what the image shows and how it may be used in a question.',
+          },
+          educational_relevance: {
+            type: 'string',
+            description: 'What a student likely needs from this image to answer a question.',
+          },
+          contains_text: {
+            type: 'boolean',
+            description: 'Whether the image contains meaningful readable text.',
+          },
+          extracted_text: {
+            type: ['string', 'null'],
+            description: 'Any important text visible inside the image, or null.',
+          },
+        },
+        required: [
+          'image_type',
+          'short_description',
+          'summary',
+          'educational_relevance',
+          'contains_text',
+          'extracted_text',
+        ],
+      },
+      strict: true,
+    },
+  };
 }
 
-function normalizePages(payload: any): MistralOcrPage[] {
-  const rawPages = Array.isArray(payload?.pages) ? payload.pages : [];
-  return rawPages.map((page: any, pageIndex: number) => {
-    const index = Number(page.index ?? page.page_index ?? pageIndex);
-    const rawImages = Array.isArray(page.images) ? page.images : [];
-    const images: MistralOcrImage[] = rawImages.map((image: any, imageIndex: number) => ({
-      id: String(image.id ?? image.image_id ?? `page-${index}-image-${imageIndex}`),
-      page_index: index,
-      image_base64: image.image_base64 ?? image.base64 ?? undefined,
-      annotation: parseAnnotation(image.image_annotation ?? image.annotation),
-    }));
+function normalizeAnnotation(raw: unknown): MistralOcrImageAnnotation | null {
+  if (!raw) return null;
+  if (typeof raw === 'string') {
+    try {
+      return JSON.parse(raw) as MistralOcrImageAnnotation;
+    } catch {
+      return { summary: raw };
+    }
+  }
+  if (typeof raw === 'object') return raw as MistralOcrImageAnnotation;
+  return null;
+}
 
-    return {
-      index,
-      markdown: String(page.markdown ?? page.text ?? ''),
-      images,
-    };
-  });
+function normalizePages(rawPages: MistralOcrApiResponse['pages']): MistralOcrPage[] {
+  return (rawPages ?? []).map((page, i) => ({
+    index: page.index ?? i,
+    markdown: page.markdown ?? '',
+    images: (page.images ?? [])
+      .filter((image) => image.id)
+      .map((image) => ({
+        id: image.id as string,
+        page_index: page.index ?? i,
+        top_left_x: image.top_left_x,
+        top_left_y: image.top_left_y,
+        bottom_right_x: image.bottom_right_x,
+        bottom_right_y: image.bottom_right_y,
+        image_base64: image.image_base64,
+        annotation: normalizeAnnotation(
+          image.annotation ?? image.image_annotation ?? image.bbox_annotation,
+        ),
+      })),
+    dimensions: page.dimensions ?? null,
+  }));
 }
 
 export class MistralOcrService {
   static isSupportedMime(mime: string): boolean {
-    return isSupportedMime(mime);
+    const normalized = (mime || '').toLowerCase();
+    return isPdfMime(normalized) || isImageMime(normalized);
+  }
+
+  static resolveSupportedMime(file: Express.Multer.File): string {
+    const mime = resolveMimeType(file);
+    if (isPdfMime(mime) || isImageMime(mime)) {
+      return mime;
+    }
+    throw new HttpError(
+      400,
+      'نوع الملف غير مدعوم. ارفع PDF أو صورة (png, jpg, jpeg, webp, gif, avif)',
+    );
   }
 
   static async extractTextFromFile(
     file: Express.Multer.File,
-    options: { annotateImages?: boolean; includeImageBase64?: boolean } = {},
+    options: MistralOcrOptions = {},
   ): Promise<MistralOcrResult> {
     assertMistralConfigured();
 
-    const mime = normalizeMime(file);
-    if (!isSupportedMime(mime)) {
-      throw new Error('Only PDF and image files are supported');
+    const mime = this.resolveSupportedMime(file);
+    const filePath = file.path;
+    if (!filePath || !fs.existsSync(filePath)) {
+      throw new HttpError(400, 'ملف مرفوع غير موجود');
     }
 
-    const buffer = await fs.readFile(file.path);
+    const buffer = fs.readFileSync(filePath);
+    if (buffer.length === 0) {
+      throw new HttpError(400, 'الملف فارغ');
+    }
+
+    const { apiKey, apiBaseUrl, ocrModel: defaultOcrModel } = getMistralConfig();
+    const ocrModel = options.ocrModel?.trim() || defaultOcrModel;
     const dataUri = buildDataUri(mime, buffer);
     const document = buildDocumentPayload(mime, dataUri);
-
     const body: Record<string, unknown> = {
-      model: config.MISTRAL_OCR_MODEL,
+      model: ocrModel,
       document,
       include_image_base64: options.includeImageBase64 ?? false,
     };
@@ -119,35 +293,118 @@ export class MistralOcrService {
       body.bbox_annotation_format = buildImageAnnotationFormat();
     }
 
-    const response = await fetch(`${config.MISTRAL_API_BASE_URL}/ocr`, {
+    if (options.pages?.length) {
+      body.pages = options.pages;
+    }
+
+    const response = await fetch(`${apiBaseUrl}/ocr`, {
       method: 'POST',
       headers: {
-        Authorization: `Bearer ${config.MISTRAL_API_KEY}`,
+        Authorization: `Bearer ${apiKey}`,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify(body),
     });
 
     if (!response.ok) {
-      throw new Error(`Mistral OCR failed: ${response.status} ${await response.text()}`);
+      const errBody = await response.text();
+      if (response.status === 401) {
+        throw new HttpError(
+          502,
+          'Mistral رفض مفتاح API (401 Unauthorized). تأكد أن MISTRAL_API_KEY صحيح وفعّال من https://console.mistral.ai',
+        );
+      }
+      throw new HttpError(
+        response.status >= 500 ? 502 : 400,
+        `Mistral OCR failed (${response.status}): ${errBody.slice(0, 500)}`,
+      );
     }
 
-    const payload = (await response.json()) as any;
-    const pages = normalizePages(payload);
+    const payload = (await response.json()) as MistralOcrApiResponse;
+    const pages = normalizePages(payload.pages);
     const text = pages
-      .map((page) => page.markdown)
+      .map((p) => p.markdown.trim())
       .filter(Boolean)
-      .join('\n\n');
+      .join('\n\n---\n\n');
 
     return {
-      filename: file.originalname || path.basename(file.path),
+      filename: file.originalname || path.basename(filePath),
       mime_type: mime,
       document_type: isPdfMime(mime) ? 'pdf' : 'image',
-      model: String(payload.model ?? config.MISTRAL_OCR_MODEL),
+      model: payload.model ?? ocrModel,
       page_count: pages.length || 1,
       text,
       pages,
       usage_info: payload.usage_info,
     };
+  }
+
+  static mergeOcrResults(
+    results: MistralOcrResult[],
+    opts: { document_type?: 'pdf' | 'image' } = {},
+  ): MistralOcrResult {
+    if (results.length === 0) {
+      throw new HttpError(400, 'لا توجد ملفات للدمج');
+    }
+    if (results.length === 1) return results[0];
+
+    let pageOffset = 0;
+    const mergedPages: MistralOcrPage[] = [];
+
+    for (let fileIndex = 0; fileIndex < results.length; fileIndex++) {
+      const result = results[fileIndex];
+      for (const page of result.pages) {
+        const mergedIndex = pageOffset++;
+        mergedPages.push({
+          ...page,
+          index: mergedIndex,
+          images: page.images.map((image) => ({
+            ...image,
+            page_index: mergedIndex,
+            id: `f${fileIndex}-${image.id}`,
+          })),
+        });
+      }
+    }
+
+    const text = mergedPages
+      .map((p) => p.markdown.trim())
+      .filter(Boolean)
+      .join('\n\n---\n\n');
+
+    const first = results[0];
+    return {
+      filename: results.map((r) => r.filename).join(', '),
+      mime_type: first.mime_type,
+      document_type: opts.document_type ?? first.document_type,
+      model: first.model,
+      page_count: mergedPages.length || 1,
+      text,
+      pages: mergedPages,
+      usage_info: {
+        pages_processed: mergedPages.length,
+        doc_size_bytes: null,
+      },
+    };
+  }
+
+  static async extractTextFromFiles(
+    files: Express.Multer.File[],
+    options: MistralOcrOptions = {},
+  ): Promise<MistralOcrResult> {
+    if (files.length === 0) {
+      throw new HttpError(400, 'يجب رفع ملف واحد على الأقل');
+    }
+
+    const results: MistralOcrResult[] = [];
+    for (const file of files) {
+      results.push(await this.extractTextFromFile(file, options));
+    }
+
+    const documentType = results.every((r) => r.document_type === 'image')
+      ? 'image'
+      : results[0].document_type;
+
+    return this.mergeOcrResults(results, { document_type: documentType });
   }
 }

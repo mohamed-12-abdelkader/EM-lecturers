@@ -9,10 +9,18 @@ const pool_1 = __importDefault(require("../db/pool"));
  * Service للتحكم في الوصول إلى محتوى المقرر الدراسي
  */
 class CourseAccessService {
+    /** كورس مجاني — المحتوى متاح لأي طالب مسجّل دخول بدون enrollment */
+    static async isFreePublicCourse(courseId) {
+        const result = await pool_1.default.query(`SELECT COALESCE(is_free, FALSE) AS is_free FROM courses WHERE id = $1 LIMIT 1`, [courseId]);
+        return result.rowCount ? result.rows[0].is_free === true : false;
+    }
     /**
      * التحقق من صلاحية الطالب للوصول إلى محتوى المقرر
      */
     static async checkStudentAccess(studentId, courseId) {
+        if (await this.isFreePublicCourse(courseId)) {
+            return { hasAccess: true };
+        }
         // جلب معلومات التسجيل
         const enrollmentResult = await pool_1.default.query(`SELECT 
         id, user_id, course_id, subscription_status, 

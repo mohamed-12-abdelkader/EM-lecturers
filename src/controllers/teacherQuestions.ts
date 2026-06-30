@@ -15,14 +15,10 @@ function parseNullableNumber(value: unknown, fieldName: string): number | null {
   return n;
 }
 
-async function verifyPartOwnership(partId: number, teacherId: number): Promise<boolean> {
+async function verifyLessonOwnership(lessonId: number, teacherId: number): Promise<boolean> {
   const result = await pool.query(
-    `SELECT p.id
-     FROM teacher_question_parts p
-     JOIN teacher_question_lessons l ON p.lesson_id = l.id
-     JOIN teacher_question_chapters c ON l.chapter_id = c.id
-     WHERE p.id = $1 AND c.teacher_id = $2`,
-    [partId, teacherId],
+    `SELECT id FROM teacher_question_lessons WHERE id = $1 AND teacher_id = $2`,
+    [lessonId, teacherId],
   );
   return Boolean(result.rowCount);
 }
@@ -30,124 +26,29 @@ async function verifyPartOwnership(partId: number, teacherId: number): Promise<b
 async function verifyPassageOwnership(
   passageId: number,
   teacherId: number,
-): Promise<{ id: number; part_id: number } | null> {
+): Promise<{ id: number; lesson_id: number } | null> {
   const result = await pool.query(
-    `SELECT p.id, p.part_id
+    `SELECT p.id, p.lesson_id
      FROM teacher_question_passages p
-     JOIN teacher_question_parts part ON part.id = p.part_id
-     JOIN teacher_question_lessons l ON part.lesson_id = l.id
-     JOIN teacher_question_chapters c ON l.chapter_id = c.id
-     WHERE p.id = $1 AND c.teacher_id = $2`,
+     JOIN teacher_question_lessons l ON l.id = p.lesson_id
+     WHERE p.id = $1 AND l.teacher_id = $2`,
     [passageId, teacherId],
   );
   return result.rows[0] ?? null;
 }
 
-// ========== الفصول (Chapters) ==========
-// إضافة فصل جديد
-router.post(
-  '/chapter',
-  authMiddleware(['teacher']),
-  asyncWrapper(async (req, res) => {
-    const { title } = req.body;
-    const teacher_id = req.user!.id;
-    if (!title) throw new HttpError(400, 'العنوان مطلوب');
-    const result = await pool.query(
-      'INSERT INTO teacher_question_chapters (teacher_id, title) VALUES ($1, $2) RETURNING *',
-      [teacher_id, title],
-    );
-    await TeacherActivityLogService.log({
-      teacher_id,
-      action: 'add_chapter',
-      entity_type: 'chapter',
-      entity_id: result.rows[0].id,
-      description: `أضاف فصل: ${title}`,
-    });
-    res.status(201).json({ chapter: result.rows[0] });
-  }),
-);
+// ========== الدروس (Lessons) — مباشرة داخل مكتبة المدرّس ==========
 
-// تعديل فصل
-router.put(
-  '/chapter/:id',
-  authMiddleware(['teacher']),
-  asyncWrapper(async (req, res) => {
-    const { title } = req.body;
-    const teacher_id = req.user!.id;
-    const { id } = req.params;
-    const chapterIdNum = Number(id);
-    const result = await pool.query(
-      'UPDATE teacher_question_chapters SET title = $1 WHERE id = $2 AND teacher_id = $3 RETURNING *',
-      [title, chapterIdNum, teacher_id],
-    );
-    if (!result.rowCount) throw new HttpError(404, 'الفصل غير موجود');
-    await TeacherActivityLogService.log({
-      teacher_id,
-      action: 'edit_chapter',
-      entity_type: 'chapter',
-      entity_id: chapterIdNum,
-      description: `تعديل فصل: ${title}`,
-    });
-    res.json({ chapter: result.rows[0] });
-  }),
-);
-
-// حذف فصل
-router.delete(
-  '/chapter/:id',
-  authMiddleware(['teacher']),
-  asyncWrapper(async (req, res) => {
-    const teacher_id = req.user!.id;
-    const { id } = req.params;
-    const chapterIdNum = Number(id);
-    const result = await pool.query(
-      'DELETE FROM teacher_question_chapters WHERE id = $1 AND teacher_id = $2 RETURNING id',
-      [chapterIdNum, teacher_id],
-    );
-    if (!result.rowCount) throw new HttpError(404, 'الفصل غير موجود');
-    await TeacherActivityLogService.log({
-      teacher_id,
-      action: 'delete_chapter',
-      entity_type: 'chapter',
-      entity_id: chapterIdNum,
-      description: `حذف فصل: ${id}`,
-    });
-    res.json({ success: true });
-  }),
-);
-
-// جلب كل الفصول للمدرس
-router.get(
-  '/chapters',
-  authMiddleware(['teacher']),
-  asyncWrapper(async (req, res) => {
-    const teacher_id = req.user!.id;
-    const result = await pool.query(
-      'SELECT * FROM teacher_question_chapters WHERE teacher_id = $1 ORDER BY id',
-      [teacher_id],
-    );
-    res.json({ chapters: result.rows });
-  }),
-);
-
-// ========== الدروس (Lessons) ==========
-// إضافة درس
 router.post(
   '/lesson',
   authMiddleware(['teacher']),
   asyncWrapper(async (req, res) => {
-    const { chapter_id, title } = req.body;
+    const { title } = req.body;
     const teacher_id = req.user!.id;
-    const chapterIdNum = Number(chapter_id);
-    // تحقق أن الفصل يخص المدرس
-    const check = await pool.query(
-      'SELECT id FROM teacher_question_chapters WHERE id = $1 AND teacher_id = $2',
-      [chapterIdNum, teacher_id],
-    );
-    if (!check.rowCount) throw new HttpError(404, 'الفصل غير موجود');
+    if (!title?.trim()) throw new HttpError(400, 'العنوان مطلوب');
     const result = await pool.query(
-      'INSERT INTO teacher_question_lessons (chapter_id, title) VALUES ($1, $2) RETURNING *',
-      [chapterIdNum, title],
+      'INSERT INTO teacher_question_lessons (teacher_id, title) VALUES ($1, $2) RETURNING *',
+      [teacher_id, title.trim()],
     );
     await TeacherActivityLogService.log({
       teacher_id,
@@ -160,213 +61,94 @@ router.post(
   }),
 );
 
-// تعديل درس
 router.put(
   '/lesson/:id',
   authMiddleware(['teacher']),
   asyncWrapper(async (req, res) => {
     const { title } = req.body;
     const teacher_id = req.user!.id;
-    const { id } = req.params;
-    // تحقق أن الدرس يخص المدرس
-    const check = await pool.query(
-      'SELECT l.id FROM teacher_question_lessons l JOIN teacher_question_chapters c ON l.chapter_id = c.id WHERE l.id = $1 AND c.teacher_id = $2',
-      [id, teacher_id],
-    );
-    if (!check.rowCount) throw new HttpError(404, 'الدرس غير موجود');
+    const lessonIdNum = Number(req.params.id);
+    if (!title?.trim()) throw new HttpError(400, 'العنوان مطلوب');
     const result = await pool.query(
-      'UPDATE teacher_question_lessons SET title = $1 WHERE id = $2 RETURNING *',
-      [title, id],
+      'UPDATE teacher_question_lessons SET title = $1 WHERE id = $2 AND teacher_id = $3 RETURNING *',
+      [title.trim(), lessonIdNum, teacher_id],
     );
+    if (!result.rowCount) throw new HttpError(404, 'الدرس غير موجود');
     await TeacherActivityLogService.log({
       teacher_id,
       action: 'edit_lesson',
       entity_type: 'lesson',
-      entity_id: id,
+      entity_id: lessonIdNum,
       description: `تعديل درس: ${title}`,
     });
     res.json({ lesson: result.rows[0] });
   }),
 );
 
-// حذف درس
 router.delete(
   '/lesson/:id',
   authMiddleware(['teacher']),
   asyncWrapper(async (req, res) => {
     const teacher_id = req.user!.id;
-    const { id } = req.params;
-    const lessonIdNum = Number(id);
-    // تحقق أن الدرس يخص المدرس
-    const check = await pool.query(
-      'SELECT l.id FROM teacher_question_lessons l JOIN teacher_question_chapters c ON l.chapter_id = c.id WHERE l.id = $1 AND c.teacher_id = $2',
+    const lessonIdNum = Number(req.params.id);
+    const result = await pool.query(
+      'DELETE FROM teacher_question_lessons WHERE id = $1 AND teacher_id = $2 RETURNING id',
       [lessonIdNum, teacher_id],
     );
-    if (!check.rowCount) throw new HttpError(404, 'الدرس غير موجود');
+    if (!result.rowCount) throw new HttpError(404, 'الدرس غير موجود');
     await TeacherActivityLogService.log({
       teacher_id,
       action: 'delete_lesson',
       entity_type: 'lesson',
       entity_id: lessonIdNum,
-      description: `حذف درس: ${id}`,
+      description: `حذف درس: ${lessonIdNum}`,
     });
-    await pool.query('DELETE FROM teacher_question_lessons WHERE id = $1', [lessonIdNum]);
     res.json({ success: true });
   }),
 );
 
-// جلب الدروس لفصل معين
 router.get(
-  '/lessons/:chapter_id',
+  '/lessons',
   authMiddleware(['teacher']),
   asyncWrapper(async (req, res) => {
     const teacher_id = req.user!.id;
-    const { chapter_id } = req.params;
-    const chapterIdNum = Number(chapter_id);
-    // تحقق أن الفصل يخص المدرس
-    const check = await pool.query(
-      'SELECT id FROM teacher_question_chapters WHERE id = $1 AND teacher_id = $2',
-      [chapterIdNum, teacher_id],
-    );
-    if (!check.rowCount) throw new HttpError(404, 'الفصل غير موجود');
     const result = await pool.query(
-      'SELECT * FROM teacher_question_lessons WHERE chapter_id = $1 ORDER BY id',
-      [chapterIdNum],
+      `SELECT l.*,
+              COUNT(q.id)::int AS questions_count
+       FROM teacher_question_lessons l
+       LEFT JOIN teacher_questions q ON q.lesson_id = l.id
+       WHERE l.teacher_id = $1
+       GROUP BY l.id
+       ORDER BY l.id`,
+      [teacher_id],
     );
     res.json({ lessons: result.rows });
   }),
 );
 
-// ========== الأجزاء (Parts) ==========
-// إضافة جزء
-router.post(
-  '/part',
-  authMiddleware(['teacher']),
-  asyncWrapper(async (req, res) => {
-    const { lesson_id, title } = req.body;
-    const teacher_id = req.user!.id;
-    const lessonIdNum = Number(lesson_id);
-    // تحقق أن الدرس يخص المدرس
-    const check = await pool.query(
-      'SELECT l.id FROM teacher_question_lessons l JOIN teacher_question_chapters c ON l.chapter_id = c.id WHERE l.id = $1 AND c.teacher_id = $2',
-      [lessonIdNum, teacher_id],
-    );
-    if (!check.rowCount) throw new HttpError(404, 'الدرس غير موجود');
-    const result = await pool.query(
-      'INSERT INTO teacher_question_parts (lesson_id, title) VALUES ($1, $2) RETURNING *',
-      [lessonIdNum, title],
-    );
-    await TeacherActivityLogService.log({
-      teacher_id,
-      action: 'add_part',
-      entity_type: 'part',
-      entity_id: result.rows[0].id,
-      description: `أضاف جزء: ${title}`,
-    });
-    res.status(201).json({ part: result.rows[0] });
-  }),
-);
+// ========== القطع (Passages) — مرتبطة بالدرس ==========
 
-// تعديل جزء
-router.put(
-  '/part/:id',
-  authMiddleware(['teacher']),
-  asyncWrapper(async (req, res) => {
-    const { title } = req.body;
-    const teacher_id = req.user!.id;
-    const { id } = req.params;
-    const partIdNum = Number(id);
-    // تحقق أن الجزء يخص المدرس
-    const check = await pool.query(
-      'SELECT p.id FROM teacher_question_parts p JOIN teacher_question_lessons l ON p.lesson_id = l.id JOIN teacher_question_chapters c ON l.chapter_id = c.id WHERE p.id = $1 AND c.teacher_id = $2',
-      [partIdNum, teacher_id],
-    );
-    if (!check.rowCount) throw new HttpError(404, 'الجزء غير موجود');
-    const result = await pool.query(
-      'UPDATE teacher_question_parts SET title = $1 WHERE id = $2 RETURNING *',
-      [title, partIdNum],
-    );
-    await TeacherActivityLogService.log({
-      teacher_id,
-      action: 'edit_part',
-      entity_type: 'part',
-      entity_id: partIdNum,
-      description: `تعديل جزء: ${title}`,
-    });
-    res.json({ part: result.rows[0] });
-  }),
-);
-
-// حذف جزء
-router.delete(
-  '/part/:id',
-  authMiddleware(['teacher']),
-  asyncWrapper(async (req, res) => {
-    const teacher_id = req.user!.id;
-    const { id } = req.params;
-    const partIdNum = Number(id);
-    // تحقق أن الجزء يخص المدرس
-    const check = await pool.query(
-      'SELECT p.id FROM teacher_question_parts p JOIN teacher_question_lessons l ON p.lesson_id = l.id JOIN teacher_question_chapters c ON l.chapter_id = c.id WHERE p.id = $1 AND c.teacher_id = $2',
-      [partIdNum, teacher_id],
-    );
-    if (!check.rowCount) throw new HttpError(404, 'الجزء غير موجود');
-    await TeacherActivityLogService.log({
-      teacher_id,
-      action: 'delete_part',
-      entity_type: 'part',
-      entity_id: partIdNum,
-      description: `حذف جزء: ${id}`,
-    });
-    await pool.query('DELETE FROM teacher_question_parts WHERE id = $1', [partIdNum]);
-    res.json({ success: true });
-  }),
-);
-
-// جلب الأجزاء لدرس معين
-router.get(
-  '/parts/:lesson_id',
-  authMiddleware(['teacher']),
-  asyncWrapper(async (req, res) => {
-    const teacher_id = req.user!.id;
-    const { lesson_id } = req.params;
-    const lessonIdNum = Number(lesson_id);
-    // تحقق أن الدرس يخص المدرس
-    const check = await pool.query(
-      'SELECT l.id FROM teacher_question_lessons l JOIN teacher_question_chapters c ON l.chapter_id = c.id WHERE l.id = $1 AND c.teacher_id = $2',
-      [lessonIdNum, teacher_id],
-    );
-    if (!check.rowCount) throw new HttpError(404, 'الدرس غير موجود');
-    const result = await pool.query(
-      'SELECT * FROM teacher_question_parts WHERE lesson_id = $1 ORDER BY id',
-      [lessonIdNum],
-    );
-    res.json({ parts: result.rows });
-  }),
-);
-
-// ========== القطع (Passages) ==========
 router.post(
   '/passage',
   authMiddleware(['teacher']),
   asyncWrapper(async (req, res) => {
     const teacher_id = req.user!.id;
-    const partIdNum = parseNullableNumber(req.body.part_id, 'part_id')!;
+    const lessonIdNum = parseNullableNumber(req.body.lesson_id, 'lesson_id')!;
     const { title, content, questions = [] } = req.body;
 
     if (!content || !String(content).trim()) throw new HttpError(400, 'نص القطعة مطلوب');
-    if (!(await verifyPartOwnership(partIdNum, teacher_id))) {
-      throw new HttpError(404, 'الجزء غير موجود');
+    if (!(await verifyLessonOwnership(lessonIdNum, teacher_id))) {
+      throw new HttpError(404, 'الدرس غير موجود');
     }
 
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
       const passageResult = await client.query(
-        `INSERT INTO teacher_question_passages (part_id, title, content, order_index)
+        `INSERT INTO teacher_question_passages (lesson_id, title, content, order_index)
          VALUES ($1, $2, $3, 0)
          RETURNING *`,
-        [partIdNum, title || null, content],
+        [lessonIdNum, title || null, content],
       );
       const passage = passageResult.rows[0];
       const createdQuestions = [];
@@ -374,13 +156,13 @@ router.post(
       for (const q of Array.isArray(questions) ? questions : []) {
         const result = await client.query(
           `INSERT INTO teacher_questions (
-             part_id, passage_id, question_text, question_type, choices, answer, image_url,
+             lesson_id, passage_id, question_text, question_type, choices, answer, image_url,
              correct_answer_index, explanation, difficulty_level, points
            )
            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
            RETURNING *`,
           [
-            partIdNum,
+            lessonIdNum,
             passage.id,
             q.question_text,
             q.question_type || (Array.isArray(q.choices) ? 'choice' : 'text'),
@@ -408,22 +190,22 @@ router.post(
 );
 
 router.get(
-  '/passages/:part_id',
+  '/passages/:lesson_id',
   authMiddleware(['teacher']),
   asyncWrapper(async (req, res) => {
     const teacher_id = req.user!.id;
-    const partIdNum = Number(req.params.part_id);
-    if (!Number.isInteger(partIdNum) || partIdNum <= 0) {
-      throw new HttpError(400, 'part_id غير صحيح');
+    const lessonIdNum = Number(req.params.lesson_id);
+    if (!Number.isInteger(lessonIdNum) || lessonIdNum <= 0) {
+      throw new HttpError(400, 'lesson_id غير صحيح');
     }
-    if (!(await verifyPartOwnership(partIdNum, teacher_id))) {
-      throw new HttpError(404, 'الجزء غير موجود');
+    if (!(await verifyLessonOwnership(lessonIdNum, teacher_id))) {
+      throw new HttpError(404, 'الدرس غير موجود');
     }
 
     const passages = (
       await pool.query(
-        'SELECT * FROM teacher_question_passages WHERE part_id = $1 ORDER BY order_index, id',
-        [partIdNum],
+        'SELECT * FROM teacher_question_passages WHERE lesson_id = $1 ORDER BY order_index, id',
+        [lessonIdNum],
       )
     ).rows;
     const passageIds = passages.map((p) => p.id);
@@ -468,14 +250,14 @@ router.get(
   }),
 );
 
-// ========== الأسئلة (Questions) ==========
-// إضافة سؤال
+// ========== الأسئلة (Questions) — مباشرة داخل الدرس ==========
+
 router.post(
   '/question',
   authMiddleware(['teacher']),
   asyncWrapper(async (req, res) => {
     const {
-      part_id,
+      lesson_id,
       question_text,
       question_type,
       choices,
@@ -487,30 +269,29 @@ router.post(
       points,
     } = req.body;
     const teacher_id = req.user!.id;
+    const lessonIdNum = Number(lesson_id);
     const passageId = parseNullableNumber(req.body.passage_id, 'passage_id');
-    // تحقق أن الجزء يخص المدرس
-    const check = await pool.query(
-      'SELECT p.id FROM teacher_question_parts p JOIN teacher_question_lessons l ON p.lesson_id = l.id JOIN teacher_question_chapters c ON l.chapter_id = c.id WHERE p.id = $1 AND c.teacher_id = $2',
-      [part_id, teacher_id],
-    );
-    if (!check.rowCount) throw new HttpError(404, 'الجزء غير موجود');
+
+    if (!(await verifyLessonOwnership(lessonIdNum, teacher_id))) {
+      throw new HttpError(404, 'الدرس غير موجود');
+    }
 
     if (passageId != null) {
       const passage = await verifyPassageOwnership(passageId, teacher_id);
-      if (!passage || passage.part_id !== Number(part_id)) {
-        throw new HttpError(404, 'القطعة غير موجودة داخل هذا الجزء');
+      if (!passage || passage.lesson_id !== lessonIdNum) {
+        throw new HttpError(404, 'القطعة غير موجودة داخل هذا الدرس');
       }
     }
 
     const result = await pool.query(
       `INSERT INTO teacher_questions (
-         part_id, passage_id, question_text, question_type, choices, answer, image_url,
+         lesson_id, passage_id, question_text, question_type, choices, answer, image_url,
          correct_answer_index, explanation, difficulty_level, points
        )
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
        RETURNING *`,
       [
-        part_id,
+        lessonIdNum,
         passageId,
         question_text,
         question_type,
@@ -534,7 +315,6 @@ router.post(
   }),
 );
 
-// تعديل سؤال
 router.put(
   '/question/:id',
   authMiddleware(['teacher']),
@@ -551,19 +331,22 @@ router.put(
       points,
     } = req.body;
     const teacher_id = req.user!.id;
-    const { id } = req.params;
+    const questionIdNum = Number(req.params.id);
     const passageId = parseNullableNumber(req.body.passage_id, 'passage_id');
-    // تحقق أن السؤال يخص المدرس
+
     const check = await pool.query(
-      'SELECT q.id, q.part_id FROM teacher_questions q JOIN teacher_question_parts p ON q.part_id = p.id JOIN teacher_question_lessons l ON p.lesson_id = l.id JOIN teacher_question_chapters c ON l.chapter_id = c.id WHERE q.id = $1 AND c.teacher_id = $2',
-      [id, teacher_id],
+      `SELECT q.id, q.lesson_id
+       FROM teacher_questions q
+       JOIN teacher_question_lessons l ON q.lesson_id = l.id
+       WHERE q.id = $1 AND l.teacher_id = $2`,
+      [questionIdNum, teacher_id],
     );
     if (!check.rowCount) throw new HttpError(404, 'السؤال غير موجود');
 
     if (passageId != null) {
       const passage = await verifyPassageOwnership(passageId, teacher_id);
-      if (!passage || passage.part_id !== Number(check.rows[0].part_id)) {
-        throw new HttpError(404, 'القطعة غير موجودة داخل هذا الجزء');
+      if (!passage || passage.lesson_id !== Number(check.rows[0].lesson_id)) {
+        throw new HttpError(404, 'القطعة غير موجودة داخل هذا الدرس');
       }
     }
 
@@ -592,31 +375,31 @@ router.put(
         explanation || null,
         difficulty_level || 'medium',
         points || 1,
-        id,
+        questionIdNum,
       ],
     );
     await TeacherActivityLogService.log({
       teacher_id,
       action: 'edit_question',
       entity_type: 'question',
-      entity_id: id,
+      entity_id: questionIdNum,
       description: `تعديل سؤال: ${question_text}`,
     });
     res.json({ question: result.rows[0] });
   }),
 );
 
-// حذف سؤال
 router.delete(
   '/question/:id',
   authMiddleware(['teacher']),
   asyncWrapper(async (req, res) => {
     const teacher_id = req.user!.id;
-    const { id } = req.params;
-    const questionIdNum = Number(id);
-    // تحقق أن السؤال يخص المدرس
+    const questionIdNum = Number(req.params.id);
     const check = await pool.query(
-      'SELECT q.id FROM teacher_questions q JOIN teacher_question_parts p ON q.part_id = p.id JOIN teacher_question_lessons l ON p.lesson_id = l.id JOIN teacher_question_chapters c ON l.chapter_id = c.id WHERE q.id = $1 AND c.teacher_id = $2',
+      `SELECT q.id
+       FROM teacher_questions q
+       JOIN teacher_question_lessons l ON q.lesson_id = l.id
+       WHERE q.id = $1 AND l.teacher_id = $2`,
       [questionIdNum, teacher_id],
     );
     if (!check.rowCount) throw new HttpError(404, 'السؤال غير موجود');
@@ -625,52 +408,42 @@ router.delete(
       action: 'delete_question',
       entity_type: 'question',
       entity_id: questionIdNum,
-      description: `حذف سؤال: ${id}`,
+      description: `حذف سؤال: ${questionIdNum}`,
     });
     await pool.query('DELETE FROM teacher_questions WHERE id = $1', [questionIdNum]);
     res.json({ success: true });
   }),
 );
 
-// جلب الأسئلة لجزء معين
 router.get(
-  '/questions/:part_id',
+  '/questions/:lesson_id',
   authMiddleware(['teacher']),
   asyncWrapper(async (req, res) => {
     const teacher_id = req.user!.id;
-    const { part_id } = req.params;
-    const partIdNum = Number(part_id);
-    // تحقق أن الجزء يخص المدرس
-    const check = await pool.query(
-      'SELECT p.id FROM teacher_question_parts p JOIN teacher_question_lessons l ON p.lesson_id = l.id JOIN teacher_question_chapters c ON l.chapter_id = c.id WHERE p.id = $1 AND c.teacher_id = $2',
-      [partIdNum, teacher_id],
-    );
-    if (!check.rowCount) throw new HttpError(404, 'الجزء غير موجود');
+    const lessonIdNum = Number(req.params.lesson_id);
+    if (!(await verifyLessonOwnership(lessonIdNum, teacher_id))) {
+      throw new HttpError(404, 'الدرس غير موجود');
+    }
     const result = await pool.query(
-      'SELECT * FROM teacher_questions WHERE part_id = $1 ORDER BY id',
-      [partIdNum],
+      'SELECT * FROM teacher_questions WHERE lesson_id = $1 ORDER BY id',
+      [lessonIdNum],
     );
     res.json({ questions: result.rows });
   }),
 );
 
-// ========== إضافة أسئلة دفعة واحدة (Bulk Insert) ==========
 router.post(
   '/bulk',
   authMiddleware(['teacher']),
   asyncWrapper(async (req, res) => {
-    const { part_id, bulk_text } = req.body;
+    const { lesson_id, bulk_text } = req.body;
     const teacher_id = req.user!.id;
-    const partIdNum = Number(part_id);
-    if (!partIdNum || !bulk_text) throw new HttpError(400, 'part_id و bulk_text مطلوبان');
-    // تحقق أن الجزء يخص المدرس
-    const check = await pool.query(
-      'SELECT p.id FROM teacher_question_parts p JOIN teacher_question_lessons l ON p.lesson_id = l.id JOIN teacher_question_chapters c ON l.chapter_id = c.id WHERE p.id = $1 AND c.teacher_id = $2',
-      [partIdNum, teacher_id],
-    );
-    if (!check.rowCount) throw new HttpError(404, 'الجزء غير موجود');
+    const lessonIdNum = Number(lesson_id);
+    if (!lessonIdNum || !bulk_text) throw new HttpError(400, 'lesson_id و bulk_text مطلوبان');
+    if (!(await verifyLessonOwnership(lessonIdNum, teacher_id))) {
+      throw new HttpError(404, 'الدرس غير موجود');
+    }
 
-    // منطق تقسيم مرن لقبول جميع الصيغ
     const questionBlocks = bulk_text
       .split(/\n\s*\n/)
       .map((b: string) => b.trim())
@@ -691,7 +464,6 @@ router.post(
       const question_text = lines[0];
       const choices: string[] = [];
       for (let i = 1; i < lines.length && choices.length < 4; i++) {
-        // يقبل أي بادئة A/B/C/D مع أي فاصل أو حتى بدون فاصل
         const match = lines[i].match(/^[A-D][).:,-]?\s*(.+)$/i);
         if (match) {
           choices.push(match[1].trim());
@@ -713,12 +485,11 @@ router.post(
       });
     }
 
-    // إدخال الأسئلة في قاعدة البيانات
     let inserted = 0;
     for (const q of questions) {
       await pool.query(
-        'INSERT INTO teacher_questions (part_id, question_text, question_type, choices) VALUES ($1, $2, $3, $4)',
-        [partIdNum, q.question_text, 'choice', JSON.stringify(q.choices)],
+        'INSERT INTO teacher_questions (lesson_id, question_text, question_type, choices) VALUES ($1, $2, $3, $4)',
+        [lessonIdNum, q.question_text, 'choice', JSON.stringify(q.choices)],
       );
       inserted++;
     }
@@ -727,17 +498,14 @@ router.post(
   }),
 );
 
-// ========== عرض الأسئلة لأي مستخدم (بدون تحقق ملكية المدرس) ==========
 router.get(
-  '/public/questions/:part_id',
+  '/public/questions/:lesson_id',
   asyncWrapper(async (req, res) => {
-    const { part_id } = req.params;
-    // جلب الأسئلة لهذا الجزء
+    const lessonIdNum = Number(req.params.lesson_id);
     const result = await pool.query(
-      'SELECT * FROM teacher_questions WHERE part_id = $1 ORDER BY id',
-      [part_id],
+      'SELECT * FROM teacher_questions WHERE lesson_id = $1 ORDER BY id',
+      [lessonIdNum],
     );
-    // إذا كانت choices نصية (string) وليست Array، حاول تحويلها
     const questions = result.rows.map((q) => ({
       ...q,
       choices:
@@ -755,49 +523,55 @@ router.get(
   }),
 );
 
-// ========== جلب الشجرة الكاملة للمدرس ==========
 router.get(
   '/tree',
   authMiddleware(['teacher']),
   asyncWrapper(async (req, res) => {
     const teacher_id = req.user!.id;
-    // جلب الفصول
-    const chapters = (
+
+    const lessons = (
       await pool.query(
-        'SELECT * FROM teacher_question_chapters WHERE teacher_id = $1 ORDER BY id',
+        'SELECT * FROM teacher_question_lessons WHERE teacher_id = $1 ORDER BY id',
         [teacher_id],
       )
     ).rows;
-    // جلب الدروس
-    const lessons = (
-      await pool.query(
-        'SELECT * FROM teacher_question_lessons WHERE chapter_id = ANY($1::int[]) ORDER BY id',
-        [chapters.map((c) => c.id)],
-      )
-    ).rows;
-    // جلب الأجزاء
-    const parts = (
-      await pool.query(
-        'SELECT * FROM teacher_question_parts WHERE lesson_id = ANY($1::int[]) ORDER BY id',
-        [lessons.map((l) => l.id)],
-      )
-    ).rows;
-    // جلب الأسئلة
-    const questions = (
-      await pool.query(
-        'SELECT * FROM teacher_questions WHERE part_id = ANY($1::int[]) ORDER BY id',
-        [parts.map((p) => p.id)],
-      )
-    ).rows;
 
-    // بناء الشجرة
-    const partsMap = Object.fromEntries(parts.map((p) => [p.id, { ...p, questions: [] }]));
-    for (const q of questions) partsMap[q.part_id]?.questions.push(q);
-    const lessonsMap = Object.fromEntries(lessons.map((l) => [l.id, { ...l, parts: [] }]));
-    for (const p of parts) lessonsMap[p.lesson_id]?.parts.push(partsMap[p.id]);
-    const chaptersMap = Object.fromEntries(chapters.map((c) => [c.id, { ...c, lessons: [] }]));
-    for (const l of lessons) chaptersMap[l.chapter_id]?.lessons.push(lessonsMap[l.id]);
+    const lessonIds = lessons.map((l) => l.id);
+    const questions = lessonIds.length
+      ? (
+          await pool.query(
+            'SELECT * FROM teacher_questions WHERE lesson_id = ANY($1::int[]) ORDER BY id',
+            [lessonIds],
+          )
+        ).rows
+      : [];
 
-    res.json({ chapters: Object.values(chaptersMap) });
+    const passages = lessonIds.length
+      ? (
+          await pool.query(
+            'SELECT * FROM teacher_question_passages WHERE lesson_id = ANY($1::int[]) ORDER BY order_index, id',
+            [lessonIds],
+          )
+        ).rows
+      : [];
+
+    const lessonsMap = Object.fromEntries(
+      lessons.map((l) => [l.id, { ...l, questions: [] as typeof questions, passages: [] as typeof passages }]),
+    );
+
+    for (const q of questions) {
+      lessonsMap[q.lesson_id]?.questions.push(q);
+    }
+    for (const p of passages) {
+      const lesson = lessonsMap[p.lesson_id];
+      if (lesson) {
+        lesson.passages.push({
+          ...p,
+          questions: questions.filter((q) => q.passage_id === p.id),
+        });
+      }
+    }
+
+    res.json({ lessons: Object.values(lessonsMap) });
   }),
 );

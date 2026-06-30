@@ -18,6 +18,7 @@ const multer_1 = __importDefault(require("multer"));
 const path_1 = __importDefault(require("path"));
 const fs_1 = __importDefault(require("fs"));
 const pool_1 = __importDefault(require("../db/pool"));
+const teacherLibraryExamQuestions_1 = require("../services/teacherLibraryExamQuestions");
 exports.router = (0, express_1.Router)();
 // Configure multer for image uploads
 const questionImageStorage = multer_1.default.diskStorage({
@@ -171,8 +172,10 @@ exports.router.post('/', (0, authentication_1.authMiddleware)(['teacher']), (0, 
     // Handle lecture exam (existing logic)
     if (isLectureExam) {
         const teacherId = req.user.id;
+        const rawType = (0, requestParsers_1.pickBodyValue)(req.body, 'type', 'examType', 'exam_type');
         const exam = await examFlow_1.ExamFlowService.createExam(teacherId, {
             lectureId: Number(rawLectureId),
+            type: typeof rawType === 'string' ? rawType : undefined,
             title: req.body.title,
             totalGrade: req.body.totalGrade,
             duration: req.body.duration,
@@ -229,7 +232,7 @@ exports.router.get('/course/:courseId', (0, authentication_1.authMiddleware)(['t
 }));
 exports.router.get('/teacher', (0, authentication_1.authMiddleware)(['teacher']), (0, utils_1.asyncWrapper)(async (req, res) => {
     const exams = await courseLevelExams_1.CourseLevelExamsService.getExamsByTeacher(req.user.id);
-    res.json({ exams });
+    res.json({ success: true, total: exams.length, exams });
 }));
 // POST /api/exams/lecture/:examId/questions/bulk — إضافة مجموعة أسئلة بنص واحد لامتحان المحاضرة (نفس صيغة امتحان الكورس: سؤال ثم a. b. c. d.)
 exports.router.post('/lecture/:examId/questions/bulk', (0, authentication_1.authMiddleware)(['teacher']), (0, utils_1.asyncWrapper)(async (req, res) => {
@@ -325,10 +328,30 @@ exports.router.post('/lecture/:examId/questions/passage/bulk', (0, authenticatio
         added: result.added,
     });
 }));
-// GET /api/exams/teacher/lecture-exams - Get all lecture exams for teacher (across all courses)
-exports.router.get('/teacher/lecture-exams', (0, authentication_1.authMiddleware)(['teacher']), (0, utils_1.asyncWrapper)(async (req, res) => {
-    const exams = await examFlow_1.ExamFlowService.getExamsByTeacher(req.user.id);
-    res.json({ exams });
+// GET /api/exams/teacher/lecture-exams - كل امتحانات المحاضرات للمدرس
+exports.router.get('/teacher/lecture-exams', (0, authentication_1.authMiddleware)(['teacher', 'admin']), (0, utils_1.asyncWrapper)(async (req, res) => {
+    const teacherId = req.user.role === 'admin'
+        ? (0, requestParsers_1.parseNumberInput)(req.query.teacher_id) ?? req.user.id
+        : req.user.id;
+    const courseId = (0, requestParsers_1.parseNumberInput)(req.query.course_id);
+    const lectureId = (0, requestParsers_1.parseNumberInput)(req.query.lecture_id);
+    const type = typeof req.query.type === 'string' ? req.query.type : undefined;
+    const exams = await examFlow_1.ExamFlowService.getExamsByTeacher(teacherId, {
+        courseId: courseId ?? undefined,
+        lectureId: lectureId ?? undefined,
+        type,
+    });
+    res.json({
+        success: true,
+        total: exams.length,
+        exams,
+        filters: {
+            teacherId,
+            courseId: courseId ?? null,
+            lectureId: lectureId ?? null,
+            type: type ?? 'all',
+        },
+    });
 }));
 // Get exam grades for all students (teacher only)
 exports.router.get('/:examId/grades', (0, authentication_1.authMiddleware)(['teacher', 'admin']), (0, utils_1.asyncWrapper)(async (req, res) => {
@@ -512,8 +535,6 @@ exports.router.post('/:examId/questions/from-bank', (0, authentication_1.authMid
     if (questionIds.length === 0) {
         return res.status(400).json({ message: 'questionIds is required and must be a non-empty array of question IDs' });
     }
-    // eslint-disable-next-line @typescript-eslint/ban-ts-comment
-    // @ts-expect-error
     const { missing } = await courseLevelExams_1.CourseLevelExamsService.validateQuestionIdsInBank(questionIds);
     if (missing.length > 0) {
         return res.status(400).json({
@@ -618,6 +639,163 @@ exports.router.post('/:examId/questions/from-bank', (0, authentication_1.authMid
         addedQuestions: addedBankIds,
         examId,
         examType: 'lecture-exam',
+    });
+}));
+function parseTeacherLibraryBody(body) {
+    const questionIds = Array.isArray(body.questionIds)
+        ? body.questionIds.map((id) => Number(id)).filter((n) => Number.isInteger(n) && n > 0)
+        : [];
+    const lessonId = body.lessonId != null ? Number(body.lessonId) : null;
+    const passageId = body.passageId != null ? Number(body.passageId) : null;
+    return { questionIds, lessonId, passageId };
+}
+async function resolveTeacherLibraryQuestionIds(teacherId, body) {
+    const { questionIds, lessonId, passageId } = parseTeacherLibraryBody(body);
+    if (lessonId != null && Number.isInteger(lessonId) && lessonId > 0) {
+        return teacherLibraryExamQuestions_1.TeacherLibraryExamQuestionsService.fetchLessonQuestionIds(teacherId, lessonId);
+    }
+    if (passageId != null && Number.isInteger(passageId) && passageId > 0) {
+        return teacherLibraryExamQuestions_1.TeacherLibraryExamQuestionsService.fetchPassageQuestionIds(teacherId, passageId);
+    }
+    return questionIds;
+}
+// POST /api/exams/lecture/:examId/questions/from-teacher-library — امتحان المحاضرة
+exports.router.post('/lecture/:examId/questions/from-teacher-library', (0, authentication_1.authMiddleware)(['teacher']), (0, utils_1.asyncWrapper)(async (req, res) => {
+    const examId = Number(req.params.examId);
+    if (Number.isNaN(examId) || examId <= 0) {
+        return res.status(400).json({ message: 'Invalid exam id' });
+    }
+    const teacherId = req.user.id;
+    const questionIds = await resolveTeacherLibraryQuestionIds(teacherId, req.body ?? {});
+    if (!questionIds.length) {
+        return res.status(400).json({
+            message: 'Provide questionIds (non-empty array), or lessonId, or passageId from your question library',
+        });
+    }
+    const { missing } = await teacherLibraryExamQuestions_1.TeacherLibraryExamQuestionsService.validateQuestionIds(teacherId, questionIds);
+    if (missing.length) {
+        return res.status(400).json({
+            message: 'Some question IDs were not found in your question library',
+            missingQuestionIds: missing,
+        });
+    }
+    const result = await teacherLibraryExamQuestions_1.TeacherLibraryExamQuestionsService.addToLectureExam(teacherId, examId, questionIds);
+    return res.status(200).json({
+        message: result.addedCount > 0 ? 'Questions added successfully' : 'All selected questions already exist',
+        examId,
+        examType: 'lecture-exam',
+        addedCount: result.addedCount,
+        examQuestionIds: result.examQuestionIds,
+        addedTeacherQuestionIds: result.addedTeacherQuestionIds,
+        skippedTeacherQuestionIds: result.skippedTeacherQuestionIds,
+    });
+}));
+// POST /api/exams/course-level/:examId/questions/from-teacher-library — امتحان الكورس العام
+exports.router.post('/course-level/:examId/questions/from-teacher-library', (0, authentication_1.authMiddleware)(['teacher']), (0, utils_1.asyncWrapper)(async (req, res) => {
+    const examId = Number(req.params.examId);
+    if (Number.isNaN(examId) || examId <= 0) {
+        return res.status(400).json({ message: 'Invalid exam id' });
+    }
+    const teacherId = req.user.id;
+    const questionIds = await resolveTeacherLibraryQuestionIds(teacherId, req.body ?? {});
+    if (!questionIds.length) {
+        return res.status(400).json({
+            message: 'Provide questionIds (non-empty array), or lessonId, or passageId from your question library',
+        });
+    }
+    const { missing } = await teacherLibraryExamQuestions_1.TeacherLibraryExamQuestionsService.validateQuestionIds(teacherId, questionIds);
+    if (missing.length) {
+        return res.status(400).json({
+            message: 'Some question IDs were not found in your question library',
+            missingQuestionIds: missing,
+        });
+    }
+    const client = await pool_1.default.connect();
+    try {
+        await client.query('BEGIN');
+        const result = await teacherLibraryExamQuestions_1.TeacherLibraryExamQuestionsService.addToCourseExam(teacherId, examId, questionIds, client);
+        await client.query('COMMIT');
+        return res.status(200).json({
+            message: result.addedCount > 0 ? 'Questions added successfully' : 'All selected questions already exist',
+            examId,
+            examType: 'course-exam',
+            addedCount: result.addedCount,
+            addedTeacherQuestionIds: result.addedTeacherQuestionIds,
+            skippedTeacherQuestionIds: result.skippedTeacherQuestionIds,
+            questions: result.addedQuestions,
+        });
+    }
+    catch (err) {
+        await client.query('ROLLBACK').catch(() => { });
+        throw err;
+    }
+    finally {
+        client.release();
+    }
+}));
+// POST /api/exams/:examId/questions/from-teacher-library — إضافة من مكتبة أسئلة المدرس
+// Body: { questionIds?: number[], lessonId?: number, passageId?: number, type?: "course-exam" }
+exports.router.post('/:examId/questions/from-teacher-library', (0, authentication_1.authMiddleware)(['teacher']), (0, utils_1.asyncWrapper)(async (req, res) => {
+    const examId = Number(req.params.examId);
+    if (Number.isNaN(examId) || examId <= 0) {
+        return res.status(400).json({ message: 'Invalid exam id' });
+    }
+    const teacherId = req.user.id;
+    const questionIds = await resolveTeacherLibraryQuestionIds(teacherId, req.body ?? {});
+    if (!questionIds.length) {
+        return res.status(400).json({
+            message: 'Provide questionIds (non-empty array), or lessonId, or passageId from your question library',
+        });
+    }
+    const { missing } = await teacherLibraryExamQuestions_1.TeacherLibraryExamQuestionsService.validateQuestionIds(teacherId, questionIds);
+    if (missing.length > 0) {
+        return res.status(400).json({
+            message: 'Some question IDs were not found in your question library',
+            missingQuestionIds: missing,
+        });
+    }
+    const isCourseExam = req.body?.type === 'course-exam';
+    if (isCourseExam) {
+        const client = await pool_1.default.connect();
+        try {
+            await client.query('BEGIN');
+            const result = await teacherLibraryExamQuestions_1.TeacherLibraryExamQuestionsService.addToCourseExam(teacherId, examId, questionIds, client);
+            await client.query('COMMIT');
+            return res.status(200).json({
+                message: result.skippedTeacherQuestionIds.length > 0 && result.addedCount > 0
+                    ? 'Some questions were skipped because they already exist'
+                    : result.addedCount > 0
+                        ? 'Questions added successfully'
+                        : 'All selected questions already exist in this exam',
+                examId,
+                examType: 'course-exam',
+                addedCount: result.addedCount,
+                addedTeacherQuestionIds: result.addedTeacherQuestionIds,
+                skippedTeacherQuestionIds: result.skippedTeacherQuestionIds,
+                questions: result.addedQuestions,
+            });
+        }
+        catch (err) {
+            await client.query('ROLLBACK').catch(() => { });
+            throw err;
+        }
+        finally {
+            client.release();
+        }
+    }
+    const result = await teacherLibraryExamQuestions_1.TeacherLibraryExamQuestionsService.addToLectureExam(teacherId, examId, questionIds);
+    return res.status(200).json({
+        message: result.skippedTeacherQuestionIds.length > 0 && result.addedCount > 0
+            ? 'Some questions were skipped because they already exist'
+            : result.addedCount > 0
+                ? 'Questions added successfully'
+                : 'All selected questions already exist in this exam',
+        examId,
+        examType: 'lecture-exam',
+        addedCount: result.addedCount,
+        examQuestionIds: result.examQuestionIds,
+        addedTeacherQuestionIds: result.addedTeacherQuestionIds,
+        skippedTeacherQuestionIds: result.skippedTeacherQuestionIds,
     });
 }));
 // POST /api/exams/:examId/questions/from-passage — إضافة كل أسئلة قطعة واحدة (Reading Comprehension) لامتحان المحاضرة

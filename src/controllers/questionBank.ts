@@ -20,12 +20,14 @@ router.get(
            qb.grade_id,
            g.name as grade_name,
            COUNT(DISTINCT s.id) as subjects_count,
+           COUNT(DISTINCT bk.id) as books_count,
            COUNT(DISTINCT c.id) as chapters_count,
            COUNT(DISTINCT l.id) as lessons_count,
            COUNT(DISTINCT q.id) as questions_count
          FROM question_banks qb
          JOIN grades g ON g.id = qb.grade_id
          LEFT JOIN subjects s ON s.question_bank_id = qb.id
+         LEFT JOIN subject_books bk ON bk.subject_id = s.id
          LEFT JOIN chapters c ON c.subject_id = s.id
          LEFT JOIN lessons l ON l.chapter_id = c.id
          LEFT JOIN questions q ON q.lesson_id = l.id
@@ -43,6 +45,7 @@ router.get(
           grade_id: bank.grade_id,
           grade_name: bank.grade_name,
           subjects_count: parseInt(bank.subjects_count),
+          books_count: parseInt(bank.books_count || '0'),
           chapters_count: parseInt(bank.chapters_count),
           lessons_count: parseInt(bank.lessons_count),
           questions_count: parseInt(bank.questions_count),
@@ -159,10 +162,12 @@ router.get(
           s.description,
           s.image_url,
           s.color,
+          COUNT(DISTINCT sb.id) as books_count,
           COUNT(DISTINCT c.id) as chapters_count,
           COUNT(DISTINCT l.id) as lessons_count,
           COUNT(DISTINCT q.id) as questions_count
          FROM subjects s
+         LEFT JOIN subject_books sb ON sb.subject_id = s.id AND sb.is_active = TRUE
          LEFT JOIN chapters c ON c.subject_id = s.id
          LEFT JOIN lessons l ON l.chapter_id = c.id
          LEFT JOIN questions q ON q.lesson_id = l.id
@@ -185,6 +190,7 @@ router.get(
           description: subject.description,
           image_url: subject.image_url,
           color: subject.color,
+          books_count: parseInt(subject.books_count || '0'),
           chapters_count: parseInt(subject.chapters_count),
           lessons_count: parseInt(subject.lessons_count),
           questions_count: parseInt(subject.questions_count),
@@ -201,7 +207,125 @@ router.get(
   }),
 );
 
-// API للطالب ليعرض الفصول الموجودة في مادة معينة
+// API للطالب ليعرض الكتب داخل مادة
+router.get(
+  '/student/subjects/:subjectId/books',
+  authMiddleware(['student']),
+  asyncWrapper(async (req, res) => {
+    const studentId = req.user!.id;
+    const subjectId = Number(req.params.subjectId);
+
+    if (isNaN(subjectId)) {
+      return res.status(400).json({ message: 'Invalid subject ID' });
+    }
+
+    const subjectCheckResult = await pool.query(
+      `SELECT s.id 
+       FROM subjects s
+       JOIN question_banks qb ON qb.id = s.question_bank_id
+       JOIN user_grades ug ON ug.grade_id = qb.grade_id
+       WHERE s.id = $1 AND ug.user_id = $2 AND s.is_active = true`,
+      [subjectId, studentId],
+    );
+
+    if (!subjectCheckResult.rowCount) {
+      return res.status(404).json({ message: 'Subject not found or not accessible' });
+    }
+
+    const booksResult = await pool.query(
+      `SELECT 
+        sb.id,
+        sb.name,
+        sb.description,
+        sb.image_url,
+        sb.order_num,
+        COUNT(DISTINCT c.id) as chapters_count,
+        COUNT(DISTINCT l.id) as lessons_count,
+        COUNT(DISTINCT q.id) as questions_count
+       FROM subject_books sb
+       LEFT JOIN chapters c ON c.book_id = sb.id
+       LEFT JOIN lessons l ON l.chapter_id = c.id
+       LEFT JOIN questions q ON q.lesson_id = l.id
+       WHERE sb.subject_id = $1 AND sb.is_active = TRUE
+       GROUP BY sb.id, sb.name, sb.description, sb.image_url, sb.order_num
+       ORDER BY sb.order_num ASC, sb.name ASC`,
+      [subjectId],
+    );
+
+    res.json({
+      success: true,
+      data: booksResult.rows.map((book) => ({
+        id: book.id,
+        name: book.name,
+        description: book.description,
+        image_url: book.image_url,
+        order_num: book.order_num,
+        chapters_count: parseInt(book.chapters_count),
+        lessons_count: parseInt(book.lessons_count),
+        questions_count: parseInt(book.questions_count),
+      })),
+    });
+  }),
+);
+
+// API للطالب ليعرض الفصول داخل كتاب
+router.get(
+  '/student/books/:bookId/chapters',
+  authMiddleware(['student']),
+  asyncWrapper(async (req, res) => {
+    const studentId = req.user!.id;
+    const bookId = Number(req.params.bookId);
+
+    if (isNaN(bookId)) {
+      return res.status(400).json({ message: 'Invalid book ID' });
+    }
+
+    const bookCheckResult = await pool.query(
+      `SELECT sb.id
+       FROM subject_books sb
+       JOIN subjects s ON s.id = sb.subject_id
+       JOIN question_banks qb ON qb.id = s.question_bank_id
+       JOIN user_grades ug ON ug.grade_id = qb.grade_id
+       WHERE sb.id = $1 AND ug.user_id = $2 AND sb.is_active = TRUE`,
+      [bookId, studentId],
+    );
+
+    if (!bookCheckResult.rowCount) {
+      return res.status(404).json({ message: 'Book not found or not accessible' });
+    }
+
+    const chaptersResult = await pool.query(
+      `SELECT 
+        c.id,
+        c.name,
+        c.description,
+        c.image_url,
+        COUNT(DISTINCT l.id) as lessons_count,
+        COUNT(DISTINCT q.id) as questions_count
+       FROM chapters c
+       LEFT JOIN lessons l ON l.chapter_id = c.id
+       LEFT JOIN questions q ON q.lesson_id = l.id
+       WHERE c.book_id = $1
+       GROUP BY c.id, c.name, c.description, c.image_url
+       ORDER BY c.order_num ASC, c.name ASC`,
+      [bookId],
+    );
+
+    res.json({
+      success: true,
+      data: chaptersResult.rows.map((chapter) => ({
+        id: chapter.id,
+        name: chapter.name,
+        description: chapter.description,
+        image_url: chapter.image_url,
+        lessons_count: parseInt(chapter.lessons_count),
+        questions_count: parseInt(chapter.questions_count),
+      })),
+    });
+  }),
+);
+
+// API للطالب ليعرض الفصول الموجودة في مادة معينة (كل الكتب — legacy)
 router.get(
   '/student/subjects/:subjectId/chapters',
   authMiddleware(['student']),

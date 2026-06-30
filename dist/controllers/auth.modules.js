@@ -76,14 +76,32 @@ exports.Login = zod_1.z
         .string()
         .regex(/^\+?[0-9]{8,15}$/, 'Invalid phone number')
         .optional(),
-    password: zod_1.z.string(),
+    student_code: zod_1.z
+        .string()
+        .min(4)
+        .max(20)
+        .transform((s) => s.replace(/\D/g, ''))
+        .optional(),
+    password: zod_1.z.string().optional(),
     device_ip: zod_1.z.string().optional(),
-    /** When Host resolves to tenant `default`, pass the teacher platform subdomain (same as URL subdomain). */
+    /** للطالب عند تسجيل الدخول من host افتراضي (localhost / ngrok). المدرس لا يحتاجه — يُكتشف تلقائياً. */
     subdomain: zod_1.z.string().min(2).max(63).optional(),
     tenant_subdomain: zod_1.z.string().min(2).max(63).optional(),
 })
-    .refine((data) => data.email || data.phone, {
-    message: 'Either email or phone must be provided',
+    .refine((data) => data.email || data.phone || data.student_code, {
+    message: 'Either email, phone, or student_code must be provided',
+})
+    .refine((data) => {
+    if (data.email || data.phone)
+        return !!data.password?.length;
+    return true;
+}, {
+    message: 'password is required when logging in with email or phone',
+    path: ['password'],
+})
+    .refine((data) => !data.student_code || data.student_code.length >= 4, {
+    message: 'student_code must be at least 4 digits',
+    path: ['student_code'],
 });
 exports.ForgotPassword = zod_1.z.object({
     email: zod_1.z.string().email(),

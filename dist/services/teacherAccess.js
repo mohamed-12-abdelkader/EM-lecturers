@@ -5,6 +5,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.teacherHasSubjectAccess = teacherHasSubjectAccess;
 exports.getSubjectIdByChapterId = getSubjectIdByChapterId;
+exports.getSubjectIdByBookId = getSubjectIdByBookId;
 exports.getSubjectIdByLessonId = getSubjectIdByLessonId;
 const pool_1 = __importDefault(require("../db/pool"));
 async function teacherHasSubjectAccess(teacherId, subjectId) {
@@ -12,7 +13,16 @@ async function teacherHasSubjectAccess(teacherId, subjectId) {
     return !!res.rowCount && res.rowCount > 0;
 }
 async function getSubjectIdByChapterId(chapterId) {
-    const res = await pool_1.default.query('SELECT subject_id FROM chapters WHERE id = $1', [chapterId]);
+    const res = await pool_1.default.query(`SELECT COALESCE(c.subject_id, sb.subject_id) AS subject_id
+     FROM chapters c
+     LEFT JOIN subject_books sb ON sb.id = c.book_id
+     WHERE c.id = $1`, [chapterId]);
+    if (!res.rowCount)
+        return null;
+    return res.rows[0].subject_id;
+}
+async function getSubjectIdByBookId(bookId) {
+    const res = await pool_1.default.query(`SELECT subject_id FROM subject_books WHERE id = $1`, [bookId]);
     if (!res.rowCount)
         return null;
     return res.rows[0].subject_id;

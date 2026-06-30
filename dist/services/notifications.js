@@ -42,6 +42,7 @@ exports.emitLectureLockUpdated = emitLectureLockUpdated;
 const pool_1 = __importDefault(require("../db/pool"));
 const utils_1 = require("../utils");
 const ExpoPushService = __importStar(require("./expoPushService"));
+const webPushSender_1 = require("./webPushSender");
 // Function to get Socket.IO instance
 let getIOInstance = null;
 function setIOGetter(getter) {
@@ -49,6 +50,9 @@ function setIOGetter(getter) {
 }
 function getIO() {
     return getIOInstance ? getIOInstance() : null;
+}
+function enqueueWebPush(userId, title, message, type, notificationId, data) {
+    (0, webPushSender_1.scheduleWebPushForUser)(userId, { title, body: message, type, notification_id: notificationId, data });
 }
 /** إرسال حدث لتحديث قفل المحاضرات للطالب (بعد ظهور نتيجة امتحان محاضرة) */
 function emitLectureLockUpdated(studentId, courseId) {
@@ -153,6 +157,11 @@ class NotificationService {
                     if (notificationData.meeting_id)
                         broadcastPayload.meeting_id = notificationData.meeting_id;
                     broadcastNotification(notification.user_id, broadcastPayload);
+                    enqueueWebPush(notification.user_id, insertedNotification.title, insertedNotification.message, notification.type, insertedNotification.id, {
+                        course_id: insertedNotification.course_id,
+                        lecture_id: insertedNotification.lecture_id,
+                        exam_id: insertedNotification.exam_id,
+                    });
                     insertedCount++;
                 }
                 catch (insertError) {
@@ -230,6 +239,11 @@ class NotificationService {
                 is_read: notification.is_read,
                 created_at: notification.created_at,
             });
+            enqueueWebPush(userId, title, message, type, notification.id, {
+                course_id: courseId,
+                general_course_id: generalCourseId,
+                lecture_id: lectureId,
+            });
             // Expo Push للموبايل (إضافة فقط)
             ExpoPushService.sendPushNotification(userId, title, message, {
                 type,
@@ -268,6 +282,7 @@ class NotificationService {
                 is_read: notification.is_read,
                 created_at: notification.created_at,
             });
+            enqueueWebPush(userId, title, message, type, notification.id, { task_id: taskId });
             ExpoPushService.sendPushNotification(userId, title, message, {
                 type,
                 task_id: taskId,
@@ -314,6 +329,7 @@ class NotificationService {
                 is_read: notification.is_read,
                 created_at: notification.created_at,
             });
+            enqueueWebPush(userId, title, message, 'teacher_creative_reminder', notification.id, metadata);
             ExpoPushService.sendPushNotification(userId, title, message, {
                 type: 'teacher_creative_reminder',
                 ...metadata,
@@ -405,6 +421,11 @@ class NotificationService {
             };
             const result = await pool_1.default.query(`INSERT INTO notifications (user_id, title, message, type, post_id, comment_id, sender_id) 
          VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`, [userId, title, message, type, postId, commentId, senderId]);
+            enqueueWebPush(userId, title, message, type, result.rows[0].id, {
+                post_id: postId,
+                comment_id: commentId,
+                sender_id: senderId,
+            });
             await (0, utils_1.sendPushNotification)([userId], title, message, {
                 type,
                 post_id: postId,
@@ -1182,6 +1203,11 @@ class NotificationService {
                         video_id: insertedNotification.video_id,
                         is_read: insertedNotification.is_read,
                         created_at: insertedNotification.created_at,
+                    });
+                    enqueueWebPush(studentId, insertedNotification.title, insertedNotification.message, notificationData.type, insertedNotification.id, {
+                        package_id: packageId,
+                        subject_id: notificationData.subject_id,
+                        lesson_id: notificationData.lesson_id,
                     });
                 }
                 catch (insertError) {

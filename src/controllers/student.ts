@@ -278,11 +278,25 @@ router.get(
       return res.status(404).json({ success: false, message: 'Teacher platform not found' });
     }
     const tenant = tenantRes.rows[0];
-    if (!tenant.is_active) {
-      return res.status(403).json({ success: false, message: 'Teacher platform is inactive' });
-    }
     if (!tenant.owner_user_id) {
       return res.status(404).json({ success: false, message: 'Teacher owner not found for platform' });
+    }
+
+    const { TeacherPlatformSubscriptionsService } = await import(
+      '../services/teacherPlatformSubscriptions.js'
+    );
+    const access = await TeacherPlatformSubscriptionsService.getPlatformAccessState(
+      tenant.owner_user_id,
+    );
+    if (!access.allowed) {
+      return res.status(403).json({
+        success: false,
+        code: 'PLATFORM_SUBSCRIPTION_SUSPENDED',
+        message: 'تم إيقاف هذه المنصة لعدم تجديد اشتراك المدرس',
+      });
+    }
+    if (!tenant.is_active) {
+      return res.status(403).json({ success: false, message: 'Teacher platform is inactive' });
     }
     const teacherRes = await pool.query<{ id: number; avatar: string | null }>(
       `SELECT id, avatar
@@ -327,6 +341,7 @@ router.get(
          c.avatar,
          c.grade_id,
          c.created_at,
+         COALESCE(c.is_free, FALSE) AS is_free,
          g.name AS grade_name,
          g.slug AS grade_slug,
          CASE WHEN e.user_id IS NOT NULL THEN true ELSE false END AS is_enrolled
@@ -345,6 +360,7 @@ router.get(
       description: course.description,
       price: course.price,
       avatar: course.avatar,
+      is_free: course.is_free === true,
       grade: course.grade_id
         ? {
             id: course.grade_id,
@@ -353,7 +369,7 @@ router.get(
           }
         : null,
       is_enrolled: Boolean(course.is_enrolled),
-      access_status: course.is_enrolled ? 'open' : 'locked',
+      access_status: course.is_free || course.is_enrolled ? 'open' : 'locked',
       created_at: course.created_at,
     }));
 

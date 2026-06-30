@@ -67,11 +67,11 @@ export async function uploadToBunnyStorage(
 ): Promise<string> {
   const hash = generateHash(16) + '.' + file.ext;
   const url = `https://storage.bunnycdn.com/${STORAGE_ZONE_NAME}/${MEDIA_PATH}/${hash}`;
-  const fileStream = fs.createReadStream(file.path);
 
   try {
     await retryRequest(
       async () => {
+        const fileStream = fs.createReadStream(file.path);
         return axios.put(url, fileStream, {
           headers: {
             AccessKey: BUNNY_ACCESS_KEY,
@@ -87,9 +87,13 @@ export async function uploadToBunnyStorage(
     );
     return `https://${PUBLIC_HOSTNAME}/${MEDIA_PATH}/${hash}`;
   } catch (error: any) {
-    throw new Error(`Failed to upload to Bunny.net: ${error.message}`);
+    const detail =
+      error?.response?.status != null
+        ? `HTTP ${error.response.status}`
+        : error?.message || 'unknown error';
+    throw new Error(`Failed to upload to Bunny.net: ${detail}`);
   } finally {
-    if (file && file.path) {
+    if (file?.path) {
       fs.unlinkSync(file.path);
     }
   }

@@ -1,753 +1,572 @@
-# 📚 توثيق API المساعد العلمي (Scientific Chatbot API)
+# Scientific Chatbot API — المساعد العلمي (RAG)
 
-## نظرة عامة
+توثيق تكامل **شات بوت الدعم العلمي** الحالي في المنصة. النظام يعتمد على **RAG**:
 
-يوفر API المساعد العلمي نظام إجابة على الأسئلة مدعوم بالذكاء الاصطناعي للكورسات. يمكن للمدرسين رفع ملفات محتوى الكورس (نص، markdown)، والتي يتم معالجتها وتخزينها كـ vector embeddings. يمكن للطلاب بعد ذلك طرح أسئلة حول محتوى الكورس والحصول على إجابات مدعومة بالذكاء الاصطناعي بناءً على المواد المرفوعة.
-
-النظام يستخدم:
-- **Vector embeddings** للبحث الدلالي
-- **Milvus** لتخزين المتجهات والبحث عن التشابه
-- **Text chunking** للمعالجة الفعالة
-- **RAG (Retrieval-Augmented Generation)** للحصول على إجابات دقيقة
+1. المدرس يرفع مواد دراسية (نص / Markdown / PDF)
+2. النص يُقسّم ويُحوَّل إلى **embeddings** ويُخزَّن في **Milvus**
+3. الطالب يسأل → يُسترجَع السياق الأقرب → **DeepSeek** (أو **Mistral Pixtral** مع صور) يُجيب من المادة فقط
 
 ---
 
 ## Base URL
 
+```txt
+https://YOUR_API_DOMAIN/api/scientific-chatbot
 ```
+
+تطوير محلي:
+
+```txt
 http://localhost:8000/api/scientific-chatbot
 ```
 
-جميع الـ endpoints تتطلب مصادقة باستخدام Bearer token في Authorization header.
+**المسار في الكود:** `src/routes.ts` → `/scientific-chatbot`
 
 ---
 
-## 🔐 المصادقة
+## المصادقة
 
-جميع الـ endpoints تتطلب مصادقة. قم بتضمين Bearer token في Authorization header:
-
-```
-Authorization: Bearer <your_token>
+```http
+Authorization: Bearer <ACCESS_TOKEN>
 ```
 
-**الأدوار المطلوبة:**
-- **Teacher/Admin**: يمكن رفع الملفات وإدارتها وإعادة تعيين الـ embeddings
-- **Student**: يمكن طرح الأسئلة وعرض سجل المحادثة
+| الدور | الصلاحيات |
+|-------|-----------|
+| `teacher` | رفع/إدارة ملفات كورساته + ملفات على مستوى المدرس |
+| `admin` | إدارة أي كورس؛ يمرّر `teacher_id` عند الحاجة |
+| `student` | طرح أسئلة + سجل المحادثة (بعد الاشتراك) |
 
 ---
 
-## 👨‍🏫 APIs للمدرس/المدير
+## أدوات الذكاء الاصطناعي والبنية
 
-### 1. رفع ملف محتوى الكورس
+| المكوّن | الأداة | الاستخدام |
+|---------|--------|-----------|
+| **Embeddings** | OpenAI (`OPENAI_EMBEDDING_MODEL`) | تحويل النص إلى vectors للبحث |
+| **Vector DB** | Milvus (`course_content_vectors`) | تخزين وبحث أجزاء المحتوى |
+| **إعادة صياغة السؤال** | DeepSeek (`deepseek-chat`) | جعل السؤال مستقلاً عند وجود سياق سابق |
+| **توليد الإجابة (نص)** | DeepSeek (`deepseek-chat`) | RAG answer |
+| **توليد الإجابة (مع صور)** | Mistral Pixtral (`pixtral-12b-2409`) | عند إرفاق صور مع السؤال |
+| **استخراج PDF** | Mistral OCR (`MistralOcrService`) | استخراج نص من ملفات PDF المرفوعة |
 
-قم برفع ملف نصي أو markdown يحتوي على محتوى الكورس. سيتم معالجة الملف وتقسيمه وتخزينه كـ vector embeddings.
+**متغيرات البيئة الشائعة:**
 
-**Endpoint**: `POST /api/scientific-chatbot/courses/:courseId/files`
+```env
+OPENAI_API_KEY=...
+OPENAI_EMBEDDING_MODEL=text-embedding-3-small
+OPENAI_EMBEDDING_DIMENSIONS=1536
+DEEPSEEK_API_KEY=...
+DEEPSEEK_API_URL=https://api.deepseek.com
+MISTRAL_API_KEY=...
+MISTRAL_API_BASE_URL=...
+# + إعدادات Milvus حسب milvusService
+```
 
-**المصادقة**: Teacher أو Admin
+---
 
-**الطلب**:
-- **Method**: `POST`
-- **Content-Type**: `multipart/form-data`
-- **Path Parameters**:
-  - `courseId` (integer, required): معرف الكورس
+## نطاقان للمحتوى والأسئلة
 
-**Form Data**:
-- `file` (file, required): ملف محتوى الكورس
-  - **الأنواع المسموحة**: `.txt`, `.md`, `.pdf`
-  - **الحجم الأقصى**: 10MB
-  - **MIME types**: `text/plain`, `text/markdown`, `application/pdf`
+| النطاق | رفع الملفات | طرح السؤال | السجل |
+|--------|-------------|-------------|--------|
+| **كورس** | `POST /courses/:courseId/files` | `POST /courses/:courseId/ask` | `GET /courses/:courseId/history` |
+| **مدرس (كل مواد المدرس)** | `POST /files` | `POST /teachers/:teacherId/ask` | `GET /teachers/:teacherId/history` |
 
-**Response (201 Created)**:
+> ملفات مستوى المدرس تُخزَّن بـ `course_id = null` وتُفهرَس لجميع كورسات/محتوى ذلك المدرس.
+
+---
+
+## نظرة عامة على المسارات
+
+```http
+# ── محتوى على مستوى المدرس (Teacher/Admin) ──
+POST /files
+GET  /files
+POST /reset-embeddings
+
+# ── محتوى على مستوى الكورس (Teacher/Admin) ──
+POST   /courses/:courseId/files
+GET    /courses/:courseId/files
+POST   /courses/:courseId/reset-embeddings
+DELETE /files/:fileId
+
+# ── طالب — أسئلة على كورس ──
+POST /courses/:courseId/ask
+GET  /courses/:courseId/history
+
+# ── طالب — أسئلة على كل مواد مدرس ──
+POST /teachers/:teacherId/ask
+GET  /teachers/:teacherId/history
+
+# ── مدرس — مراجعة شاتات الطلاب مع AI ──
+GET /teacher/student-chats
+GET /teacher/student-chats/:studentId/messages
+```
+
+---
+
+# 1) المدرس / الأدمن — محتوى على مستوى المدرس
+
+### `POST /files`
+
+رفع ملف مواد علمية **للمدرس** (ليست مربوطة بكورس واحد).
+
+**Auth:** `teacher` | `admin`  
+**Content-Type:** `multipart/form-data`
+
+| Field | الوصف |
+|-------|--------|
+| `file` | `.txt`, `.md`, `.pdf` — حد **10MB** |
+| `teacher_id` | **إلزامي للأدmin** (body أو query: `teacher_id` / `teacherId`) |
+
+**شروط:**
+
+- المدرس يجب أن يملك **كورساً واحداً على الأقل**
+- PDF يُمرَّر على **Mistral OCR** لاستخراج النص
+
+**Response `201`:**
+
 ```json
 {
   "message": "File uploaded and processed successfully",
   "file": {
     "id": 1,
-    "course_id": 5,
+    "course_id": null,
     "teacher_id": 10,
-    "file_name": "lecture-notes.txt",
-    "file_path": "uploads/course-content/scientific-content-1234567890.txt",
+    "file_name": "physics-notes.txt",
+    "file_path": "uploads/course-content/scientific-content-....txt",
     "file_size": 45678,
     "file_type": "text/plain",
-    "content_text": "Course content text...",
-    "uploaded_at": "2024-01-15T10:00:00Z",
-    "updated_at": "2024-01-15T10:00:00Z"
+    "content_text": "...",
+    "uploaded_at": "...",
+    "updated_at": "..."
   }
 }
 ```
 
-**Response (400 Bad Request)**:
+**Response مع تحذير embeddings (الخدمة غير متاحة):**
+
 ```json
 {
-  "error": "No file uploaded"
+  "message": "File saved. Embeddings could not be generated...",
+  "file": { "...": "..." },
+  "warning": "Embedding service (OpenAI) was unavailable..."
 }
-```
-
-**Response (403 Forbidden)**:
-```json
-{
-  "error": "You do not have permission to upload files for this course"
-}
-```
-
-**Response (404 Not Found)**:
-```json
-{
-  "error": "Course not found"
-}
-```
-
-**Response (500 Internal Server Error)**:
-```json
-{
-  "error": "Error uploading file"
-}
-```
-
-**مثال (cURL)**:
-```bash
-curl -X POST "http://localhost:8000/api/scientific-chatbot/courses/5/files" \
-  -H "Authorization: Bearer YOUR_TOKEN" \
-  -F "file=@lecture-notes.txt"
-```
-
-**مثال (JavaScript - Fetch)**:
-```javascript
-const formData = new FormData();
-formData.append('file', fileInput.files[0]);
-
-const response = await fetch('http://localhost:8000/api/scientific-chatbot/courses/5/files', {
-  method: 'POST',
-  headers: {
-    'Authorization': 'Bearer YOUR_TOKEN'
-  },
-  body: formData
-});
-
-const data = await response.json();
-console.log(data);
-```
-
-**مثال (JavaScript - Axios)**:
-```javascript
-const axios = require('axios');
-const FormData = require('form-data');
-const fs = require('fs');
-
-const form = new FormData();
-form.append('file', fs.createReadStream('lecture-notes.txt'));
-
-const response = await axios.post(
-  'http://localhost:8000/api/scientific-chatbot/courses/5/files',
-  form,
-  {
-    headers: {
-      'Authorization': 'Bearer YOUR_TOKEN',
-      ...form.getHeaders()
-    }
-  }
-);
-
-console.log(response.data);
 ```
 
 ---
 
-### 2. عرض ملفات محتوى الكورس
+### `GET /files`
 
-الحصول على قائمة بجميع الملفات المرفوعة لكورس محدد.
+قائمة ملفات المدرس.
 
-**Endpoint**: `GET /api/scientific-chatbot/courses/:courseId/files`
+**Query (admin):** `teacher_id` أو `teacherId`
 
-**المصادقة**: Teacher أو Admin
+**Response `200`:**
 
-**الطلب**:
-- **Method**: `GET`
-- **Path Parameters**:
-  - `courseId` (integer, required): معرف الكورس
-
-**Response (200 OK)**:
 ```json
-{
-  "files": [
-    {
-      "id": 1,
-      "course_id": 5,
-      "teacher_id": 10,
-      "file_name": "lecture-notes.txt",
-      "file_path": "uploads/course-content/scientific-content-1234567890.txt",
-      "file_size": 45678,
-      "file_type": "text/plain",
-      "content_text": "Course content text...",
-      "uploaded_at": "2024-01-15T10:00:00Z",
-      "updated_at": "2024-01-15T10:00:00Z"
-    },
-    {
-      "id": 2,
-      "course_id": 5,
-      "teacher_id": 10,
-      "file_name": "chapter-2.md",
-      "file_path": "uploads/course-content/scientific-content-1234567891.md",
-      "file_size": 23456,
-      "file_type": "text/markdown",
-      "content_text": "# Chapter 2\n\nContent...",
-      "uploaded_at": "2024-01-16T14:30:00Z",
-      "updated_at": "2024-01-16T14:30:00Z"
-    }
-  ]
-}
-```
-
-**Response (403 Forbidden)**:
-```json
-{
-  "error": "You do not have permission to view files for this course"
-}
-```
-
-**Response (404 Not Found)**:
-```json
-{
-  "error": "Course not found"
-}
-```
-
-**مثال (cURL)**:
-```bash
-curl -X GET "http://localhost:8000/api/scientific-chatbot/courses/5/files" \
-  -H "Authorization: Bearer YOUR_TOKEN"
-```
-
-**مثال (JavaScript - Fetch)**:
-```javascript
-const response = await fetch('http://localhost:8000/api/scientific-chatbot/courses/5/files', {
-  method: 'GET',
-  headers: {
-    'Authorization': 'Bearer YOUR_TOKEN'
-  }
-});
-
-const data = await response.json();
-console.log(data.files);
+{ "files": [ /* CourseContentFile[] */ ] }
 ```
 
 ---
 
-### 3. حذف ملف محتوى الكورس
+### `POST /reset-embeddings`
 
-حذف ملف محتوى الكورس والـ embeddings المرتبطة به.
+إعادة توليد embeddings **لجميع** ملفات المدرس (مستوى المدرس + يمكن استخدامه بعد عودة OpenAI/Milvus).
 
-**Endpoint**: `DELETE /api/scientific-chatbot/files/:fileId`
+**Body/Query (admin):** `teacher_id`
 
-**المصادقة**: Teacher أو Admin
+**Response `200`:**
 
-**الطلب**:
-- **Method**: `DELETE`
-- **Path Parameters**:
-  - `fileId` (integer, required): معرف الملف المراد حذفه
-
-**Response (200 OK)**:
 ```json
-{
-  "message": "File deleted successfully"
-}
-```
-
-**Response (403 Forbidden)**:
-```json
-{
-  "error": "You do not have permission to delete this file"
-}
-```
-
-**Response (404 Not Found)**:
-```json
-{
-  "error": "File not found"
-}
-```
-
-**مثال (cURL)**:
-```bash
-curl -X DELETE "http://localhost:8000/api/scientific-chatbot/files/1" \
-  -H "Authorization: Bearer YOUR_TOKEN"
-```
-
-**مثال (JavaScript - Fetch)**:
-```javascript
-const response = await fetch('http://localhost:8000/api/scientific-chatbot/files/1', {
-  method: 'DELETE',
-  headers: {
-    'Authorization': 'Bearer YOUR_TOKEN'
-  }
-});
-
-const data = await response.json();
-console.log(data);
+{ "message": "Embeddings reset successfully" }
 ```
 
 ---
 
-### 4. إعادة تعيين الـ Embeddings للكورس
+# 2) المدرس / الأدمن — محتوى على مستوى الكورس
 
-حذف جميع الـ embeddings للكورس وإعادة توليدها من الملفات المرفوعة. مفيد عندما تريد إعادة معالجة جميع المحتويات.
+### `POST /courses/:courseId/files`
 
-**Endpoint**: `POST /api/scientific-chatbot/courses/:courseId/reset-embeddings`
+**Auth:** `teacher` (مالك الكورس) | `admin`
 
-**المصادقة**: Teacher أو Admin
+**Form:** `file` — `.txt`, `.md`, `.pdf` — **10MB**
 
-**الطلب**:
-- **Method**: `POST`
-- **Path Parameters**:
-  - `courseId` (integer, required): معرف الكورس
+**Response `201`:** مثل `/files` لكن `course_id` = معرف الكورس
 
-**Response (200 OK)**:
-```json
-{
-  "message": "Embeddings reset successfully"
-}
-```
+**أخطاء:**
 
-**Response (403 Forbidden)**:
-```json
-{
-  "error": "You do not have permission to reset embeddings for this course"
-}
-```
-
-**Response (404 Not Found)**:
-```json
-{
-  "error": "Course not found"
-}
-```
-
-**مثال (cURL)**:
-```bash
-curl -X POST "http://localhost:8000/api/scientific-chatbot/courses/5/reset-embeddings" \
-  -H "Authorization: Bearer YOUR_TOKEN"
-```
-
-**مثال (JavaScript - Fetch)**:
-```javascript
-const response = await fetch('http://localhost:8000/api/scientific-chatbot/courses/5/reset-embeddings', {
-  method: 'POST',
-  headers: {
-    'Authorization': 'Bearer YOUR_TOKEN'
-  }
-});
-
-const data = await response.json();
-console.log(data);
-```
+| HTTP | السبب |
+|------|--------|
+| `403` | المدرس ليس مالك الكورس |
+| `404` | الكورس غير موجود |
 
 ---
 
-## 👨‍🎓 APIs للطالب
+### `GET /courses/:courseId/files`
 
-### 5. طرح سؤال
+**Response `200`:** `{ "files": [...] }`
 
-اطرح سؤالاً حول محتوى الكورس. سيبحث النظام عن أجزاء المحتوى ذات الصلة ويولد إجابة.
+---
 
-**Endpoint**: `POST /api/scientific-chatbot/courses/:courseId/ask`
+### `POST /courses/:courseId/reset-embeddings`
 
-**المصادقة**: Student
+حذف embeddings الكورس وإعادة توليدها من الملفات الحالية.
 
-**الطلب**:
-- **Method**: `POST`
-- **Content-Type**: `application/json`
-- **Path Parameters**:
-  - `courseId` (integer, required): معرف الكورس
+---
 
-**Request Body**:
+### `DELETE /files/:fileId`
+
+حذف ملف وembeddings المرتبطة.
+
+**Response `200`:**
+
 ```json
 {
-  "question": "What is the main topic of chapter 2?"
+  "message": "File deleted successfully",
+  "warning": "Vector index (Milvus) was unavailable..." 
 }
 ```
 
-**حقول Request Body**:
-- `question` (string, required): السؤال المراد طرحه حول محتوى الكورس
-  - يجب أن يكون نصاً غير فارغ
-  - سيتم إزالة المسافات الزائدة
+(`warning` اختياري إذا Milvus غير متاح)
 
-**Response (200 OK)**:
+---
+
+# 3) الطالب — أسئلة على **كورس**
+
+### `POST /courses/:courseId/ask`
+
+**Auth:** `student`  
+**Content-Type:** `multipart/form-data` (ليس JSON)
+
+| Field | إلزامي | الوصف |
+|-------|--------|--------|
+| `question` | نعم | نص السؤال |
+| `images` | لا | حتى **5** صور — `image/*` — **5MB** لكل صورة |
+
+**شروط الوصول:**
+
+- الطالب **مشترك** في الكورس (`enrollments`)
+- الكورس فيه **محتوى مرفوع**
+
+**Response `200`:**
+
 ```json
 {
-  "answer": "Chapter 2 covers the fundamentals of quantum mechanics, including wave-particle duality and the uncertainty principle...",
+  "answer": "الإجابة بالعربية أو الإنجليزية حسب لغة السؤال...",
   "retrieved_chunks": [
     {
-      "id": "123",
-      "content": "Chapter 2: Quantum Mechanics Fundamentals\n\nWave-particle duality is a fundamental concept...",
-      "file_id": 1,
-      "chunk_index": 5,
-      "similarity_score": 0.89
-    },
-    {
-      "id": "124",
-      "content": "The uncertainty principle, formulated by Heisenberg, states that...",
-      "file_id": 1,
-      "chunk_index": 6,
-      "similarity_score": 0.85
+      "chunk_text": "نص الجزء المسترجع من المادة...",
+      "file_id": 12,
+      "chunk_index": 4
     }
   ]
 }
 ```
 
-**حقول Response**:
-- `answer` (string): الإجابة المولدة بالذكاء الاصطناعي للسؤال
-- `retrieved_chunks` (array): مصفوفة أجزاء المحتوى ذات الصلة المستخدمة لتوليد الإجابة
-  - `id` (string): معرف فريد للجزء
-  - `content` (string): المحتوى النصي للجزء
-  - `file_id` (number): معرف الملف المصدر
-  - `chunk_index` (number): فهرس الجزء داخل الملف
-  - `similarity_score` (number): درجة التشابه (0-1) تشير إلى الصلة
+**أخطاء:**
 
-**Response (400 Bad Request)**:
-```json
-{
-  "error": "Question is required"
-}
-```
+| HTTP | Body |
+|------|------|
+| `400` | `{ "error": "Question is required" }` |
+| `403` | `{ "error": "You must be subscribed to this course to ask about its content." }` |
+| `404` | `{ "error": "This course does not have uploaded content yet..." }` |
+| `503` | `{ "error": "Answer service is temporarily unavailable..." }` |
+| `500` | خطأ عام |
 
-**Response (404 Not Found)**:
-```json
-{
-  "error": "This course does not have uploaded content yet. Please ask your teacher to upload course materials."
-}
-```
+**مثال curl:**
 
-**Response (500 Internal Server Error)**:
-```json
-{
-  "error": "Error answering question"
-}
-```
-
-**مثال (cURL)**:
 ```bash
 curl -X POST "http://localhost:8000/api/scientific-chatbot/courses/5/ask" \
-  -H "Authorization: Bearer YOUR_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "question": "What is the main topic of chapter 2?"
-  }'
-```
-
-**مثال (JavaScript - Fetch)**:
-```javascript
-const response = await fetch('http://localhost:8000/api/scientific-chatbot/courses/5/ask', {
-  method: 'POST',
-  headers: {
-    'Authorization': 'Bearer YOUR_TOKEN',
-    'Content-Type': 'application/json'
-  },
-  body: JSON.stringify({
-    question: 'What is the main topic of chapter 2?'
-  })
-});
-
-const data = await response.json();
-console.log('Answer:', data.answer);
-console.log('Retrieved chunks:', data.retrieved_chunks);
-```
-
-**مثال (JavaScript - Axios)**:
-```javascript
-const axios = require('axios');
-
-const response = await axios.post(
-  'http://localhost:8000/api/scientific-chatbot/courses/5/ask',
-  {
-    question: 'What is the main topic of chapter 2?'
-  },
-  {
-    headers: {
-      'Authorization': 'Bearer YOUR_TOKEN',
-      'Content-Type': 'application/json'
-    }
-  }
-);
-
-console.log('Answer:', response.data.answer);
-console.log('Retrieved chunks:', response.data.retrieved_chunks);
+  -H "Authorization: Bearer STUDENT_TOKEN" \
+  -F "question=ما هو قانون نيوتن الثاني؟" \
+  -F "images=@diagram.png"
 ```
 
 ---
 
-### 6. الحصول على سجل المحادثة
+### `GET /courses/:courseId/history`
 
-استرجاع سجل المحادثة (الأسئلة والإجابات) لكورس محدد.
+**Query:**
 
-**Endpoint**: `GET /api/scientific-chatbot/courses/:courseId/history`
+| Param | Default | الوصف |
+|-------|---------|--------|
+| `limit` | `50` | عدد الرسائل |
+| `beforeId` | — | pagination (id أصغر) |
 
-**المصادقة**: Student
+**Response `200`:**
 
-**الطلب**:
-- **Method**: `GET`
-- **Path Parameters**:
-  - `courseId` (integer, required): معرف الكورس
-
-**Query Parameters**:
-- `limit` (integer, optional, default: 50): الحد الأقصى لعدد الرسائل المراد استرجاعها
-- `beforeId` (integer, optional): استرجاع الرسائل قبل معرف الرسالة هذا (للـ pagination)
-
-**Response (200 OK)**:
 ```json
 {
   "history": [
     {
-      "id": 10,
-      "student_id": 5,
+      "id": 150,
+      "student_id": 123,
       "course_id": 5,
-      "question": "What is the main topic of chapter 2?",
-      "rewritten_question": "What is the main topic of chapter 2?",
-      "answer": "Chapter 2 covers the fundamentals of quantum mechanics...",
-      "retrieved_chunks": [
-        {
-          "id": "123",
-          "content": "Chapter 2: Quantum Mechanics Fundamentals...",
-          "file_id": 1,
-          "chunk_index": 5,
-          "similarity_score": 0.89
-        }
-      ],
-      "created_at": "2024-01-15T10:30:00Z"
-    },
-    {
-      "id": 9,
-      "student_id": 5,
-      "course_id": 5,
-      "question": "Explain wave-particle duality",
-      "rewritten_question": "Explain wave-particle duality",
-      "answer": "Wave-particle duality is a fundamental concept in quantum mechanics...",
-      "retrieved_chunks": [
-        {
-          "id": "124",
-          "content": "Wave-particle duality is a fundamental concept...",
-          "file_id": 1,
-          "chunk_index": 6,
-          "similarity_score": 0.92
-        }
-      ],
-      "created_at": "2024-01-15T09:15:00Z"
+      "teacher_id": 10,
+      "question": "ما هو...",
+      "rewritten_question": "ما هو قانون نيوتن الثاني؟",
+      "answer": "...",
+      "retrieved_chunks": [ /* ... */ ],
+      "images": ["uploads/chat-images/chat-image-....png"],
+      "created_at": "2026-06-16T12:00:00.000Z"
     }
   ]
 }
 ```
 
-**حقول Response**:
-- `history` (array): مصفوفة رسائل المحادثة، مرتبة من الأحدث إلى الأقدم
-  - `id` (number): معرف الرسالة الفريد
-  - `student_id` (number): معرف الطالب الذي طرح السؤال
-  - `course_id` (number): معرف الكورس
-  - `question` (string): السؤال الأصلي
-  - `rewritten_question` (string | null): النسخة المعاد كتابتها/المحسنة من السؤال (إن وجدت)
-  - `answer` (string): الإجابة المولدة بالذكاء الاصطناعي
-  - `retrieved_chunks` (array): مصفوفة أجزاء المحتوى ذات الصلة المستخدمة
-  - `created_at` (string): طابع زمني ISO 8601 لوقت إنشاء الرسالة
+> الترتيب في الاستجابة: **من الأقدم للأحدث** داخل الصفحة.
 
-**Response (500 Internal Server Error)**:
+---
+
+# 4) الطالب — أسئلة على **كل مواد مدرس**
+
+### `POST /teachers/:teacherId/ask`
+
+يبحث في **كل** ملفات المدرس (كورسات + ملفات مستوى المدرس).
+
+**Auth:** `student`  
+**Content-Type:** `multipart/form-data`
+
+| Field | إلزامي |
+|-------|--------|
+| `question` | نعم |
+| `images` | لا (حتى 5) |
+
+**شروط:**
+
+- الطالب مشترك في **كورس واحد على الأقل** لهذا المدرس
+- المدرس لديه **ملفات مرفوعة**
+
+**Response `200`:** نفس شكل `/courses/:courseId/ask`
+
+**أخطاء إضافية:**
+
+| HTTP | Body |
+|------|------|
+| `403` | `{ "error": "You must be subscribed to at least one course with this teacher." }` |
+
+---
+
+### `GET /teachers/:teacherId/history`
+
+سجل أسئلة الطالب مع هذا المدرس (`course_id IS NULL` في السجل).
+
+**Query:** `limit`, `beforeId` — نفس الكورس.
+
+---
+
+# 5) المدرس — مراجعة شاتات الطلاب مع AI
+
+يسمح للمدرس بمتابعة أسئلة الطلاب وردود الـ AI للمراجعة والتدقيق.
+
+### `GET /teacher/student-chats`
+
+قائمة مختصرة بمحادثات الطلاب (آخر سؤال/رد + عدد الرسائل).
+
+**Auth:** `teacher` | `admin`
+
+**Query:**
+
+| Param | الوصف |
+|-------|--------|
+| `courseId` | فلترة على كورس معيّن |
+| `scope=teacher` | محادثات نطاق المدرس العام فقط (`course_id IS NULL`) |
+| `studentId` | فلترة على طالب معيّن |
+| `limit` | default `30` |
+| `offset` | default `0` |
+| `teacher_id` | **للأدmin فقط** |
+
+**Response `200`:**
+
 ```json
 {
-  "error": "Error getting chat history"
+  "chats": [
+    {
+      "student_id": 14,
+      "student_name": "أحمد محمد",
+      "student_avatar": "https://...",
+      "course_id": 1,
+      "course_name": "كيمياء 3ث",
+      "message_count": 5,
+      "last_question": "ما هي العناصر الانتقالية؟",
+      "last_answer": "العناصر الانتقالية هي...",
+      "last_at": "2026-06-16T20:47:00.000Z"
+    }
+  ]
 }
 ```
 
-**مثال (cURL)**:
+---
+
+### `GET /teacher/student-chats/:studentId/messages`
+
+تفاصيل المحادثة الكاملة (كل الأسئلة + ردود AI + المصادر المسترجعة).
+
+**Auth:** `teacher` | `admin`
+
+**Query:**
+
+| Param | الوصف |
+|-------|--------|
+| `courseId` | كورس معيّن |
+| `scope=teacher` | محادثات نطاق المدرس العام |
+| `limit` | default `50` |
+| `beforeId` | pagination |
+| `teacher_id` | **للأدmin** |
+
+**Response `200`:**
+
+```json
+{
+  "messages": [
+    {
+      "id": 120,
+      "student_id": 14,
+      "course_id": 1,
+      "teacher_id": 5,
+      "question": "ما هي العناصر الانتقالية؟",
+      "rewritten_question": "ما هي العناصر الانتقالية في الجدول الدوري؟",
+      "answer": "...",
+      "retrieved_chunks": [
+        { "chunk_text": "...", "file_id": 36, "chunk_index": 2 }
+      ],
+      "images": [],
+      "created_at": "2026-06-16T20:47:00.000Z",
+      "student_name": "أحمد محمد",
+      "student_avatar": "https://...",
+      "course_name": "كيمياء 3ث"
+    }
+  ]
+}
+```
+
+**أخطاء:** `403` — لا صلاحية | `400` — معرف غير صالح
+
+> **ملاحظة:** تُحفظ في السجل المحادثات التي تم فيها توليد إجابة فعلية. رسائل "الخدمة غير متاحة" لا تُسجَّل حالياً.
+
+---
+
+# 6) آلية الإجابة (RAG Pipeline)
+
+```mermaid
+sequenceDiagram
+  participant S as Student
+  participant API as scientific-chatbot
+  participant DS as DeepSeek
+  participant OAI as OpenAI Embeddings
+  participant M as Milvus
+
+  S->>API: POST /ask (question + optional images)
+  API->>DS: rewriteQuestion (if prior context)
+  API->>OAI: embed rewritten question
+  API->>M: search top 3 similar chunks
+  alt with images
+    API->>API: Mistral Pixtral + RAG prompt
+  else text only
+    API->>DS: deepseek-chat + RAG prompt
+  end
+  API->>API: save scientific_chat_history
+  API-->>S: answer + retrieved_chunks
+```
+
+**قواعد الإجابة:**
+
+- الإجابة **من المادة المسترجعة فقط**
+- نفس **لغة** سؤال الطالب
+- إن لم يُوجَد سياق: `"لا يمكنني العثور على هذه المعلومات في مواد الدورة التدريبية."`
+
+---
+
+# 7) معالجة الملفات
+
+| الخطوة | التفاصيل |
+|--------|----------|
+| رفع | `uploads/course-content/` |
+| PDF | Mistral OCR → نص |
+| txt/md | قراءة UTF-8 |
+| Chunking | 500 حرف، تداخل 15% |
+| Embedding | OpenAI → Milvus |
+| Fallback | الملف يُحفظ في DB حتى لو فشل embedding؛ استخدم `reset-embeddings` لاحقاً |
+
+---
+
+# 8) أمثلة `curl` سريعة
+
+### مدرس — رفع ملف لكورس
+
 ```bash
-# الحصول على آخر 50 رسالة
-curl -X GET "http://localhost:8000/api/scientific-chatbot/courses/5/history" \
-  -H "Authorization: Bearer YOUR_TOKEN"
-
-# الحصول على آخر 20 رسالة
-curl -X GET "http://localhost:8000/api/scientific-chatbot/courses/5/history?limit=20" \
-  -H "Authorization: Bearer YOUR_TOKEN"
-
-# الحصول على الرسائل قبل معرف الرسالة 10 (pagination)
-curl -X GET "http://localhost:8000/api/scientific-chatbot/courses/5/history?limit=20&beforeId=10" \
-  -H "Authorization: Bearer YOUR_TOKEN"
+curl -X POST "http://localhost:8000/api/scientific-chatbot/courses/5/files" \
+  -H "Authorization: Bearer TEACHER_TOKEN" \
+  -F "file=@notes.txt"
 ```
 
-**مثال (JavaScript - Fetch)**:
-```javascript
-// الحصول على آخر 50 رسالة
-const response = await fetch('http://localhost:8000/api/scientific-chatbot/courses/5/history', {
-  method: 'GET',
-  headers: {
-    'Authorization': 'Bearer YOUR_TOKEN'
-  }
-});
+### مدرس — رفع ملف على مستوى المدرس
 
-const data = await response.json();
-console.log('Chat history:', data.history);
-
-// الحصول على آخر 20 رسالة مع pagination
-const response2 = await fetch('http://localhost:8000/api/scientific-chatbot/courses/5/history?limit=20&beforeId=10', {
-  method: 'GET',
-  headers: {
-    'Authorization': 'Bearer YOUR_TOKEN'
-  }
-});
-
-const data2 = await response2.json();
-console.log('More history:', data2.history);
+```bash
+curl -X POST "http://localhost:8000/api/scientific-chatbot/files" \
+  -H "Authorization: Bearer TEACHER_TOKEN" \
+  -F "file=@general-physics.pdf"
 ```
 
----
+### أدmin — رفع لمدرس معيّن
 
-## ⚠️ استجابات الأخطاء
-
-جميع الـ endpoints قد ترجع استجابات الأخطاء التالية:
-
-### 400 Bad Request
-```json
-{
-  "error": "Error message describing what went wrong"
-}
+```bash
+curl -X POST "http://localhost:8000/api/scientific-chatbot/files?teacher_id=10" \
+  -H "Authorization: Bearer ADMIN_TOKEN" \
+  -F "file=@notes.txt"
 ```
 
-### 401 Unauthorized
-```json
-{
-  "error": "Unauthorized"
-}
+### طالب — سؤال على كورس
+
+```bash
+curl -X POST "http://localhost:8000/api/scientific-chatbot/courses/5/ask" \
+  -H "Authorization: Bearer STUDENT_TOKEN" \
+  -F "question=اشرح قانون أوم"
 ```
 
-### 403 Forbidden
-```json
-{
-  "error": "You do not have permission to perform this action"
-}
-```
+### طالب — سؤال على كل مواد المدرس
 
-### 404 Not Found
-```json
-{
-  "error": "Resource not found"
-}
-```
-
-### 500 Internal Server Error
-```json
-{
-  "error": "Error message describing the server error"
-}
+```bash
+curl -X POST "http://localhost:8000/api/scientific-chatbot/teachers/10/ask" \
+  -H "Authorization: Bearer STUDENT_TOKEN" \
+  -F "question=ما الفرق بين التيار والجهد؟"
 ```
 
 ---
 
-## 🔧 التفاصيل التقنية
+# 9) الفرق بين الشات بوتات في المنصة
 
-### معالجة الملفات
-
-1. **رفع الملف**: يتم رفع الملفات عبر multipart/form-data
-2. **استخراج النص**: يتم استخراج المحتوى من الملف
-3. **التقسيم**: يتم تقسيم النص إلى أجزاء (افتراضي: 500 حرف مع تداخل 15%)
-4. **توليد الـ Embedding**: يتم تحويل كل جزء إلى vector embedding
-5. **التخزين**: يتم تخزين الـ embeddings في قاعدة بيانات Milvus
-
-### عملية الإجابة على الأسئلة
-
-1. **معالجة السؤال**: يتم استقبال سؤال الطالب
-2. **إعادة كتابة السؤال** (اختياري): قد يتم إعادة كتابة السؤال للبحث الأفضل
-3. **توليد الـ Embedding**: يتم تحويل السؤال إلى vector embedding
-4. **البحث عن التشابه**: يبحث Milvus عن أجزاء المحتوى المشابهة
-5. **استرجاع السياق**: يتم استرجاع أهم الأجزاء ذات الصلة
-6. **توليد الإجابة**: يولد نموذج ذكاء اصطناعي إجابة بناءً على السياق المسترجع
-7. **الاستجابة**: يتم إرجاع الإجابة والأجزاء المسترجعة للطالب
-
-### قاعدة بيانات المتجهات
-
-- **اسم المجموعة**: `course_content_vectors`
-- **البعد**: يتم تحديده بواسطة نموذج الـ embedding (عادة 384 أو 768)
-- **نوع المقياس**: Inner Product (IP)
-- **مستوى الاتساق**: Bounded
-
-### استراتيجية التقسيم
-
-- **حجم الجزء**: 500 حرف
-- **تداخل الأجزاء**: 15% (75 حرف)
-- **الغرض**: يضمن الحفاظ على السياق عبر حدود الأجزاء
+| | **المساعد العلمي** | **دعم فني** (`/support`) | **محلل البيانات** |
+|--|-------------------|--------------------------|-------------------|
+| **الهدف** | أسئلة علمية من المادة | مشاكل تقنية + تقارير مدرس | تحليل أداء الطلاب |
+| **المستخدم** | طالب (سؤال) + مدرس (رفع) | طالب/مدرس/ضيف | مدرس |
+| **المصدر** | ملفات RAG | بيانات المنصة + DeepSeek | SQL + DeepSeek |
+| **صور مع السؤال** | ✅ (Mistral) | ❌ (دعم فني) | ❌ |
 
 ---
 
-## 💡 أفضل الممارسات
+## الملفات المصدرية
 
-### للمدرسين
-
-1. **تنسيق الملف**: استخدم ملفات نصية عادية (`.txt`) أو Markdown (`.md`) للحصول على أفضل النتائج
-2. **حجم الملف**: حافظ على الملفات أقل من 10MB للمعالجة المثلى
-3. **جودة المحتوى**: تأكد من أن المحتوى المرفوع منظم جيداً وذو صلة
-4. **ملفات متعددة**: ارفع عدة ملفات صغيرة بدلاً من ملف كبير واحد لتنظيم أفضل
-5. **إعادة تعيين الـ Embeddings**: استخدم endpoint إعادة تعيين الـ embeddings إذا قمت بتحديث محتوى الكورس
-
-### للطلاب
-
-1. **أسئلة واضحة**: اطرح أسئلة محددة وواضحة للحصول على إجابات أفضل
-2. **السياق**: أشر إلى فصول أو مواضيع محددة عند الإمكان
-3. **المتابعة**: استخدم سجل المحادثة لطرح أسئلة متابعة
-4. **مراجعة الأجزاء**: راجع الأجزاء المسترجعة لفهم مصدر الإجابة
+| الملف | الدور |
+|--------|--------|
+| `src/controllers/scientificChatbot.ts` | مسارات HTTP |
+| `src/services/scientificChatbot.ts` | RAG، Milvus، حفظ السجل |
+| `src/services/embeddingService.ts` | OpenAI embeddings |
+| `src/services/milvusService.ts` | Vector search |
+| `src/services/mistralOcr.ts` | استخراج PDF |
+| `migrations/1700000000960_create_scientific_chatbot_tables.sql` | جداول أساسية |
+| `migrations/1772107203678_add_images_to_scientific_chat_history.sql` | صور في السجل |
+| `migrations/1772108800000_update_scientific_chatbot_for_teachers.sql` | نطاق المدرس |
 
 ---
 
-## ⚙️ القيود
+## توثيق إضافي (قديم / جزئي)
 
-1. **أنواع الملفات**: يدعم حالياً ملفات `.txt` و `.md` و `.pdf` (دعم PDF قد يكون محدوداً)
-2. **حجم الملف**: الحد الأقصى لحجم الملف هو 10MB
-3. **اللغة**: محسّن لمحتوى العربية والإنجليزية
-4. **اعتماد Milvus**: يتطلب تكوين Milvus وتشغيله
-5. **نموذج الـ Embedding**: يعتمد على خدمة الـ embedding المكونة
+- [`scientific-chatbot-students-api.md`](./scientific-chatbot-students-api.md) — تركيز على الطالب (إنجليزي)
+- [`scientific-chatbot-teachers-api.md`](./scientific-chatbot-teachers-api.md) — تركيز على المدرس (إنجليزي)
 
----
-
-## 🐛 استكشاف الأخطاء
-
-### المشكلة: "This course does not have uploaded content yet"
-
-**الحل**: يحتاج المدرس إلى رفع ملفات محتوى الكورس أولاً باستخدام endpoint الرفع.
-
-### المشكلة: "Error uploading file"
-
-**الأسباب المحتملة**:
-- حجم الملف يتجاوز 10MB
-- نوع الملف غير مدعوم
-- Milvus غير مكون أو غير قيد التشغيل
-- خدمة الـ embedding غير متاحة
-
-**الحل**: 
-- تحقق من حجم الملف ونوعه
-- تحقق من تكوين Milvus
-- راجع سجلات الخادم للحصول على رسائل الخطأ التفصيلية
-
-### المشكلة: الإجابات غير دقيقة
-
-**الأسباب المحتملة**:
-- محتوى الكورس غير شامل
-- السؤال غامض جداً
-- تحتاج الـ embeddings إلى إعادة توليد
-
-**الحل**:
-- تأكد من أن محتوى الكورس كامل ومنظم جيداً
-- اطرح أسئلة أكثر تحديداً
-- جرب إعادة تعيين الـ embeddings باستخدام endpoint الإعادة
+> **هذا الملف** هو المرجع الموحّد المحدّث لجميع الـ APIs الحالية.
 
 ---
 
-## 📚 التوثيق ذو الصلة
-
-- [Milvus Service Documentation](./milvus-service.md)
-- [Embedding Service Documentation](./embedding-service.md)
-- [Authentication Guide](./authentication.md)
-- [Course API Documentation](./courses-api.md)
-
----
-
-## 🆘 الدعم
-
-للأسئلة أو المشاكل، يرجى الاتصال بفريق التطوير أو مراجعة سجلات الخادم للحصول على رسائل الخطأ التفصيلية.
-
----
-
-**آخر تحديث:** 2024-01-15
+*آخر تحديث يتوافق مع `src/controllers/scientificChatbot.ts` و`src/services/scientificChatbot.ts`.*

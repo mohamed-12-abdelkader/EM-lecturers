@@ -86,12 +86,42 @@ export const UpdateSubjectSchema = z.object({
   is_active: z.boolean().optional(),
 });
 
+// Subject Book Schema
+export const SubjectBookSchema = z.object({
+  id: z.number(),
+  subject_id: z.number(),
+  name: z.string().min(1, 'اسم الكتاب مطلوب'),
+  description: z.string().optional(),
+  image_url: z.string().optional(),
+  order_num: z.number().min(1).default(1),
+  is_active: z.boolean().default(true),
+  created_at: z.date(),
+  updated_at: z.date(),
+});
+
+export const CreateSubjectBookSchema = z.object({
+  name: z.string().min(1, 'اسم الكتاب مطلوب'),
+  description: z.string().optional(),
+  image_url: z.string().optional(),
+  order_num: z.coerce.number().min(1).optional(),
+  is_active: z.boolean().default(true),
+});
+
+export const UpdateSubjectBookSchema = z.object({
+  name: z.string().min(1, 'اسم الكتاب مطلوب').optional(),
+  description: z.string().optional(),
+  image_url: z.string().optional(),
+  order_num: z.coerce.number().min(1).optional(),
+  is_active: z.boolean().optional(),
+});
+
 // Chapter Schema
 export const ChapterSchema = z.object({
   id: z.number(),
   name: z.string().min(1, 'اسم الفصل مطلوب'),
   description: z.string().optional(),
   subject_id: z.number(),
+  book_id: z.number().optional(),
   question_bank_id: z.number(),
   order: z.number().min(1, 'ترتيب الفصل مطلوب'),
   is_active: z.boolean().default(true),
@@ -217,6 +247,9 @@ export type UpdateQuestionBank = z.infer<typeof UpdateQuestionBankSchema>;
 export type Subject = z.infer<typeof SubjectSchema>;
 export type CreateSubject = z.infer<typeof CreateSubjectSchema>;
 export type UpdateSubject = z.infer<typeof UpdateSubjectSchema>;
+export type SubjectBook = z.infer<typeof SubjectBookSchema>;
+export type CreateSubjectBook = z.infer<typeof CreateSubjectBookSchema>;
+export type UpdateSubjectBook = z.infer<typeof UpdateSubjectBookSchema>;
 export type Chapter = z.infer<typeof ChapterSchema>;
 export type CreateChapter = z.infer<typeof CreateChapterSchema>;
 export type UpdateChapter = z.infer<typeof UpdateChapterSchema>;

@@ -10,6 +10,9 @@ const authentication_1 = require("../middleware/authentication");
 const utils_1 = require("../utils");
 const questionBankV2_1 = require("../services/questionBankV2");
 const questionBankV2_2 = require("../db/types/questionBankV2");
+const questionExtractionImport_1 = require("../services/questionExtractionImport");
+const mistralQuestionExtraction_1 = require("../types/mistralQuestionExtraction");
+const zod_1 = require("zod");
 const multer_1 = __importDefault(require("multer"));
 const path_1 = __importDefault(require("path"));
 const fs_1 = __importDefault(require("fs"));
@@ -253,6 +256,47 @@ exports.router.post('/lesson/:lessonId/questions/image-only-bulk', (0, authentic
             ? `تمت إضافة ${result.added} سؤال بنجاح`
             : `تمت إضافة ${result.added} سؤال، وفشل ${result.failed}`,
         data: result,
+    });
+}));
+// ============================================
+// 4b. استيراد أسئلة مستخرجة بالـ AI (OCR) إلى الدرس
+// ============================================
+exports.router.post('/lesson/:lessonId/import-extraction', (0, authentication_1.authMiddleware)(['teacher', 'admin', 'employee']), (0, permissions_1.checkPermission)('question_bank_management'), (0, utils_1.asyncWrapper)(async (req, res) => {
+    const lessonId = parseInt(req.params.lessonId);
+    if (isNaN(lessonId) || lessonId <= 0) {
+        return res.status(400).json({
+            success: false,
+            message: 'معرف الدرس غير صحيح',
+        });
+    }
+    let payload;
+    try {
+        payload = (0, mistralQuestionExtraction_1.parseQuestionExtractionImportPayload)(req.body);
+        mistralQuestionExtraction_1.MistralQuestionExtractionSchema.parse(payload.extraction);
+    }
+    catch (error) {
+        if (error instanceof zod_1.z.ZodError) {
+            return res.status(400).json({
+                success: false,
+                message: 'Validation failed',
+                errors: error.errors,
+            });
+        }
+        return res.status(400).json({
+            success: false,
+            message: 'صيغة بيانات الاستخراج غير صحيحة — أرسل ناتج extract-questions كما هو (data) أو { extraction: ... }',
+        });
+    }
+    const result = await questionExtractionImport_1.QuestionExtractionImportService.importToQuestionBankV2({
+        lessonId,
+        teacherId: req.user.id,
+        userRole: req.user.role,
+        extraction: payload.extraction,
+    });
+    return res.status(201).json({
+        success: true,
+        message: `تم استيراد ${result.questions.length} سؤال`,
+        data: (0, questionExtractionImport_1.buildImportExtractionResponse)(payload.meta, result),
     });
 }));
 // ============================================

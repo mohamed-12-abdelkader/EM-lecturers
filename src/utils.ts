@@ -23,6 +23,9 @@ const envFile =
       : '.env.development';
 
 dotenv.config({ path: envFile });
+if (process.env.NODE_ENV === 'development') {
+  dotenv.config({ path: '.env.ngrok.local', override: true });
+}
 
 // Utils functions
 export const asyncWrapper = (fn: RequestHandler) => {
@@ -57,20 +60,33 @@ export const loggerMiddleware = pinoHttp({
 export class HttpError extends Error {
   readonly status: number;
   readonly message: string;
+  readonly details?: Record<string, unknown>;
 
-  constructor(status: number, message: string) {
+  constructor(status: number, message: string, details?: Record<string, unknown>) {
     super(message);
     this.name = 'HttpError';
     this.status = status;
     this.message = message;
+    this.details = details;
   }
 }
 
 // Config
 export const config = cleanEnv(process.env, {
   NODE_ENV: str({ devDefault: testOnly('test'), choices: ['development', 'production', 'test'] }),
+  APP_ENV: str({ default: 'development', choices: ['development', 'staging', 'production'] }),
   CORS_ORIGIN: str(),
   FRONTEND_HOST: str(),
+  /** Public API base (HTTPS). Set automatically by npm run dev:expo */
+  BASE_URL: str({ default: '' }),
+  API_URL: str({ default: '' }),
+  LOCAL_URL: str({ default: '' }),
+  NGROK_URL: str({ default: '' }),
+  PRODUCTION_URL: str({ default: '' }),
+  USE_NGROK: bool({ default: false }),
+  NGROK_AUTHTOKEN: str({ default: '' }),
+  NGROK_DOMAIN: str({ default: '' }),
+  NGROK_RELAX_CORS: bool({ default: true }),
   /** e.g. next-edu.online — used to parse {sub}.root from Host. Empty = always default tenant unless X-Tenant-Subdomain. */
   TENANT_ROOT_DOMAIN: str({ default: '' }),
   SECRET_KEY: str({ devDefault: testOnly(crypto.randomBytes(32).toString('hex')) }),
@@ -150,6 +166,15 @@ export const config = cleanEnv(process.env, {
   MILVUS_ADDRESS: str({ default: 'localhost:19530' }),
   MILVUS_USERNAME: str({ default: 'root' }),
   MILVUS_PASSWORD: str({ default: 'Milvus' }),
+
+  // Web Push (VAPID)
+  VAPID_PUBLIC_KEY: str({ default: '' }),
+  VAPID_PRIVATE_KEY: str({ default: '' }),
+  VAPID_SUBJECT: str({ default: 'mailto:support@example.com' }),
+  WEB_PUSH_WORKER_ENABLED: bool({ default: true }),
+  WEB_PUSH_WORKER_INTERVAL_MS: num({ default: 2000 }),
+  WEB_PUSH_WORKER_BATCH_SIZE: num({ default: 50 }),
+  WEB_PUSH_MAX_ATTEMPTS: num({ default: 5 }),
 });
 
 // Security
@@ -373,3 +398,5 @@ export async function sendPushNotification(
     return null;
   }
 }
+
+export { getBaseUrl, getApiUrl, buildFileUrl, getSocketUrl, getServerInfo } from './config/appUrls';

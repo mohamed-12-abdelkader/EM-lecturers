@@ -157,12 +157,11 @@ class MilvusService {
                 collection_name: collectionName,
                 data: [queryVector],
                 limit,
-                filter: `teacher_id == ${teacherId} && course_id == ${courseId}`,
+                filter: `teacher_id == ${teacherId} && (course_id == ${courseId} || course_id == 0)`,
                 output_fields: ['chunk_text', 'teacher_id', 'course_id', 'file_id', 'chunk_index'],
                 params: { ef: 64 },
             });
-            console.log('results', results);
-            if (!results.results || results.status.error_code !== "Success" || results.results.length === 0) {
+            if (!results.results || results.status.error_code !== 'Success' || results.results.length === 0) {
                 return [];
             }
             return results.results.map((result) => ({
@@ -202,6 +201,88 @@ class MilvusService {
         }
         catch (error) {
             utils_1.logger.error(`Error deleting chunks:`, error.message);
+            throw error;
+        }
+    }
+    /**
+     * Search for similar chunks by teacher across all their content
+     */
+    static async searchSimilarChunksByTeacher(collectionName, queryVector, teacherId, limit = 3) {
+        const client = await this.getClient();
+        try {
+            const results = await client.search({
+                collection_name: collectionName,
+                data: [queryVector],
+                limit,
+                filter: `teacher_id == ${teacherId}`,
+                output_fields: ['chunk_text', 'teacher_id', 'course_id', 'file_id', 'chunk_index'],
+                params: { ef: 64 },
+            });
+            console.log('results', results);
+            if (!results.results || results.status.error_code !== "Success" || results.results.length === 0) {
+                return [];
+            }
+            return results.results.map((result) => ({
+                score: result.score,
+                chunk_text: result.chunk_text,
+                teacher_id: result.teacher_id,
+                course_id: result.course_id,
+                file_id: result.file_id,
+                chunk_index: result.chunk_index,
+            }));
+        }
+        catch (error) {
+            utils_1.logger.error(`Error searching chunks by teacher:`, error.message);
+            throw error;
+        }
+    }
+    /**
+     * Delete all chunks for a specific teacher
+     */
+    static async deleteTeacherChunks(collectionName, teacherId) {
+        const client = await this.getClient();
+        try {
+            const searchResults = await client.query({
+                collection_name: collectionName,
+                filter: `teacher_id == ${teacherId}`,
+                output_fields: ['id'],
+            });
+            if (searchResults.data && searchResults.data.length > 0) {
+                const ids = searchResults.data.map((item) => item.id);
+                await client.delete({
+                    collection_name: collectionName,
+                    ids: ids,
+                });
+                utils_1.logger.info(`✅ Deleted ${ids.length} chunks for teacher ${teacherId}`);
+            }
+        }
+        catch (error) {
+            utils_1.logger.error(`Error deleting teacher chunks:`, error.message);
+            throw error;
+        }
+    }
+    /**
+     * Delete chunks for a specific file
+     */
+    static async deleteFileChunks(collectionName, teacherId, fileId) {
+        const client = await this.getClient();
+        try {
+            const searchResults = await client.query({
+                collection_name: collectionName,
+                filter: `teacher_id == ${teacherId} && file_id == ${fileId}`,
+                output_fields: ['id'],
+            });
+            if (searchResults.data && searchResults.data.length > 0) {
+                const ids = searchResults.data.map((item) => item.id);
+                await client.delete({
+                    collection_name: collectionName,
+                    ids: ids,
+                });
+                utils_1.logger.info(`✅ Deleted ${ids.length} chunks for file ${fileId}`);
+            }
+        }
+        catch (error) {
+            utils_1.logger.error(`Error deleting file chunks:`, error.message);
             throw error;
         }
     }

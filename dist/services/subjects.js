@@ -182,6 +182,7 @@ class SubjectService {
         // Check if there are any chapters, lessons, or questions (use joins to avoid missing columns)
         const checkQuery = `
       SELECT 
+        (SELECT COUNT(*) FROM subject_books WHERE subject_id = $1) AS books_count,
         (SELECT COUNT(*) FROM chapters c WHERE c.subject_id = $1) AS chapters_count,
         (SELECT COUNT(*) 
            FROM lessons l 
@@ -195,8 +196,8 @@ class SubjectService {
     `;
         const checkResult = await pool_1.default.query(checkQuery, [subjectId]);
         const counts = checkResult.rows[0];
-        if (counts.chapters_count > 0 || counts.lessons_count > 0 || counts.questions_count > 0) {
-            throw new Error('لا يمكن حذف المادة لوجود فصول أو دروس أو أسئلة مرتبطة بها');
+        if (counts.books_count > 0 || counts.chapters_count > 0 || counts.lessons_count > 0 || counts.questions_count > 0) {
+            throw new Error('لا يمكن حذف المادة لوجود كتب أو فصول أو دروس أو أسئلة مرتبطة بها');
         }
         // Cascade delete related data safely in a transaction
         await pool_1.default.query('BEGIN');
@@ -209,7 +210,8 @@ class SubjectService {
             await pool_1.default.query(`DELETE FROM lessons l
          USING chapters c
          WHERE l.chapter_id = c.id AND c.subject_id = $1`, [subjectId]);
-            // Delete chapters under this subject
+            // Delete chapters under this subject (books cascade via FK)
+            await pool_1.default.query(`DELETE FROM subject_books WHERE subject_id = $1`, [subjectId]);
             await pool_1.default.query(`DELETE FROM chapters WHERE subject_id = $1`, [subjectId]);
             // Delete teacher_subjects assignments
             await pool_1.default.query(`DELETE FROM teacher_subjects WHERE subject_id = $1`, [subjectId]);

@@ -93,6 +93,22 @@ function getOpenAIImageSize(
   return '1024x1024';
 }
 
+function sanitizeOpenAIImageResponse(payload: any): Record<string, unknown> {
+  const data = Array.isArray(payload?.data)
+    ? payload.data.map((item: any) => ({
+        revised_prompt: item?.revised_prompt || null,
+        has_b64_json: typeof item?.b64_json === 'string' && item.b64_json.length > 0,
+        has_url: typeof item?.url === 'string' && item.url.length > 0,
+      }))
+    : [];
+
+  return {
+    created: payload?.created || null,
+    usage: payload?.usage || null,
+    data,
+  };
+}
+
 async function appendImageFileToFormData(
   formData: FormData,
   fieldName: string,
@@ -472,7 +488,7 @@ Rules:
     return {
       buffer,
       model,
-      response: payload,
+      response: sanitizeOpenAIImageResponse(payload),
     };
   }
 
@@ -695,7 +711,23 @@ Rules:
 
     const [items, count] = await Promise.all([
       pool.query(
-        `SELECT * FROM teacher_creative_generations
+        `SELECT id,
+                teacher_id,
+                request_type,
+                prompt,
+                platform,
+                tone,
+                aspect_ratio,
+                status,
+                generated_text,
+                generated_image_url,
+                provider,
+                provider_model,
+                error_message,
+                created_at,
+                updated_at,
+                completed_at
+         FROM teacher_creative_generations
          WHERE teacher_id = $1
          ORDER BY created_at DESC
          LIMIT $2 OFFSET $3`,
@@ -719,7 +751,23 @@ Rules:
     if (!Number.isInteger(generationId) || generationId <= 0) return null;
 
     const generationRes = await pool.query(
-      `SELECT * FROM teacher_creative_generations
+      `SELECT id,
+              teacher_id,
+              request_type,
+              prompt,
+              platform,
+              tone,
+              aspect_ratio,
+              status,
+              generated_text,
+              generated_image_url,
+              provider,
+              provider_model,
+              error_message,
+              created_at,
+              updated_at,
+              completed_at
+       FROM teacher_creative_generations
        WHERE teacher_id = $1 AND id = $2`,
       [teacherId, generationId],
     );

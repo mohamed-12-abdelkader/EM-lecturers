@@ -11,6 +11,8 @@ const questionBank_1 = require("../services/questionBank");
 const subjects_1 = require("../services/subjects");
 const chapters_1 = require("../services/chapters");
 const lessonsAdmin_1 = require("../services/lessonsAdmin");
+const subjectBooks_1 = require("../services/subjectBooks");
+const questionBankHierarchy_1 = require("../services/questionBankHierarchy");
 const questionBank_2 = require("../db/types/questionBank");
 const zod_1 = require("zod");
 const multer_1 = __importDefault(require("multer"));
@@ -52,11 +54,23 @@ const upload = (0, multer_1.default)({
     }
 });
 // POST /api/question-banks (create)
-router.post('/', (0, utils_1.asyncWrapper)(async (req, res) => {
+router.post('/', upload.single('image'), (0, utils_1.asyncWrapper)(async (req, res) => {
     try {
-        console.log('Received data:', req.body);
-        console.log('Content-Type:', req.headers['content-type']);
-        const validatedData = questionBank_2.CreateQuestionBankSchema.parse(req.body);
+        const createData = { ...req.body };
+        if (req.file) {
+            try {
+                const uploaded = await (0, utils_1.uploadToCloudinary)(req.file.path);
+                createData.image_url = uploaded.secure_url;
+            }
+            catch (uploadError) {
+                console.error('Error uploading image:', uploadError);
+                return res.status(500).json({
+                    success: false,
+                    message: 'فشل في رفع الصورة',
+                });
+            }
+        }
+        const validatedData = questionBank_2.CreateQuestionBankSchema.parse(createData);
         const createdBy = req.user.id;
         const questionBank = await questionBank_1.QuestionBankService.create(validatedData, createdBy);
         res.status(201).json({
@@ -123,39 +137,21 @@ router.get('/:id/with-subjects', (0, utils_1.asyncWrapper)(async (req, res) => {
         }
         // جلب المواد
         const subjects = await subjects_1.SubjectService.getByQuestionBank(id);
-        // جلب الفصول والدروس لكل مادة
-        const subjectsWithChaptersAndLessons = await Promise.all(subjects.map(async (subject) => {
-            // جلب الفصول للمادة
-            const chapters = await chapters_1.ChapterService.getBySubjectId(subject.id);
-            // جلب الدروس لكل فصل
-            const chaptersWithLessons = await Promise.all(chapters.map(async (chapter) => {
-                try {
-                    // استخدام AdminLessonService للحصول على الدروس بالفصل
-                    const lessons = await lessonsAdmin_1.AdminLessonService.getByChapterId(chapter.id);
-                    return {
-                        ...chapter,
-                        lessons: lessons,
-                    };
-                }
-                catch (error) {
-                    // إذا فشل جلب الدروس، نرجع الفصل بدون دروس
-                    console.error(`Error fetching lessons for chapter ${chapter.id}:`, error);
-                    return {
-                        ...chapter,
-                        lessons: [],
-                    };
-                }
-            }));
+        // جلب المواد مع الكتب والفصول والدروس
+        const subjectsWithBooks = await Promise.all(subjects.map(async (subject) => {
+            const books = await (0, questionBankHierarchy_1.getSubjectBooksWithChaptersAndLessons)(subject.id);
             return {
                 ...subject,
-                chapters: chaptersWithLessons,
+                books,
+                // backward compatibility: flat chapters list across all books
+                chapters: books.flatMap((b) => b.chapters),
             };
         }));
         res.json({
             success: true,
             data: {
                 question_bank: questionBank,
-                subjects: subjectsWithChaptersAndLessons,
+                subjects: subjectsWithBooks,
             },
         });
     }
@@ -371,9 +367,14 @@ router.patch('/change-requests/:id/approve', (0, utils_1.asyncWrapper)(async (re
             await subjects_1.SubjectService.delete(existing.question_bank_id, request.entity_id);
             applied = { id: request.entity_id };
         }
+        else if (request.entity_type === 'book' && request.action === 'update') {
+            applied = await subjectBooks_1.SubjectBookService.update(request.entity_id, request.payload);
+        }
+        else if (request.entity_type === 'book' && request.action === 'delete') {
+            await subjectBooks_1.SubjectBookService.delete(request.entity_id);
+            applied = { id: request.entity_id };
+        }
         else if (request.entity_type === 'chapter' && request.action === 'update') {
-            // eslint-disable-next-line @typescript-eslint/ban-ts-comment
-            // @ts-expect-error
             applied = await chapters_1.ChapterService.update(request.entity_id, request.payload);
         }
         else if (request.entity_type === 'chapter' && request.action === 'delete') {

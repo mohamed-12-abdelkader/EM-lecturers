@@ -36,7 +36,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.generateRandomString = exports.uploadTeacherAvatar = exports.uploadExamImage = exports.uploadBufferToCloudinary = exports.deleteCloudinaryAssetByUrl = exports.uploadToCloudinary = exports.upload = exports.verifyToken = exports.config = exports.HttpError = exports.loggerMiddleware = exports.logger = exports.asyncWrapper = void 0;
+exports.getServerInfo = exports.getSocketUrl = exports.buildFileUrl = exports.getApiUrl = exports.getBaseUrl = exports.generateRandomString = exports.uploadTeacherAvatar = exports.uploadExamImage = exports.uploadBufferToCloudinary = exports.deleteCloudinaryAssetByUrl = exports.uploadToCloudinary = exports.upload = exports.verifyToken = exports.config = exports.HttpError = exports.loggerMiddleware = exports.logger = exports.asyncWrapper = void 0;
 exports.generateToken = generateToken;
 exports.sendEmail = sendEmail;
 exports.sendPushNotification = sendPushNotification;
@@ -59,6 +59,9 @@ const envFile = process.env.NODE_ENV === 'production'
         ? '.env'
         : '.env.development';
 dotenv.config({ path: envFile });
+if (process.env.NODE_ENV === 'development') {
+    dotenv.config({ path: '.env.ngrok.local', override: true });
+}
 // Utils functions
 const asyncWrapper = (fn) => {
     return (req, res, next) => {
@@ -91,19 +94,32 @@ exports.loggerMiddleware = (0, pino_http_1.pinoHttp)({
 class HttpError extends Error {
     status;
     message;
-    constructor(status, message) {
+    details;
+    constructor(status, message, details) {
         super(message);
         this.name = 'HttpError';
         this.status = status;
         this.message = message;
+        this.details = details;
     }
 }
 exports.HttpError = HttpError;
 // Config
 exports.config = (0, envalid_1.cleanEnv)(process.env, {
     NODE_ENV: (0, envalid_1.str)({ devDefault: (0, envalid_1.testOnly)('test'), choices: ['development', 'production', 'test'] }),
+    APP_ENV: (0, envalid_1.str)({ default: 'development', choices: ['development', 'staging', 'production'] }),
     CORS_ORIGIN: (0, envalid_1.str)(),
     FRONTEND_HOST: (0, envalid_1.str)(),
+    /** Public API base (HTTPS). Set automatically by npm run dev:expo */
+    BASE_URL: (0, envalid_1.str)({ default: '' }),
+    API_URL: (0, envalid_1.str)({ default: '' }),
+    LOCAL_URL: (0, envalid_1.str)({ default: '' }),
+    NGROK_URL: (0, envalid_1.str)({ default: '' }),
+    PRODUCTION_URL: (0, envalid_1.str)({ default: '' }),
+    USE_NGROK: (0, envalid_1.bool)({ default: false }),
+    NGROK_AUTHTOKEN: (0, envalid_1.str)({ default: '' }),
+    NGROK_DOMAIN: (0, envalid_1.str)({ default: '' }),
+    NGROK_RELAX_CORS: (0, envalid_1.bool)({ default: true }),
     /** e.g. next-edu.online — used to parse {sub}.root from Host. Empty = always default tenant unless X-Tenant-Subdomain. */
     TENANT_ROOT_DOMAIN: (0, envalid_1.str)({ default: '' }),
     SECRET_KEY: (0, envalid_1.str)({ devDefault: (0, envalid_1.testOnly)(crypto.randomBytes(32).toString('hex')) }),
@@ -159,8 +175,10 @@ exports.config = (0, envalid_1.cleanEnv)(process.env, {
     MISTRAL_API_BASE_URL: (0, envalid_1.str)({ default: 'https://api.mistral.ai/v1' }),
     // Teacher creative chatbot
     OPENAI_API_KEY: (0, envalid_1.str)({ default: '' }),
-    OPENAI_IMAGE_MODEL: (0, envalid_1.str)({ default: 'gpt-image-1' }),
+    OPENAI_IMAGE_MODEL: (0, envalid_1.str)({ default: 'gpt-image-2' }),
     TEACHER_CREATIVE_LOGO_PATH: (0, envalid_1.str)({ default: '' }),
+    OPENAI_EMBEDDING_MODEL: (0, envalid_1.str)({ default: 'text-embedding-3-small' }),
+    OPENAI_EMBEDDING_DIMENSIONS: (0, envalid_1.num)({ default: 1536 }),
     // Ollama
     OLLAMA_API_URL: (0, envalid_1.str)({ default: 'http://ollama.next-edu.online' }),
     OLLAMA_EMBEDDING_MODEL: (0, envalid_1.str)({ default: 'embeddinggemma:300m' }),
@@ -168,6 +186,14 @@ exports.config = (0, envalid_1.cleanEnv)(process.env, {
     MILVUS_ADDRESS: (0, envalid_1.str)({ default: 'localhost:19530' }),
     MILVUS_USERNAME: (0, envalid_1.str)({ default: 'root' }),
     MILVUS_PASSWORD: (0, envalid_1.str)({ default: 'Milvus' }),
+    // Web Push (VAPID)
+    VAPID_PUBLIC_KEY: (0, envalid_1.str)({ default: '' }),
+    VAPID_PRIVATE_KEY: (0, envalid_1.str)({ default: '' }),
+    VAPID_SUBJECT: (0, envalid_1.str)({ default: 'mailto:support@example.com' }),
+    WEB_PUSH_WORKER_ENABLED: (0, envalid_1.bool)({ default: true }),
+    WEB_PUSH_WORKER_INTERVAL_MS: (0, envalid_1.num)({ default: 2000 }),
+    WEB_PUSH_WORKER_BATCH_SIZE: (0, envalid_1.num)({ default: 50 }),
+    WEB_PUSH_MAX_ATTEMPTS: (0, envalid_1.num)({ default: 5 }),
 });
 async function generateToken(user, pool, opts) {
     const jti = crypto.randomUUID();
@@ -354,3 +380,9 @@ async function sendPushNotification(externalUserIds, title, message, data = {}) 
         return null;
     }
 }
+var appUrls_1 = require("./config/appUrls");
+Object.defineProperty(exports, "getBaseUrl", { enumerable: true, get: function () { return appUrls_1.getBaseUrl; } });
+Object.defineProperty(exports, "getApiUrl", { enumerable: true, get: function () { return appUrls_1.getApiUrl; } });
+Object.defineProperty(exports, "buildFileUrl", { enumerable: true, get: function () { return appUrls_1.buildFileUrl; } });
+Object.defineProperty(exports, "getSocketUrl", { enumerable: true, get: function () { return appUrls_1.getSocketUrl; } });
+Object.defineProperty(exports, "getServerInfo", { enumerable: true, get: function () { return appUrls_1.getServerInfo; } });

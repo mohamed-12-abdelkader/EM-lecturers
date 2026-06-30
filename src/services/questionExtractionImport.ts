@@ -1,15 +1,37 @@
 import pool from '../db/pool';
+import type { QuestionV2 } from '../db/types/questionBankV2';
 import type {
   MistralExtractedQuestion,
   MistralQuestionExtractionResult,
+  MistralQuestionImage,
 } from '../types/mistralQuestionExtraction';
+import { expandMultiPartQuestions } from '../utils/expandMultiPartQuestions';
 import { QuestionBankV2Service } from './questionBankV2';
 
 type ImportResult = {
-  passages: Array<{ temp_passage_id: string; db_passage: any }>;
-  questions: any[];
-  skipped: Array<{ index: number; reason: string }>;
+  passages: Array<{ temp_passage_id: string; db_passage: unknown }>;
+  questions: QuestionV2[];
+  /** Original extraction rows aligned with `questions` (skipped items omitted). */
+  originalQuestions: MistralExtractedQuestion[];
+  skipped: Array<{ index: number; reason: string; source_number?: string }>;
 };
+
+type ImportKind = 'text_mcq' | 'image_choices' | 'open_answer';
+
+const OPTION_LABELS = ['أ', 'ب', 'ج', 'د'];
+
+function imageUrls(question: MistralExtractedQuestion): string[] {
+  return (question.question_images || [])
+    .map((image) => image.image_url)
+    .filter((url): url is string => Boolean(url));
+}
+
+function classifyImportKind(question: MistralExtractedQuestion): ImportKind {
+  if (question.options.length === 4) return 'text_mcq';
+  const urls = imageUrls(question);
+  if (question.options.length === 0 && urls.length >= 4) return 'image_choices';
+  return 'open_answer';
+}
 
 function normalizeCorrectAnswerIndex(question: MistralExtractedQuestion): number {
   const index = question.correct_answer_index;
@@ -23,33 +45,108 @@ function normalizeDifficulty(value?: string): 'easy' | 'medium' | 'hard' {
 }
 
 function optionText(question: MistralExtractedQuestion, index: number): string {
-  return question.options[index]?.text?.trim() || ['أ', 'ب', 'ج', 'د'][index];
+  return question.options[index]?.text?.trim() || OPTION_LABELS[index];
 }
 
-async function verifyLessonAccess(
-  lessonId: number,
-  userId: number,
-  userRole?: string,
-): Promise<void> {
-  // Reuse existing service access check through a zero-row bulk shape by checking lesson through public method side effect is not available.
-  // Keep the same broad role policy used by question-bank-v2 controller: teacher/admin/employee.
-  if (userRole === 'admin' || userRole === 'employee') {
-    const exists = await pool.query('SELECT id FROM lessons WHERE id = $1 LIMIT 1', [lessonId]);
-    if (!exists.rowCount) throw new Error('الدرس غير موجود');
-    return;
+function placeholderOptions(correctAnswer?: string | null): string[] {
+  if (correctAnswer?.trim()) {
+    return [correctAnswer.trim(), '—', '—', '—'];
+  }
+  return [...OPTION_LABELS];
+}
+
+function mediaTypeFromImage(image?: MistralQuestionImage): 'image' | 'diagram' | 'chart' {
+  if (image?.image_type === 'chart' || image?.image_type === 'diagram') {
+    return image.image_type;
+  }
+  return 'image';
+}
+
+/** Map saved question back to extract-questions shape for the frontend */
+export function mapImportedQuestionToExtractionShape(
+  original: MistralExtractedQuestion | undefined,
+  saved: QuestionV2,
+  index: number,
+) {
+  const textOptions =
+    saved.options?.filter((o) => o.option_type === 'text' && o.text_content?.trim()) ?? [];
+  const imageOptions =
+    saved.options?.filter((o) => o.option_type === 'image' && o.image_url) ?? [];
+
+  let questionImages: MistralQuestionImage[] = original?.question_images ?? [];
+
+  if (saved.question_type === 'image_choices' && imageOptions.length > 0) {
+    questionImages = imageOptions.map((opt, i) => {
+      const source = original?.question_images?.[i];
+      return {
+        image_id: source?.image_id ?? `imported-opt-${opt.option_index}`,
+        page_index: source?.page_index ?? 0,
+        image_type: source?.image_type ?? 'diagram',
+        short_description: source?.short_description,
+        summary: source?.summary,
+        educational_relevance: source?.educational_relevance,
+        image_url: opt.image_url!,
+      };
+    });
+  } else if (saved.media?.media_url) {
+    const first = original?.question_images?.find((img) => img.image_url) ?? original?.question_images?.[0];
+    questionImages = [
+      {
+        image_id: first?.image_id ?? 'question-media',
+        page_index: first?.page_index ?? 0,
+        image_type: first?.image_type ?? saved.media.media_type,
+        short_description: first?.short_description ?? saved.media.media_name ?? undefined,
+        summary: first?.summary,
+        educational_relevance: first?.educational_relevance,
+        image_url: saved.media.media_url,
+      },
+    ];
   }
 
-  const result = await pool.query(
-    `SELECT l.id
-     FROM lessons l
-     JOIN chapters c ON c.id = l.chapter_id
-     JOIN subjects s ON s.id = c.subject_id
-     JOIN question_banks qb ON qb.id = s.question_bank_id
-     WHERE l.id = $1 AND qb.created_by = $2
-     LIMIT 1`,
-    [lessonId, userId],
-  );
-  if (!result.rowCount) throw new Error('ليس لديك صلاحية لإضافة أسئلة لهذا الدرس');
+  const options =
+    saved.question_type === 'image_choices'
+      ? []
+      : textOptions.length === 4
+        ? textOptions.map((opt, i) => ({
+            label: original?.options[i]?.label ?? OPTION_LABELS[i],
+            text: opt.text_content ?? '',
+          }))
+        : (original?.options ?? []);
+
+  return {
+    number: original?.number ?? index + 1,
+    source_number: original?.source_number ?? String(index + 1),
+    question_text: saved.question_text,
+    passage_id: original?.passage_id ?? null,
+    options,
+    question_images: questionImages,
+    correct_answer: saved.explanation ?? original?.correct_answer ?? null,
+    correct_answer_index:
+      saved.correct_answer_index ?? original?.correct_answer_index ?? null,
+    correct_answer_inferred: original?.correct_answer_inferred ?? false,
+    db_id: saved.id,
+    question_type: saved.question_type,
+    status: saved.status,
+  };
+}
+
+export function buildImportExtractionResponse(
+  meta: Partial<MistralQuestionExtractionResult>,
+  result: ImportResult,
+) {
+  return {
+    ...meta,
+    question_count: result.questions.length,
+    passages: result.passages.map((p) => p.db_passage),
+    questions: result.questions.map((saved, index) =>
+      mapImportedQuestionToExtractionShape(
+        result.originalQuestions[index],
+        saved,
+        index,
+      ),
+    ),
+    skipped: result.skipped,
+  };
 }
 
 export class QuestionExtractionImportService {
@@ -60,7 +157,12 @@ export class QuestionExtractionImportService {
     extraction: Pick<MistralQuestionExtractionResult, 'passages' | 'questions'>;
   }): Promise<ImportResult> {
     const { lessonId, teacherId, userRole, extraction } = input;
-    await verifyLessonAccess(lessonId, teacherId, userRole);
+    await QuestionBankV2Service.verifyLessonAccess(lessonId, teacherId, userRole);
+
+    const normalizedExtraction = expandMultiPartQuestions(
+      extraction.passages || [],
+      extraction.questions,
+    );
 
     const client = await pool.connect();
     try {
@@ -68,7 +170,7 @@ export class QuestionExtractionImportService {
 
       const passageMap = new Map<string, number>();
       const importedPassages: ImportResult['passages'] = [];
-      for (const passage of extraction.passages || []) {
+      for (const passage of normalizedExtraction.passages || []) {
         const result = await client.query(
           `INSERT INTO question_passages (lesson_id, title, content, order_index)
            VALUES ($1, $2, $3, 0)
@@ -82,19 +184,43 @@ export class QuestionExtractionImportService {
         });
       }
 
-      const importedQuestions: any[] = [];
+      const importedQuestions: QuestionV2[] = [];
+      const originalQuestions: MistralExtractedQuestion[] = [];
       const skipped: ImportResult['skipped'] = [];
 
-      for (let index = 0; index < extraction.questions.length; index++) {
-        const question = extraction.questions[index];
-        const hasOptions = question.options.length === 4;
-        if (!question.question_text.trim() && question.question_images.length === 0) {
-          skipped.push({ index, reason: 'Question has no text or image' });
+      for (let index = 0; index < normalizedExtraction.questions.length; index++) {
+        const question = normalizedExtraction.questions[index];
+        const kind = classifyImportKind(question);
+        const urls = imageUrls(question);
+
+        if (!question.question_text.trim() && urls.length === 0) {
+          skipped.push({
+            index,
+            source_number: question.source_number,
+            reason: 'Question has no text or image',
+          });
+          continue;
+        }
+
+        if (kind === 'image_choices' && urls.length < 4) {
+          skipped.push({
+            index,
+            source_number: question.source_number,
+            reason: 'image_choices requires at least 4 images',
+          });
           continue;
         }
 
         const passageId = question.passage_id ? passageMap.get(question.passage_id) : null;
-        const questionType = question.question_images.length > 0 ? 'text_with_image' : 'text_only';
+        const questionType =
+          kind === 'image_choices'
+            ? 'image_choices'
+            : urls.length > 0
+              ? 'text_with_image'
+              : 'text_only';
+
+        const explanation = question.correct_answer?.trim() || null;
+
         const questionResult = await client.query(
           `INSERT INTO questions_v2 (
              question_text, question_type, lesson_id, teacher_id, passage_id,
@@ -103,68 +229,73 @@ export class QuestionExtractionImportService {
            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1, 'pending')
            RETURNING *`,
           [
-            question.question_text.trim(),
+            question.question_text.trim() || 'اختر الإجابة الصحيحة من الصور',
             questionType,
             lessonId,
             teacherId,
             passageId || null,
             normalizeCorrectAnswerIndex(question),
-            question.correct_answer || null,
+            explanation,
             normalizeDifficulty(),
           ],
         );
 
         const questionId = questionResult.rows[0].id;
-        for (let optionIndex = 0; optionIndex < 4; optionIndex++) {
-          await client.query(
-            `INSERT INTO question_options (question_id, option_index, option_type, text_content)
-             VALUES ($1, $2, 'text', $3)`,
-            [
-              questionId,
-              optionIndex,
-              hasOptions ? optionText(question, optionIndex) : ['أ', 'ب', 'ج', 'د'][optionIndex],
-            ],
-          );
+
+        if (kind === 'image_choices') {
+          for (let optionIndex = 0; optionIndex < 4; optionIndex++) {
+            await client.query(
+              `INSERT INTO question_options (question_id, option_index, option_type, image_url)
+               VALUES ($1, $2, 'image', $3)`,
+              [questionId, optionIndex, urls[optionIndex]],
+            );
+          }
+        } else {
+          const optionTexts =
+            kind === 'text_mcq'
+              ? [0, 1, 2, 3].map((i) => optionText(question, i))
+              : placeholderOptions(question.correct_answer);
+
+          for (let optionIndex = 0; optionIndex < 4; optionIndex++) {
+            await client.query(
+              `INSERT INTO question_options (question_id, option_index, option_type, text_content)
+               VALUES ($1, $2, 'text', $3)`,
+              [questionId, optionIndex, optionTexts[optionIndex]],
+            );
+          }
+
+          if (urls.length > 0) {
+            const firstImage = question.question_images?.find((image) => image.image_url);
+            if (firstImage?.image_url) {
+              await client.query(
+                `INSERT INTO question_media (question_id, media_type, media_url, media_name, uploaded_by)
+                 VALUES ($1, $2, $3, $4, $5)
+                 ON CONFLICT (question_id) DO UPDATE SET
+                   media_type = EXCLUDED.media_type,
+                   media_url = EXCLUDED.media_url,
+                   media_name = EXCLUDED.media_name,
+                   uploaded_by = EXCLUDED.uploaded_by`,
+                [
+                  questionId,
+                  mediaTypeFromImage(firstImage),
+                  firstImage.image_url,
+                  firstImage.short_description || firstImage.image_id,
+                  teacherId,
+                ],
+              );
+            }
+          }
         }
 
-        const firstImage = question.question_images.find((image) => image.image_url);
-        if (firstImage?.image_url) {
-          await client.query(
-            `INSERT INTO question_media (question_id, media_type, media_url, media_name, uploaded_by)
-             VALUES ($1, $2, $3, $4, $5)
-             ON CONFLICT (question_id) DO UPDATE SET
-               media_type = EXCLUDED.media_type,
-               media_url = EXCLUDED.media_url,
-               media_name = EXCLUDED.media_name,
-               uploaded_by = EXCLUDED.uploaded_by`,
-            [
-              questionId,
-              firstImage.image_type === 'chart' || firstImage.image_type === 'diagram'
-                ? firstImage.image_type
-                : 'image',
-              firstImage.image_url,
-              firstImage.short_description || firstImage.image_id,
-              teacherId,
-            ],
-          );
+        const hydrated = await QuestionBankV2Service.getQuestionById(questionId, client);
+        if (hydrated) {
+          importedQuestions.push(hydrated);
+          originalQuestions.push(question);
         }
-
-        importedQuestions.push(questionResult.rows[0]);
       }
 
       await client.query('COMMIT');
-
-      const hydratedQuestions = [];
-      for (const question of importedQuestions) {
-        const hydrated = await QuestionBankV2Service.getQuestionById(question.id);
-        if (hydrated) hydratedQuestions.push(hydrated);
-      }
-
-      return {
-        passages: importedPassages,
-        questions: hydratedQuestions,
-        skipped,
-      };
+      return { passages: importedPassages, questions: importedQuestions, originalQuestions, skipped };
     } catch (error) {
       await client.query('ROLLBACK');
       throw error;

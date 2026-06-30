@@ -16,6 +16,9 @@ import { CourseLevelExamsService } from '../services/courseLevelExams';
 import { TeacherReportsService } from '../services/teacherReports';
 import { ExamsService } from '../services/exams';
 import * as ExpoPushService from '../services/expoPushService';
+import { NotificationTriggers } from '../services/notificationTriggers';
+import { VideoViewTrackingService } from '../services/videoViewTracking';
+import { SeoHooks } from '../services/seo/hooks';
 
 export const router = Router();
 
@@ -91,6 +94,20 @@ const CourseSchema = z.object({
     .transform((val) => Number(val))
     .refine((val) => !isNaN(val) && val >= 0, {
       message: 'Price must be a valid non-negative number',
+    })
+    .optional(),
+  is_free: z
+    .union([z.string(), z.boolean(), z.number()])
+    .optional()
+    .transform((val) => {
+      if (val === undefined || val === null || val === '') return undefined;
+      if (val === true || val === 1) return true;
+      if (val === false || val === 0) return false;
+      if (typeof val === 'string') {
+        const v = val.trim().toLowerCase();
+        return v === 'true' || v === '1' || v === 'yes';
+      }
+      return false;
     }),
   description: z.string().optional(),
   grade_id: z
@@ -100,6 +117,18 @@ const CourseSchema = z.object({
       message: 'Grade ID must be a valid positive number',
     }),
 });
+
+function resolveCoursePricing(input: { price?: number; is_free?: boolean }) {
+  const isFree = input.is_free === true;
+  if (isFree) {
+    return { is_free: true, price: 0 };
+  }
+  const price = input.price ?? 0;
+  if (price <= 0) {
+    throw new Error('PAID_COURSE_REQUIRES_PRICE');
+  }
+  return { is_free: false, price };
+}
 
 // مخطط التحقق لإنشاء كود التفعيل
 const CreateActivationCodeSchema = z.object({
@@ -125,8 +154,17 @@ router.post(
         return res.status(400).json({ message: 'Validation failed', errors: parse.error.errors });
       }
 
-      const { title, price, description, grade_id } = parse.data;
+      const { title, description, grade_id, price, is_free } = parse.data;
       const teacher_id = req.user!.id;
+
+      let pricing: { is_free: boolean; price: number };
+      try {
+        pricing = resolveCoursePricing({ price, is_free });
+      } catch {
+        return res.status(400).json({
+          message: 'الكورس المدفوع يجب أن يكون له سعر أكبر من صفر، أو حدّد is_free=true',
+        });
+      }
 
       // تحقق من وجود الصف الدراسي
       const gradeCheck = await pool.query('SELECT id FROM grades WHERE id = $1', [grade_id]);
@@ -136,11 +174,19 @@ router.post(
       const avatar = file ? (await uploadToCloudinary(file.path)).secure_url : null;
 
       const result = await pool.query(
-        `INSERT INTO courses (title, price, description, teacher_id, grade_id, avatar) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
-        [title, price, description, teacher_id, grade_id, avatar],
+        `INSERT INTO courses (title, price, description, teacher_id, grade_id, avatar, is_free)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
+         RETURNING *`,
+        [title, pricing.price, description, teacher_id, grade_id, avatar, pricing.is_free],
       );
 
       const course = result.rows[0];
+
+      try {
+        await SeoHooks.onCourseChanged(teacher_id, course.id, title);
+      } catch (seoError) {
+        console.error('SEO hook after course create:', seoError);
+      }
 
       // تسجيل نشاط إنشاء الكورس
       try {
@@ -507,6 +553,21 @@ router.post(
     const { code, course_id } = parse.data;
     const student_id = req.user!.id;
 
+    const freeCourseCheck = await pool.query(
+      `SELECT id, title, COALESCE(is_free, FALSE) AS is_free FROM courses WHERE id = $1`,
+      [course_id],
+    );
+    if (freeCourseCheck.rowCount && freeCourseCheck.rows[0].is_free) {
+      return res.status(400).json({
+        message: 'هذا الكورس مجاني — المحتوى متاح مباشرة بدون كود تفعيل',
+        course: {
+          id: freeCourseCheck.rows[0].id,
+          title: freeCourseCheck.rows[0].title,
+          is_free: true,
+        },
+      });
+    }
+
     // البحث عن كود التفعيل
     const codeCheck = await pool.query(
       `SELECT 
@@ -582,6 +643,12 @@ router.post(
       console.warn('Failed to add student to chat group after activation:', err);
     }
 
+    NotificationTriggers.onCoursePurchase(
+      student_id,
+      activationCode.course_title,
+      activationCode.course_id,
+    ).catch((err) => console.warn('Course purchase notification failed:', err));
+
     res.status(200).json({
       message: 'Course activated successfully',
       course: {
@@ -605,14 +672,30 @@ router.post(
     const studentId = req.user!.id;
 
     const courseRow = await pool.query(
-      `SELECT id, title, price, grade_id, teacher_id FROM courses WHERE id = $1`,
+      `SELECT id, title, price, grade_id, teacher_id, COALESCE(is_free, FALSE) AS is_free
+       FROM courses WHERE id = $1`,
       [courseId],
     );
     if (!courseRow.rowCount) {
       return res.status(404).json({ message: 'الكورس غير موجود' });
     }
 
-    const course = courseRow.rows[0] as { id: number; title: string; price: number | string; grade_id: number; teacher_id: number };
+    const course = courseRow.rows[0] as {
+      id: number;
+      title: string;
+      price: number | string;
+      grade_id: number;
+      teacher_id: number;
+      is_free: boolean;
+    };
+
+    if (course.is_free) {
+      return res.status(400).json({
+        message: 'هذا الكورس مجاني — المحتوى متاح مباشرة بدون تفعيل',
+        course: { id: course.id, title: course.title, is_free: true },
+      });
+    }
+
     const price = Number(course.price);
     if (price > 0) {
       return res.status(400).json({
@@ -827,16 +910,37 @@ router.put(
         return res.status(400).json({ message: 'Validation failed', errors: parse.error.errors });
       }
 
+      let pricingUpdate: { is_free: boolean; price: number } | null = null;
+      if (parse.data.is_free !== undefined || parse.data.price !== undefined) {
+        const existing = courseCheck.rows[0];
+        try {
+          pricingUpdate = resolveCoursePricing({
+            price: parse.data.price !== undefined ? parse.data.price : Number(existing.price),
+            is_free: parse.data.is_free !== undefined ? parse.data.is_free : existing.is_free,
+          });
+        } catch {
+          return res.status(400).json({
+            message: 'الكورس المدفوع يجب أن يكون له سعر أكبر من صفر، أو حدّد is_free=true',
+          });
+        }
+      }
+
       const fields = [];
       const values = [];
       let i = 1;
 
-      // إضافة الحقول النصية
       for (const [key, value] of Object.entries(parse.data)) {
-        if (value !== undefined) {
+        if (value !== undefined && key !== 'price' && key !== 'is_free') {
           fields.push(`${key} = $${i++}`);
           values.push(value);
         }
+      }
+
+      if (pricingUpdate) {
+        fields.push(`is_free = $${i++}`);
+        values.push(pricingUpdate.is_free);
+        fields.push(`price = $${i++}`);
+        values.push(pricingUpdate.price);
       }
 
       const file = req.file ?? null;
@@ -857,6 +961,12 @@ router.put(
       );
 
       const course = result.rows[0];
+
+      try {
+        await SeoHooks.onCourseChanged(teacher_id, course.id, parse.data.title ?? course.title);
+      } catch (seoError) {
+        console.error('SEO hook after course update:', seoError);
+      }
 
       res.json({ course });
     } catch (error: any) {
@@ -892,6 +1002,13 @@ router.delete(
       [courseId, teacher_id],
     );
     if (!result.rowCount) return res.status(404).json({ message: 'Course not found or not yours' });
+
+    try {
+      await SeoHooks.onCourseDeleted(teacher_id);
+    } catch (seoError) {
+      console.error('SEO hook after course delete:', seoError);
+    }
+
     res.json({ message: 'Course deleted successfully' });
   }),
 );
@@ -1005,6 +1122,7 @@ router.get(
         c.grade_id,
         c.avatar,
         c.created_at,
+        COALESCE(c.is_free, FALSE) AS is_free,
         CASE WHEN e.user_id IS NOT NULL THEN true ELSE false END as is_activated
        FROM courses c
        LEFT JOIN enrollments e ON c.id = e.course_id AND e.user_id = $1
@@ -1022,7 +1140,8 @@ router.get(
         grade_id: row.grade_id,
         avatar: row.avatar,
         created_at: row.created_at,
-        is_activated: row.is_activated,
+        is_free: row.is_free === true,
+        is_activated: row.is_activated || row.is_free === true,
       })),
     });
   }),
@@ -1588,6 +1707,23 @@ router.get(
     if (user.role === 'student') {
       lectures = lectures.filter((l) => l.is_visible !== false);
       lectures = lectures.sort((a, b) => a.position - b.position || a.created_at - b.created_at);
+
+      const isFreeCourse = course.is_free === true;
+
+      if (isFreeCourse) {
+        lectures = lectures.map((lec) => {
+          const exam =
+            exams.find((e) => e.lecture_id === lec.id && e.is_visible === true) || null;
+          return {
+            ...lec,
+            videos: videos.filter((v) => v.lecture_id === lec.id),
+            files: files.filter((f) => f.lecture_id === lec.id),
+            exam,
+            locked: false,
+            is_visible: lec.is_visible,
+          };
+        });
+      } else {
       let lockAll = false;
       for (let i = 0; i < lectures.length; i++) {
         const lec = lectures[i];
@@ -1646,6 +1782,7 @@ router.get(
           is_visible: lec.is_visible,
         };
       }
+      }
     } else {
       // المدرس يرى كل المحاضرات (لا فلترة)
       lectures = lectures.map((lec) => {
@@ -1660,12 +1797,97 @@ router.get(
         };
       });
     }
+
+    if (user.role === 'student' && lectureIds.length > 0) {
+      const studentId = user.id;
+      const visibleExamIds = lectures
+        .map((lec) => lec.exam?.id)
+        .filter((id): id is number => id != null);
+
+      const [videoViewsRes, examSubsRes] = await Promise.all([
+        pool.query(
+          `SELECT video_id, lecture_id, viewed_at, is_completed
+           FROM video_views
+           WHERE user_id = $1 AND course_id = $2`,
+          [studentId, courseId],
+        ),
+        visibleExamIds.length
+          ? pool.query(
+              `SELECT exam_id, total_grade, passed, submitted_at, status
+               FROM exam_submissions
+               WHERE student_id = $1 AND exam_id = ANY($2::int[])`,
+              [studentId, visibleExamIds],
+            )
+          : Promise.resolve({ rows: [] as any[] }),
+      ]);
+
+      const viewsByVideoId = new Map(
+        videoViewsRes.rows.map((row) => [row.video_id, row]),
+      );
+      const subsByExamId = new Map(
+        examSubsRes.rows.map((row) => [row.exam_id, row]),
+      );
+
+      lectures = lectures.map((lec) => {
+        const lecVideos = (lec.videos || []).map((video: any) => {
+          const view = viewsByVideoId.get(video.id);
+          return {
+            ...video,
+            is_watched: !!view,
+            is_completed: view?.is_completed ?? false,
+            viewed_at: view?.viewed_at ?? null,
+          };
+        });
+
+        let examWithProgress = lec.exam;
+        if (lec.exam) {
+          const submission = subsByExamId.get(lec.exam.id);
+          const submissionStatus = submission?.status ?? null;
+          const isSubmitted =
+            !!submission &&
+            (submission.submitted_at != null ||
+              ['submitted', 'late', 'expired'].includes(submissionStatus ?? ''));
+
+          examWithProgress = {
+            ...lec.exam,
+            is_solved: isSubmitted,
+            is_started: !!submission,
+            in_progress: submissionStatus === 'in_progress',
+            student_submission: submission
+              ? {
+                  total_grade: submission.total_grade,
+                  passed: submission.passed,
+                  submitted_at: submission.submitted_at,
+                  status: submissionStatus,
+                }
+              : null,
+          };
+        }
+
+        const watchedCount = lecVideos.filter((v: { is_watched: boolean }) => v.is_watched).length;
+
+        return {
+          ...lec,
+          videos: lecVideos,
+          exam: examWithProgress,
+          progress: {
+            watched_videos: watchedCount,
+            total_videos: lecVideos.length,
+            all_videos_watched:
+              lecVideos.length > 0 && watchedCount === lecVideos.length,
+            exam_solved: examWithProgress?.is_solved ?? false,
+          },
+        };
+      });
+    }
+
     res.json({
       course: {
         id: course.id,
         title: course.title,
         description: course.description,
         price: course.price,
+        is_free: course.is_free === true,
         teacher_id: course.teacher_id,
         avatar: course.avatar,
         created_at: course.created_at,
@@ -2454,6 +2676,8 @@ router.post(
       lock_next_lectures,
       show_answers_immediately,
       show_answers_after_hours,
+      type,
+      exam_type,
     } = req.body;
 
     if (isNaN(lectureId)) {
@@ -2496,6 +2720,9 @@ router.post(
     const showAnswersImmediately =
       show_answers_immediately !== false && show_answers_immediately !== 'false';
     const showAnswersAfterHours = show_answers_after_hours ? Number(show_answers_after_hours) : 0;
+    const examTypeRaw = typeof type === 'string' ? type : typeof exam_type === 'string' ? exam_type : 'exam';
+    const examType =
+      examTypeRaw.trim().toLowerCase() === 'assignment' ? 'assignment' : 'exam';
 
     const exam = await pool.query(
       `INSERT INTO exams (
@@ -2503,9 +2730,10 @@ router.post(
         show_at, hide_at, lock_next_lectures, 
         show_answers_immediately, show_answers_after_hours
       ) 
-       VALUES ($1, 'exam', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *`,
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING *`,
       [
         lectureId,
+        examType,
         examTotalGrade,
         req.user!.id,
         examTitle,
@@ -3602,6 +3830,8 @@ router.get(
             u.id as student_id,
             u.name as student_name,
             u.email as student_email,
+            u.phone as student_phone,
+            u.parent_phone as student_parent_phone,
             e.enrolled_at,
             -- إحصائيات المحاضرات
             COUNT(DISTINCT lv_views.lecture_id) as watched_lectures_count,
@@ -3620,13 +3850,15 @@ router.get(
             SELECT id FROM exams WHERE lecture_id IN (SELECT id FROM lectures WHERE course_id = $1) AND type = 'exam'
           )
           WHERE e.course_id = $1
-          GROUP BY u.id, u.name, u.email, e.enrolled_at
+          GROUP BY u.id, u.name, u.email, u.phone, u.parent_phone, e.enrolled_at
         )
         SELECT 
           cd.*,
           sd.student_id,
           sd.student_name,
           sd.student_email,
+          sd.student_phone,
+          sd.student_parent_phone,
           sd.enrolled_at,
           sd.watched_lectures_count,
           sd.watched_videos_count,
@@ -3649,6 +3881,8 @@ router.get(
         id: row.student_id,
         name: row.student_name,
         email: row.student_email,
+        phone: row.student_phone ?? null,
+        parent_phone: row.student_parent_phone ?? null,
         enrolled_at: row.enrolled_at,
         watched_lectures_count: parseInt(row.watched_lectures_count) || 0,
         watched_videos_count: parseInt(row.watched_videos_count) || 0,
@@ -3829,6 +4063,8 @@ router.get(
           id: student.id,
           name: student.name,
           email: student.email,
+          phone: student.phone,
+          parent_phone: student.parent_phone,
           enrolled_at: student.enrolled_at,
           // إحصائيات المحاضرات
           watched_lectures_count: watchedLectures.length,
@@ -4188,89 +4424,44 @@ router.get(
 
     const video = videoInfo;
 
+    let viewTracking: {
+      view_tracked: boolean;
+      lecture_view_tracked: boolean;
+      is_first_video_view?: boolean;
+      lecture_points_awarded?: boolean;
+      lecture_watch_percentage?: number;
+    } | null = null;
+
     // تسجيل المشاهدة تلقائياً للطالب عند جلب رابط الفيديو
     if (userRole === 'student') {
       try {
-        // التحقق من وجود سجل مشاهدة سابق
-        await pool.query('SELECT id FROM video_views WHERE user_id = $1 AND video_id = $2', [
+        const tracking = await VideoViewTrackingService.trackStudentVideoView({
           userId,
           videoId,
-        ]);
-
-        // إنشاء أو تحديث سجل المشاهدة تلقائياً
-        await pool.query(
-          `INSERT INTO video_views (user_id, video_id, lecture_id, course_id, watch_duration, completion_percentage, is_completed, viewed_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
-           ON CONFLICT (user_id, video_id) 
-           DO UPDATE SET 
-             viewed_at = NOW(),
-             updated_at = NOW()`,
-          [
-            userId,
-            videoId,
-            video.lecture_id,
-            video.course_id,
-            0, // watch_duration
-            0, // completion_percentage
-            false, // is_completed
-          ],
-        );
-
-        // إضافة نقاط المحاضرة (10 نقاط) - مرة واحدة فقط لكل محاضرة
-        // التحقق من المحاضرة مباشرة (حتى لو شاهد الفيديو من قبل)
-        try {
-          // eslint-disable-next-line @typescript-eslint/ban-ts-comment
-          // @ts-expect-error
-          const { StudentPointsService } = await import('../services/studentPoints');
-          const hasPoints = await StudentPointsService.hasLecturePoints(userId, video.lecture_id);
-
-          if (!hasPoints) {
-            // حساب عدد الفيديوهات المشاهدة في المحاضرة (بما في ذلك القديمة)
-            const lectureVideosCount = await pool.query(
-              `SELECT COUNT(DISTINCT vv.video_id) as watched_count
-               FROM video_views vv
-               WHERE vv.user_id = $1 AND vv.lecture_id = $2`,
-              [userId, video.lecture_id],
-            );
-
-            const totalVideosCount = await pool.query(
-              `SELECT COUNT(*) as total_count
-               FROM lecture_videos
-               WHERE lecture_id = $1`,
-              [video.lecture_id],
-            );
-
-            const watchedCount = parseInt(lectureVideosCount.rows[0].watched_count) || 0;
-            const totalCount = parseInt(totalVideosCount.rows[0].total_count) || 0;
-
-            // إذا شاهد 33% من الفيديوهات أو أكثر، أو إذا كان له أي سجل في video_views، أضف 10 نقاط
-            const watchPercentage = totalCount > 0 ? (watchedCount / totalCount) * 100 : 0;
-
-            if (watchPercentage >= 33.33 || watchedCount > 0) {
-              await StudentPointsService.addLectureWatchPoints(
-                userId,
-                video.lecture_id,
-                video.lecture_title,
-              );
-              console.log(
-                `Added 10 points for lecture ${video.lecture_id} to student ${userId} (watched ${watchedCount}/${totalCount})`,
-              );
-            }
-          }
-        } catch (pointsError) {
-          // لا نوقف العملية إذا فشل إضافة النقاط
-          console.error('Error adding lecture points:', pointsError);
-        }
+          lectureId: video.lecture_id,
+          courseId: video.course_id,
+          lectureTitle: video.lecture_title,
+        });
+        viewTracking = {
+          view_tracked: tracking.viewTracked,
+          lecture_view_tracked: tracking.lectureViewTracked,
+          is_first_video_view: tracking.isFirstVideoView,
+          lecture_points_awarded: tracking.lecturePointsAwarded,
+          lecture_watch_percentage: tracking.lectureWatchPercentage,
+        };
       } catch (error) {
-        // لا نوقف العملية إذا فشل تسجيل المشاهدة، فقط نسجل الخطأ
         console.error('Error auto-tracking video view:', error);
+        viewTracking = {
+          view_tracked: false,
+          lecture_view_tracked: false,
+        };
       }
     }
 
-    // إرجاع رابط الفيديو فقط
     res.json({
       video_url: video.video_url,
       message: 'تم جلب رابط الفيديو بنجاح',
+      ...(viewTracking ?? {}),
     });
   }),
 );
@@ -4317,32 +4508,29 @@ router.post(
     }
 
     try {
-      // تحديث أو إدراج سجل المشاهدة
-      const result = await pool.query(
-        `INSERT INTO video_views (user_id, video_id, lecture_id, course_id, watch_duration, completion_percentage, is_completed)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)
-         ON CONFLICT (user_id, video_id) 
-         DO UPDATE SET 
-           watch_duration = EXCLUDED.watch_duration,
-           completion_percentage = EXCLUDED.completion_percentage,
-           is_completed = EXCLUDED.is_completed,
-           viewed_at = NOW(),
-           updated_at = NOW()
-         RETURNING *`,
-        [
-          userId,
-          videoId,
-          video.lecture_id,
-          video.course_id,
-          watch_duration || 0,
-          completion_percentage || 0,
-          is_completed || false,
-        ],
+      const tracking = await VideoViewTrackingService.trackStudentVideoView({
+        userId,
+        videoId,
+        lectureId: video.lecture_id,
+        courseId: video.course_id,
+        watchDuration: watch_duration || 0,
+        completionPercentage: completion_percentage || 0,
+        isCompleted: is_completed || false,
+        updateProgress: true,
+      });
+
+      const viewResult = await pool.query(
+        'SELECT * FROM video_views WHERE user_id = $1 AND video_id = $2',
+        [userId, videoId],
       );
 
       res.json({
         message: 'تم تسجيل المشاهدة بنجاح',
-        view: result.rows[0],
+        view: viewResult.rows[0],
+        view_tracked: tracking.viewTracked,
+        lecture_view_tracked: tracking.lectureViewTracked,
+        is_first_video_view: tracking.isFirstVideoView,
+        lecture_points_awarded: tracking.lecturePointsAwarded,
       });
     } catch (error) {
       console.error('Error tracking video view:', error);
