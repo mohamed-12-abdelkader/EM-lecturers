@@ -317,3 +317,15 @@ exports.router.patch('/:id', (req, res, next) => {
         throw e;
     }
 }));
+exports.router.delete('/:id', (0, utils_1.asyncWrapper)(async (req, res) => {
+    const id = Number(req.params.id);
+    if (!id || Number.isNaN(id))
+        return res.status(400).json({ message: 'Invalid id' });
+    const confirmSubdomain = typeof req.body?.confirm_subdomain === 'string'
+        ? req.body.confirm_subdomain
+        : typeof req.query.confirm_subdomain === 'string'
+            ? req.query.confirm_subdomain
+            : undefined;
+    const result = await tenants_1.TenantService.deleteTenantForAdmin(id, { confirmSubdomain });
+    res.json({ success: true, message: 'Tenant deleted', data: result });
+}));

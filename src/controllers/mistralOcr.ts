@@ -1,8 +1,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { Router, type Request } from 'express';
+import { Router, type NextFunction, type Request, type Response } from 'express';
 import multer from 'multer';
 import { z } from 'zod';
+import { getMistralConfig } from '../config/mistral';
 import { authMiddleware } from '../middleware/authentication';
 import { asyncWrapper, HttpError } from '../utils';
 import { MistralOcrService, parsePdfPageRange } from '../services/mistralOcr';
@@ -20,32 +21,64 @@ fs.mkdirSync(uploadDir, { recursive: true });
 
 const MAX_UPLOAD_FILES = 20;
 
-const upload = multer({
-  storage: multer.diskStorage({
-    destination: (_req, _file, cb) => cb(null, uploadDir),
-    filename: (_req, file, cb) => {
-      const ext = path.extname(file.originalname || '');
-      cb(null, `mistral-ocr-${Date.now()}-${Math.round(Math.random() * 1e9)}${ext}`);
+function buildOcrUpload() {
+  const maxBytes = getMistralConfig().maxUploadBytes;
+  return multer({
+    storage: multer.diskStorage({
+      destination: (_req, _file, cb) => cb(null, uploadDir),
+      filename: (_req, file, cb) => {
+        const ext = path.extname(file.originalname || '');
+        cb(null, `mistral-ocr-${Date.now()}-${Math.round(Math.random() * 1e9)}${ext}`);
+      },
+    }),
+    limits: {
+      // Omit fileSize when unlimited (MISTRAL_OCR_MAX_FILE_SIZE_MB=0)
+      ...(Number.isFinite(maxBytes) ? { fileSize: maxBytes } : {}),
+      files: MAX_UPLOAD_FILES,
     },
-  }),
-  limits: {
-    fileSize: 50 * 1024 * 1024,
-    files: MAX_UPLOAD_FILES,
-  },
-  fileFilter: (_req, file, cb) => {
-    try {
-      MistralOcrService.resolveSupportedMime(file);
-      cb(null, true);
-    } catch {
-      cb(new Error('يسمح برفع PDF أو صورة فقط'));
-    }
-  },
-});
+    fileFilter: (_req, file, cb) => {
+      try {
+        MistralOcrService.resolveSupportedMime(file);
+        cb(null, true);
+      } catch {
+        cb(new Error('يسمح برفع PDF أو صورة فقط'));
+      }
+    },
+  });
+}
 
-const uploadExtract = upload.fields([
+const uploadExtract = buildOcrUpload().fields([
   { name: 'file', maxCount: 1 },
   { name: 'files', maxCount: MAX_UPLOAD_FILES },
 ]);
+
+/** Multer with Arabic 413 on oversized files (limit from MISTRAL_OCR_MAX_FILE_SIZE_MB). */
+function uploadExtractSafe(req: Request, res: Response, next: NextFunction) {
+  uploadExtract(req, res, (err: unknown) => {
+    if (!err) return next();
+    if (err instanceof multer.MulterError) {
+      if (err.code === 'LIMIT_FILE_SIZE') {
+        const maxMb = getMistralConfig().maxUploadBytes;
+        const limitLabel = Number.isFinite(maxMb)
+          ? `${Math.round(maxMb / (1024 * 1024))} MB`
+          : 'غير محدود';
+        return res.status(413).json({
+          success: false,
+          message: `حجم الملف أكبر من الحد المسموح (${limitLabel}). زد MISTRAL_OCR_MAX_FILE_SIZE_MB أو ضع 0 بلا حد`,
+        });
+      }
+      if (err.code === 'LIMIT_FILE_COUNT' || err.code === 'LIMIT_UNEXPECTED_FILE') {
+        return res.status(400).json({
+          success: false,
+          message: `عدد الملفات يتجاوز الحد (${MAX_UPLOAD_FILES})`,
+        });
+      }
+      return res.status(400).json({ success: false, message: err.message });
+    }
+    const msg = err instanceof Error ? err.message : 'خطأ في رفع الملف';
+    return res.status(400).json({ success: false, message: msg });
+  });
+}
 
 const ImportQuestionBankV2Schema = z
   .object({
@@ -166,7 +199,7 @@ async function runOcrExtraction(
 router.post(
   '/extract-text',
   authMiddleware(['teacher', 'admin', 'employee']),
-  uploadExtract,
+  uploadExtractSafe,
   asyncWrapper(async (req, res) => {
     const files = collectUploadedFiles(req);
     if (files.length === 0) {
@@ -194,7 +227,7 @@ router.post(
 router.post(
   '/extract-questions',
   authMiddleware(['teacher', 'admin', 'employee']),
-  uploadExtract,
+  uploadExtractSafe,
   asyncWrapper(async (req, res) => {
     const files = collectUploadedFiles(req);
     if (files.length === 0) {

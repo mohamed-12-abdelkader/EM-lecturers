@@ -17,6 +17,8 @@ export interface TeacherFileRow {
   file_extension: string;
   mime_type: string;
   category_id: number | null;
+  source_type: 'upload' | 'drive';
+  drive_url: string | null;
   downloads_count: number;
   created_at: Date;
   updated_at: Date;

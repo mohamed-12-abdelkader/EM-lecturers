@@ -129,3 +129,40 @@ export async function recordFinancialTransaction(input: {
     ],
   );
 }
+
+export async function recordFinancialTransactionWithClient(
+  client: import('pg').PoolClient,
+  input: {
+    transaction_kind: string;
+    reference_table: string;
+    reference_id: number;
+    amount: number;
+    direction: 'in' | 'out';
+    teacher_id?: number | null;
+    plan_code?: string | null;
+    category?: string | null;
+    transaction_date: string;
+    description?: string | null;
+    created_by: number;
+  },
+) {
+  await client.query(
+    `INSERT INTO platform_financial_transactions (
+       transaction_kind, reference_table, reference_id, amount, direction,
+       teacher_id, plan_code, category, transaction_date, description, created_by
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+    [
+      input.transaction_kind,
+      input.reference_table,
+      input.reference_id,
+      input.amount,
+      input.direction,
+      input.teacher_id ?? null,
+      input.plan_code ?? null,
+      input.category ?? null,
+      input.transaction_date,
+      input.description ?? null,
+      input.created_by,
+    ],
+  );
+}

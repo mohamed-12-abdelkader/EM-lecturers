@@ -81,14 +81,15 @@ sequenceDiagram
 ## متغيرات البيئة
 
 ```env
-# إلزامي
 MISTRAL_API_KEY=...
 MISTRAL_API_BASE_URL=https://api.mistral.ai/v1
 MISTRAL_OCR_MODEL=mistral-ocr-latest
 MISTRAL_CHAT_MODEL=mistral-large-latest
 
+# حجم ملف OCR الأقصى بالميجابايت — افتراضي 512 — ضع 0 بلا حد
+MISTRAL_OCR_MAX_FILE_SIZE_MB=512
+
 # مطلوب عند include_question_images=true (رفع صور OCR إلى CDN)
-# مطلوب عند include_question_images=true (رفع صور OCR)
 CLOUDINARY_CLOUD_NAME=...
 CLOUDINARY_API_KEY=...
 CLOUDINARY_API_SECRET=...
@@ -110,8 +111,10 @@ CLOUDINARY_URL=...
 | BMP | `image/bmp` |
 | TIFF | `image/tiff` |
 
-**الحد الأقصى لحجم الملف:** `25 MB`  
-**Content-Type:** `multipart/form-data` — حقل واحد `file`
+**الحد الأقصى لحجم الملف:** يُضبط عبر `MISTRAL_OCR_MAX_FILE_SIZE_MB` (افتراضي **512 MB**، و`0` = بلا حد من جهة التطبيق).  
+**Content-Type:** `multipart/form-data` — حقل `file` أو `files`
+
+> **إنتاج:** تأكد أيضاً أن الـ reverse proxy (nginx / Cloudflare / load balancer) يسمح بجسم الطلب بنفس الحجم أو أكبر (`client_max_body_size` في nginx مثلاً). ملفات PDF الطويلة تُقسَّم تلقائياً داخلياً (OCR كل 50 صفحة + تحليل أسئلة على دفعات).
 
 ---
 
@@ -216,7 +219,7 @@ curl -X POST "http://localhost:8000/api/ocr/extract-questions" \
 
 > **ملاحظات:**
 > - أرقام الصفحات **1-based** (الصفحة الأولى = 1).
-> - الحد الأقصى **50 صفحة** في طلب واحد.
+> - لا يوجد حد أقصى لعدد الصفحات في الطلب — الـ API يقسّم PDF تلقائياً إلى دفعات (حد مزوّد OCR = 50 صفحة/طلب داخلياً).
 > - لا يمكن رفع PDF وصور معاً في نفس الطلب.
 
 **مثال curl (ملف واحد):**
@@ -515,6 +518,7 @@ for (const passage of passages) {
 |------|---------|--------------|
 | `400` | `يجب رفع ملف واحد في الحقل file` | لم يُرفَع ملف |
 | `400` | `يسمح برفع PDF أو صورة فقط` | نوع ملف غير مدعوم |
+| `413` | `حجم الملف أكبر من الحد المسموح...` | زد `MISTRAL_OCR_MAX_FILE_SIZE_MB` أو ضع `0` بلا حد |
 | `400` | `OCR provider returned invalid question JSON` | Mistral رجّع JSON غير مطابق للـ schema |
 | `400` | `Validation failed` | body الاستيراد غير صالح (Zod) |
 | `403` / خطأ | `ليس لديك صلاحية لإضافة أسئلة لهذا الدرس` | المدرس ليس مالك بنك الأسئلة |

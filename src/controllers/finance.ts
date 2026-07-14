@@ -81,6 +81,11 @@ const UpgradeSubscriptionSchema = z.object({
   notes: z.string().optional().nullable(),
 });
 
+const CancelSubscriptionSchema = z.object({
+  notes: z.string().optional().nullable(),
+  reason: z.string().optional().nullable(),
+});
+
 const UpdateSubscriptionStatusSchema = z.object({
   status: z.enum(['active', 'expired', 'suspended', 'cancelled']),
   notes: z.string().optional().nullable(),
@@ -253,7 +258,39 @@ router.patch(
       (req as any).user.id,
       req.body.notes,
     );
-    res.json({ success: true, message: 'تم تحديث حالة الاشتراك', data: sub });
+    const message =
+      req.body.status === 'cancelled' ? 'تم إلغاء الاشتراك' : 'تم تحديث حالة الاشتراك';
+    res.json({ success: true, message, data: sub });
+  }),
+);
+
+router.post(
+  '/subscriptions/:id/cancel',
+  validate(CancelSubscriptionSchema),
+  asyncWrapper(async (req, res) => {
+    const sub = await TeacherPlatformSubscriptionsService.cancel(
+      Number(req.params.id),
+      (req as any).user.id,
+      req.body,
+    );
+    res.json({ success: true, message: 'تم إلغاء الاشتراك', data: sub });
+  }),
+);
+
+router.delete(
+  '/subscriptions/:id',
+  asyncWrapper(async (req, res) => {
+    const force = req.query.force === 'true';
+    const result = await TeacherPlatformSubscriptionsService.deleteSubscription(
+      Number(req.params.id),
+      (req as any).user.id,
+      { force },
+    );
+    res.json({
+      success: true,
+      message: 'تم حذف الاشتراك من السجل',
+      data: result,
+    });
   }),
 );
 
@@ -384,6 +421,26 @@ router.delete(
 );
 
 // Income (legacy compatible + list)
+router.get(
+  '/income/details',
+  asyncWrapper(async (req, res) => {
+    const data = await FinancialDashboardService.listIncomeDetails({
+      teacher_id: req.query.teacher_id ? Number(req.query.teacher_id) : undefined,
+      subscription_id: req.query.subscription_id ? Number(req.query.subscription_id) : undefined,
+      plan_code: req.query.plan_code as string,
+      payment_type: req.query.payment_type as string,
+      start_date: req.query.start_date as string,
+      end_date: req.query.end_date as string,
+      search: req.query.search as string,
+      counted_only: req.query.counted_only === 'true',
+      include_reversals: req.query.include_reversals !== 'false',
+      limit: req.query.limit ? Number(req.query.limit) : undefined,
+      offset: req.query.offset ? Number(req.query.offset) : undefined,
+    });
+    res.json({ success: true, data });
+  }),
+);
+
 router.get(
   '/income',
   asyncWrapper(async (req, res) => {

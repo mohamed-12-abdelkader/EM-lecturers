@@ -518,6 +518,132 @@ async function parseQuestionsWithChat(
   };
 }
 
+/** Soft limits so huge PDFs don't blow the chat context window. */
+const CHAT_BATCH_MAX_PAGES = 15;
+const CHAT_BATCH_MAX_CHARS = 90_000;
+
+function chunkOcrPagesForChat(ocr: MistralOcrResult): MistralOcrResult[] {
+  if (ocr.pages.length <= CHAT_BATCH_MAX_PAGES) {
+    const chars = buildDocumentContext(ocr).length;
+    if (chars <= CHAT_BATCH_MAX_CHARS) return [ocr];
+  }
+
+  const batches: MistralOcrResult[] = [];
+  let currentPages: MistralOcrResult['pages'] = [];
+  let currentChars = 0;
+
+  const flush = () => {
+    if (currentPages.length === 0) return;
+    const pages = currentPages;
+    const text = pages
+      .map((p) => p.markdown.trim())
+      .filter(Boolean)
+      .join('\n\n---\n\n');
+    batches.push({
+      ...ocr,
+      pages,
+      text,
+      page_count: pages.length,
+    });
+    currentPages = [];
+    currentChars = 0;
+  };
+
+  for (const page of ocr.pages) {
+    const pageChars = (page.markdown?.length ?? 0) + 64;
+    if (
+      currentPages.length > 0 &&
+      (currentPages.length >= CHAT_BATCH_MAX_PAGES ||
+        currentChars + pageChars > CHAT_BATCH_MAX_CHARS)
+    ) {
+      flush();
+    }
+    currentPages.push(page);
+    currentChars += pageChars;
+  }
+  flush();
+
+  return batches.length > 0 ? batches : [ocr];
+}
+
+function prefixPassageIds(
+  passages: MistralExtractedPassage[],
+  questions: MistralExtractedQuestion[],
+  prefix: string,
+): { passages: MistralExtractedPassage[]; questions: MistralExtractedQuestion[] } {
+  if (!prefix) return { passages, questions };
+  return {
+    passages: passages.map((p) => ({
+      ...p,
+      passage_id: `${prefix}${p.passage_id}`,
+    })),
+    questions: questions.map((q) => ({
+      ...q,
+      passage_id: q.passage_id ? `${prefix}${q.passage_id}` : q.passage_id,
+    })),
+  };
+}
+
+async function parseQuestionsWithChatBatched(
+  ocr: MistralOcrResult,
+  inferCorrectAnswer: boolean,
+  chatModelOverride?: string,
+): Promise<{
+  passages: MistralExtractedPassage[];
+  questions: MistralExtractedQuestion[];
+  notes?: string;
+  chatModel: string;
+}> {
+  const batches = chunkOcrPagesForChat(ocr);
+  if (batches.length === 1) {
+    return parseQuestionsWithChat(
+      buildDocumentContext(batches[0]),
+      ocr.filename,
+      inferCorrectAnswer,
+      chatModelOverride,
+    );
+  }
+
+  const allPassages: MistralExtractedPassage[] = [];
+  const allQuestions: MistralExtractedQuestion[] = [];
+  const notesParts: string[] = [];
+  let chatModel = '';
+
+  for (let i = 0; i < batches.length; i++) {
+    const batch = batches[i];
+    const context = buildDocumentContext(batch);
+    if (!context.trim()) continue;
+
+    const result = await parseQuestionsWithChat(
+      context,
+      `${ocr.filename} [pages-batch ${i + 1}/${batches.length}]`,
+      inferCorrectAnswer,
+      chatModelOverride,
+    );
+    chatModel = result.chatModel;
+    const remapped = prefixPassageIds(result.passages, result.questions, `b${i + 1}_`);
+    allPassages.push(...remapped.passages);
+    allQuestions.push(...remapped.questions);
+    if (result.notes?.trim()) notesParts.push(result.notes.trim());
+  }
+
+  if (allQuestions.length === 0 && allPassages.length === 0) {
+    throw new HttpError(400, 'لم يُستخرج أي أسئلة من الملف');
+  }
+
+  const expanded = expandMultiPartQuestions(
+    normalizePassages(allPassages),
+    dedupeByNumber(allQuestions),
+  );
+
+  return {
+    passages: expanded.passages,
+    questions: expanded.questions,
+    notes: notesParts.length ? notesParts.join('\n') : undefined,
+    chatModel: chatModel || getMistralConfig().chatModel,
+  };
+}
+
 export class MistralQuestionExtractionService {
   /**
    * Pipeline: Mistral OCR (PDF/صورة → markdown) → Mistral Chat (markdown → أسئلة JSON)
@@ -616,9 +742,8 @@ export class MistralQuestionExtractionService {
     }
 
     const extractedImages = extractOcrImages(ocr);
-    const { passages, questions, notes, chatModel } = await parseQuestionsWithChat(
-      documentContext,
-      ocr.filename,
+    const { passages, questions, notes, chatModel } = await parseQuestionsWithChatBatched(
+      ocr,
       opts.inferCorrectAnswer,
       opts.requestedChatModel,
     );

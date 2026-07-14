@@ -103,8 +103,10 @@ image/tiff
 Max file size:
 
 ```txt
-25MB
+MISTRAL_OCR_MAX_FILE_SIZE_MB (default 512 MB; 0 = unlimited at app level)
 ```
+
+Large PDFs are auto-batched (50 pages per OCR call). Raise reverse-proxy body limits in production as well.
 
 ### Example
 

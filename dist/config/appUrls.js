@@ -5,6 +5,7 @@ exports.getNgrokUrl = getNgrokUrl;
 exports.getProductionUrl = getProductionUrl;
 exports.getBaseUrl = getBaseUrl;
 exports.getApiUrl = getApiUrl;
+exports.isAllowedSubdomain = isAllowedSubdomain;
 exports.getSocketUrl = getSocketUrl;
 exports.buildFileUrl = buildFileUrl;
 exports.rewriteLoopbackUrl = rewriteLoopbackUrl;
@@ -73,6 +74,19 @@ function getApiUrl() {
         return stripTrailingSlash(explicit);
     return `${getBaseUrl()}/api`;
 }
+function isAllowedSubdomain(origin) {
+    const root = utils_1.config.TENANT_ROOT_DOMAIN?.trim().toLowerCase();
+    if (!root)
+        return false;
+    try {
+        const { hostname } = new URL(origin);
+        return (hostname === root ||
+            hostname.endsWith(`.${root}`));
+    }
+    catch {
+        return false;
+    }
+}
 /** wss://xxxx.ngrok-free.app for Socket.IO */
 function getSocketUrl() {
     return getBaseUrl().replace(/^https:/i, 'wss:').replace(/^http:/i, 'ws:');
@@ -130,15 +144,23 @@ function getAllowedCorsOrigins() {
 }
 function isCorsOriginAllowed(origin) {
     const allowed = getAllowedCorsOrigins();
-    if (allowed.includes('*'))
+    if (allowed.includes("*"))
         return true;
-    if (!origin)
-        return utils_1.config.NGROK_RELAX_CORS && utils_1.config.NODE_ENV === 'development';
-    if (allowed.includes(origin))
+    if (!origin) {
+        return utils_1.config.NGROK_RELAX_CORS && utils_1.config.NODE_ENV === "development";
+    }
+    // Exact origins
+    if (allowed.includes(origin)) {
         return true;
-    if (utils_1.config.NODE_ENV === 'development' && utils_1.config.NGROK_RELAX_CORS) {
-        if (isExpoOrigin(origin) || isNgrokOrigin(origin))
+    }
+    // Any *.next-edu.online
+    if (isAllowedSubdomain(origin)) {
+        return true;
+    }
+    if (utils_1.config.NODE_ENV === "development" && utils_1.config.NGROK_RELAX_CORS) {
+        if (isExpoOrigin(origin) || isNgrokOrigin(origin)) {
             return true;
+        }
     }
     return false;
 }

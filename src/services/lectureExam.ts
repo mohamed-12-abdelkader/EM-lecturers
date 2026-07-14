@@ -1,5 +1,12 @@
 import pool from '../db/pool';
 
+/** كورس مجاني أو طالب مسجّل — بدون اشتراك إلزامي للكورسات المجانية */
+const studentCourseAccessSql = (studentParam: string) =>
+  `(COALESCE(c.is_free, FALSE) = TRUE OR EXISTS (
+    SELECT 1 FROM enrollments en_access
+    WHERE en_access.course_id = c.id AND en_access.user_id = ${studentParam}
+  ))`;
+
 export interface LectureExam {
   id: number;
   lecture_id: number;
@@ -214,8 +221,7 @@ export class LectureExamService {
       query += ` AND EXISTS (
         SELECT 1 FROM lectures l 
         JOIN courses c ON l.course_id = c.id 
-        JOIN enrollments en ON c.id = en.course_id 
-        WHERE l.id = e.lecture_id AND en.user_id = $2
+        WHERE l.id = e.lecture_id AND ${studentCourseAccessSql('$2')}
       )`;
       params.push(userId);
     } else if (userRole === 'teacher') {
@@ -258,8 +264,7 @@ export class LectureExamService {
       query += ` AND EXISTS (
         SELECT 1 FROM lectures l 
         JOIN courses c ON l.course_id = c.id 
-        JOIN enrollments en ON c.id = en.course_id 
-        WHERE l.id = e.lecture_id AND en.user_id = $2
+        WHERE l.id = e.lecture_id AND ${studentCourseAccessSql('$2')}
       )`;
       params.push(userId);
     } else if (userRole === 'teacher') {
@@ -288,8 +293,7 @@ export class LectureExamService {
        FROM exams e
        JOIN lectures l ON l.id = e.lecture_id
        JOIN courses c ON c.id = l.course_id
-       JOIN enrollments en ON en.course_id = c.id
-       WHERE e.id = $1 AND en.user_id = $2
+       WHERE e.id = $1 AND ${studentCourseAccessSql('$2')}
        AND (e.show_at IS NULL OR e.show_at <= $3)
        AND (e.hide_at IS NULL OR e.hide_at >= $3)
        AND e.is_visible = true`,
@@ -320,9 +324,8 @@ export class LectureExamService {
       `SELECT e.id FROM exams e
        JOIN lectures l ON l.id = e.lecture_id
        JOIN courses c ON c.id = l.course_id
-       JOIN enrollments en ON en.course_id = c.id
        WHERE e.lecture_id = $1 
-       AND en.user_id = $2
+       AND ${studentCourseAccessSql('$2')}
        AND e.lock_next_lectures = true
        AND e.is_visible = true
        AND (e.show_at IS NULL OR e.show_at <= $3)
@@ -346,9 +349,8 @@ export class LectureExamService {
          FROM exams e
          JOIN lectures l ON l.id = e.lecture_id
          JOIN courses c ON c.id = l.course_id
-         JOIN enrollments en ON en.course_id = c.id
          WHERE e.lecture_id = $1 
-         AND en.user_id = $2`,
+         AND ${studentCourseAccessSql('$2')}`,
         [lectureId, studentId, now],
       );
 
@@ -418,10 +420,9 @@ export class LectureExamService {
               END as visibility_status
        FROM lectures l
        JOIN courses c ON c.id = l.course_id
-       JOIN enrollments en ON en.course_id = c.id
        JOIN exams e ON e.lecture_id = l.id
        WHERE c.id = (SELECT course_id FROM lectures WHERE id = $1)
-       AND en.user_id = $2
+       AND ${studentCourseAccessSql('$2')}
        AND (l.position, COALESCE(l.created_at, '1970-01-01'::timestamp), l.id) <
            (SELECT position, COALESCE(created_at, '1970-01-01'::timestamp), id FROM lectures WHERE id = $1)
        ORDER BY l.position DESC, l.created_at DESC NULLS LAST, l.id DESC`,
@@ -434,10 +435,9 @@ export class LectureExamService {
               e.show_at, e.hide_at, l.title as lecture_title, l.position
        FROM lectures l
        JOIN courses c ON c.id = l.course_id
-       JOIN enrollments en ON en.course_id = c.id
        JOIN exams e ON e.lecture_id = l.id
        WHERE c.id = (SELECT course_id FROM lectures WHERE id = $1)
-       AND en.user_id = $2
+       AND ${studentCourseAccessSql('$2')}
        AND (l.position, COALESCE(l.created_at, '1970-01-01'::timestamp), l.id) <
            (SELECT position, COALESCE(created_at, '1970-01-01'::timestamp), id FROM lectures WHERE id = $1)
        AND e.lock_next_lectures = true
@@ -483,10 +483,9 @@ export class LectureExamService {
       `SELECT l.id as lecture_id, l.position
        FROM lectures l
        JOIN courses c ON c.id = l.course_id
-       JOIN enrollments en ON en.course_id = c.id
        JOIN exams e ON e.lecture_id = l.id
        WHERE c.id = (SELECT course_id FROM lectures WHERE id = $1)
-       AND en.user_id = $2
+       AND ${studentCourseAccessSql('$2')}
        AND (l.position, COALESCE(l.created_at, '1970-01-01'::timestamp), l.id) <
            (SELECT position, COALESCE(created_at, '1970-01-01'::timestamp), id FROM lectures WHERE id = $1)
        AND e.lock_next_lectures = true
@@ -515,10 +514,9 @@ export class LectureExamService {
                 END as reason
          FROM lectures l
          JOIN courses c ON c.id = l.course_id
-         JOIN enrollments en ON en.course_id = c.id
          JOIN exams e ON e.lecture_id = l.id
          WHERE c.id = (SELECT course_id FROM lectures WHERE id = $1)
-         AND en.user_id = $2
+         AND ${studentCourseAccessSql('$2')}
          AND (l.position, COALESCE(l.created_at, '1970-01-01'::timestamp), l.id) <
              (SELECT position, COALESCE(created_at, '1970-01-01'::timestamp), id FROM lectures WHERE id = $1)
          ORDER BY l.position DESC, l.created_at DESC NULLS LAST, l.id DESC`,
@@ -565,11 +563,10 @@ export class LectureExamService {
               s.submitted_at, s.total_grade as student_grade
        FROM lectures l
        JOIN courses c ON c.id = l.course_id
-       JOIN enrollments en ON en.course_id = c.id
        JOIN exams e ON e.lecture_id = l.id
        LEFT JOIN exam_submissions s ON s.exam_id = e.id AND s.student_id = $2
        WHERE c.id = (SELECT course_id FROM lectures WHERE id = $1)
-       AND en.user_id = $2
+       AND ${studentCourseAccessSql('$2')}
        AND (l.position, COALESCE(l.created_at, '1970-01-01'::timestamp), l.id) <
            (SELECT position, COALESCE(created_at, '1970-01-01'::timestamp), id FROM lectures WHERE id = $1)
        AND e.lock_next_lectures = true
@@ -594,9 +591,8 @@ export class LectureExamService {
       `SELECT e.id FROM exams e
        JOIN lectures l ON l.id = e.lecture_id
        JOIN courses c ON c.id = l.course_id
-       JOIN enrollments en ON en.course_id = c.id
        WHERE e.id = $1 
-       AND en.user_id = $2
+       AND ${studentCourseAccessSql('$2')}
        AND e.is_visible = true
        AND (e.show_at IS NULL OR e.show_at <= $3)
        AND (e.hide_at IS NULL OR e.hide_at >= $3)`,

@@ -80,6 +80,7 @@ import { router as mistralOcrRouter } from './controllers/mistralOcr';
 import { router as examBuilderChatbotRouter } from './controllers/examBuilderChatbot';
 import { router as teacherStudentsRouter } from './controllers/teacherStudents';
 import { teacherFilesRouter, teacherFileCategoriesRouter } from './modules/myFiles/controllers/teacherMyFiles.controller';
+import { centerRouter } from './modules/centerMgmt';
 
 export const router = Router();
 
@@ -109,6 +110,7 @@ router.use('/teacher/exam-builder', examBuilderChatbotRouter);
 router.use('/teacher/students', teacherStudentsRouter);
 router.use('/teacher/files', teacherFilesRouter);
 router.use('/teacher/file-categories', teacherFileCategoriesRouter);
+router.use('/teacher/center', centerRouter);
 router.use('/ocr', mistralOcrRouter);
 router.use('/teacher/questions', teacherQuestionsRouter);
 router.use('/teacher/free-lectures', teacherFreeLecturesRouter);

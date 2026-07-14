@@ -426,6 +426,7 @@ router.get(
         users.description,
         users.subject,
         users.facebook_url,
+        users.instagram_url,
         users.youtube_url,
         users.tiktok_url,
         users.whatsapp_number,
@@ -439,7 +440,7 @@ router.get(
       LEFT JOIN courses c ON users.id = c.teacher_id
       LEFT JOIN enrollments e ON c.id = e.course_id
       WHERE ${whereClause}
-      GROUP BY users.id, users.name, users.email, users.phone, users.avatar, users.description, users.subject, users.facebook_url, users.youtube_url, users.tiktok_url, users.whatsapp_number, users.created_at, t.subdomain
+      GROUP BY users.id, users.name, users.email, users.phone, users.avatar, users.description, users.subject, users.facebook_url, users.instagram_url, users.youtube_url, users.tiktok_url, users.whatsapp_number, users.created_at, t.subdomain
       ORDER BY users.created_at DESC
       ${limitSQL}
       ${offsetSQL}
@@ -499,6 +500,7 @@ router.put(
       subject,
       grade_ids,
       facebook_url,
+      instagram_url,
       youtube_url,
       tiktok_url,
       whatsapp_number,
@@ -547,6 +549,10 @@ router.put(
       updates.push(`facebook_url = $${counter++}`);
       values.push(facebook_url);
     }
+    if (instagram_url !== undefined) {
+      updates.push(`instagram_url = $${counter++}`);
+      values.push(instagram_url);
+    }
     if (youtube_url !== undefined) {
       updates.push(`youtube_url = $${counter++}`);
       values.push(youtube_url);
@@ -568,13 +574,13 @@ router.put(
         `UPDATE users 
        SET ${updates.join(', ')} 
        WHERE id = $${counter++} AND role = 'teacher' 
-       RETURNING id, name, email, phone, avatar, description, subject, facebook_url, youtube_url, tiktok_url, whatsapp_number, created_at`,
+       RETURNING id, name, email, phone, avatar, description, subject, facebook_url, instagram_url, youtube_url, tiktok_url, whatsapp_number, created_at`,
         values,
       );
     } else {
       // إذا لم يكن هناك تحديثات في جدول users، جلب البيانات الحالية
       result = await pool.query(
-        `SELECT id, name, email, phone, avatar, description, subject, facebook_url, youtube_url, tiktok_url, whatsapp_number, created_at 
+        `SELECT id, name, email, phone, avatar, description, subject, facebook_url, instagram_url, youtube_url, tiktok_url, whatsapp_number, created_at
          FROM users 
          WHERE id = $1 AND role = 'teacher'`,
         [id],

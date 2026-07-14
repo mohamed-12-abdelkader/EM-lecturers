@@ -3,13 +3,13 @@ import { z } from 'zod';
 import { authMiddleware } from '../middleware/authentication';
 import { requireDefaultTenantMiddleware } from '../middleware/tenantContext';
 import { validate } from '../middleware/validateReq';
-import { asyncWrapper, HttpError, uploadTeacherAvatar, uploadToCloudinary } from '../utils';
+import { asyncWrapper, HttpError, uploadToCloudinary } from '../utils';
 import { TenantService, type CreateTenantInput } from '../services/tenants';
 import {
   buildPatchTenantFromMultipart,
   isMultipartRequest,
   PatchTenantBodySchema,
-  uploadTenantFiles,
+  uploadTenantFilesSafe,
 } from '../utils/tenantFormPayload';
 
 export const router = Router();
@@ -25,6 +25,11 @@ const OwnerSchema = z
     description: z.string().optional(),
     subject: z.string().optional(),
     grade_ids: z.array(z.number().int().positive()).optional(),
+    facebook_url: z.string().optional().nullable(),
+    instagram_url: z.string().optional().nullable(),
+    youtube_url: z.string().optional().nullable(),
+    tiktok_url: z.string().optional().nullable(),
+    whatsapp_number: z.string().optional().nullable(),
   })
   .optional();
 
@@ -187,6 +192,11 @@ async function buildCreateTenantFromMultipart(
           description: z.string().optional(),
           subject: z.string().optional(),
           grade_ids: z.array(z.number().int().positive()).optional(),
+          facebook_url: z.string().optional().nullable(),
+          instagram_url: z.string().optional().nullable(),
+          youtube_url: z.string().optional().nullable(),
+          tiktok_url: z.string().optional().nullable(),
+          whatsapp_number: z.string().optional().nullable(),
         })
         .safeParse(parsed);
       if (!o.success) return { error: 'Invalid owner JSON' };
@@ -206,6 +216,11 @@ async function buildCreateTenantFromMultipart(
         description: formStr(b.owner_description),
         subject: formStr(b.owner_subject),
         grade_ids: parseGradeIdsInput(b.owner_grade_ids),
+        facebook_url: formStr(b.owner_facebook_url) ?? null,
+        instagram_url: formStr(b.owner_instagram_url) ?? null,
+        youtube_url: formStr(b.owner_youtube_url) ?? null,
+        tiktok_url: formStr(b.owner_tiktok_url) ?? null,
+        whatsapp_number: formStr(b.owner_whatsapp_number) ?? null,
       };
     }
   }
@@ -235,12 +250,7 @@ async function buildCreateTenantFromMultipart(
   return { data };
 }
 
-const uploadTenantCreateFiles = uploadTeacherAvatar.fields([
-  { name: 'avatar', maxCount: 1 },
-  { name: 'favicon', maxCount: 1 },
-  { name: 'og_image', maxCount: 1 },
-  { name: 'hero_image', maxCount: 1 },
-]);
+const uploadTenantCreateFiles = uploadTenantFilesSafe;
 
 router.get(
   '/',
@@ -253,7 +263,6 @@ router.get(
       const { tenants, total } = await TenantService.listTeacherTenantsForAdmin({
         limit: Number.isFinite(limit) ? limit : 200,
         offset: Number.isFinite(offset) ? offset : 0,
-        includeDefault: req.query.include_default === 'true',
       });
       return res.json({ success: true, tenants, total });
     }
@@ -308,7 +317,7 @@ router.patch(
   '/:id',
   (req, res, next) => {
     if (isMultipartRequest(req)) {
-      return uploadTenantFiles(req, res, next);
+      return uploadTenantFilesSafe(req, res, next);
     }
     next();
   },
@@ -346,5 +355,23 @@ router.patch(
       }
       throw e;
     }
+  }),
+);
+
+router.delete(
+  '/:id',
+  asyncWrapper(async (req, res) => {
+    const id = Number(req.params.id);
+    if (!id || Number.isNaN(id)) return res.status(400).json({ message: 'Invalid id' });
+
+    const confirmSubdomain =
+      typeof req.body?.confirm_subdomain === 'string'
+        ? req.body.confirm_subdomain
+        : typeof req.query.confirm_subdomain === 'string'
+          ? req.query.confirm_subdomain
+          : undefined;
+
+    const result = await TenantService.deleteTenantForAdmin(id, { confirmSubdomain });
+    res.json({ success: true, message: 'Tenant deleted', data: result });
   }),
 );

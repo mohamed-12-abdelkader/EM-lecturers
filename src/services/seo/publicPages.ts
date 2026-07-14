@@ -94,7 +94,7 @@ export class PublicPagesService {
 
     const [teacherRes, gradesRes, statsRes, coursesRes, ratingsRes] = await Promise.all([
       pool.query(
-        `SELECT name, avatar, description, subject, facebook_url, youtube_url, tiktok_url, whatsapp_number
+        `SELECT name, avatar, description, subject, facebook_url, instagram_url, youtube_url, tiktok_url, whatsapp_number
          FROM users WHERE id = $1 LIMIT 1`,
         [teacherId],
       ),
@@ -146,6 +146,7 @@ export class PublicPagesService {
 
     const social_links: PublicTeacherPage['social_links'] = [];
     if (teacher?.facebook_url) social_links.push({ type: 'facebook', url: teacher.facebook_url });
+    if (teacher?.instagram_url) social_links.push({ type: 'instagram', url: teacher.instagram_url });
     if (teacher?.youtube_url) social_links.push({ type: 'youtube', url: teacher.youtube_url });
     if (teacher?.tiktok_url) social_links.push({ type: 'tiktok', url: teacher.tiktok_url });
     if (teacher?.whatsapp_number) {
@@ -177,6 +178,7 @@ export class PublicPagesService {
             description: teacher.description,
             subject: teacher.subject,
             facebook_url: teacher.facebook_url,
+            instagram_url: teacher.instagram_url,
             youtube_url: teacher.youtube_url,
             tiktok_url: teacher.tiktok_url,
             whatsapp_number: teacher.whatsapp_number,

@@ -1,10 +1,19 @@
 import type { PoolClient } from 'pg';
 import pool from '../db/pool';
+import { HttpError } from '../utils';
 import {
   OWNER_BILLING_SUBSCRIPTION_JOIN,
   OWNER_BILLING_SUBSCRIPTION_SELECT,
 } from './teacherPlanPolicy';
 import { SeoHooks } from './seo/hooks';
+import { TenantSitemapService } from './seo/sitemap';
+import { seoCacheDeletePrefix } from './seo/cache';
+
+function buildArchivedSubdomain(tenantId: number, currentSubdomain: string): string {
+  const base = String(currentSubdomain).replace(/^deleted-\d+-/, '');
+  const prefix = `deleted-${tenantId}-`;
+  return (prefix + base).slice(0, 63);
+}
 
 type OwnerSubscriptionPackage = 'bronze' | 'silver' | 'gold' | 'diamond';
 
@@ -50,6 +59,11 @@ export type CreateTenantInput = {
     description?: string;
     subject?: string;
     grade_ids?: number[];
+    facebook_url?: string | null;
+    instagram_url?: string | null;
+    youtube_url?: string | null;
+    tiktok_url?: string | null;
+    whatsapp_number?: string | null;
   };
 };
 
@@ -80,6 +94,7 @@ export type PatchTenantInput = Partial<
     subject?: string | null;
     phone?: string | null;
     facebook_url?: string | null;
+    instagram_url?: string | null;
     youtube_url?: string | null;
     tiktok_url?: string | null;
     whatsapp_number?: string | null;
@@ -134,6 +149,7 @@ export type AdminTeacherTenantDetail = AdminTeacherTenantListItem & {
     | (NonNullable<AdminTeacherTenantListItem['owner']> & {
         description: string | null;
         facebook_url: string | null;
+        instagram_url: string | null;
         youtube_url: string | null;
         tiktok_url: string | null;
         whatsapp_number: string | null;
@@ -208,7 +224,8 @@ export class TenantService {
       pool.query(`SELECT page FROM tenant_landing_pages WHERE tenant_id = $1`, [tenant.id]),
       ownerId
         ? pool.query(
-            `SELECT name, avatar, description, subject, facebook_url, youtube_url, tiktok_url, whatsapp_number
+            `SELECT name, avatar, description, subject,
+                    facebook_url, instagram_url, youtube_url, tiktok_url, whatsapp_number
              FROM users
              WHERE id = $1 AND role = 'teacher' AND tenant_id = $2
              LIMIT 1`,
@@ -246,6 +263,7 @@ export class TenantService {
           description: string | null;
           subject: string | null;
           facebook_url: string | null;
+          instagram_url: string | null;
           youtube_url: string | null;
           tiktok_url: string | null;
           whatsapp_number: string | null;
@@ -259,6 +277,7 @@ export class TenantService {
           description: row.description,
           subject: row.subject,
           facebook_url: row.facebook_url,
+          instagram_url: row.instagram_url,
           youtube_url: row.youtube_url,
           tiktok_url: row.tiktok_url,
           whatsapp_number: row.whatsapp_number,
@@ -367,8 +386,11 @@ export class TenantService {
       const description = input.owner.description ?? '';
       const subject = input.owner.subject ?? '';
       const u = await client.query(
-        `INSERT INTO users (email, password, name, avatar, role, description, subject, tenant_id)
-         VALUES ($1, $2, $3, $4, 'teacher', $5, $6, $7)
+        `INSERT INTO users (
+           email, password, name, avatar, role, description, subject, tenant_id,
+           facebook_url, instagram_url, youtube_url, tiktok_url, whatsapp_number
+         )
+         VALUES ($1, $2, $3, $4, 'teacher', $5, $6, $7, $8, $9, $10, $11, $12)
          RETURNING id`,
         [
           input.owner.email,
@@ -378,6 +400,11 @@ export class TenantService {
           description,
           subject,
           created.id,
+          input.owner.facebook_url ?? null,
+          input.owner.instagram_url ?? null,
+          input.owner.youtube_url ?? null,
+          input.owner.tiktok_url ?? null,
+          input.owner.whatsapp_number ?? null,
         ],
       );
       const teacherId = u.rows[0].id as number;
@@ -434,6 +461,8 @@ export class TenantService {
     const r = await pool.query(
       `SELECT id, subdomain, display_name, is_active, owner_user_id, created_at
        FROM tenants
+       WHERE subdomain <> 'default'
+         AND subdomain NOT LIKE 'deleted-%'
        ORDER BY id ASC
        LIMIT $1 OFFSET $2`,
       [limit, offset],
@@ -444,22 +473,21 @@ export class TenantService {
   static async listTeacherTenantsForAdmin(options: {
     limit?: number;
     offset?: number;
-    includeDefault?: boolean;
+    includeDeleted?: boolean;
     isActive?: boolean | null;
     search?: string;
   } = {}): Promise<{ tenants: AdminTeacherTenantListItem[]; total: number }> {
     const limit = Math.min(Math.max(options.limit ?? 50, 1), 200);
     const offset = Math.max(options.offset ?? 0, 0);
-    const includeDefault = options.includeDefault ?? false;
     const search = options.search?.trim() || null;
     const isActive = options.isActive ?? null;
 
-    const conditions: string[] = [];
+    const conditions: string[] = [`t.subdomain <> 'default'`];
     const values: unknown[] = [];
     let i = 1;
 
-    if (!includeDefault) {
-      conditions.push(`t.subdomain <> 'default'`);
+    if (!options.includeDeleted) {
+      conditions.push(`t.subdomain NOT LIKE 'deleted-%'`);
     }
     if (isActive !== null) {
       conditions.push(`t.is_active = $${i++}`);
@@ -602,6 +630,7 @@ export class TenantService {
          owner.avatar AS owner_avatar,
          owner.description AS owner_description,
          owner.facebook_url AS owner_facebook_url,
+         owner.instagram_url AS owner_instagram_url,
          owner.youtube_url AS owner_youtube_url,
          owner.tiktok_url AS owner_tiktok_url,
          owner.whatsapp_number AS owner_whatsapp_number,
@@ -685,6 +714,7 @@ export class TenantService {
             created_at: row.owner_created_at,
             description: row.owner_description,
             facebook_url: row.owner_facebook_url,
+            instagram_url: row.owner_instagram_url,
             youtube_url: row.owner_youtube_url,
             tiktok_url: row.owner_tiktok_url,
             whatsapp_number: row.owner_whatsapp_number,
@@ -784,8 +814,11 @@ export class TenantService {
           const bcrypt = await import('bcrypt');
           const hashed = await bcrypt.hash(patch.owner.password, 10);
           const createdOwner = await client.query<{ id: number }>(
-            `INSERT INTO users (email, password, name, avatar, role, description, subject, tenant_id)
-             VALUES ($1, $2, $3, $4, 'teacher', $5, $6, $7)
+            `INSERT INTO users (
+               email, password, name, avatar, role, description, subject, tenant_id,
+               facebook_url, instagram_url, youtube_url, tiktok_url, whatsapp_number
+             )
+             VALUES ($1, $2, $3, $4, 'teacher', $5, $6, $7, $8, $9, $10, $11, $12)
              RETURNING id`,
             [
               patch.owner.email,
@@ -795,6 +828,11 @@ export class TenantService {
               patch.owner.description ?? '',
               patch.owner.subject ?? '',
               id,
+              patch.owner.facebook_url ?? null,
+              patch.owner.instagram_url ?? null,
+              patch.owner.youtube_url ?? null,
+              patch.owner.tiktok_url ?? null,
+              patch.owner.whatsapp_number ?? null,
             ],
           );
           ownerId = createdOwner.rows[0].id;
@@ -815,6 +853,9 @@ export class TenantService {
           if (patch.owner.subject !== undefined) addOwner('subject', patch.owner.subject ?? '');
           if (patch.owner.phone !== undefined) addOwner('phone', patch.owner.phone);
           if (patch.owner.facebook_url !== undefined) addOwner('facebook_url', patch.owner.facebook_url);
+          if (patch.owner.instagram_url !== undefined) {
+            addOwner('instagram_url', patch.owner.instagram_url);
+          }
           if (patch.owner.youtube_url !== undefined) addOwner('youtube_url', patch.owner.youtube_url);
           if (patch.owner.tiktok_url !== undefined) addOwner('tiktok_url', patch.owner.tiktok_url);
           if (patch.owner.whatsapp_number !== undefined) {
@@ -876,6 +917,98 @@ export class TenantService {
       const updated = await this.getTenantForAdmin(id);
       if (!updated) throw new Error('Tenant not found after update');
       return updated;
+    } catch (e) {
+      await client.query('ROLLBACK');
+      throw e;
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * أرشفة منصة مدرس (حذف منطقي): تعطيل المنصة، تحرير الـ subdomain، وتعطيل حساب المالك.
+   */
+  static async deleteTenantForAdmin(
+    id: number,
+    options?: { confirmSubdomain?: string },
+  ): Promise<{ id: number; subdomain: string; archived_subdomain: string }> {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      const tenantRes = await client.query<{
+        id: number;
+        subdomain: string;
+        display_name: string;
+        owner_user_id: number | null;
+      }>(
+        `SELECT id, subdomain, display_name, owner_user_id
+         FROM tenants
+         WHERE id = $1
+         FOR UPDATE`,
+        [id],
+      );
+
+      if (!tenantRes.rowCount) {
+        throw new HttpError(404, 'المنصة غير موجودة');
+      }
+
+      const tenant = tenantRes.rows[0];
+
+      if (tenant.subdomain === 'default') {
+        throw new HttpError(400, 'لا يمكن حذف المنصة الافتراضية');
+      }
+
+      if (tenant.subdomain.startsWith('deleted-')) {
+        throw new HttpError(400, 'المنصة محذوفة مسبقاً');
+      }
+
+      if (
+        options?.confirmSubdomain &&
+        options.confirmSubdomain.trim().toLowerCase() !== tenant.subdomain.toLowerCase()
+      ) {
+        throw new HttpError(400, 'confirm_subdomain لا يطابق subdomain المنصة');
+      }
+
+      const archivedSubdomain = buildArchivedSubdomain(tenant.id, tenant.subdomain);
+
+      await client.query(
+        `UPDATE tenants
+         SET is_active = FALSE,
+             subdomain = $2,
+             updated_at = NOW()
+         WHERE id = $1`,
+        [id, archivedSubdomain],
+      );
+
+      if (tenant.owner_user_id) {
+        await client.query(
+          `UPDATE users
+           SET account_status = 'inactive'
+           WHERE id = $1 AND tenant_id = $2`,
+          [tenant.owner_user_id, id],
+        );
+      }
+
+      await client.query(
+        `UPDATE users
+         SET account_status = 'inactive'
+         WHERE tenant_id = $1 AND role IN ('teacher', 'student')`,
+        [id],
+      );
+
+      await client.query('COMMIT');
+
+      TenantSitemapService.invalidate(id);
+      seoCacheDeletePrefix('teacher-page:');
+      seoCacheDeletePrefix('metadata:');
+      seoCacheDeletePrefix('sitemap:');
+
+      return {
+        id: tenant.id,
+        subdomain: tenant.subdomain,
+        archived_subdomain: archivedSubdomain,
+      };
     } catch (e) {
       await client.query('ROLLBACK');
       throw e;

@@ -73,7 +73,7 @@ router.get(
     // Get teachers who are assigned to the same grade(s)
     const teachersRes = await pool.query(
       `
-      SELECT DISTINCT u.id, u.name, u.avatar, u.subject, u.description, u.phone, u.email, u.facebook_url, u.youtube_url, u.tiktok_url, u.whatsapp_number
+      SELECT DISTINCT u.id, u.name, u.avatar, u.subject, u.description, u.phone, u.email, u.facebook_url, u.instagram_url, u.youtube_url, u.tiktok_url, u.whatsapp_number
       FROM users u
       JOIN teacher_grades tg ON u.id = tg.teacher_id
       WHERE u.role = 'teacher' AND u.account_status = 'active' AND tg.grade_id = ANY($1::int[])
@@ -120,7 +120,7 @@ router.get(
 
       // التحقق من أن المدرس موجود
       const teacherCheck = await pool.query(
-        'SELECT id, name, email, phone, avatar, created_at, description, subject, facebook_url, youtube_url, tiktok_url, whatsapp_number FROM users WHERE id = $1 AND role = $2 AND account_status = $3',
+        'SELECT id, name, email, phone, avatar, created_at, description, subject, facebook_url, instagram_url, youtube_url, tiktok_url, whatsapp_number FROM users WHERE id = $1 AND role = $2 AND account_status = $3',
         [teacherId, 'teacher', 'active'],
       );
 
@@ -173,7 +173,16 @@ router.get(
                 CASE WHEN e.user_id IS NOT NULL THEN true ELSE false END as is_enrolled
          FROM courses c
          LEFT JOIN enrollments e ON c.id = e.course_id AND e.user_id = $1
-         WHERE c.teacher_id = $2 AND c.grade_id = ANY($3::int[])`,
+         WHERE c.teacher_id = $2
+           AND (
+             EXISTS (
+               SELECT 1 FROM course_grades cg
+               WHERE cg.course_id = c.id AND cg.grade_id = ANY($3::int[])
+             )
+             OR (c.grade_id = ANY($3::int[]) AND NOT EXISTS (
+               SELECT 1 FROM course_grades cg2 WHERE cg2.course_id = c.id
+             ))
+           )`,
         [studentId, teacherId, commonGrades],
       );
 
@@ -188,6 +197,7 @@ router.get(
           description: teacher.description,
           subject: teacher.subject,
           facebook_url: teacher.facebook_url,
+          instagram_url: teacher.instagram_url,
           youtube_url: teacher.youtube_url,
           tiktok_url: teacher.tiktok_url,
           whatsapp_number: teacher.whatsapp_number,
@@ -214,7 +224,7 @@ router.get(
     try {
       const studentId = req.user!.id;
       const result = await pool.query(
-        `SELECT DISTINCT u.id as teacher_id, u.name, u.avatar, u.phone, u.subject, u.facebook_url, u.youtube_url, u.tiktok_url, u.whatsapp_number, c.id as course_id, c.title as course_title, c.description as course_description, c.avatar as course_avatar
+        `SELECT DISTINCT u.id as teacher_id, u.name, u.avatar, u.phone, u.subject, u.facebook_url, u.instagram_url, u.youtube_url, u.tiktok_url, u.whatsapp_number, c.id as course_id, c.title as course_title, c.description as course_description, c.avatar as course_avatar
          FROM enrollments e
          JOIN courses c ON e.course_id = c.id
          JOIN users u ON c.teacher_id = u.id
@@ -232,6 +242,7 @@ router.get(
             phone: row.phone,
             subject: row.subject,
             facebook_url: row.facebook_url,
+            instagram_url: row.instagram_url,
             youtube_url: row.youtube_url,
             tiktok_url: row.tiktok_url,
             whatsapp_number: row.whatsapp_number,
@@ -349,7 +360,16 @@ router.get(
        LEFT JOIN grades g ON g.id = c.grade_id
        LEFT JOIN enrollments e ON e.course_id = c.id AND e.user_id = $1
        WHERE c.teacher_id = $2
-         AND (c.grade_id = ANY($3::int[]) OR c.grade_id IS NULL)
+         AND (
+           EXISTS (
+             SELECT 1 FROM course_grades cg
+             WHERE cg.course_id = c.id AND cg.grade_id = ANY($3::int[])
+           )
+           OR (c.grade_id = ANY($3::int[]) AND NOT EXISTS (
+             SELECT 1 FROM course_grades cg2 WHERE cg2.course_id = c.id
+           ))
+           OR c.grade_id IS NULL
+         )
        ORDER BY c.created_at DESC`,
       [studentId, tenant.owner_user_id, studentGradeIds],
     );

@@ -6,15 +6,23 @@
 - **المسار:**  
   `POST /course`
 - **الصلاحية:** مدرس فقط (Teacher)
-- **Content-Type:** `multipart/form-data`
-- **Body (Form Data):**
+- **Content-Type:** `multipart/form-data` أو `application/json`
+- **Body:**
   ```
-  title: "كورس فيزياء أولى ثانوي"
-  price: 150 (رقم)
+  title: "كورس فيزياء ثانوي"
+  price: 150
   description: "شرح شامل لمنهج الفيزياء"
-  grade_id: 4 (رقم)
+  grade_ids: [4, 5, 6]     # مفضل — أكتر من صف
+  # أو للتوافق مع القديم:
+  # grade_id: 4
   avatar: [ملف صورة - اختياري]
+  is_free: false
   ```
+- **ملاحظات الصفوف:**
+  - `grade_ids` مصفوفة أرقام (أو نص `"4,5,6"` / JSON `"[4,5,6]"` في multipart)
+  - الكورس يظهر لكل الصفوف المختارة عند الطالب/الفلاتر
+  - `grade_id` في الرد = أول صف (للتوافق مع الشات والقديم)
+  - الرد يتضمن أيضاً `grade_ids` و `grades: [{id, name}, ...]`
 - **ملاحظات الصورة:**
   - أنواع الصور المسموحة: JPG, JPEG, PNG, GIF, WEBP
   - الحجم الأقصى: 5MB
@@ -24,12 +32,18 @@
   {
     "course": {
       "id": 1,
-      "title": "كورس فيزياء أولى ثانوي",
+      "title": "كورس فيزياء ثانوي",
       "price": "150.00",
       "description": "شرح شامل لمنهج الفيزياء",
       "grade_id": 4,
+      "grade_ids": [4, 5, 6],
+      "grades": [
+        { "id": 4, "name": "أولى ثانوي" },
+        { "id": 5, "name": "تانية ثانوي" },
+        { "id": 6, "name": "تالتة ثانوي" }
+      ],
       "teacher_id": 5,
-      "avatar": "http://localhost:8000/uploads/course-1234567890-123456789.jpg",
+      "avatar": "...",
       "created_at": "2024-06-01T12:34:56.000Z"
     }
   }
@@ -41,17 +55,16 @@
 - **المسار:**  
   `PUT /course/:id`
 - **الصلاحية:** المدرس صاحب الكورس فقط
-- **Content-Type:** `multipart/form-data`
-- **Body (Form Data):** (أرسل فقط الحقول التي تريد تعديلها)
+- **Content-Type:** `multipart/form-data` أو `application/json`
+- **Body:** (أرسل فقط الحقول التي تريد تعديلها)
   ```
   title: "اسم جديد (اختياري)"
-  price: 200 (رقم)
+  price: 200
   description: "وصف جديد (اختياري)"
-  grade_id: 4 (رقم)
+  grade_ids: [4, 5]   # أو grade_id: 4
   avatar: [ملف صورة جديد - اختياري]
   ```
-  
-- **ملاحظات الصورة:**
+  - **ملاحظات الصورة:**
 
   - إذا تم رفع صورة جديدة، سيتم حذف الصورة القديمة تلقائياً
   - أنواع الصور المسموحة: JPG, JPEG, PNG, GIF, WEBP

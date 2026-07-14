@@ -5,8 +5,16 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.TenantService = void 0;
 const pool_1 = __importDefault(require("../db/pool"));
+const utils_1 = require("../utils");
 const teacherPlanPolicy_1 = require("./teacherPlanPolicy");
 const hooks_1 = require("./seo/hooks");
+const sitemap_1 = require("./seo/sitemap");
+const cache_1 = require("./seo/cache");
+function buildArchivedSubdomain(tenantId, currentSubdomain) {
+    const base = String(currentSubdomain).replace(/^deleted-\d+-/, '');
+    const prefix = `deleted-${tenantId}-`;
+    return (prefix + base).slice(0, 63);
+}
 function resolveOwnerSubscriptionFields(row) {
     const pkg = (row.owner_billing_plan_code ??
         row.owner_subscription_package ??
@@ -256,6 +264,9 @@ class TenantService {
         let i = 1;
         if (!includeDefault) {
             conditions.push(`t.subdomain <> 'default'`);
+        }
+        if (!options.includeDeleted) {
+            conditions.push(`t.subdomain NOT LIKE 'deleted-%'`);
         }
         if (isActive !== null) {
             conditions.push(`t.is_active = $${i++}`);
@@ -623,6 +634,64 @@ class TenantService {
             if (!updated)
                 throw new Error('Tenant not found after update');
             return updated;
+        }
+        catch (e) {
+            await client.query('ROLLBACK');
+            throw e;
+        }
+        finally {
+            client.release();
+        }
+    }
+    /**
+     * أرشفة منصة مدرس (حذف منطقي): تعطيل المنصة، تحرير الـ subdomain، وتعطيل حساب المالك.
+     */
+    static async deleteTenantForAdmin(id, options) {
+        const client = await pool_1.default.connect();
+        try {
+            await client.query('BEGIN');
+            const tenantRes = await client.query(`SELECT id, subdomain, display_name, owner_user_id
+         FROM tenants
+         WHERE id = $1
+         FOR UPDATE`, [id]);
+            if (!tenantRes.rowCount) {
+                throw new utils_1.HttpError(404, 'المنصة غير موجودة');
+            }
+            const tenant = tenantRes.rows[0];
+            if (tenant.subdomain === 'default') {
+                throw new utils_1.HttpError(400, 'لا يمكن حذف المنصة الافتراضية');
+            }
+            if (tenant.subdomain.startsWith('deleted-')) {
+                throw new utils_1.HttpError(400, 'المنصة محذوفة مسبقاً');
+            }
+            if (options?.confirmSubdomain &&
+                options.confirmSubdomain.trim().toLowerCase() !== tenant.subdomain.toLowerCase()) {
+                throw new utils_1.HttpError(400, 'confirm_subdomain لا يطابق subdomain المنصة');
+            }
+            const archivedSubdomain = buildArchivedSubdomain(tenant.id, tenant.subdomain);
+            await client.query(`UPDATE tenants
+         SET is_active = FALSE,
+             subdomain = $2,
+             updated_at = NOW()
+         WHERE id = $1`, [id, archivedSubdomain]);
+            if (tenant.owner_user_id) {
+                await client.query(`UPDATE users
+           SET account_status = 'inactive'
+           WHERE id = $1 AND tenant_id = $2`, [tenant.owner_user_id, id]);
+            }
+            await client.query(`UPDATE users
+         SET account_status = 'inactive'
+         WHERE tenant_id = $1 AND role IN ('teacher', 'student')`, [id]);
+            await client.query('COMMIT');
+            sitemap_1.TenantSitemapService.invalidate(id);
+            (0, cache_1.seoCacheDeletePrefix)('teacher-page:');
+            (0, cache_1.seoCacheDeletePrefix)('metadata:');
+            (0, cache_1.seoCacheDeletePrefix)('sitemap:');
+            return {
+                id: tenant.id,
+                subdomain: tenant.subdomain,
+                archived_subdomain: archivedSubdomain,
+            };
         }
         catch (e) {
             await client.query('ROLLBACK');

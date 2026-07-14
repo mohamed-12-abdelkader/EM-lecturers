@@ -150,6 +150,10 @@ export const config = cleanEnv(process.env, {
   MISTRAL_OCR_MODEL: str({ default: 'mistral-ocr-latest' }),
   MISTRAL_CHAT_MODEL: str({ default: 'mistral-large-latest' }),
   MISTRAL_API_BASE_URL: str({ default: 'https://api.mistral.ai/v1' }),
+  /** Max OCR upload size in MB. 0 = unlimited. Default 512. */
+  MISTRAL_OCR_MAX_FILE_SIZE_MB: num({ default: 512 }),
+  /** Max tenant platform image (avatar/favicon/og/hero) in MB. 0 = unlimited. Default 0. */
+  TENANT_IMAGE_MAX_FILE_SIZE_MB: num({ default: 0 }),
 
   // Teacher creative chatbot
   OPENAI_API_KEY: str({ default: '' }),
@@ -267,18 +271,39 @@ cloudinary.config({
 
 export const uploadToCloudinary = async (
   filePath: string,
-  options?: { resource_type?: 'image' | 'video' | 'raw' | 'auto' },
+  options?: {
+    resource_type?: 'image' | 'video' | 'raw' | 'auto';
+    type?: 'upload' | 'authenticated' | 'private';
+    access_mode?: 'public' | 'authenticated';
+  },
 ) => {
-  const uploadOptions: any = {
+  const uploadOptions: Record<string, unknown> = {
     folder: 'media',
   };
 
-  // تحديد نوع الملف إذا تم تمريره
   if (options?.resource_type) {
     uploadOptions.resource_type = options.resource_type;
   }
+  if (options?.type) {
+    uploadOptions.type = options.type;
+  }
+  if (options?.access_mode) {
+    uploadOptions.access_mode = options.access_mode;
+  }
 
-  const result = await cloudinary.uploader.upload(filePath, uploadOptions);
+  // Large files: chunked upload (Cloudinary) so platform hero/avatar aren't capped by single PUT size
+  const fileSize = fs.existsSync(filePath) ? fs.statSync(filePath).size : 0;
+  const useLarge = fileSize > 10 * 1024 * 1024;
+  if (useLarge && !uploadOptions.resource_type) {
+    uploadOptions.resource_type = 'auto';
+  }
+
+  const result = useLarge
+    ? await cloudinary.uploader.upload_large(filePath, {
+        ...uploadOptions,
+        chunk_size: 6_000_000,
+      })
+    : await cloudinary.uploader.upload(filePath, uploadOptions);
   await unlinkFile(filePath);
   return result;
 };

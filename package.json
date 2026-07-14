@@ -48,6 +48,7 @@
     "node-pg-migrate": "^7.9.1",
     "nodemailer": "^7.0.3",
     "ollama": "^0.6.3",
+    "pdf-lib": "^1.17.1",
     "pdf-parse": "^1.1.1",
     "pdf-to-img": "^5.0.0",
     "pg": "^8.17.2",

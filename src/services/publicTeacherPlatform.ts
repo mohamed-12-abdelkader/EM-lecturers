@@ -126,7 +126,15 @@ export async function getPublicCoursesBySubdomain(
       throw new HttpError(400, 'grade_id غير صحيح');
     }
     params.push(gradeId);
-    gradeFilter = ` AND c.grade_id = $${params.length}`;
+    gradeFilter = ` AND (
+      EXISTS (
+        SELECT 1 FROM course_grades cg
+        WHERE cg.course_id = c.id AND cg.grade_id = $${params.length}
+      )
+      OR (c.grade_id = $${params.length} AND NOT EXISTS (
+        SELECT 1 FROM course_grades cg2 WHERE cg2.course_id = c.id
+      ))
+    )`;
   }
 
   const coursesRes = await pool.query(

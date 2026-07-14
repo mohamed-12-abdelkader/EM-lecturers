@@ -181,16 +181,16 @@ export class TeacherLibraryExamQuestionsService {
       if (q.question_type === 'choice' && choices.length > 0) {
         const limit = Math.min(choices.length, 4);
         for (let i = 0; i < limit; i++) {
-          try {
-            await db.query(
-              `INSERT INTO exam_question_options (exam_question_id, option_index, text_content)
-               VALUES ($1, $2, $3)`,
-              [examQuestionId, i, choices[i]],
-            );
-          } catch {
-            // exam_question_options table may be missing on old DBs
-          }
+          await db.query(
+            `INSERT INTO exam_question_options (exam_question_id, option_index, text_content)
+             VALUES ($1, $2, $3)
+             ON CONFLICT (exam_question_id, option_index) DO UPDATE
+             SET text_content = EXCLUDED.text_content`,
+            [examQuestionId, i, choices[i]],
+          );
         }
+      } else if (q.question_type === 'choice') {
+        throw new HttpError(400, `Question ${q.id} has no choices to add to the exam`);
       }
     }
 

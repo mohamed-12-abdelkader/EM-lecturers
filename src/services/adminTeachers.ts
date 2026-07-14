@@ -17,6 +17,11 @@ export type UpdateTeacherPayload = {
   account_status?: TeacherAccountStatus;
   subscription_package?: TeacherSubscriptionPackage;
   grade_ids?: number[];
+  facebook_url?: string | null;
+  instagram_url?: string | null;
+  youtube_url?: string | null;
+  tiktok_url?: string | null;
+  whatsapp_number?: string | null;
 };
 
 type TeacherRow = {
@@ -60,6 +65,7 @@ export class AdminTeachersService {
     const r = await pool.query(
       `SELECT u.id, u.name, u.email, u.phone, u.avatar, u.subject, u.description, u.account_status, u.created_at
               ,u.subscription_package
+              ,u.facebook_url, u.instagram_url, u.youtube_url, u.tiktok_url, u.whatsapp_number
        FROM users u
        WHERE u.id = $1
          AND u.role = 'teacher'
@@ -109,6 +115,13 @@ export class AdminTeachersService {
         updates.push('subscription_package_assigned_at = NOW()');
       }
       if (patch.password) add('password', await bcrypt.hash(patch.password, 10));
+      if (patch.facebook_url !== undefined) add('facebook_url', patch.facebook_url || null);
+      if (patch.instagram_url !== undefined) add('instagram_url', patch.instagram_url || null);
+      if (patch.youtube_url !== undefined) add('youtube_url', patch.youtube_url || null);
+      if (patch.tiktok_url !== undefined) add('tiktok_url', patch.tiktok_url || null);
+      if (patch.whatsapp_number !== undefined) {
+        add('whatsapp_number', patch.whatsapp_number || null);
+      }
 
       if (patch.email !== undefined && patch.email) {
         const ex = await client.query(

@@ -121,7 +121,7 @@ exports.config = (0, envalid_1.cleanEnv)(process.env, {
     NGROK_DOMAIN: (0, envalid_1.str)({ default: '' }),
     NGROK_RELAX_CORS: (0, envalid_1.bool)({ default: true }),
     /** e.g. next-edu.online — used to parse {sub}.root from Host. Empty = always default tenant unless X-Tenant-Subdomain. */
-    TENANT_ROOT_DOMAIN: (0, envalid_1.str)({ default: '' }),
+    TENANT_ROOT_DOMAIN: (0, envalid_1.str)({ default: 'em-online.online' }),
     SECRET_KEY: (0, envalid_1.str)({ devDefault: (0, envalid_1.testOnly)(crypto.randomBytes(32).toString('hex')) }),
     ACCESS_TOKEN_EXPIRE_MINUTES: (0, envalid_1.num)({ default: 60 * 24 * 8 }), // 8 days
     COMMON_TOKEN_EXPIRE_HOURS: (0, envalid_1.num)({ default: 8 }),

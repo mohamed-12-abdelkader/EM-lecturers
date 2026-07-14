@@ -19,6 +19,12 @@ import * as ExpoPushService from '../services/expoPushService';
 import { NotificationTriggers } from '../services/notificationTriggers';
 import { VideoViewTrackingService } from '../services/videoViewTracking';
 import { SeoHooks } from '../services/seo/hooks';
+import {
+  getCourseGradesMap,
+  resolveCourseGradeIds,
+  syncCourseGrades,
+  withCourseGrades,
+} from '../utils/courseGrades';
 
 export const router = Router();
 
@@ -87,6 +93,7 @@ const uploadQuestionImage = multer({
 });
 
 // مخطط التحقق لإنشاء وتعديل الكورس
+// الصف: grade_ids[] (مفضل) أو grade_id واحد للتوافق مع القديم
 const CourseSchema = z.object({
   title: z.string().min(2),
   price: z
@@ -112,10 +119,12 @@ const CourseSchema = z.object({
   description: z.string().optional(),
   grade_id: z
     .union([z.string(), z.number()])
-    .transform((val) => Number(val))
-    .refine((val) => !isNaN(val) && val > 0, {
-      message: 'Grade ID must be a valid positive number',
+    .optional()
+    .transform((val) => {
+      if (val === undefined || val === null || val === '') return undefined;
+      return Number(val);
     }),
+  grade_ids: z.any().optional(),
 });
 
 function resolveCoursePricing(input: { price?: number; is_free?: boolean }) {
@@ -154,8 +163,14 @@ router.post(
         return res.status(400).json({ message: 'Validation failed', errors: parse.error.errors });
       }
 
-      const { title, description, grade_id, price, is_free } = parse.data;
+      const { title, description, price, is_free } = parse.data;
       const teacher_id = req.user!.id;
+      const gradeIds = resolveCourseGradeIds(req.body as Record<string, unknown>);
+      if (!gradeIds.length) {
+        return res.status(400).json({
+          message: 'يجب اختيار صف واحد على الأقل (grade_ids أو grade_id)',
+        });
+      }
 
       let pricing: { is_free: boolean; price: number };
       try {
@@ -166,21 +181,28 @@ router.post(
         });
       }
 
-      // تحقق من وجود الصف الدراسي
-      const gradeCheck = await pool.query('SELECT id FROM grades WHERE id = $1', [grade_id]);
-      if (!gradeCheck.rowCount) return res.status(400).json({ message: 'Invalid grade selected' });
-
       const file = req.file ?? null;
       const avatar = file ? (await uploadToCloudinary(file.path)).secure_url : null;
+      const primaryGradeId = gradeIds[0];
 
       const result = await pool.query(
         `INSERT INTO courses (title, price, description, teacher_id, grade_id, avatar, is_free)
          VALUES ($1, $2, $3, $4, $5, $6, $7)
          RETURNING *`,
-        [title, pricing.price, description, teacher_id, grade_id, avatar, pricing.is_free],
+        [title, pricing.price, description, teacher_id, primaryGradeId, avatar, pricing.is_free],
       );
 
       const course = result.rows[0];
+      try {
+        await syncCourseGrades(course.id, gradeIds);
+      } catch (gradeErr: any) {
+        await pool.query(`DELETE FROM courses WHERE id = $1`, [course.id]);
+        return res.status(gradeErr.status || 400).json({
+          message: gradeErr.message || 'Invalid grades',
+        });
+      }
+
+      const gradesMap = await getCourseGradesMap([course.id]);
 
       try {
         await SeoHooks.onCourseChanged(teacher_id, course.id, title);
@@ -193,10 +215,9 @@ router.post(
         await TeacherActivityService.logCourseCreated(teacher_id, course.id, title);
       } catch (activityError) {
         console.error('Error logging activity:', activityError);
-        // لا نوقف العملية إذا فشل في تسجيل النشاط
       }
 
-      res.status(201).json({ course });
+      res.status(201).json({ course: withCourseGrades(course, gradesMap) });
     } catch (error: any) {
       console.error('Error creating course:', error);
 
@@ -929,8 +950,19 @@ router.put(
       const values = [];
       let i = 1;
 
+      const gradeIds = resolveCourseGradeIds(req.body as Record<string, unknown>);
+      const hasGradeUpdate =
+        (req.body as any).grade_ids !== undefined ||
+        (req.body as any).grade_id !== undefined;
+
       for (const [key, value] of Object.entries(parse.data)) {
-        if (value !== undefined && key !== 'price' && key !== 'is_free') {
+        if (
+          value !== undefined &&
+          key !== 'price' &&
+          key !== 'is_free' &&
+          key !== 'grade_id' &&
+          key !== 'grade_ids'
+        ) {
           fields.push(`${key} = $${i++}`);
           values.push(value);
         }
@@ -943,6 +975,23 @@ router.put(
         values.push(pricingUpdate.price);
       }
 
+      if (hasGradeUpdate) {
+        if (!gradeIds.length) {
+          return res.status(400).json({
+            message: 'يجب اختيار صف واحد على الأقل (grade_ids أو grade_id)',
+          });
+        }
+        try {
+          await syncCourseGrades(Number(courseId), gradeIds);
+        } catch (gradeErr: any) {
+          return res.status(gradeErr.status || 400).json({
+            message: gradeErr.message || 'Invalid grades',
+          });
+        }
+        fields.push(`grade_id = $${i++}`);
+        values.push(gradeIds[0]);
+      }
+
       const file = req.file ?? null;
       const avatar = file ? (await uploadToCloudinary(file.path)).secure_url : null;
       if (avatar) {
@@ -950,17 +999,24 @@ router.put(
         values.push(avatar);
       }
 
-      if (!fields.length) return res.status(400).json({ message: 'No fields to update' });
+      if (!fields.length && !hasGradeUpdate) {
+        return res.status(400).json({ message: 'No fields to update' });
+      }
 
-      values.push(courseId, teacher_id);
+      let course = courseCheck.rows[0];
+      if (fields.length) {
+        values.push(courseId, teacher_id);
+        const result = await pool.query(
+          `UPDATE courses SET ${fields.join(', ')} WHERE id = $${i++} AND teacher_id = $${i} RETURNING *`,
+          values,
+        );
+        course = result.rows[0];
+      } else {
+        const refreshed = await pool.query(`SELECT * FROM courses WHERE id = $1`, [courseId]);
+        course = refreshed.rows[0];
+      }
 
-      // محاولة التحديث مع avatar أولاً، ثم بدون avatar إذا فشل
-      const result = await pool.query(
-        `UPDATE courses SET ${fields.join(', ')} WHERE id = $${i++} AND teacher_id = $${i} RETURNING *`,
-        values,
-      );
-
-      const course = result.rows[0];
+      const gradesMap = await getCourseGradesMap([course.id]);
 
       try {
         await SeoHooks.onCourseChanged(teacher_id, course.id, parse.data.title ?? course.title);
@@ -968,7 +1024,7 @@ router.put(
         console.error('SEO hook after course update:', seoError);
       }
 
-      res.json({ course });
+      res.json({ course: withCourseGrades(course, gradesMap) });
     } catch (error: any) {
       console.error('Error updating course:', error);
 
@@ -1126,28 +1182,45 @@ router.get(
         CASE WHEN e.user_id IS NOT NULL THEN true ELSE false END as is_activated
        FROM courses c
        LEFT JOIN enrollments e ON c.id = e.course_id AND e.user_id = $1
-       WHERE c.teacher_id = $2 AND c.grade_id = ANY($3::int[]) AND c.is_visible = true
+       WHERE c.teacher_id = $2
+         AND c.is_visible = true
+         AND (
+           EXISTS (
+             SELECT 1 FROM course_grades cg
+             WHERE cg.course_id = c.id AND cg.grade_id = ANY($3::int[])
+           )
+           OR (c.grade_id = ANY($3::int[]) AND NOT EXISTS (
+             SELECT 1 FROM course_grades cg2 WHERE cg2.course_id = c.id
+           ))
+         )
        ORDER BY c.created_at DESC`,
       [studentId, teacherId, gradeIds],
     );
 
+    const gradesMap = await getCourseGradesMap(coursesRes.rows.map((r) => r.id));
+
     res.json({
-      courses: coursesRes.rows.map((row) => ({
-        id: row.id,
-        title: row.title,
-        price: row.price,
-        description: row.description,
-        grade_id: row.grade_id,
-        avatar: row.avatar,
-        created_at: row.created_at,
-        is_free: row.is_free === true,
-        is_activated: row.is_activated || row.is_free === true,
-      })),
+      courses: coursesRes.rows.map((row) =>
+        withCourseGrades(
+          {
+            id: row.id,
+            title: row.title,
+            price: row.price,
+            description: row.description,
+            grade_id: row.grade_id,
+            avatar: row.avatar,
+            created_at: row.created_at,
+            is_free: row.is_free === true,
+            is_activated: row.is_activated || row.is_free === true,
+          },
+          gradesMap,
+        ),
+      ),
     });
   }),
 );
 
-// عرض كل كورسات المدرس مع إمكانية الفلترة حسب الصف (grade_id فقط)
+// عرض كل كورسات المدرس مع إمكانية الفلترة حسب الصف (grade_id)
 router.get(
   '/my-courses',
   authMiddleware(['teacher']),
@@ -1161,29 +1234,34 @@ router.get(
       if (isNaN(grade_id)) {
         return res.status(400).json({ message: 'grade_id must be a number' });
       }
-      query += ' AND grade_id = $2';
+      query += ` AND (
+        EXISTS (SELECT 1 FROM course_grades cg WHERE cg.course_id = courses.id AND cg.grade_id = $2)
+        OR (courses.grade_id = $2 AND NOT EXISTS (
+          SELECT 1 FROM course_grades cg2 WHERE cg2.course_id = courses.id
+        ))
+      )`;
       values.push(grade_id);
     }
     const result = await pool.query(query, values);
+    const gradesMap = await getCourseGradesMap(result.rows.map((r) => r.id));
 
-    // Debug: طباعة البيانات الخام
-    console.log('DEBUG my-courses raw data:', result.rows);
+    const courses = result.rows.map((row) =>
+      withCourseGrades(
+        {
+          id: row.id,
+          title: row.title,
+          price: row.price,
+          description: row.description,
+          grade_id: row.grade_id,
+          avatar: row.avatar,
+          created_at: row.created_at,
+          is_visible: row.is_visible,
+          is_free: row.is_free === true,
+        },
+        gradesMap,
+      ),
+    );
 
-    const courses = result.rows.map((row) => {
-      console.log(`DEBUG course ${row.id} avatar:`, row.avatar);
-      return {
-        id: row.id,
-        title: row.title,
-        price: row.price,
-        description: row.description,
-        grade_id: row.grade_id,
-        avatar: row.avatar,
-        created_at: row.created_at,
-        is_visible: row.is_visible,
-      };
-    });
-
-    console.log('DEBUG final courses:', courses);
     res.json({ courses });
   }),
 );
@@ -1708,22 +1786,6 @@ router.get(
       lectures = lectures.filter((l) => l.is_visible !== false);
       lectures = lectures.sort((a, b) => a.position - b.position || a.created_at - b.created_at);
 
-      const isFreeCourse = course.is_free === true;
-
-      if (isFreeCourse) {
-        lectures = lectures.map((lec) => {
-          const exam =
-            exams.find((e) => e.lecture_id === lec.id && e.is_visible === true) || null;
-          return {
-            ...lec,
-            videos: videos.filter((v) => v.lecture_id === lec.id),
-            files: files.filter((f) => f.lecture_id === lec.id),
-            exam,
-            locked: false,
-            is_visible: lec.is_visible,
-          };
-        });
-      } else {
       let lockAll = false;
       for (let i = 0; i < lectures.length; i++) {
         const lec = lectures[i];
@@ -1781,7 +1843,6 @@ router.get(
           locked: false,
           is_visible: lec.is_visible,
         };
-      }
       }
     } else {
       // المدرس يرى كل المحاضرات (لا فلترة)

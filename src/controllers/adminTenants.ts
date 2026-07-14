@@ -12,7 +12,7 @@ import {
   buildPatchTenantFromMultipart,
   isMultipartRequest,
   PatchTenantBodySchema,
-  uploadTenantFiles,
+  uploadTenantFilesSafe,
 } from '../utils/tenantFormPayload';
 
 export const router = Router();
@@ -38,14 +38,14 @@ router.get(
   asyncWrapper(async (req, res) => {
     const limit = Number(req.query.limit ?? 50);
     const offset = Number(req.query.offset ?? 0);
-    const includeDefault = req.query.include_default === 'true' || req.query.include_default === '1';
+    const includeDeleted = req.query.include_deleted === 'true' || req.query.include_deleted === '1';
     const isActive = parseBooleanQuery(req.query.is_active);
     const search = typeof req.query.search === 'string' ? req.query.search : undefined;
 
     const { tenants, total } = await TenantService.listTeacherTenantsForAdmin({
       limit: Number.isFinite(limit) ? limit : 50,
       offset: Number.isFinite(offset) ? offset : 0,
-      includeDefault,
+      includeDeleted,
       isActive,
       search,
     });
@@ -75,7 +75,7 @@ router.patch(
   '/:id',
   (req, res, next) => {
     if (isMultipartRequest(req)) {
-      return uploadTenantFiles(req, res, next);
+      return uploadTenantFilesSafe(req, res, next);
     }
     next();
   },
@@ -161,6 +161,27 @@ router.patch(
       success: true,
       message: 'تم تحديث إعدادات SEO',
       data: seo,
+    });
+  }),
+);
+
+router.delete(
+  '/:id',
+  asyncWrapper(async (req, res) => {
+    const id = parseTenantId(req.params.id);
+    const confirmSubdomain =
+      typeof req.body?.confirm_subdomain === 'string'
+        ? req.body.confirm_subdomain
+        : typeof req.query.confirm_subdomain === 'string'
+          ? req.query.confirm_subdomain
+          : undefined;
+
+    const result = await TenantService.deleteTenantForAdmin(id, { confirmSubdomain });
+
+    res.json({
+      success: true,
+      message: 'تم حذف المنصة بنجاح',
+      data: result,
     });
   }),
 );

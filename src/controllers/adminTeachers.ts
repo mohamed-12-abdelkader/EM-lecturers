@@ -41,6 +41,11 @@ const UpdateTeacherSchema = z.object({
   account_status: z.enum(['active', 'inactive', 'suspended']).optional(),
   subscription_package: z.enum(['bronze', 'silver', 'gold', 'diamond']).optional(),
   grade_ids: z.array(z.coerce.number().int().positive()).optional(),
+  facebook_url: z.string().url().optional().or(z.literal('')).nullable(),
+  instagram_url: z.string().url().optional().or(z.literal('')).nullable(),
+  youtube_url: z.string().url().optional().or(z.literal('')).nullable(),
+  tiktok_url: z.string().url().optional().or(z.literal('')).nullable(),
+  whatsapp_number: z.string().optional().or(z.literal('')).nullable(),
 });
 
 function parseGradeIds(raw: unknown): number[] | undefined {
@@ -111,6 +116,11 @@ router.put(
       account_status: body.account_status as TeacherAccountStatus | undefined,
       subscription_package: body.subscription_package as TeacherSubscriptionPackage | undefined,
       grade_ids: body.grade_ids,
+      facebook_url: body.facebook_url === '' ? null : body.facebook_url,
+      instagram_url: body.instagram_url === '' ? null : body.instagram_url,
+      youtube_url: body.youtube_url === '' ? null : body.youtube_url,
+      tiktok_url: body.tiktok_url === '' ? null : body.tiktok_url,
+      whatsapp_number: body.whatsapp_number === '' ? null : body.whatsapp_number,
     };
 
     const { previousAvatar } = await AdminTeachersService.updateTeacher(teacherId, tenantId, payload);

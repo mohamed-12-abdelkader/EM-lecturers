@@ -1784,6 +1784,58 @@ export class ExamFlowService {
       }
     }
 
+    // Fallback: أسئلة مكتبة المدرس بدون snapshot — اقرأ الخيارات من teacher_questions
+    const missingChoiceIds = Array.from(map.entries())
+      .filter(([, q]) => q.choices.length === 0)
+      .map(([id]) => id);
+    if (missingChoiceIds.length > 0) {
+      try {
+        const libraryRes = await pool.query<{
+          exam_question_id: number;
+          choices: unknown;
+          correct_answer_index: number | null;
+        }>(
+          `SELECT eq.id AS exam_question_id, tq.choices, tq.correct_answer_index
+           FROM exam_questions eq
+           JOIN teacher_questions tq ON tq.id = eq.teacher_question_id
+           WHERE eq.id = ANY($1::int[])`,
+          [missingChoiceIds],
+        );
+        for (const row of libraryRes.rows) {
+          const question = map.get(row.exam_question_id);
+          if (!question) continue;
+          let choices: string[] = [];
+          if (Array.isArray(row.choices)) {
+            choices = row.choices.map((v) => String(v ?? '').trim()).filter(Boolean);
+          } else if (typeof row.choices === 'string') {
+            try {
+              const parsed = JSON.parse(row.choices);
+              if (Array.isArray(parsed)) {
+                choices = parsed.map((v) => String(v ?? '').trim()).filter(Boolean);
+              }
+            } catch {
+              choices = [];
+            }
+          }
+          if (choices.length === 0) continue;
+          const override = question.correct_answer_index_override;
+          const bankCorrect =
+            row.correct_answer_index != null ? Number(row.correct_answer_index) : null;
+          const effectiveCorrect = override ?? bankCorrect;
+          if (question.correct_answer_index == null && bankCorrect != null) {
+            question.correct_answer_index = bankCorrect;
+          }
+          question.choices = choices.slice(0, 4).map((text, i) => ({
+            id: -(row.exam_question_id * 10 + i + 1),
+            text,
+            isCorrect: effectiveCorrect !== null && i === effectiveCorrect,
+          }));
+        }
+      } catch {
+        // teacher_questions / teacher_question_id may be unavailable on older DBs
+      }
+    }
+
     // أسئلة صورة من بنك الأسئلة قد تُضاف بدون صفوف في question_options أو question_choices؛ إضافة خيارات افتراضية أ، ب، ج، د
     const defaultChoiceLabels = ['أ', 'ب', 'ج', 'د'];
     map.forEach((question) => {

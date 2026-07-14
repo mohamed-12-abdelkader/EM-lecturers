@@ -122,15 +122,52 @@ export function parsePdfPageRange(
     throw new HttpError(400, 'أرقام الصفحات غير صحيحة');
   }
 
-  const maxPagesPerRequest = 50;
-  if (end - start + 1 > maxPagesPerRequest) {
-    throw new HttpError(
-      400,
-      `الحد الأقصى ${maxPagesPerRequest} صفحة في الطلب الواحد`,
-    );
-  }
-
+  // Allow any size range — large ranges are auto-batched in extractTextFromFile
   return Array.from({ length: end - start + 1 }, (_, i) => start - 1 + i);
+}
+
+function chunkPages(pages: number[], chunkSize: number): number[][] {
+  const chunks: number[][] = [];
+  for (let i = 0; i < pages.length; i += chunkSize) {
+    chunks.push(pages.slice(i, i + chunkSize));
+  }
+  return chunks;
+}
+
+async function getPdfPageCount(buffer: Buffer): Promise<number> {
+  try {
+    const { PDFDocument } = await import('pdf-lib');
+    const doc = await PDFDocument.load(buffer, { ignoreEncryption: true });
+    const n = doc.getPageCount();
+    return n > 0 ? n : 1;
+  } catch {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const pdfParse = require('pdf-parse') as (
+        data: Buffer,
+      ) => Promise<{ numpages?: number }>;
+      const parsed = await pdfParse(buffer);
+      const n = Number(parsed?.numpages ?? 0);
+      return Number.isFinite(n) && n > 0 ? Math.trunc(n) : 1;
+    } catch {
+      return 1;
+    }
+  }
+}
+
+/** Slice a PDF buffer to the given 0-based page indices (for large-file OCR batches). */
+async function slicePdfBuffer(buffer: Buffer, pageIndices0: number[]): Promise<Buffer> {
+  const { PDFDocument } = await import('pdf-lib');
+  const src = await PDFDocument.load(buffer, { ignoreEncryption: true });
+  const total = src.getPageCount();
+  const valid = pageIndices0.filter((i) => i >= 0 && i < total);
+  if (valid.length === 0) {
+    throw new HttpError(400, 'نطاق الصفحات خارج حدود الملف');
+  }
+  const out = await PDFDocument.create();
+  const copied = await out.copyPages(src, valid);
+  for (const page of copied) out.addPage(page);
+  return Buffer.from(await out.save());
 }
 
 function resolveMimeType(file: Express.Multer.File): string {
@@ -245,6 +282,18 @@ function normalizePages(rawPages: MistralOcrApiResponse['pages']): MistralOcrPag
   }));
 }
 
+function isFullDocumentSingleBatch(
+  targetPages: number[],
+  batch: number[],
+  maxPages: number,
+): boolean {
+  return (
+    batch.length === targetPages.length &&
+    targetPages.length <= maxPages &&
+    targetPages.every((p, i) => p === i)
+  );
+}
+
 export class MistralOcrService {
   static isSupportedMime(mime: string): boolean {
     const normalized = (mime || '').toLowerCase();
@@ -262,25 +311,17 @@ export class MistralOcrService {
     );
   }
 
-  static async extractTextFromFile(
-    file: Express.Multer.File,
-    options: MistralOcrOptions = {},
-  ): Promise<MistralOcrResult> {
-    assertMistralConfigured();
-
-    const mime = this.resolveSupportedMime(file);
-    const filePath = file.path;
-    if (!filePath || !fs.existsSync(filePath)) {
-      throw new HttpError(400, 'ملف مرفوع غير موجود');
-    }
-
-    const buffer = fs.readFileSync(filePath);
-    if (buffer.length === 0) {
-      throw new HttpError(400, 'الملف فارغ');
-    }
-
-    const { apiKey, apiBaseUrl, ocrModel: defaultOcrModel } = getMistralConfig();
-    const ocrModel = options.ocrModel?.trim() || defaultOcrModel;
+  private static async callMistralOcr(
+    mime: string,
+    buffer: Buffer,
+    options: MistralOcrOptions,
+    ocrModel: string,
+  ): Promise<{
+    pages: MistralOcrPage[];
+    model: string;
+    usage_info: MistralOcrApiResponse['usage_info'];
+  }> {
+    const { apiKey, apiBaseUrl } = getMistralConfig();
     const dataUri = buildDataUri(mime, buffer);
     const document = buildDocumentPayload(mime, dataUri);
     const body: Record<string, unknown> = {
@@ -292,7 +333,6 @@ export class MistralOcrService {
     if (options.annotateImages) {
       body.bbox_annotation_format = buildImageAnnotationFormat();
     }
-
     if (options.pages?.length) {
       body.pages = options.pages;
     }
@@ -321,21 +361,113 @@ export class MistralOcrService {
     }
 
     const payload = (await response.json()) as MistralOcrApiResponse;
-    const pages = normalizePages(payload.pages);
-    const text = pages
+    return {
+      pages: normalizePages(payload.pages),
+      model: payload.model ?? ocrModel,
+      usage_info: payload.usage_info,
+    };
+  }
+
+  static async extractTextFromFile(
+    file: Express.Multer.File,
+    options: MistralOcrOptions = {},
+  ): Promise<MistralOcrResult> {
+    assertMistralConfigured();
+
+    const mime = this.resolveSupportedMime(file);
+    const filePath = file.path;
+    if (!filePath || !fs.existsSync(filePath)) {
+      throw new HttpError(400, 'ملف مرفوع غير موجود');
+    }
+
+    const buffer = fs.readFileSync(filePath);
+    if (buffer.length === 0) {
+      throw new HttpError(400, 'الملف فارغ');
+    }
+
+    const { ocrModel: defaultOcrModel, maxPagesPerOcrRequest } = getMistralConfig();
+    const ocrModel = options.ocrModel?.trim() || defaultOcrModel;
+    const filename = file.originalname || path.basename(filePath);
+
+    if (!isPdfMime(mime)) {
+      const result = await this.callMistralOcr(mime, buffer, options, ocrModel);
+      const text = result.pages
+        .map((p) => p.markdown.trim())
+        .filter(Boolean)
+        .join('\n\n---\n\n');
+      return {
+        filename,
+        mime_type: mime,
+        document_type: 'image',
+        model: result.model,
+        page_count: result.pages.length || 1,
+        text,
+        pages: result.pages,
+        usage_info: result.usage_info,
+      };
+    }
+
+    let targetPages = options.pages;
+    if (!targetPages?.length) {
+      const pageCount = await getPdfPageCount(buffer);
+      targetPages = Array.from({ length: pageCount }, (_, i) => i);
+    }
+
+    const batches = chunkPages(targetPages, maxPagesPerOcrRequest);
+    const mergedPages: MistralOcrPage[] = [];
+    let lastModel = ocrModel;
+    let lastUsage: MistralOcrApiResponse['usage_info'];
+
+    for (const batch of batches) {
+      const sliceBuffer = isFullDocumentSingleBatch(targetPages, batch, maxPagesPerOcrRequest)
+        ? buffer
+        : await slicePdfBuffer(buffer, batch);
+
+      const result = await this.callMistralOcr(
+        mime,
+        sliceBuffer,
+        { ...options, pages: undefined },
+        ocrModel,
+      );
+      lastModel = result.model;
+      lastUsage = result.usage_info;
+
+      for (let i = 0; i < result.pages.length; i++) {
+        const absoluteIndex = batch[Math.min(i, batch.length - 1)] ?? batch[0];
+        const page = result.pages[i];
+        mergedPages.push({
+          ...page,
+          index: absoluteIndex,
+          images: page.images.map((image) => ({
+            ...image,
+            page_index: absoluteIndex,
+            id: image.id.includes(`p${absoluteIndex}-`)
+              ? image.id
+              : `p${absoluteIndex}-${image.id}`,
+          })),
+        });
+      }
+    }
+
+    mergedPages.sort((a, b) => a.index - b.index);
+    const text = mergedPages
       .map((p) => p.markdown.trim())
       .filter(Boolean)
       .join('\n\n---\n\n');
 
     return {
-      filename: file.originalname || path.basename(filePath),
+      filename,
       mime_type: mime,
-      document_type: isPdfMime(mime) ? 'pdf' : 'image',
-      model: payload.model ?? ocrModel,
-      page_count: pages.length || 1,
+      document_type: 'pdf',
+      model: lastModel,
+      page_count: mergedPages.length || 1,
       text,
-      pages,
-      usage_info: payload.usage_info,
+      pages: mergedPages,
+      usage_info:
+        lastUsage ?? {
+          pages_processed: mergedPages.length,
+          doc_size_bytes: buffer.length,
+        },
     };
   }
 

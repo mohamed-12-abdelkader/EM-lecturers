@@ -132,6 +132,7 @@ curl -X POST "http://localhost:8000/api/super/tenants" ^
 ### 2ب) رفع صور من الجهاز — `multipart/form-data`
 
 - **لا** تُستخدم `validate` بنفس جسم JSON؛ الحقول النصية تُقرأ من حقول النموذج، و`landing` / `settings` / `owner` تُرسل عادةً كـ **سلاسل JSON** (نص واحد لكل حقل).
+- **حجم الصور:** بلا حد من جهة التطبيق افتراضياً (`TENANT_IMAGE_MAX_FILE_SIZE_MB=0`). يمكن وضع رقم (ميجابايت) إن أردت حداً. في البروداكشن ارفع أيضاً حد الـ reverse proxy (`client_max_body_size` في nginx).
 - الملفات المدعومة في هذا المسار (أسماء حقول **`multipart`**):
 
 | حقل الملف | النتيجة بعد الرفع |
@@ -179,6 +180,7 @@ curl -X POST "http://localhost:8000/api/super/tenants" ^
 | الحالة | الاستجابة |
 |--------|------------|
 | `subdomain` مكرر | **409** — `Subdomain already taken` |
+| صورة أكبر من حد مضبوط | **413** — زد أو صفّر `TENANT_IMAGE_MAX_FILE_SIZE_MB` (الافتراضي `0` = بلا حد) |
 | ليس على tenant `default` | **403** — كود `SUPER_ADMIN_HOST_REQUIRED` |
 | توكن غير أدمن | **403** |
 | **400** — `Validation failed` و`subdomain` / `display_name` مطلوبان | غالباً الجسم لم يُستقبل كـ JSON صالح، أو الحقول داخل غلاف (`tenant` / `data`)، أو أسماء **camelCase** فقط (`displayName`, `subDomain`) — الـ API يدعم الآن الغلاف والأسماء البديلة. إن كنت تستخدم **FormData** فلا تضبط `Content-Type: application/json` يدوياً؛ اترك المتصفح يضبط `multipart/form-data` مع `boundary`. |

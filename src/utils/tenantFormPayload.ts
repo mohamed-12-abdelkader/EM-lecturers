@@ -1,16 +1,83 @@
-import type { Request } from 'express';
+import type { NextFunction, Request, Response } from 'express';
+import fs from 'node:fs';
+import path from 'node:path';
+import multer from 'multer';
 import { z } from 'zod';
-import { uploadTeacherAvatar, uploadToCloudinary } from '../utils';
+import { uploadToCloudinary } from '../utils';
 import type { PatchTenantInput } from '../services/tenants';
 
 export const SUBDOMAIN_REGEX = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 
-export const uploadTenantFiles = uploadTeacherAvatar.fields([
+/**
+ * Max tenant platform image size in bytes.
+ * Env: TENANT_IMAGE_MAX_FILE_SIZE_MB — default 0 = unlimited.
+ */
+export function getTenantImageMaxBytes(): number {
+  const raw = process.env.TENANT_IMAGE_MAX_FILE_SIZE_MB;
+  if (raw === undefined || raw === '') return Number.POSITIVE_INFINITY;
+  const mb = Number(raw);
+  if (!Number.isFinite(mb) || mb < 0) return Number.POSITIVE_INFINITY;
+  if (mb === 0) return Number.POSITIVE_INFINITY;
+  return Math.trunc(mb) * 1024 * 1024;
+}
+
+const tenantImageStorage = multer.diskStorage({
+  destination: (_req, _file, cb) => {
+    const dir = path.join(process.cwd(), 'uploads');
+    fs.mkdirSync(dir, { recursive: true });
+    cb(null, dir);
+  },
+  filename: (_req, file, cb) => {
+    cb(null, `tenant-${Date.now()}-${Math.round(Math.random() * 1e9)}${path.extname(file.originalname || '')}`);
+  },
+});
+
+function buildTenantImageUpload() {
+  const maxBytes = getTenantImageMaxBytes();
+  return multer({
+    storage: tenantImageStorage,
+    fileFilter: (_req, file, cb) => {
+      if (file.mimetype?.startsWith('image/')) cb(null, true);
+      else cb(new Error('يسمح برفع صور فقط'));
+    },
+    limits: {
+      ...(Number.isFinite(maxBytes) ? { fileSize: maxBytes } : {}),
+      files: 4,
+    },
+  });
+}
+
+const tenantImageFields = [
   { name: 'avatar', maxCount: 1 },
   { name: 'favicon', maxCount: 1 },
   { name: 'og_image', maxCount: 1 },
   { name: 'hero_image', maxCount: 1 },
-]);
+] as const;
+
+/** Raw multer fields handler (prefer uploadTenantFilesSafe). */
+export const uploadTenantFiles = buildTenantImageUpload().fields([...tenantImageFields]);
+
+/** Multer with Arabic 413 when over TENANT_IMAGE_MAX_FILE_SIZE_MB (if set). */
+export function uploadTenantFilesSafe(req: Request, res: Response, next: NextFunction) {
+  uploadTenantFiles(req, res, (err: unknown) => {
+    if (!err) return next();
+    if (err instanceof multer.MulterError) {
+      if (err.code === 'LIMIT_FILE_SIZE') {
+        const maxBytes = getTenantImageMaxBytes();
+        const label = Number.isFinite(maxBytes)
+          ? `${Math.round(maxBytes / (1024 * 1024))} MB`
+          : 'غير محدود';
+        return res.status(413).json({
+          success: false,
+          message: `حجم الصورة أكبر من الحد المسموح (${label}). زد TENANT_IMAGE_MAX_FILE_SIZE_MB أو ضع 0 بلا حد`,
+        });
+      }
+      return res.status(400).json({ success: false, message: err.message });
+    }
+    const msg = err instanceof Error ? err.message : 'خطأ في رفع الصورة';
+    return res.status(400).json({ success: false, message: msg });
+  });
+}
 
 export function isMultipartRequest(req: Request): boolean {
   const ct = (req.headers['content-type'] || '').toLowerCase();
@@ -78,6 +145,7 @@ const OwnerPatchSchema = z
     subject: z.string().optional().nullable(),
     phone: z.string().optional().nullable(),
     facebook_url: z.string().optional().nullable(),
+    instagram_url: z.string().optional().nullable(),
     youtube_url: z.string().optional().nullable(),
     tiktok_url: z.string().optional().nullable(),
     whatsapp_number: z.string().optional().nullable(),
@@ -169,6 +237,9 @@ function parseOwnerFromBody(b: Record<string, unknown>): PatchTenantInput['owner
   if (b.owner_subject !== undefined) owner.subject = formStr(b.owner_subject) ?? null;
   if (b.owner_phone !== undefined) owner.phone = formStr(b.owner_phone) ?? null;
   if (b.owner_facebook_url !== undefined) owner.facebook_url = formStr(b.owner_facebook_url) ?? null;
+  if (b.owner_instagram_url !== undefined) {
+    owner.instagram_url = formStr(b.owner_instagram_url) ?? null;
+  }
   if (b.owner_youtube_url !== undefined) owner.youtube_url = formStr(b.owner_youtube_url) ?? null;
   if (b.owner_tiktok_url !== undefined) owner.tiktok_url = formStr(b.owner_tiktok_url) ?? null;
   if (b.owner_whatsapp_number !== undefined) {

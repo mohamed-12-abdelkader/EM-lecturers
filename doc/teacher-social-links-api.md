@@ -5,9 +5,12 @@
 
 ## الحقول المضافة
 - `facebook_url`: رابط صفحة الفيسبوك
+- `instagram_url`: رابط حساب/بيدج الإنستجرام
 - `youtube_url`: رابط قناة اليوتيوب  
 - `tiktok_url`: رابط حساب التيك توك
 - `whatsapp_number`: رقم الواتساب للتواصل
+
+> توثيق إنشاء/تعديل المنصة: [`teacher-platform-social-links-ar.md`](./teacher-platform-social-links-ar.md)
 
 ## APIs المحدثة
 

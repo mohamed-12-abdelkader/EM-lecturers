@@ -11,6 +11,11 @@ import { tenantContextMiddleware } from './middleware/tenantContext';
 export const app = express();
 export const server = createServer(app);
 
+// Large OCR / file uploads can take a long time (multi-page PDF batches)
+server.timeout = 0;
+server.requestTimeout = 0;
+server.headersTimeout = 0;
+
 // Parse JSON bodies; include text/plain because some clients (e.g. Postman "raw" default) send JSON with Content-Type: text/plain
 app.use(express.json({ type: ['application/json', 'text/plain'] }));
 app.use(express.urlencoded({ extended: true }));

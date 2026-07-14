@@ -1,11 +1,11 @@
 import pool from '../db/pool';
 import { HttpError } from '../utils';
 import { AccountingService } from './accounting';
-import { FinancialAuditService, recordFinancialTransaction } from './financialAudit';
+import { FinancialAuditService, recordFinancialTransaction, recordFinancialTransactionWithClient } from './financialAudit';
 import { TeacherCustomPricingService } from './teacherCustomPricing';
 import { TeacherSubscriptionInvoicesService } from './teacherSubscriptionInvoices';
 import { TeacherSubscriptionPlansService } from './teacherSubscriptionPlans';
-import { packageLevel, type TeacherPackage } from './teacherPlanPolicy';
+import { packageLevel, TEACHER_BILLING_SUBSCRIPTION_ORDER, type TeacherPackage } from './teacherPlanPolicy';
 
 export type SubscriptionStatus = 'active' | 'expired' | 'suspended' | 'cancelled';
 export type PaymentStatus = 'paid' | 'partial' | 'unpaid';
@@ -146,6 +146,155 @@ async function reactivateTeacherPlatform(
      WHERE owner_user_id = $1`,
     [teacherId],
   );
+}
+
+async function deactivateTeacherPlatformIfNoActiveSubscription(
+  client: import('pg').PoolClient,
+  teacherId: number,
+): Promise<void> {
+  const active = await client.query(
+    `SELECT 1 FROM teacher_platform_subscriptions
+     WHERE teacher_id = $1 AND status = 'active' AND ends_at >= CURRENT_DATE
+     LIMIT 1`,
+    [teacherId],
+  );
+  if (!active.rowCount) {
+    await client.query(
+      `UPDATE tenants SET is_active = false, updated_at = NOW() WHERE owner_user_id = $1`,
+      [teacherId],
+    );
+  }
+}
+
+async function syncTeacherPackageFromBilling(
+  client: import('pg').PoolClient,
+  teacherId: number,
+): Promise<void> {
+  const billing = await client.query<{ code: string; starts_at: string | Date | null }>(
+    `SELECT p.code, s.starts_at
+     FROM teacher_platform_subscriptions s
+     JOIN teacher_subscription_plans p ON p.id = s.plan_id
+     WHERE s.teacher_id = $1 AND s.status <> 'cancelled'
+     ORDER BY ${TEACHER_BILLING_SUBSCRIPTION_ORDER}
+     LIMIT 1`,
+    [teacherId],
+  );
+
+  if (billing.rowCount) {
+    await client.query(
+      `UPDATE users
+       SET subscription_package = $1,
+           subscription_package_assigned_at = COALESCE($2::date, subscription_package_assigned_at, NOW())
+       WHERE id = $3 AND role = 'teacher'`,
+      [billing.rows[0].code, billing.rows[0].starts_at, teacherId],
+    );
+    return;
+  }
+
+  await client.query(
+    `UPDATE users SET subscription_package = 'bronze' WHERE id = $1 AND role = 'teacher'`,
+    [teacherId],
+  );
+}
+
+/** إزالة إيرادات الاشتراك من platform_income وسجل المعاملات عند الإلغاء */
+async function reverseSubscriptionRevenue(
+  client: import('pg').PoolClient,
+  subscriptionId: number,
+  sub: {
+    teacher_id: number;
+    subscription_number: string;
+    plan_id: number;
+  },
+  actorId: number,
+): Promise<{ reversed_total: number; income_ids_removed: number[] }> {
+  const cancelDate = new Date().toISOString().slice(0, 10);
+
+  const planRes = await client.query<{ code: string }>(
+    `SELECT code FROM teacher_subscription_plans WHERE id = $1`,
+    [sub.plan_id],
+  );
+  const planCode = planRes.rows[0]?.code ?? null;
+
+  const incomeRes = await client.query<{ income_id: number }>(
+    `SELECT DISTINCT income_id
+     FROM (
+       SELECT income_id FROM teacher_subscription_payments
+       WHERE subscription_id = $1 AND income_id IS NOT NULL
+       UNION
+       SELECT income_id FROM teacher_platform_subscriptions
+       WHERE id = $1 AND income_id IS NOT NULL
+     ) incomes`,
+    [subscriptionId],
+  );
+
+  const incomeIds = incomeRes.rows.map((row) => Number(row.income_id));
+  let reversedTotal = 0;
+
+  for (const incomeId of incomeIds) {
+    const incomeRow = await client.query<{ amount: string }>(
+      `SELECT amount FROM platform_income WHERE id = $1`,
+      [incomeId],
+    );
+    if (!incomeRow.rowCount) continue;
+    reversedTotal = roundMoney(reversedTotal + Number(incomeRow.rows[0].amount));
+    await client.query(`DELETE FROM platform_income WHERE id = $1`, [incomeId]);
+  }
+
+  await client.query(
+    `DELETE FROM platform_financial_transactions
+     WHERE direction = 'in'
+       AND (
+         (reference_table = 'teacher_platform_subscriptions' AND reference_id = $1)
+         OR (reference_table = 'teacher_subscription_payments' AND reference_id IN (
+           SELECT id FROM teacher_subscription_payments WHERE subscription_id = $1
+         ))
+         OR (reference_table = 'teacher_subscription_renewals' AND reference_id IN (
+           SELECT id FROM teacher_subscription_renewals WHERE subscription_id = $1
+         ))
+         OR (reference_table = 'teacher_subscription_upgrades' AND reference_id IN (
+           SELECT id FROM teacher_subscription_upgrades WHERE subscription_id = $1
+         ))
+       )`,
+    [subscriptionId],
+  );
+
+  if (reversedTotal > 0) {
+    await recordFinancialTransactionWithClient(client, {
+      transaction_kind: 'subscription_cancellation',
+      reference_table: 'teacher_platform_subscriptions',
+      reference_id: subscriptionId,
+      amount: reversedTotal,
+      direction: 'out',
+      teacher_id: sub.teacher_id,
+      plan_code: planCode,
+      transaction_date: cancelDate,
+      description: `إلغاء اشتراك ${sub.subscription_number}`,
+      created_by: actorId,
+    });
+  }
+
+  await client.query(`UPDATE teacher_platform_subscriptions SET income_id = NULL WHERE id = $1`, [
+    subscriptionId,
+  ]);
+  await client.query(
+    `UPDATE teacher_subscription_payments SET income_id = NULL WHERE subscription_id = $1`,
+    [subscriptionId],
+  );
+  await client.query(
+    `UPDATE teacher_subscription_renewals SET income_id = NULL WHERE subscription_id = $1`,
+    [subscriptionId],
+  );
+  await client.query(
+    `UPDATE teacher_subscription_upgrades SET income_id = NULL WHERE subscription_id = $1`,
+    [subscriptionId],
+  );
+  await client.query(
+    `UPDATE teacher_subscription_invoices SET income_id = NULL WHERE subscription_id = $1`,
+    [subscriptionId],
+  );
+
+  return { reversed_total: reversedTotal, income_ids_removed: incomeIds };
 }
 
 function toDateString(val: unknown): string | null {
@@ -1097,10 +1246,14 @@ export class TeacherPlatformSubscriptionsService {
     actorId: number,
     notes?: string,
   ) {
+    if (status === 'cancelled') {
+      return this.cancel(id, actorId, { notes });
+    }
+
     const existing = await pool.query(`SELECT * FROM teacher_platform_subscriptions WHERE id = $1`, [
       id,
     ]);
-    if (!existing.rowCount) throw new Error('Subscription not found');
+    if (!existing.rowCount) throw new HttpError(404, 'الاشتراك غير موجود');
 
     const result = await pool.query(
       `UPDATE teacher_platform_subscriptions
@@ -1120,6 +1273,145 @@ export class TeacherPlatformSubscriptionsService {
     });
 
     return this.getById(id);
+  }
+
+  /** إلغاء اشتراك: تعطيل المنصة عند الحاجة + إلغاء الفواتير المفتوحة + مزامنة الباقة */
+  static async cancel(
+    id: number,
+    actorId: number,
+    options?: { notes?: string | null; reason?: string | null },
+  ) {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      const existing = await client.query(`SELECT * FROM teacher_platform_subscriptions WHERE id = $1 FOR UPDATE`, [
+        id,
+      ]);
+      if (!existing.rowCount) throw new HttpError(404, 'الاشتراك غير موجود');
+
+      const sub = existing.rows[0];
+      if (sub.status === 'cancelled') {
+        throw new HttpError(400, 'الاشتراك ملغي مسبقاً');
+      }
+
+      const noteParts = [options?.notes, options?.reason ? `سبب الإلغاء: ${options.reason}` : null].filter(
+        Boolean,
+      );
+      const mergedNotes = [sub.notes, ...noteParts].filter(Boolean).join('\n') || null;
+
+      const result = await client.query(
+        `UPDATE teacher_platform_subscriptions
+         SET status = 'cancelled',
+             remaining_amount = 0,
+             payment_status = CASE WHEN paid_amount > 0 THEN 'paid' ELSE 'unpaid' END,
+             notes = $2,
+             updated_at = NOW()
+         WHERE id = $1
+         RETURNING *`,
+        [id, mergedNotes],
+      );
+
+      await client.query(
+        `UPDATE teacher_subscription_invoices
+         SET status = 'cancelled',
+             remaining_amount = 0
+         WHERE subscription_id = $1 AND status IN ('unpaid', 'partial')`,
+        [id],
+      );
+
+      const revenueReversal = await reverseSubscriptionRevenue(client, id, {
+        teacher_id: Number(sub.teacher_id),
+        subscription_number: String(sub.subscription_number),
+        plan_id: Number(sub.plan_id),
+      }, actorId);
+
+      await deactivateTeacherPlatformIfNoActiveSubscription(client, Number(sub.teacher_id));
+      await syncTeacherPackageFromBilling(client, Number(sub.teacher_id));
+
+      await FinancialAuditService.log({
+        entity_type: 'teacher_platform_subscription',
+        entity_id: id,
+        action: 'update',
+        actor_id: actorId,
+        before_data: sub,
+        after_data: { ...result.rows[0], revenue_reversal: revenueReversal },
+        notes: options?.reason ? `إلغاء اشتراك: ${options.reason}` : 'إلغاء اشتراك',
+      });
+
+      await client.query('COMMIT');
+      return this.getById(id);
+    } catch (e) {
+      await client.query('ROLLBACK');
+      throw e;
+    } finally {
+      client.release();
+    }
+  }
+
+  /** حذف اشتراك من السجل (بعد الإلغاء أو إن كان منتهياً/معلقاً) */
+  static async deleteSubscription(
+    id: number,
+    actorId: number,
+    options?: { force?: boolean },
+  ): Promise<{ id: number; subscription_number: string }> {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      const existing = await client.query(
+        `SELECT * FROM teacher_platform_subscriptions WHERE id = $1 FOR UPDATE`,
+        [id],
+      );
+      if (!existing.rowCount) throw new HttpError(404, 'الاشتراك غير موجود');
+
+      const sub = existing.rows[0];
+      const isActive =
+        sub.status === 'active' && String(sub.ends_at).slice(0, 10) >= new Date().toISOString().slice(0, 10);
+
+      if (isActive && !options?.force) {
+        throw new HttpError(400, 'لا يمكن حذف اشتراك فعال. قم بإلغائه أولاً عبر POST /subscriptions/:id/cancel');
+      }
+
+      if (Number(sub.remaining_amount) > 0 && !options?.force) {
+        throw new HttpError(
+          400,
+          'لا يمكن حذف اشتراك عليه مبلغ متبقي. سجّل الدفعات أو ألغِ الاشتراك أولاً، أو استخدم force=true',
+        );
+      }
+
+      await client.query(
+        `UPDATE teacher_subscription_invoices
+         SET status = 'cancelled', remaining_amount = 0
+         WHERE subscription_id = $1 AND status IN ('unpaid', 'partial')`,
+        [id],
+      );
+
+      await client.query(`DELETE FROM teacher_platform_subscriptions WHERE id = $1`, [id]);
+
+      await deactivateTeacherPlatformIfNoActiveSubscription(client, Number(sub.teacher_id));
+      await syncTeacherPackageFromBilling(client, Number(sub.teacher_id));
+
+      await FinancialAuditService.log({
+        entity_type: 'teacher_platform_subscription',
+        entity_id: id,
+        action: 'delete',
+        actor_id: actorId,
+        before_data: sub,
+        after_data: null,
+      });
+
+      await client.query('COMMIT');
+      return {
+        id: Number(sub.id),
+        subscription_number: String(sub.subscription_number),
+      };
+    } catch (e) {
+      await client.query('ROLLBACK');
+      throw e;
+    } finally {
+      client.release();
+    }
   }
 
   static async getById(id: number) {

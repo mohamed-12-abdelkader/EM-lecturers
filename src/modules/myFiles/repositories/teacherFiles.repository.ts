@@ -19,13 +19,16 @@ export class TeacherFilesRepository {
     fileExtension: string;
     mimeType: string;
     categoryId?: number | null;
+    sourceType?: 'upload' | 'drive';
+    driveUrl?: string | null;
   }): Promise<TeacherFileRow> {
     const result = await pool.query<TeacherFileRow>(
       `INSERT INTO teacher_files (
          teacher_id, name, description, file_url, file_key,
-         file_size, file_extension, mime_type, category_id
+         file_size, file_extension, mime_type, category_id,
+         source_type, drive_url
        )
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
        RETURNING *`,
       [
         input.teacherId,
@@ -37,6 +40,8 @@ export class TeacherFilesRepository {
         input.fileExtension,
         input.mimeType,
         input.categoryId ?? null,
+        input.sourceType ?? 'upload',
+        input.driveUrl ?? null,
       ],
     );
     return result.rows[0];
@@ -106,7 +111,16 @@ export class TeacherFilesRepository {
   static async update(
     id: number,
     teacherId: number,
-    fields: { name?: string; description?: string | null; categoryId?: number | null },
+    fields: {
+      name?: string;
+      description?: string | null;
+      categoryId?: number | null;
+      fileUrl?: string;
+      fileKey?: string;
+      fileExtension?: string;
+      mimeType?: string;
+      driveUrl?: string | null;
+    },
   ): Promise<TeacherFileListItem | null> {
     const sets: string[] = ['updated_at = NOW()'];
     const params: unknown[] = [id, teacherId];
@@ -122,6 +136,26 @@ export class TeacherFilesRepository {
     if (fields.categoryId !== undefined) {
       params.push(fields.categoryId);
       sets.push(`category_id = $${params.length}`);
+    }
+    if (fields.fileUrl !== undefined) {
+      params.push(fields.fileUrl);
+      sets.push(`file_url = $${params.length}`);
+    }
+    if (fields.fileKey !== undefined) {
+      params.push(fields.fileKey);
+      sets.push(`file_key = $${params.length}`);
+    }
+    if (fields.fileExtension !== undefined) {
+      params.push(fields.fileExtension);
+      sets.push(`file_extension = $${params.length}`);
+    }
+    if (fields.mimeType !== undefined) {
+      params.push(fields.mimeType);
+      sets.push(`mime_type = $${params.length}`);
+    }
+    if (fields.driveUrl !== undefined) {
+      params.push(fields.driveUrl);
+      sets.push(`drive_url = $${params.length}`);
     }
 
     const result = await pool.query<TeacherFileListItem>(

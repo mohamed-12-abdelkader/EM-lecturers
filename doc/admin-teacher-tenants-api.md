@@ -137,6 +137,8 @@ PATCH /api/admin/tenants/:id
 
 ### رفع الصور (multipart)
 
+بلا حد حجم من التطبيق افتراضياً (`TENANT_IMAGE_MAX_FILE_SIZE_MB=0`). ارفع حد الـ proxy في البروداكشن أيضاً.
+
 | ملف | يُخزَّن في |
 |-----|-----------|
 | `avatar` | `avatar_url` (+ صورة المالك إن وُجد) |

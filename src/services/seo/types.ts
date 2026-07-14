@@ -66,6 +66,7 @@ export type PublicTeacherPage = {
     description: string | null;
     subject: string | null;
     facebook_url: string | null;
+    instagram_url: string | null;
     youtube_url: string | null;
     tiktok_url: string | null;
     whatsapp_number: string | null;

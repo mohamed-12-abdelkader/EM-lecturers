@@ -11,6 +11,82 @@ import { HttpError, uploadToCloudinary } from '../../../utils';
 
 let s3Client: S3Client | null = null;
 
+function resolveCloudinaryResourceType(fileKey: string, fileUrl: string): 'image' | 'raw' {
+  if (fileUrl.includes('/raw/upload/')) return 'raw';
+  if (fileUrl.includes('/image/upload/')) return 'image';
+  const ext = path.extname(fileKey || '').toLowerCase();
+  if (['.jpg', '.jpeg', '.png', '.webp', '.gif'].includes(ext)) return 'image';
+  return 'raw';
+}
+
+function resolveCloudinaryFormat(fileKey: string, fileUrl: string): string {
+  const fromKey = path.extname(fileKey).replace(/^\./, '').toLowerCase();
+  if (fromKey) return fromKey;
+  const fromUrl = fileUrl.split('?')[0].split('.').pop()?.toLowerCase();
+  return fromUrl || 'bin';
+}
+
+function buildCloudinaryAccessUrls(fileKey: string, fileUrl: string): string[] {
+  const resourceType = resolveCloudinaryResourceType(fileKey, fileUrl);
+  const format = resolveCloudinaryFormat(fileKey, fileUrl);
+  const urls: string[] = [];
+
+  urls.push(
+    cloudinary.url(fileKey, {
+      resource_type: resourceType,
+      type: 'upload',
+      secure: true,
+      sign_url: true,
+      ...(resourceType === 'raw' ? { format } : {}),
+    }),
+  );
+
+  try {
+    urls.push(
+      cloudinary.utils.private_download_url(fileKey, format, {
+        resource_type: resourceType,
+        type: 'upload',
+        expires_at: Math.floor(Date.now() / 1000) + myFilesConfig.signedUrlTtlSeconds,
+      }),
+    );
+  } catch {
+    // signed delivery URL remains available
+  }
+
+  if (fileUrl) urls.push(fileUrl);
+  return [...new Set(urls.filter(Boolean))];
+}
+
+async function fetchCloudinaryBuffer(fileKey: string, fileUrl: string): Promise<Buffer> {
+  if (!fileKey) throw new HttpError(404, 'مفتاح الملف غير متوفر');
+
+  const candidateUrls = buildCloudinaryAccessUrls(fileKey, fileUrl);
+  let lastStatus: number | undefined;
+
+  for (const url of candidateUrls) {
+    try {
+      const response = await axios.get<ArrayBuffer>(url, {
+        responseType: 'arraybuffer',
+        timeout: 60_000,
+        maxContentLength: myFilesConfig.maxFileSizeBytes,
+        maxBodyLength: myFilesConfig.maxFileSizeBytes,
+        validateStatus: (status) => status >= 200 && status < 300,
+      });
+      return Buffer.from(response.data);
+    } catch (error: unknown) {
+      const axiosError = error as { response?: { status?: number } };
+      lastStatus = axiosError.response?.status ?? lastStatus;
+    }
+  }
+
+  throw new HttpError(
+    502,
+    lastStatus === 401
+      ? 'تعذر الوصول للملف على Cloudinary (401). تحقق من إعدادات التسليم أو استخدم FILE_STORAGE_PROVIDER=local'
+      : 'فشل جلب الملف من التخزين السحابي',
+  );
+}
+
 function getS3Client(): S3Client {
   if (!s3Client) {
     const { region, accessKeyId, secretAccessKey } = myFilesConfig.aws;
@@ -99,16 +175,8 @@ export class FileStorageService {
         return Buffer.concat(chunks);
       }
       case 'cloudinary':
-      default: {
-        if (!fileUrl) throw new HttpError(404, 'رابط الملف غير متوفر');
-        const response = await axios.get<ArrayBuffer>(fileUrl, {
-          responseType: 'arraybuffer',
-          timeout: 60_000,
-          maxContentLength: myFilesConfig.maxFileSizeBytes,
-          maxBodyLength: myFilesConfig.maxFileSizeBytes,
-        });
-        return Buffer.from(response.data);
-      }
+      default:
+        return fetchCloudinaryBuffer(fileKey, fileUrl);
     }
   }
 
@@ -124,8 +192,25 @@ export class FileStorageService {
         });
       }
       case 'cloudinary':
+      default: {
+        const signedUrls = buildCloudinaryAccessUrls(fileKey, fileUrl);
+        return signedUrls[0] || fileUrl;
+      }
+    }
+  }
+
+  /** رابط مباشر للعرض في iframe (أسرع من البروكسي عبر الـ API) */
+  static async getDirectAccessUrl(fileKey: string, fileUrl: string): Promise<string | null> {
+    switch (myFilesConfig.storageProvider) {
+      case 'cloudinary': {
+        const signedUrls = buildCloudinaryAccessUrls(fileKey, fileUrl);
+        return signedUrls[0] || null;
+      }
+      case 's3':
+        return this.getDownloadUrl(fileKey, fileUrl);
+      case 'local':
       default:
-        return fileUrl;
+        return null;
     }
   }
 
@@ -172,6 +257,8 @@ export class FileStorageService {
 
     const result = await uploadToCloudinary(filePath, {
       resource_type: resourceType,
+      type: 'upload',
+      access_mode: 'public',
     });
 
     const fileUrl = result.secure_url as string;

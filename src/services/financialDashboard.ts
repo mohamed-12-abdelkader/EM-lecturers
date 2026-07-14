@@ -13,6 +13,148 @@ export type ExpenseCategory =
   | 'maintenance'
   | 'other';
 
+const INCOME_PAYMENT_TYPE_LABELS: Record<string, string> = {
+  subscription: 'اشتراك جديد',
+  renewal: 'تجديد اشتراك',
+  upgrade: 'ترقية باقة',
+  additional_payment: 'دفعة إضافية',
+  reversal: 'إلغاء / استرداد إيراد',
+};
+
+const INCOME_DETAILS_BASE_SQL = `
+  WITH income_entries AS (
+    SELECT
+      sp.id AS entry_id,
+      'payment'::text AS entry_kind,
+      sp.amount::numeric AS amount,
+      sp.payment_date AS transaction_date,
+      sp.payment_method,
+      sp.notes,
+      sp.income_id,
+      (sp.income_id IS NOT NULL) AS is_counted_in_revenue,
+      t.id AS teacher_id,
+      t.name AS teacher_name,
+      t.email AS teacher_email,
+      s.id AS subscription_id,
+      s.subscription_number,
+      s.status AS subscription_status,
+      p.id AS plan_id,
+      p.code AS plan_code,
+      p.name_ar AS plan_name_ar,
+      CASE
+        WHEN sp.upgrade_id IS NOT NULL THEN 'upgrade'
+        WHEN sp.renewal_id IS NOT NULL THEN 'renewal'
+        WHEN sp.id = (
+          SELECT MIN(sp2.id)
+          FROM teacher_subscription_payments sp2
+          WHERE sp2.subscription_id = sp.subscription_id
+        ) THEN 'subscription'
+        ELSE 'additional_payment'
+      END AS payment_type,
+      cb.name AS recorded_by_name,
+      sp.created_at
+    FROM teacher_subscription_payments sp
+    JOIN teacher_platform_subscriptions s ON s.id = sp.subscription_id
+    JOIN users t ON t.id = sp.teacher_id
+    LEFT JOIN teacher_subscription_renewals ren ON ren.id = sp.renewal_id
+    LEFT JOIN teacher_subscription_upgrades upg ON upg.id = sp.upgrade_id
+    JOIN teacher_subscription_plans p ON p.id = COALESCE(upg.to_plan_id, ren.plan_id, s.plan_id)
+    LEFT JOIN users cb ON cb.id = sp.created_by
+
+    UNION ALL
+
+    SELECT
+      ft.id,
+      'reversal',
+      -ft.amount,
+      ft.transaction_date,
+      NULL,
+      ft.description,
+      NULL,
+      FALSE,
+      ft.teacher_id,
+      t.name,
+      t.email,
+      s.id,
+      s.subscription_number,
+      s.status,
+      p.id,
+      p.code,
+      p.name_ar,
+      'reversal',
+      cb.name,
+      ft.created_at
+    FROM platform_financial_transactions ft
+    JOIN users t ON t.id = ft.teacher_id
+    LEFT JOIN teacher_platform_subscriptions s
+      ON s.id = ft.reference_id AND ft.reference_table = 'teacher_platform_subscriptions'
+    LEFT JOIN teacher_subscription_plans p ON p.code = ft.plan_code
+    LEFT JOIN users cb ON cb.id = ft.created_by
+    WHERE ft.transaction_kind = 'subscription_cancellation' AND ft.direction = 'out'
+  )
+`;
+
+function mapIncomeDetailRow(row: Record<string, unknown>) {
+  const paymentType = String(row.payment_type ?? '');
+  const amount = Number(row.amount ?? 0);
+  return {
+    entry_id: Number(row.entry_id),
+    entry_kind: row.entry_kind,
+    payment_type: paymentType,
+    payment_type_label_ar: INCOME_PAYMENT_TYPE_LABELS[paymentType] ?? paymentType,
+    amount,
+    amount_abs: Math.abs(amount),
+    transaction_date: row.transaction_date,
+    payment_method: row.payment_method ?? null,
+    notes: row.notes ?? null,
+    income_id: row.income_id != null ? Number(row.income_id) : null,
+    is_counted_in_revenue: Boolean(row.is_counted_in_revenue),
+    teacher: {
+      id: Number(row.teacher_id),
+      name: row.teacher_name,
+      email: row.teacher_email,
+    },
+    subscription: row.subscription_id
+      ? {
+          id: Number(row.subscription_id),
+          subscription_number: row.subscription_number,
+          status: row.subscription_status,
+        }
+      : null,
+    plan: row.plan_id
+      ? {
+          id: Number(row.plan_id),
+          code: row.plan_code,
+          name_ar: row.plan_name_ar,
+        }
+      : null,
+    recorded_by_name: row.recorded_by_name ?? null,
+    description: buildIncomeDetailDescription(row),
+  };
+}
+
+function buildIncomeDetailDescription(row: Record<string, unknown>): string {
+  const teacherName = String(row.teacher_name ?? 'مدرس');
+  const planName = String(row.plan_name_ar ?? row.plan_code ?? 'باقة');
+  const amount = Math.abs(Number(row.amount ?? 0));
+  const paymentType = String(row.payment_type ?? '');
+  const subNumber = row.subscription_number ? ` (#${row.subscription_number})` : '';
+
+  if (paymentType === 'reversal') {
+    return `استرداد إيراد اشتراك ${teacherName}${subNumber} — ${amount}`;
+  }
+  if (paymentType === 'renewal') {
+    return `${teacherName} دفع ${amount} لتجديد ${planName}${subNumber}`;
+  }
+  if (paymentType === 'upgrade') {
+    return `${teacherName} دفع ${amount} لترقية الباقة إلى ${planName}${subNumber}`;
+  }
+  if (paymentType === 'additional_payment') {
+    return `${teacherName} دفع ${amount} دفعة إضافية على ${planName}${subNumber}`;
+  }
+  return `${teacherName} دفع ${amount} واشترك في ${planName}${subNumber}`;
+}
+
 function periodToDates(period?: string): { start_date?: string; end_date?: string } {
   const now = new Date();
   const today = now.toISOString().slice(0, 10);
@@ -251,6 +393,111 @@ export class FinancialDashboardService {
       offset: 0,
     });
     return list;
+  }
+
+  /** تفاصيل الإيرادات: مدرس دفع كذا وأخذ باقة كذا */
+  static async listIncomeDetails(filters: {
+    teacher_id?: number;
+    subscription_id?: number;
+    plan_code?: string;
+    payment_type?: string;
+    start_date?: string;
+    end_date?: string;
+    search?: string;
+    counted_only?: boolean;
+    include_reversals?: boolean;
+    limit?: number;
+    offset?: number;
+  }) {
+    const limit = Math.min(Math.max(filters.limit ?? 50, 1), 200);
+    const offset = Math.max(filters.offset ?? 0, 0);
+    const includeReversals = filters.include_reversals !== false;
+
+    const conditions: string[] = ['1=1'];
+    const values: unknown[] = [];
+    let i = 1;
+
+    if (!includeReversals) {
+      conditions.push(`ie.entry_kind = 'payment'`);
+    }
+    if (filters.counted_only) {
+      conditions.push(`ie.is_counted_in_revenue = TRUE`);
+    }
+    if (filters.teacher_id) {
+      conditions.push(`ie.teacher_id = $${i++}`);
+      values.push(filters.teacher_id);
+    }
+    if (filters.subscription_id) {
+      conditions.push(`ie.subscription_id = $${i++}`);
+      values.push(filters.subscription_id);
+    }
+    if (filters.plan_code) {
+      conditions.push(`ie.plan_code = $${i++}`);
+      values.push(filters.plan_code);
+    }
+    if (filters.payment_type) {
+      conditions.push(`ie.payment_type = $${i++}`);
+      values.push(filters.payment_type);
+    }
+    if (filters.start_date) {
+      conditions.push(`ie.transaction_date >= $${i++}`);
+      values.push(filters.start_date);
+    }
+    if (filters.end_date) {
+      conditions.push(`ie.transaction_date <= $${i++}`);
+      values.push(filters.end_date);
+    }
+    if (filters.search?.trim()) {
+      conditions.push(
+        `(ie.teacher_name ILIKE $${i} OR ie.teacher_email ILIKE $${i} OR ie.subscription_number ILIKE $${i})`,
+      );
+      values.push(`%${filters.search.trim()}%`);
+      i++;
+    }
+
+    const where = conditions.join(' AND ');
+
+    const countResult = await pool.query<{ total: string }>(
+      `${INCOME_DETAILS_BASE_SQL}
+       SELECT COUNT(*)::text AS total FROM income_entries ie WHERE ${where}`,
+      values,
+    );
+
+    const summaryResult = await pool.query<{
+      gross_collected: string;
+      active_revenue: string;
+      reversed_amount: string;
+    }>(
+      `${INCOME_DETAILS_BASE_SQL}
+       SELECT
+         COALESCE(SUM(CASE WHEN ie.entry_kind = 'payment' THEN ie.amount ELSE 0 END), 0)::text AS gross_collected,
+         COALESCE(SUM(CASE WHEN ie.is_counted_in_revenue THEN ie.amount ELSE 0 END), 0)::text AS active_revenue,
+         COALESCE(SUM(CASE WHEN ie.payment_type = 'reversal' THEN ABS(ie.amount) ELSE 0 END), 0)::text AS reversed_amount
+       FROM income_entries ie
+       WHERE ${where}`,
+      values,
+    );
+
+    const listResult = await pool.query(
+      `${INCOME_DETAILS_BASE_SQL}
+       SELECT ie.* FROM income_entries ie
+       WHERE ${where}
+       ORDER BY ie.transaction_date DESC, ie.created_at DESC, ie.entry_id DESC
+       LIMIT $${i++} OFFSET $${i}`,
+      [...values, limit, offset],
+    );
+
+    return {
+      items: listResult.rows.map((row) => mapIncomeDetailRow(row)),
+      total: Number(countResult.rows[0]?.total ?? 0),
+      limit,
+      offset,
+      summary: {
+        gross_collected: Number(summaryResult.rows[0]?.gross_collected ?? 0),
+        active_revenue: Number(summaryResult.rows[0]?.active_revenue ?? 0),
+        reversed_amount: Number(summaryResult.rows[0]?.reversed_amount ?? 0),
+      },
+    };
   }
 
   static async addExpenseWithAudit(

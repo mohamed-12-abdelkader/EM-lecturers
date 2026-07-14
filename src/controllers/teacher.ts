@@ -165,6 +165,7 @@ export const UpdateTeacherSchema = z.object({
   phone: z.string().optional().or(z.literal('')),
   password: z.string().min(6).optional(),
   facebook_url: z.string().url().optional().or(z.literal('')),
+  instagram_url: z.string().url().optional().or(z.literal('')),
   youtube_url: z.string().url().optional().or(z.literal('')),
   tiktok_url: z.string().url().optional().or(z.literal('')),
   whatsapp_number: z.string().optional().or(z.literal('')),
@@ -250,8 +251,17 @@ router.put(
   upload.single('avatar'),
   validate(UpdateTeacherSchema),
   asyncWrapper(async (req, res) => {
-    const { name, email, phone, password, facebook_url, youtube_url, tiktok_url, whatsapp_number } =
-      req.body;
+    const {
+      name,
+      email,
+      phone,
+      password,
+      facebook_url,
+      instagram_url,
+      youtube_url,
+      tiktok_url,
+      whatsapp_number,
+    } = req.body;
     const { id } = req.params;
 
     const file = req.file ?? null;
@@ -286,6 +296,10 @@ router.put(
       updates.push(`facebook_url = $${i++}`);
       values.push(facebook_url);
     }
+    if (instagram_url !== undefined) {
+      updates.push(`instagram_url = $${i++}`);
+      values.push(instagram_url);
+    }
     if (youtube_url !== undefined) {
       updates.push(`youtube_url = $${i++}`);
       values.push(youtube_url);
@@ -313,7 +327,9 @@ router.put(
 
     // جلب بيانات المدرس المحدثة
     const updatedTeacher = await pool.query(
-      `SELECT id, email, name, avatar, role, description, subject, facebook_url, youtube_url, tiktok_url, whatsapp_number FROM users WHERE id = $1 AND role = 'teacher'`,
+      `SELECT id, email, name, avatar, role, description, subject,
+              facebook_url, instagram_url, youtube_url, tiktok_url, whatsapp_number
+       FROM users WHERE id = $1 AND role = 'teacher'`,
       [id],
     );
 
@@ -675,6 +691,7 @@ router.get(
         u.subject, 
         u.phone,
         u.facebook_url,
+        u.instagram_url,
         u.youtube_url,
         u.tiktok_url,
         u.whatsapp_number,
@@ -686,7 +703,7 @@ router.get(
       LEFT JOIN courses c ON u.id = c.teacher_id
       LEFT JOIN enrollments e ON c.id = e.course_id
       WHERE u.role = 'teacher' AND u.tenant_id = $1
-      GROUP BY u.id, u.name, u.email, u.avatar, u.description, u.subject, u.phone, u.facebook_url, u.youtube_url, u.tiktok_url, u.whatsapp_number, u.account_status, u.created_at
+      GROUP BY u.id, u.name, u.email, u.avatar, u.description, u.subject, u.phone, u.facebook_url, u.instagram_url, u.youtube_url, u.tiktok_url, u.whatsapp_number, u.account_status, u.created_at
       ORDER BY u.created_at DESC`,
       [tenantId],
     );

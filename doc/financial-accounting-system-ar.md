@@ -241,6 +241,45 @@ PATCH /api/finance/subscriptions/:id/status
 { "status": "suspended", "notes": "تأخير في الدفع" }
 ```
 
+عند `status: "cancelled"` يُنفَّذ نفس منطق **إلغاء الاشتراك** الكامل (انظر 6.3.3).
+
+### 6.3.3 إلغاء وحذف الاشتراك
+
+**إلغاء** (يُبقي السجل في القائمة بحالة `cancelled`):
+
+```http
+POST /api/finance/subscriptions/:id/cancel
+```
+
+```json
+{ "reason": "طلب المدرس", "notes": "ملاحظة إضافية" }
+```
+
+أو عبر `PATCH .../status` مع `{ "status": "cancelled" }`.
+
+عند الإلغاء:
+- `status = cancelled` و`remaining_amount = 0`
+- إلغاء الفواتير المفتوحة (`unpaid` / `partial`) المرتبطة بالاشتراك
+- **خصم المبالغ المدفوعة فعلياً من إجمالي الإيرادات** (`platform_income` + معاملات `direction = in`)
+- تسجيل معاملة عكسية `subscription_cancellation` في `platform_financial_transactions`
+- تعطيل منصة المدرس إن لم يعد لديه اشتراك `active` آخر
+- مزامنة `users.subscription_package` (أو إرجاعها إلى `bronze` إن لم يبقَ اشتراك)
+
+**حذف من السجل** (لإزالة الاشتراك من القائمة بعد الإلغاء):
+
+```http
+DELETE /api/finance/subscriptions/:id
+DELETE /api/finance/subscriptions/:id?force=true
+```
+
+| الحالة | السلوك |
+|--------|--------|
+| `cancelled` / `expired` / `suspended` | يُسمح بالحذف |
+| `active` | مرفوض — ألغِ الاشتراك أولاً |
+| مبلغ متبقي `remaining_amount > 0` | مرفوض إلا مع `?force=true` |
+
+الحذف يزيل صف الاشتراك؛ سجلات الدفعات المرتبطة تُحذف تلقائياً (CASCADE)، والفواتير تبقى لكن `subscription_id` يصبح `NULL`.
+
 ### 6.3.1 المدرسون على وشك انتهاء الباقة (3 أيام)
 
 قائمة تُحدَّث يومياً (حسب `CURRENT_DATE` في قاعدة البيانات):
@@ -473,6 +512,59 @@ GET /api/finance/dashboard?period=month
 
 ## 9. التقارير المالية
 
+### تفاصيل الإيرادات (مدرس / باقة / مبلغ)
+
+```http
+GET /api/finance/income/details
+GET /api/finance/income/details?teacher_id=5
+GET /api/finance/income/details?plan_code=silver&start_date=2026-01-01
+GET /api/finance/income/details?search=أحمد&payment_type=subscription
+```
+
+| Query | الوصف |
+|-------|--------|
+| `teacher_id` | مدرس محدد |
+| `subscription_id` | اشتراك محدد |
+| `plan_code` | `bronze` \| `silver` \| `gold` \| `diamond` |
+| `payment_type` | `subscription` \| `renewal` \| `upgrade` \| `additional_payment` \| `reversal` |
+| `start_date` / `end_date` | فلترة بالتاريخ |
+| `search` | بحث باسم المدرس أو الإيميل أو رقم الاشتراك |
+| `counted_only=true` | الإيرادات الفعالة فقط (لم تُلغَ) |
+| `include_reversals=false` | إخفاء عمليات الاسترداد عند الإلغاء |
+| `limit` / `offset` | ترقيم |
+
+**مثال استجابة:**
+
+```json
+{
+  "success": true,
+  "data": {
+    "items": [
+      {
+        "entry_id": 12,
+        "payment_type": "subscription",
+        "payment_type_label_ar": "اشتراك جديد",
+        "amount": 1000,
+        "transaction_date": "2026-03-01",
+        "description": "أحمد محمد دفع 1000 واشترك في الباقة الاحترافية (#SUB-2026-000012)",
+        "teacher": { "id": 5, "name": "أحمد محمد", "email": "ahmed@example.com" },
+        "plan": { "id": 2, "code": "silver", "name_ar": "الباقة الاحترافية" },
+        "subscription": { "id": 12, "subscription_number": "SUB-2026-000012", "status": "active" },
+        "is_counted_in_revenue": true
+      }
+    ],
+    "summary": {
+      "gross_collected": 1000,
+      "active_revenue": 1000,
+      "reversed_amount": 0
+    },
+    "total": 1,
+    "limit": 50,
+    "offset": 0
+  }
+}
+```
+
 ### تقرير الإيرادات
 
 ```http
@@ -606,6 +698,9 @@ curl "http://localhost:8000/api/finance/dashboard?period=month" \
 | `GET/PUT /finance/plans` | باقات المدرسين |
 | `POST /finance/custom-prices` | سعر مخصص |
 | `GET/POST /finance/subscriptions` | اشتراكات |
+| `GET /finance/income/details` | تفاصيل إيرادات المدرسين |
+| `POST /finance/subscriptions/:id/cancel` | إلغاء اشتراك |
+| `DELETE /finance/subscriptions/:id` | حذف اشتراك من السجل |
 | `POST /finance/subscriptions/:id/renew` | تجديد |
 | `POST/PUT/DELETE /finance/expenses` | مصروفات |
 | `GET /finance/reports/*` | تقارير |

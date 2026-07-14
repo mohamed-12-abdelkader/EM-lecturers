@@ -2,6 +2,21 @@
 
 توثيق نظام **ملفاتي**: مكتبة سحابية داخلية لكل مدرس لرفع وتنظيم وإدارة المواد التعليمية (PDF، عروض، صور، مستندات…) واستخدامها لاحقاً في المحاضرات والامتحانات والواجبات.
 
+## البداية السريعة (عربي)
+
+| الخطوة | المسار | الوصف |
+|--------|--------|--------|
+| 1 | `POST /api/teacher/files` | رفع ملف (`multipart/form-data`، الحقل `file`) |
+| 2 | `GET /api/teacher/files` | قائمة الملفات |
+| 3 | `GET /api/teacher/files/:id/preview` | بيانات العرض + روابط جاهزة للواجهة |
+| 4 | `GET /api/teacher/files/:id/open` | فتح الملف مباشرة (PDF / صورة) |
+| 5 | `GET /api/teacher/files/:id/content` | استخراج نص PDF للقراءة |
+
+**التخزين:** يُحدَّد بـ `FILE_STORAGE_PROVIDER` — `cloudinary` (افتراضي) أو `local` (السيرفر) أو `s3`.
+
+> **دليل عرض الملفات:** [`my-files-viewing-guide-ar.md`](./my-files-viewing-guide-ar.md)  
+> **إضافة روابط Google Drive:** [`my-files-google-drive-ar.md`](./my-files-google-drive-ar.md)
+
 ---
 
 ## Base URL 
@@ -116,6 +131,7 @@ GET    /files/statistics
 GET    /files/:id
 GET    /files/:id/preview
 GET    /files/:id/view
+GET    /files/:id/open
 GET    /files/:id/content
 GET    /files/:id/download
 PUT    /files/:id

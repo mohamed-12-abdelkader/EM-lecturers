@@ -13,6 +13,7 @@ import {
   teacherFilesUploadRateLimit,
 } from '../middleware/rateLimit';
 import { FileCategoriesService, TeacherFilesService } from '../services/teacherFiles.service';
+import { FileStorageService } from '../services/fileStorage.service';
 import type { ListFilesQuery } from '../types';
 
 const MY_FILES_ROLES = ['teacher', 'admin'] as const;
@@ -69,10 +70,36 @@ const UpdateCategorySchema = z.object({
   name: z.string().min(1).max(200),
 });
 
+const CreateDriveFileSchema = z.object({
+  name: z.string().min(1).max(300),
+  driveUrl: z.string().url().min(10),
+  description: z.string().max(5000).optional().nullable(),
+  categoryId: z.coerce.number().int().positive().optional().nullable(),
+  fileExtension: z.string().max(20).optional(),
+});
+
+const BulkDriveLinksSchema = z.object({
+  links: z
+    .array(
+      z.object({
+        name: z.string().min(1).max(300),
+        driveUrl: z.string().url().min(10),
+        description: z.string().max(5000).optional().nullable(),
+        fileExtension: z.string().max(20).optional(),
+      }),
+    )
+    .min(1)
+    .max(20),
+  categoryId: z.coerce.number().int().positive().optional().nullable(),
+  description: z.string().max(5000).optional().nullable(),
+});
+
 const UpdateFileSchema = z.object({
   name: z.string().min(1).max(300).optional(),
   description: z.string().max(5000).optional().nullable(),
   categoryId: z.coerce.number().int().positive().optional().nullable(),
+  driveUrl: z.string().url().min(10).optional(),
+  fileExtension: z.string().max(20).optional(),
 });
 
 const BulkDeleteSchema = z.object({
@@ -100,39 +127,33 @@ teacherFilesRouter.post(
   '/',
   authMiddleware([...MY_FILES_ROLES]),
   teacherFilesUploadRateLimit,
-  upload.single('file'),
   asyncWrapper(async (req: Request, res: Response) => {
     const teacherId = resolveTeacherId(req);
-    const file = req.file;
-
-    const name = (req.body.name || req.body.fileName || file?.originalname || '').trim();
-    if (!name) {
-      cleanupFiles(file);
-      return res.status(400).json({ success: false, message: 'اسم الملف مطلوب' });
-    }
-    if (!file) {
-      return res.status(400).json({ success: false, message: 'الملف مطلوب' });
+    const parsed = CreateDriveFileSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({
+        success: false,
+        message: 'بيانات غير صالحة',
+        errors: parsed.error.errors,
+      });
     }
 
     try {
-      const categoryId =
-        parseNumberInput(req.body.categoryId) ?? parseNumberInput(req.body.category_id) ?? null;
-
-      const saved = await TeacherFilesService.uploadFile({
+      const saved = await TeacherFilesService.createDriveFile({
         teacherId,
-        file,
-        name,
-        description: req.body.description,
-        categoryId,
+        name: parsed.data.name,
+        driveUrl: parsed.data.driveUrl,
+        description: parsed.data.description ?? undefined,
+        categoryId: parsed.data.categoryId ?? null,
+        fileExtension: parsed.data.fileExtension,
       });
 
       return res.status(201).json({
         success: true,
-        message: 'File uploaded successfully',
+        message: 'تم إضافة رابط الملف بنجاح',
         data: TeacherFilesService.serializeFile(saved),
       });
     } catch (error) {
-      cleanupFiles(file);
       const handled = handleServiceError(res, error);
       if (handled) return handled;
       throw error;
@@ -140,6 +161,55 @@ teacherFilesRouter.post(
   }),
 );
 
+teacherFilesRouter.post(
+  '/bulk-links',
+  authMiddleware([...MY_FILES_ROLES]),
+  teacherFilesBulkUploadRateLimit,
+  asyncWrapper(async (req: Request, res: Response) => {
+    const teacherId = resolveTeacherId(req);
+    const parsed = BulkDriveLinksSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({
+        success: false,
+        message: 'بيانات غير صالحة',
+        errors: parsed.error.errors,
+      });
+    }
+
+    const categoryId = parsed.data.categoryId ?? null;
+    const baseDescription = parsed.data.description ?? undefined;
+    const added = [];
+    const errors: Array<{ name: string; error: string }> = [];
+
+    for (const link of parsed.data.links) {
+      try {
+        const saved = await TeacherFilesService.createDriveFile({
+          teacherId,
+          name: link.name,
+          driveUrl: link.driveUrl,
+          description: link.description ?? baseDescription,
+          categoryId,
+          fileExtension: link.fileExtension,
+        });
+        added.push(TeacherFilesService.serializeFile(saved));
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : 'فشل إضافة الرابط';
+        errors.push({ name: link.name, error: message });
+      }
+    }
+
+    return res.status(added.length > 0 ? 201 : 400).json({
+      success: added.length > 0,
+      message:
+        added.length > 0
+          ? `تم إضافة ${added.length} رابط بنجاح`
+          : 'فشل إضافة جميع الروابط',
+      data: { added, errors },
+    });
+  }),
+);
+
+/** @deprecated استخدم POST /bulk-links */
 teacherFilesRouter.post(
   '/bulk-upload',
   authMiddleware([...MY_FILES_ROLES]),
@@ -229,7 +299,7 @@ teacherFilesRouter.get(
     return res.json({
       success: true,
       data: {
-        items: result.items.map(TeacherFilesService.serializeFile),
+        items: result.items.map((file) => TeacherFilesService.serializeFile(file)),
         pagination: {
           page,
           limit,
@@ -269,8 +339,97 @@ teacherFilesRouter.get(
   }),
 );
 
+function extractBearerToken(req: Request): string | null {
+  const header = req.headers.authorization;
+  if (header?.startsWith('Bearer ')) return header.slice(7).trim();
+  const fromQuery =
+    (typeof req.query.access_token === 'string' && req.query.access_token) ||
+    (typeof req.query.token === 'string' && req.query.token);
+  return fromQuery || null;
+}
+
+const streamFileView = asyncWrapper(async (req: Request, res: Response) => {
+  const teacherId = resolveTeacherId(req);
+  const id = parseNumberInput(req.params.id);
+  if (!id) return res.status(400).json({ success: false, message: 'معرف الملف غير صالح' });
+
+  try {
+    const file = await TeacherFilesService.getById(teacherId, id);
+
+    if (TeacherFilesService.isDriveFile(file)) {
+      const drive = TeacherFilesService.getDriveUrls(file);
+      res.setHeader('Cache-Control', 'private, max-age=300');
+      return res.redirect(302, drive.previewUrl);
+    }
+
+    const previewType = TeacherFilesService.getPreviewType(file.file_extension, file.mime_type);
+    if (previewType === 'none') {
+      const preview = await TeacherFilesService.getFilePreview(teacherId, id, false);
+      return res.status(415).json({
+        success: false,
+        message: 'لا يمكن عرض هذا النوع داخل الموقع. استخدم التحميل.',
+        data: preview,
+      });
+    }
+
+    const fetchDest = String(req.headers['sec-fetch-dest'] || '');
+    const wantsRedirect =
+      req.query.redirect === 'true' ||
+      req.query.redirect === '1' ||
+      fetchDest === 'iframe' ||
+      fetchDest === 'embed' ||
+      fetchDest === 'object';
+
+    if (wantsRedirect) {
+      const directUrl = await FileStorageService.getDirectAccessUrl(file.file_key, file.file_url);
+      if (directUrl) {
+        res.setHeader('Cache-Control', 'private, max-age=300');
+        return res.redirect(302, directUrl);
+      }
+    }
+
+    const { buffer } = await TeacherFilesService.readFileBuffer(teacherId, id);
+
+    const baseName = (file.name || `file-${id}`).replace(/[^\w\u0600-\u06FF.\-() ]+/g, '_');
+    const ext = file.file_extension.toLowerCase();
+    const fileName = baseName.toLowerCase().endsWith(`.${ext}`) ? baseName : `${baseName}.${ext}`;
+
+    res.setHeader('Content-Type', file.mime_type || 'application/octet-stream');
+    res.setHeader('Content-Length', String(buffer.length));
+    res.setHeader('Content-Disposition', `inline; filename*=UTF-8''${encodeURIComponent(fileName)}`);
+    res.setHeader('Cache-Control', 'private, max-age=300');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+    return res.send(buffer);
+  } catch (error) {
+    const handled = handleServiceError(res, error);
+    if (handled) return handled;
+    throw error;
+  }
+});
+
 teacherFilesRouter.get(
-  '/:id/view',
+  '/:id/embed',
+  authMiddleware([...MY_FILES_ROLES]),
+  teacherFilesDownloadRateLimit,
+  asyncWrapper(async (req: Request, res: Response) => {
+    const teacherId = resolveTeacherId(req);
+    const id = parseNumberInput(req.params.id);
+    if (!id) return res.status(400).json({ success: false, message: 'معرف الملف غير صالح' });
+
+    try {
+      const data = await TeacherFilesService.getEmbedInfo(teacherId, id, extractBearerToken(req));
+      return res.json({ success: true, data });
+    } catch (error) {
+      const handled = handleServiceError(res, error);
+      if (handled) return handled;
+      throw error;
+    }
+  }),
+);
+
+teacherFilesRouter.get(
+  '/:id/thumbnail',
   attachAccessTokenFromQuery,
   authMiddleware([...MY_FILES_ROLES]),
   teacherFilesDownloadRateLimit,
@@ -280,22 +439,11 @@ teacherFilesRouter.get(
     if (!id) return res.status(400).json({ success: false, message: 'معرف الملف غير صالح' });
 
     try {
-      const { buffer, file, previewType } = await TeacherFilesService.readFileBuffer(teacherId, id);
-      if (previewType === 'none') {
-        const preview = await TeacherFilesService.getFilePreview(teacherId, id, false);
-        return res.status(415).json({
-          success: false,
-          message: 'لا يمكن عرض هذا النوع داخل الموقع. استخدم التحميل.',
-          data: preview,
-        });
-      }
-
-      const safeName = (file.name || `file-${id}`).replace(/[^\w\u0600-\u06FF.\-() ]+/g, '_');
-      res.setHeader('Content-Type', file.mime_type || 'application/octet-stream');
+      const { buffer } = await TeacherFilesService.readThumbnailBufferForBoard(teacherId, id);
+      res.setHeader('Content-Type', 'image/jpeg');
       res.setHeader('Content-Length', String(buffer.length));
-      res.setHeader('Content-Disposition', `inline; filename="${encodeURIComponent(safeName)}.${file.file_extension}"`);
       res.setHeader('Cache-Control', 'private, max-age=300');
-      res.setHeader('X-Content-Type-Options', 'nosniff');
+      res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
       return res.send(buffer);
     } catch (error) {
       const handled = handleServiceError(res, error);
@@ -303,6 +451,60 @@ teacherFilesRouter.get(
       throw error;
     }
   }),
+);
+
+teacherFilesRouter.get(
+  '/:id/board',
+  attachAccessTokenFromQuery,
+  authMiddleware([...MY_FILES_ROLES]),
+  teacherFilesDownloadRateLimit,
+  asyncWrapper(async (req: Request, res: Response) => {
+    const teacherId = resolveTeacherId(req);
+    const id = parseNumberInput(req.params.id);
+    if (!id) return res.status(400).json({ success: false, message: 'معرف الملف غير صالح' });
+
+    try {
+      const { buffer, file, previewType } = await TeacherFilesService.readFileBufferForBoard(teacherId, id);
+
+      const baseName = (file.name || `file-${id}`).replace(/[^\w\u0600-\u06FF.\-() ]+/g, '_');
+      const ext = file.file_extension.toLowerCase();
+      const fileName = baseName.toLowerCase().endsWith(`.${ext}`) ? baseName : `${baseName}.${ext}`;
+
+      const contentType =
+        previewType === 'image' && !file.mime_type.startsWith('image/')
+          ? 'image/jpeg'
+          : file.mime_type || 'application/octet-stream';
+
+      res.setHeader('Content-Type', contentType);
+      res.setHeader('Content-Length', String(buffer.length));
+      res.setHeader('Content-Disposition', `inline; filename*=UTF-8''${encodeURIComponent(fileName)}`);
+      res.setHeader('Cache-Control', 'private, max-age=300');
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+      return res.send(buffer);
+    } catch (error) {
+      const handled = handleServiceError(res, error);
+      if (handled) return handled;
+      throw error;
+    }
+  }),
+);
+
+teacherFilesRouter.get(
+  '/:id/view',
+  attachAccessTokenFromQuery,
+  authMiddleware([...MY_FILES_ROLES]),
+  teacherFilesDownloadRateLimit,
+  streamFileView,
+);
+
+/** alias لـ /view — فتح الملف مباشرة */
+teacherFilesRouter.get(
+  '/:id/open',
+  attachAccessTokenFromQuery,
+  authMiddleware([...MY_FILES_ROLES]),
+  teacherFilesDownloadRateLimit,
+  streamFileView,
 );
 
 teacherFilesRouter.get(
@@ -391,6 +593,8 @@ teacherFilesRouter.put(
         name: parsed.data.name,
         description: parsed.data.description,
         categoryId: parsed.data.categoryId ?? undefined,
+        driveUrl: parsed.data.driveUrl,
+        fileExtension: parsed.data.fileExtension,
       });
       return res.json({
         success: true,
