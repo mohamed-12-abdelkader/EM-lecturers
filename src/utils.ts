@@ -10,7 +10,7 @@ import { NextFunction, RequestHandler, Request, Response } from 'express';
 import { User } from './db/types';
 import { Pool } from 'pg';
 import multer from 'multer';
-import { v2 as cloudinary } from 'cloudinary';
+import { v2 as cloudinary, UploadApiResponse } from 'cloudinary';
 import * as fs from 'node:fs';
 import * as util from 'node:util';
 import * as path from 'node:path';
@@ -276,7 +276,7 @@ export const uploadToCloudinary = async (
     type?: 'upload' | 'authenticated' | 'private';
     access_mode?: 'public' | 'authenticated';
   },
-) => {
+): Promise<UploadApiResponse> => {
   const uploadOptions: Record<string, unknown> = {
     folder: 'media',
   };
@@ -298,11 +298,11 @@ export const uploadToCloudinary = async (
     uploadOptions.resource_type = 'auto';
   }
 
-  const result = useLarge
-    ? await cloudinary.uploader.upload_large(filePath, {
+  const result: UploadApiResponse = useLarge
+    ? ((await cloudinary.uploader.upload_large(filePath, {
         ...uploadOptions,
         chunk_size: 6_000_000,
-      })
+      })) as UploadApiResponse)
     : await cloudinary.uploader.upload(filePath, uploadOptions);
   await unlinkFile(filePath);
   return result;
@@ -334,7 +334,7 @@ export const uploadBufferToCloudinary = async (
   buffer: Buffer,
   filename: string,
   options?: { resource_type?: 'image' | 'video' | 'raw' | 'auto' },
-) => {
+): Promise<UploadApiResponse> => {
   const dir = path.join(__dirname, '../../uploads');
   fs.mkdirSync(dir, { recursive: true });
   const filePath = path.join(dir, filename);

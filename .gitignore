@@ -6,3 +6,5 @@ node_modules
 .env.production
 .env.ngrok.local
 token.json
+dist/
+uploads/
