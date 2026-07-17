@@ -170,8 +170,11 @@ router.post('/teacher/lessons/:id/questions', async (req: Request, res: Response
     const { question_text, options } = req.body as { question_text: string; options: string[] };
     if (Number.isNaN(lessonId))
       return res.status(400).json({ success: false, message: 'معرف الدرس غير صحيح' });
-    if (!question_text || !Array.isArray(options) || options.length !== 4) {
-      return res.status(400).json({ success: false, message: 'نص السؤال و 4 اختيارات مطلوبة' });
+    if (!question_text || !Array.isArray(options) || options.length < 2 || options.length > 5) {
+      return res.status(400).json({
+        success: false,
+        message: 'نص السؤال وعدد اختيارات من 2 إلى 5 مطلوب',
+      });
     }
 
     // find subject for this lesson

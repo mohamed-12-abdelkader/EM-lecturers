@@ -185,6 +185,43 @@ GET /api/teacher/students
 > تُعرض فقط الطلاب الذين أنشأهم هذا المدرس (`managed_by_teacher_id`).  
 > الطلاب المسجّلون ذاتياً (بدون `managed_by_teacher_id`) يظهرون في `GET /api/teacher/platform-students` وليس هنا.
 
+### كل طلاب المنصة (مشترك + غير مشترك)
+
+```http
+GET /api/teacher/platform-students
+Authorization: Bearer <TEACHER_TOKEN>
+```
+
+يعرض **كل** طلاب منصة المدرس (`tenant_id` الحالي) سواء مشتركين أو لا.
+
+**Query (اختياري):** `limit`, `offset`, `search`, `is_subscribed=true|false`, `account_status`
+
+```json
+{
+  "success": true,
+  "data": {
+    "tenant_id": 5,
+    "summary": { "total": 240, "subscribed": 180, "not_subscribed": 60 },
+    "total_students": 240,
+    "total": 240,
+    "limit": 100,
+    "offset": 0,
+    "students": [
+      {
+        "id": 101,
+        "name": "محمد علي",
+        "email": "student@example.com",
+        "phone": "01000000000",
+        "is_subscribed": true,
+        "subscription_label": "مشترك",
+        "grades": [],
+        "activation_codes": []
+      }
+    ]
+  }
+}
+```
+
 ---
 
 ## 3. إضافة طالب

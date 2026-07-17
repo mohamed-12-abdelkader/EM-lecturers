@@ -5,6 +5,11 @@ import type {
   MistralQuestionExtractionResult,
   MistralQuestionImage,
 } from '../types/mistralQuestionExtraction';
+import {
+  isValidMistralOptionCount,
+  MAX_MCQ_OPTIONS,
+  MIN_MCQ_OPTIONS,
+} from '../types/mistralQuestionExtraction';
 import { expandMultiPartQuestions } from '../utils/expandMultiPartQuestions';
 import { QuestionBankV2Service } from './questionBankV2';
 
@@ -18,7 +23,18 @@ type ImportResult = {
 
 type ImportKind = 'text_mcq' | 'image_choices' | 'open_answer';
 
-const OPTION_LABELS = ['أ', 'ب', 'ج', 'د'];
+const ARABIC_OPTION_LABELS = ['أ', 'ب', 'ج', 'د', 'هـ'];
+const ENGLISH_OPTION_LABELS = ['a', 'b', 'c', 'd', 'e'];
+
+function optionLabelFor(question: MistralExtractedQuestion, index: number): string {
+  const fromSource = question.options[index]?.label?.trim();
+  if (fromSource) return fromSource;
+  const englishHits = question.options.filter((o) =>
+    /^[a-e]$/i.test((o.label ?? '').trim()),
+  ).length;
+  const pool = englishHits > 0 ? ENGLISH_OPTION_LABELS : ARABIC_OPTION_LABELS;
+  return pool[index] ?? String(index + 1);
+}
 
 function imageUrls(question: MistralExtractedQuestion): string[] {
   return (question.question_images || [])
@@ -27,7 +43,12 @@ function imageUrls(question: MistralExtractedQuestion): string[] {
 }
 
 function classifyImportKind(question: MistralExtractedQuestion): ImportKind {
-  if (question.options.length === 4) return 'text_mcq';
+  if (
+    question.options.length >= MIN_MCQ_OPTIONS &&
+    question.options.length <= MAX_MCQ_OPTIONS
+  ) {
+    return 'text_mcq';
+  }
   const urls = imageUrls(question);
   if (question.options.length === 0 && urls.length >= 4) return 'image_choices';
   return 'open_answer';
@@ -35,7 +56,8 @@ function classifyImportKind(question: MistralExtractedQuestion): ImportKind {
 
 function normalizeCorrectAnswerIndex(question: MistralExtractedQuestion): number {
   const index = question.correct_answer_index;
-  if (typeof index === 'number' && index >= 0 && index <= 3) return index;
+  const max = Math.max(0, question.options.length - 1);
+  if (typeof index === 'number' && index >= 0 && index <= max) return index;
   return 0;
 }
 
@@ -45,14 +67,14 @@ function normalizeDifficulty(value?: string): 'easy' | 'medium' | 'hard' {
 }
 
 function optionText(question: MistralExtractedQuestion, index: number): string {
-  return question.options[index]?.text?.trim() || OPTION_LABELS[index];
+  return question.options[index]?.text?.trim() || optionLabelFor(question, index);
 }
 
 function placeholderOptions(correctAnswer?: string | null): string[] {
   if (correctAnswer?.trim()) {
     return [correctAnswer.trim(), '—', '—', '—'];
   }
-  return [...OPTION_LABELS];
+  return [...ARABIC_OPTION_LABELS];
 }
 
 function mediaTypeFromImage(image?: MistralQuestionImage): 'image' | 'diagram' | 'chart' {
@@ -106,9 +128,11 @@ export function mapImportedQuestionToExtractionShape(
   const options =
     saved.question_type === 'image_choices'
       ? []
-      : textOptions.length === 4
+      : textOptions.length > 0
         ? textOptions.map((opt, i) => ({
-            label: original?.options[i]?.label ?? OPTION_LABELS[i],
+            label:
+              original?.options[i]?.label ??
+              (original ? optionLabelFor(original, i) : ARABIC_OPTION_LABELS[i] ?? String(i + 1)),
             text: opt.text_content ?? '',
           }))
         : (original?.options ?? []);
@@ -202,6 +226,15 @@ export class QuestionExtractionImportService {
           continue;
         }
 
+        if (kind === 'text_mcq' && !isValidMistralOptionCount(question.options.length)) {
+          skipped.push({
+            index,
+            source_number: question.source_number,
+            reason: `text_mcq requires ${MIN_MCQ_OPTIONS}–${MAX_MCQ_OPTIONS} options`,
+          });
+          continue;
+        }
+
         if (kind === 'image_choices' && urls.length < 4) {
           skipped.push({
             index,
@@ -253,10 +286,10 @@ export class QuestionExtractionImportService {
         } else {
           const optionTexts =
             kind === 'text_mcq'
-              ? [0, 1, 2, 3].map((i) => optionText(question, i))
+              ? question.options.map((_, i) => optionText(question, i))
               : placeholderOptions(question.correct_answer);
 
-          for (let optionIndex = 0; optionIndex < 4; optionIndex++) {
+          for (let optionIndex = 0; optionIndex < optionTexts.length; optionIndex++) {
             await client.query(
               `INSERT INTO question_options (question_id, option_index, option_type, text_content)
                VALUES ($1, $2, 'text', $3)`,

@@ -397,7 +397,7 @@ export class ExamFlowService {
         isVisible ?? false,
         normalizedShowAt,
         normalizedHideAt,
-        lockNextLectures ?? false,
+        lockNextLectures ?? examType === 'assignment',
         showAnswersImmediately ?? true,
         showAnswersAfterHours ?? 0,
         allowMultipleAttempts ?? false,

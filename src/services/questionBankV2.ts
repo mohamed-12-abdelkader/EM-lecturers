@@ -584,7 +584,12 @@ export class QuestionBankV2Service {
       [lessonId]
     );
     const out: QuestionV2[] = [];
-    const correctMap: Record<string, number> = { أ: 0, ب: 1, ج: 2, د: 3, A: 0, B: 1, C: 2, D: 3 };
+    const correctMap: Record<string, number> = {
+      أ: 0, ب: 1, ج: 2, د: 3, هـ: 4, ه: 4,
+      A: 0, B: 1, C: 2, D: 3, E: 4,
+      a: 0, b: 1, c: 2, d: 3, e: 4,
+      '1': 0, '2': 1, '3': 2, '4': 3, '5': 4,
+    };
     for (const row of r.rows) {
       const opts = row.options;
       const optionsList: string[] = Array.isArray(opts)
@@ -596,7 +601,7 @@ export class QuestionBankV2Service {
         row.correct_answer != null
           ? correctMap[String(row.correct_answer).trim()] ?? 0
           : 0;
-      const options: QuestionOption[] = optionsList.slice(0, 4).map((text_content: string, i: number) => ({
+      const options: QuestionOption[] = optionsList.slice(0, 5).map((text_content: string, i: number) => ({
         id: 0,
         question_id: row.id,
         option_index: i,

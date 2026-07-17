@@ -420,7 +420,7 @@ Content-Type: application/json
 
 | شكل السؤال في AI | `question_type` في DB | ملاحظات |
 |------------------|----------------------|---------|
-| 4 خيارات نصية (`options.length === 4`) | `text_only` أو `text_with_image` | إذا وُجدت `question_images` تُحفظ أول صورة في `question_media` |
+| 2–5 خيارات نصية | `text_only` أو `text_with_image` | إذا وُجدت `question_images` تُحفظ أول صورة في `question_media` |
 | بدون خيارات + 4 صور في `question_images` | `image_choices` | كل صورة تُحفظ كخيار صورة (`question_options.image_url`) — مثل سؤال «في أي من الحالات...» |
 | بدون خيارات + إجابة نصية (`correct_answer`) | `text_with_image` أو `text_only` | تُحفظ الإجابة في `explanation` |
 | `passages[]` | `question_passages` | ربط عبر `passage_id` المؤقت |

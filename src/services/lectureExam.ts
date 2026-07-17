@@ -75,7 +75,6 @@ export class LectureExamService {
       isVisible = false,
       showAt = null,
       hideAt = null,
-      lockNextLectures = false,
       showAnswersImmediately = true,
       showAnswersAfterHours = 0,
     } = options || {};
@@ -84,6 +83,11 @@ export class LectureExamService {
       typeof type === 'string' && type.trim().toLowerCase() === 'assignment'
         ? 'assignment'
         : 'exam';
+
+    const resolvedLockNextLectures =
+      options?.lockNextLectures !== undefined
+        ? !!options.lockNextLectures
+        : examType === 'assignment'; // الواجبات تقفل التالي افتراضياً
 
     const result = await pool.query(
       `INSERT INTO exams (
@@ -102,7 +106,7 @@ export class LectureExamService {
         isVisible,
         showAt,
         hideAt,
-        lockNextLectures,
+        resolvedLockNextLectures,
         showAnswersImmediately,
         showAnswersAfterHours,
       ],
@@ -305,7 +309,9 @@ export class LectureExamService {
 
   /**
    * التحقق من إمكانية الوصول للمحاضرات التالية للطالب
-   * المحاضرة مقفلة فقط إذا كان الامتحان ظاهر للطالب ولم ينجح فيه
+   * تفتح المحاضرات التالية فقط إذا نجح الطالب في:
+   * - كل واجبات المحاضرة الظاهرة حالياً (type = assignment)
+   * - وكل امتحانات المحاضرة ذات lock_next_lectures = true الظاهرة حالياً
    */
   static async canStudentAccessNextLectures(
     lectureId: number,
@@ -313,89 +319,44 @@ export class LectureExamService {
   ): Promise<boolean> {
     const now = new Date();
 
-    console.log(`Debug - canStudentAccessNextLectures for lecture ${lectureId}:`);
-    console.log('Debug - Student ID:', studentId);
-    console.log('Debug - Current time:', now);
-    console.log('Debug - Current time ISO:', now.toISOString());
-
-    // البحث عن امتحان في هذه المحاضرة يمنع الوصول للمحاضرات التالية
-    // ولكن فقط إذا كان الامتحان مرئي للطالب حالياً والطالب مسجل في الكورس
-    const examResult = await pool.query(
-      `SELECT e.id FROM exams e
+    // كل التقييمات الظاهرة اللي لازم الطالب ينجح فيها قبل فتح المحاضرة اللي بعدها
+    const examResult = await pool.query<{ id: number; type: string; title: string | null }>(
+      `SELECT e.id, e.type, e.title
+       FROM exams e
        JOIN lectures l ON l.id = e.lecture_id
        JOIN courses c ON c.id = l.course_id
-       WHERE e.lecture_id = $1 
+       WHERE e.lecture_id = $1
        AND ${studentCourseAccessSql('$2')}
-       AND e.lock_next_lectures = true
        AND e.is_visible = true
        AND (e.show_at IS NULL OR e.show_at <= $3)
-       AND (e.hide_at IS NULL OR e.hide_at >= $3)`,
+       AND (e.hide_at IS NULL OR e.hide_at >= $3)
+       AND (
+         e.type = 'assignment'
+         OR e.lock_next_lectures = true
+       )
+       ORDER BY e.id ASC`,
       [lectureId, studentId, now],
     );
 
-    console.log('Debug - Exam result:', examResult.rows.length);
-
-    // فحص إضافي لمعرفة سبب عدم وجود امتحان مانع
     if (examResult.rowCount === 0) {
-      const debugExamResult = await pool.query(
-        `SELECT e.id, e.is_visible, e.lock_next_lectures, e.show_at, e.hide_at,
-                CASE 
-                  WHEN e.is_visible = false THEN 'hidden_by_teacher'
-                  WHEN e.show_at IS NOT NULL AND e.show_at > $3 THEN 'not_yet_visible'
-                  WHEN e.hide_at IS NOT NULL AND e.hide_at < $3 THEN 'expired'
-                  WHEN e.lock_next_lectures = false THEN 'lock_disabled'
-                  ELSE 'should_block'
-                END as reason
-         FROM exams e
-         JOIN lectures l ON l.id = e.lecture_id
-         JOIN courses c ON c.id = l.course_id
-         WHERE e.lecture_id = $1 
-         AND ${studentCourseAccessSql('$2')}`,
-        [lectureId, studentId, now],
+      return true;
+    }
+
+    for (const assessment of examResult.rows) {
+      const passResult = await pool.query<{ passed: boolean }>(
+        `SELECT s.passed FROM exam_submissions s
+         WHERE s.exam_id = $1 AND s.student_id = $2
+         ORDER BY s.submitted_at DESC NULLS LAST, s.id DESC
+         LIMIT 1`,
+        [assessment.id, studentId],
       );
 
-      console.log('Debug - All exams in lecture:', debugExamResult.rows);
-
-      // فحص خاص لحالة hide_at قبل show_at
-      for (const exam of debugExamResult.rows) {
-        if (exam.show_at && exam.hide_at) {
-          const showAt = new Date(exam.show_at);
-          const hideAt = new Date(exam.hide_at);
-          if (hideAt < showAt) {
-            console.log('Debug - Exam has invalid time range: hide_at before show_at');
-            console.log('Debug - show_at:', exam.show_at);
-            console.log('Debug - hide_at:', exam.hide_at);
-          }
-        }
+      if (passResult.rowCount === 0 || passResult.rows[0].passed !== true) {
+        return false;
       }
-
-      console.log('Debug - No blocking exam found, next lectures accessible');
-      return true; // لا يوجد امتحان يمنع الوصول أو الامتحان غير مرئي للطالب أو الطالب غير مسجل
     }
 
-    console.log('Debug - Blocking exam found:', examResult.rows[0].id);
-
-    // التحقق من نجاح الطالب في الامتحان
-    const passResult = await pool.query(
-      `SELECT s.passed FROM exam_submissions s
-       WHERE s.exam_id = $1 AND s.student_id = $2
-       ORDER BY s.submitted_at DESC LIMIT 1`,
-      [examResult.rows[0].id, studentId],
-    );
-
-    console.log(
-      'Debug - Pass result:',
-      passResult.rows.length > 0 ? passResult.rows[0] : 'No submission',
-    );
-
-    if (passResult.rowCount === 0) {
-      console.log('Debug - No submission found, blocking access (exam visible but not taken)');
-      return false; // الامتحان ظاهر للطالب ولم يخضع له بعد - قفل المحاضرات التالية
-    }
-
-    const passed = passResult.rows[0].passed === true;
-    console.log('Debug - Exam passed:', passed);
-    return passed; // إذا نجح، المحاضرات مفتوحة. إذا فشل، المحاضرات مقفلة
+    return true;
   }
 
   /**
@@ -429,9 +390,9 @@ export class LectureExamService {
       [lectureId, studentId, now],
     );
 
-    // فحص الامتحانات المانعة للوصول فقط
+    // فحص الامتحانات/الواجبات المانعة للوصول فقط
     const blockingExamsResult = await pool.query(
-      `SELECT e.id, e.title, e.is_visible, e.lock_next_lectures, 
+      `SELECT e.id, e.title, e.type, e.is_visible, e.lock_next_lectures, 
               e.show_at, e.hide_at, l.title as lecture_title, l.position
        FROM lectures l
        JOIN courses c ON c.id = l.course_id
@@ -440,11 +401,14 @@ export class LectureExamService {
        AND ${studentCourseAccessSql('$2')}
        AND (l.position, COALESCE(l.created_at, '1970-01-01'::timestamp), l.id) <
            (SELECT position, COALESCE(created_at, '1970-01-01'::timestamp), id FROM lectures WHERE id = $1)
-       AND e.lock_next_lectures = true
        AND e.is_visible = true
        AND (e.show_at IS NULL OR e.show_at <= $3)
        AND (e.hide_at IS NULL OR e.hide_at >= $3)
-       ORDER BY l.position DESC, l.created_at DESC NULLS LAST, l.id DESC`,
+       AND (
+         e.type = 'assignment'
+         OR e.lock_next_lectures = true
+       )
+       ORDER BY l.position DESC, e.id ASC`,
       [lectureId, studentId, now],
     );
 
@@ -468,19 +432,14 @@ export class LectureExamService {
 
   /**
    * التحقق من إمكانية الوصول لمحاضرة معينة للطالب
-   * يفحص إذا كان هناك امتحان في المحاضرات السابقة يمنع الوصول
+   * يفحص إذا كان هناك واجب/امتحان مانع في المحاضرات السابقة
    */
   static async canStudentAccessLecture(lectureId: number, studentId: number): Promise<boolean> {
     const now = new Date();
 
-    console.log(`Debug - canStudentAccessLecture for lecture ${lectureId}:`);
-    console.log('Debug - Student ID:', studentId);
-    console.log('Debug - Current time:', now);
-
-    // البحث عن المحاضرات السابقة التي تحتوي على امتحانات تمنع الوصول
-    // ولكن فقط إذا كانت الامتحانات مرئية للطالب حالياً
-    const blockingExamResult = await pool.query(
-      `SELECT l.id as lecture_id, l.position
+    // محاضرات سابقة فيها تقييمات تمنع التقدم (واجبات ظاهرة، أو امتحانات بقفل)
+    const blockingExamResult = await pool.query<{ lecture_id: number; position: number }>(
+      `SELECT DISTINCT l.id as lecture_id, l.position
        FROM lectures l
        JOIN courses c ON c.id = l.course_id
        JOIN exams e ON e.lecture_id = l.id
@@ -488,59 +447,29 @@ export class LectureExamService {
        AND ${studentCourseAccessSql('$2')}
        AND (l.position, COALESCE(l.created_at, '1970-01-01'::timestamp), l.id) <
            (SELECT position, COALESCE(created_at, '1970-01-01'::timestamp), id FROM lectures WHERE id = $1)
-       AND e.lock_next_lectures = true
        AND e.is_visible = true
        AND (e.show_at IS NULL OR e.show_at <= $3)
        AND (e.hide_at IS NULL OR e.hide_at >= $3)
-       ORDER BY l.position DESC, l.created_at DESC NULLS LAST, l.id DESC`,
+       AND (
+         e.type = 'assignment'
+         OR e.lock_next_lectures = true
+       )
+       ORDER BY l.position DESC`,
       [lectureId, studentId, now],
     );
 
-    console.log('Debug - Blocking exams found:', blockingExamResult.rows.length);
-
     if (blockingExamResult.rowCount === 0) {
-      console.log('Debug - No blocking exams found, access allowed');
-
-      // فحص إضافي لمعرفة سبب عدم وجود امتحانات مانعة
-      const allExamsDebugResult = await pool.query(
-        `SELECT e.id, e.title, e.is_visible, e.lock_next_lectures, 
-                e.show_at, e.hide_at, l.title as lecture_title, l.position,
-                CASE 
-                  WHEN e.is_visible = false THEN 'hidden_by_teacher'
-                  WHEN e.show_at IS NOT NULL AND e.show_at > $3 THEN 'not_yet_visible'
-                  WHEN e.hide_at IS NOT NULL AND e.hide_at < $3 THEN 'expired'
-                  WHEN e.lock_next_lectures = false THEN 'lock_disabled'
-                  ELSE 'should_block'
-                END as reason
-         FROM lectures l
-         JOIN courses c ON c.id = l.course_id
-         JOIN exams e ON e.lecture_id = l.id
-         WHERE c.id = (SELECT course_id FROM lectures WHERE id = $1)
-         AND ${studentCourseAccessSql('$2')}
-         AND (l.position, COALESCE(l.created_at, '1970-01-01'::timestamp), l.id) <
-             (SELECT position, COALESCE(created_at, '1970-01-01'::timestamp), id FROM lectures WHERE id = $1)
-         ORDER BY l.position DESC, l.created_at DESC NULLS LAST, l.id DESC`,
-        [lectureId, studentId, now],
-      );
-
-      console.log('Debug - All exams in previous lectures:', allExamsDebugResult.rows);
-      return true; // لا توجد امتحانات تمنع الوصول أو الامتحانات غير مرئية للطالب
+      return true;
     }
 
-    console.log('Debug - Blocking exams found:', blockingExamResult.rows);
-
-    // فحص كل امتحان يمنع الوصول
     for (const examLecture of blockingExamResult.rows) {
       const canAccess = await this.canStudentAccessNextLectures(examLecture.lecture_id, studentId);
-      console.log(`Debug - Exam ${examLecture.lecture_id} access check:`, canAccess);
       if (!canAccess) {
-        console.log('Debug - Access denied due to exam:', examLecture.lecture_id);
-        return false; // هناك امتحان لم ينجح فيه الطالب بعد
+        return false;
       }
     }
 
-    console.log('Debug - All exams passed, access allowed');
-    return true; // نجح في جميع الامتحانات المطلوبة
+    return true;
   }
 
   /**
@@ -554,7 +483,8 @@ export class LectureExamService {
     console.log('Debug - Current time:', now);
 
     const result = await pool.query(
-      `SELECT e.id, e.title, e.total_grade, l.title as lecture_title, l.position,
+      `SELECT e.id, e.title, e.type, e.total_grade, e.lock_next_lectures,
+              l.title as lecture_title, l.position,
               CASE 
                 WHEN s.id IS NULL THEN 'not_taken'
                 WHEN s.passed = true THEN 'passed'
@@ -564,20 +494,28 @@ export class LectureExamService {
        FROM lectures l
        JOIN courses c ON c.id = l.course_id
        JOIN exams e ON e.lecture_id = l.id
-       LEFT JOIN exam_submissions s ON s.exam_id = e.id AND s.student_id = $2
+       LEFT JOIN LATERAL (
+         SELECT es.id, es.passed, es.submitted_at, es.total_grade
+         FROM exam_submissions es
+         WHERE es.exam_id = e.id AND es.student_id = $2
+         ORDER BY es.submitted_at DESC NULLS LAST, es.id DESC
+         LIMIT 1
+       ) s ON TRUE
        WHERE c.id = (SELECT course_id FROM lectures WHERE id = $1)
        AND ${studentCourseAccessSql('$2')}
        AND (l.position, COALESCE(l.created_at, '1970-01-01'::timestamp), l.id) <
            (SELECT position, COALESCE(created_at, '1970-01-01'::timestamp), id FROM lectures WHERE id = $1)
-       AND e.lock_next_lectures = true
        AND e.is_visible = true
        AND (e.show_at IS NULL OR e.show_at <= $3)
        AND (e.hide_at IS NULL OR e.hide_at >= $3)
-       ORDER BY l.position DESC, l.created_at DESC NULLS LAST, l.id DESC`,
+       AND (
+         e.type = 'assignment'
+         OR e.lock_next_lectures = true
+       )
+       ORDER BY l.position DESC, e.id ASC`,
       [lectureId, studentId, now],
     );
 
-    console.log('Debug - Blocking exams result:', result.rows.length);
     return result.rows;
   }
 

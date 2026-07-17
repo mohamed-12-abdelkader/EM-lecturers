@@ -32,7 +32,7 @@ CREATE TABLE IF NOT EXISTS questions_v2 (
 CREATE TABLE IF NOT EXISTS question_options (
     id SERIAL PRIMARY KEY,
     question_id INTEGER NOT NULL REFERENCES questions_v2(id) ON DELETE CASCADE,
-    option_index INTEGER NOT NULL CHECK (option_index >= 0 AND option_index <= 3),
+    option_index INTEGER NOT NULL CHECK (option_index >= 0 AND option_index <= 4),
     option_type VARCHAR(20) NOT NULL CHECK (option_type IN ('text', 'image')),
     text_content TEXT, -- للخيارات النصية
     image_url TEXT, -- للخيارات الصورية

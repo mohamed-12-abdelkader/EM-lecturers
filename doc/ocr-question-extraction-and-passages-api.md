@@ -237,7 +237,7 @@ curl -X POST "http://localhost:8000/api/ocr/extract-questions" \
 د = 3
 ```
 
-- `options` are either empty or exactly 4 choices.
+- `options` are either empty or contain **2–5** choices (e.g. 3 or 5 in English exams).
 - If OCR returns incomplete option text, the API normalizes `null` option text to an empty string.
 - If `include_question_images=true`, linked images may include `image_url` after upload to Bunny CDN.
 

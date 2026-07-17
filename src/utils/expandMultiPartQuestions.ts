@@ -2,6 +2,7 @@ import type {
   MistralExtractedPassage,
   MistralExtractedQuestion,
 } from '../types/mistralQuestionExtraction';
+import { isValidMistralOptionCount, MIN_MCQ_OPTIONS } from '../types/mistralQuestionExtraction';
 
 function isSubQuestionSourceNumber(sourceNumber?: string | null): boolean {
   if (!sourceNumber?.trim()) return false;
@@ -30,7 +31,9 @@ function looksLikeSharedStemSubQuestions(
   const subBySource = group.filter((q) => isSubQuestionSourceNumber(q.source_number));
   if (subBySource.length >= 2) return true;
 
-  const withOptions = group.filter((q) => q.options.length === 4);
+  const withOptions = group.filter(
+    (q) => q.options.length >= MIN_MCQ_OPTIONS && isValidMistralOptionCount(q.options.length),
+  );
   if (withOptions.length < 2) return false;
 
   const stem = passage.content.trim();

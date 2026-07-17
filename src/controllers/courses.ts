@@ -1772,16 +1772,35 @@ router.get(
       );
       files = filesRes.rows;
     }
-    // جلب الامتحانات لكل محاضرة
-    let exams = [];
+    // جلب الامتحانات والواجبات لكل محاضرة (يُسمح بأكثر من واحد لنفس المحاضرة)
+    let assessments: any[] = [];
     if (lectureIds.length) {
       const examsRes = await pool.query(
-        `SELECT * FROM exams WHERE lecture_id = ANY($1::int[]) AND type = 'exam'`,
+        `SELECT * FROM exams
+         WHERE lecture_id = ANY($1::int[])
+         ORDER BY id ASC`,
         [lectureIds],
       );
-      exams = examsRes.rows;
+      assessments = examsRes.rows;
     }
-    // ربط الفيديوهات والملفات والامتحان بكل محاضرة
+
+    const attachAssessments = (lec: any, role: string) => {
+      const forLec = assessments.filter(
+        (e) =>
+          e.lecture_id === lec.id &&
+          (role === 'teacher' || role === 'admin' || e.is_visible === true),
+      );
+      const examsList = forLec.filter((e) => e.type === 'exam');
+      const assignmentsList = forLec.filter((e) => e.type === 'assignment');
+      return {
+        /** أول امتحان (للتوافق مع الواجهات القديمة) */
+        exam: examsList[0] || null,
+        exams: examsList,
+        assignments: assignmentsList,
+      };
+    };
+
+    // ربط الفيديوهات والملفات والامتحانات/الواجبات بكل محاضرة
     if (user.role === 'student') {
       lectures = lectures.filter((l) => l.is_visible !== false);
       lectures = lectures.sort((a, b) => a.position - b.position || a.created_at - b.created_at);
@@ -1789,10 +1808,7 @@ router.get(
       let lockAll = false;
       for (let i = 0; i < lectures.length; i++) {
         const lec = lectures[i];
-        const exam =
-          exams.find(
-            (e) => e.lecture_id === lec.id && (user!.role === 'teacher' || e.is_visible === true),
-          ) || null;
+        const { exam, exams: examsList, assignments } = attachAssessments(lec, 'student');
         // المحاضرة الأولى دائماً مفتوحة
         if (i === 0) {
           lectures[i] = {
@@ -1800,6 +1816,8 @@ router.get(
             videos: videos.filter((v) => v.lecture_id === lec.id),
             files: files.filter((f) => f.lecture_id === lec.id),
             exam,
+            exams: examsList,
+            assignments,
             locked: false,
             is_visible: lec.is_visible,
           };
@@ -1811,6 +1829,8 @@ router.get(
             videos: videos.filter((v) => v.lecture_id === lec.id),
             files: files.filter((f) => f.lecture_id === lec.id),
             exam,
+            exams: examsList,
+            assignments,
             locked: true,
             is_visible: lec.is_visible,
           };
@@ -1826,6 +1846,8 @@ router.get(
               videos: videos.filter((v) => v.lecture_id === lec.id),
               files: files.filter((f) => f.lecture_id === lec.id),
               exam,
+              exams: examsList,
+              assignments,
               locked: true,
               is_visible: lec.is_visible,
             };
@@ -1840,6 +1862,8 @@ router.get(
           videos: videos.filter((v) => v.lecture_id === lec.id),
           files: files.filter((f) => f.lecture_id === lec.id),
           exam,
+          exams: examsList,
+          assignments,
           locked: false,
           is_visible: lec.is_visible,
         };
@@ -1847,12 +1871,14 @@ router.get(
     } else {
       // المدرس يرى كل المحاضرات (لا فلترة)
       lectures = lectures.map((lec) => {
-        const exam = exams.find((e) => e.lecture_id === lec.id) || null;
+        const { exam, exams: examsList, assignments } = attachAssessments(lec, 'teacher');
         return {
           ...lec,
           videos: videos.filter((v) => v.lecture_id === lec.id),
           files: files.filter((f) => f.lecture_id === lec.id),
           exam,
+          exams: examsList,
+          assignments,
           locked: false,
           is_visible: lec.is_visible, // إرجاع حالة الظهور دائماً
         };
@@ -1861,9 +1887,12 @@ router.get(
 
     if (user.role === 'student' && lectureIds.length > 0) {
       const studentId = user.id;
-      const visibleExamIds = lectures
-        .map((lec) => lec.exam?.id)
-        .filter((id): id is number => id != null);
+      const visibleAssessmentIds = lectures
+        .flatMap((lec: any) => [
+          ...(lec.exams || []).map((e: any) => e.id),
+          ...(lec.assignments || []).map((a: any) => a.id),
+        ])
+        .filter((id: number | undefined): id is number => id != null);
 
       const [videoViewsRes, examSubsRes] = await Promise.all([
         pool.query(
@@ -1872,12 +1901,14 @@ router.get(
            WHERE user_id = $1 AND course_id = $2`,
           [studentId, courseId],
         ),
-        visibleExamIds.length
+        visibleAssessmentIds.length
           ? pool.query(
-              `SELECT exam_id, total_grade, passed, submitted_at, status
+              `SELECT DISTINCT ON (exam_id)
+                      exam_id, total_grade, passed, submitted_at, status
                FROM exam_submissions
-               WHERE student_id = $1 AND exam_id = ANY($2::int[])`,
-              [studentId, visibleExamIds],
+               WHERE student_id = $1 AND exam_id = ANY($2::int[])
+               ORDER BY exam_id, submitted_at DESC NULLS LAST, id DESC`,
+              [studentId, visibleAssessmentIds],
             )
           : Promise.resolve({ rows: [] as any[] }),
       ]);
@@ -1889,7 +1920,32 @@ router.get(
         examSubsRes.rows.map((row) => [row.exam_id, row]),
       );
 
-      lectures = lectures.map((lec) => {
+      const withProgress = (item: any) => {
+        if (!item) return item;
+        const submission = subsByExamId.get(item.id);
+        const submissionStatus = submission?.status ?? null;
+        const isSubmitted =
+          !!submission &&
+          (submission.submitted_at != null ||
+            ['submitted', 'late', 'expired'].includes(submissionStatus ?? ''));
+
+        return {
+          ...item,
+          is_solved: isSubmitted,
+          is_started: !!submission,
+          in_progress: submissionStatus === 'in_progress',
+          student_submission: submission
+            ? {
+                total_grade: submission.total_grade,
+                passed: submission.passed,
+                submitted_at: submission.submitted_at,
+                status: submissionStatus,
+              }
+            : null,
+        };
+      };
+
+      lectures = lectures.map((lec: any) => {
         const lecVideos = (lec.videos || []).map((video: any) => {
           const view = viewsByVideoId.get(video.id);
           return {
@@ -1900,43 +1956,30 @@ router.get(
           };
         });
 
-        let examWithProgress = lec.exam;
-        if (lec.exam) {
-          const submission = subsByExamId.get(lec.exam.id);
-          const submissionStatus = submission?.status ?? null;
-          const isSubmitted =
-            !!submission &&
-            (submission.submitted_at != null ||
-              ['submitted', 'late', 'expired'].includes(submissionStatus ?? ''));
-
-          examWithProgress = {
-            ...lec.exam,
-            is_solved: isSubmitted,
-            is_started: !!submission,
-            in_progress: submissionStatus === 'in_progress',
-            student_submission: submission
-              ? {
-                  total_grade: submission.total_grade,
-                  passed: submission.passed,
-                  submitted_at: submission.submitted_at,
-                  status: submissionStatus,
-                }
-              : null,
-          };
-        }
+        const examsWithProgress = (lec.exams || []).map(withProgress);
+        const assignmentsWithProgress = (lec.assignments || []).map(withProgress);
+        const examWithProgress = examsWithProgress[0] || null;
 
         const watchedCount = lecVideos.filter((v: { is_watched: boolean }) => v.is_watched).length;
+        const assignmentsPassed =
+          assignmentsWithProgress.length > 0 &&
+          assignmentsWithProgress.every((a: any) => a.student_submission?.passed === true);
 
         return {
           ...lec,
           videos: lecVideos,
           exam: examWithProgress,
+          exams: examsWithProgress,
+          assignments: assignmentsWithProgress,
           progress: {
             watched_videos: watchedCount,
             total_videos: lecVideos.length,
             all_videos_watched:
               lecVideos.length > 0 && watchedCount === lecVideos.length,
             exam_solved: examWithProgress?.is_solved ?? false,
+            assignments_solved_count: assignmentsWithProgress.filter((a: any) => a.is_solved).length,
+            assignments_total: assignmentsWithProgress.length,
+            all_assignments_passed: assignmentsWithProgress.length === 0 || assignmentsPassed,
           },
         };
       });
@@ -2758,7 +2801,6 @@ router.post(
     }
 
     // معالجة البيانات
-    const examTitle = title || 'Lecture Exam';
     const examTotalGrade = total_grade || 100;
     const examDuration = duration ? Number(duration) : null;
 
@@ -2777,20 +2819,26 @@ router.post(
     const hideAt = hide_at ? new Date(hide_at) : null;
 
     // معالجة الإعدادات المتقدمة
-    const lockNextLectures = lock_next_lectures === true || lock_next_lectures === 'true';
-    const showAnswersImmediately =
-      show_answers_immediately !== false && show_answers_immediately !== 'false';
-    const showAnswersAfterHours = show_answers_after_hours ? Number(show_answers_after_hours) : 0;
+    // الواجبات تقفل المحاضرات التالية افتراضياً (يمكن تعطيلها صراحةً بـ false)
     const examTypeRaw = typeof type === 'string' ? type : typeof exam_type === 'string' ? exam_type : 'exam';
     const examType =
       examTypeRaw.trim().toLowerCase() === 'assignment' ? 'assignment' : 'exam';
+    const lockNextLectures =
+      examType === 'assignment'
+        ? !(lock_next_lectures === false || lock_next_lectures === 'false')
+        : lock_next_lectures === true || lock_next_lectures === 'true';
+    const showAnswersImmediately =
+      show_answers_immediately !== false && show_answers_immediately !== 'false';
+    const showAnswersAfterHours = show_answers_after_hours ? Number(show_answers_after_hours) : 0;
+    const examTitle =
+      title || (examType === 'assignment' ? 'Lecture Assignment' : 'Lecture Exam');
 
     const exam = await pool.query(
       `INSERT INTO exams (
         lecture_id, type, total_grade, created_by, title, duration, is_visible,
-        show_at, hide_at, lock_next_lectures, 
+        show_at, hide_at, lock_next_lectures,
         show_answers_immediately, show_answers_after_hours
-      ) 
+      )
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING *`,
       [
         lectureId,
@@ -2942,13 +2990,15 @@ router.patch(
   }),
 );
 
-// جلب امتحان محاضرة (مع مراعاة حالة is_visible)
+// جلب امتحانات / واجبات محاضرة (يدعم أكثر من واحد)
+// ?type=exam | assignment | all (افتراضي all للمدرس، وكلا النوعين للطالب حسب الظهور)
 router.get(
   '/lecture/:lectureId/exam',
   authMiddleware(['teacher', 'student']),
   asyncWrapper(async (req, res) => {
     const lectureId = Number(req.params.lectureId);
     const user = req.user!;
+    const typeParam = String(req.query.type || 'all').trim().toLowerCase();
 
     if (isNaN(lectureId)) {
       return res.status(400).json({ message: 'Invalid lecture ID' });
@@ -2978,31 +3028,50 @@ router.get(
       return res.status(403).json({ message: 'Not allowed to view this exam' });
     }
 
-    // جلب الامتحان مع مراعاة حالة is_visible والإعدادات المتقدمة
+    const typeFilterSql =
+      typeParam === 'exam'
+        ? `AND type = 'exam'`
+        : typeParam === 'assignment'
+          ? `AND type = 'assignment'`
+          : '';
+
     let examQuery = '';
-    let examParams = [];
+    let examParams: unknown[] = [];
 
     if (user.role === 'teacher') {
-      // المدرس يرى الامتحان حتى لو كان مخفي
-      examQuery = `SELECT * FROM exams WHERE lecture_id = $1 AND type = 'exam'`;
+      examQuery = `SELECT * FROM exams WHERE lecture_id = $1 ${typeFilterSql} ORDER BY id ASC`;
       examParams = [lectureId];
     } else {
-      // الطالب يرى الامتحان فقط إذا كان ظاهر وفي الوقت المحدد
       const now = new Date();
-      examQuery = `SELECT * FROM exams 
-                   WHERE lecture_id = $1 AND type = 'exam' AND is_visible = true
+      examQuery = `SELECT * FROM exams
+                   WHERE lecture_id = $1 ${typeFilterSql} AND is_visible = true
                    AND (show_at IS NULL OR show_at <= $2)
-                   AND (hide_at IS NULL OR hide_at >= $2)`;
+                   AND (hide_at IS NULL OR hide_at >= $2)
+                   ORDER BY id ASC`;
       examParams = [lectureId, now];
     }
 
     const examRes = await pool.query(examQuery, examParams);
 
     if (!examRes.rowCount) {
-      return res.status(404).json({ message: 'Exam not found or not visible' });
+      return res.status(404).json({
+        message: 'Exam not found or not visible',
+        exams: [],
+        assignments: [],
+        exam: null,
+      });
     }
 
-    res.json({ exam: examRes.rows[0] });
+    const exams = examRes.rows.filter((r) => r.type === 'exam');
+    const assignments = examRes.rows.filter((r) => r.type === 'assignment');
+
+    res.json({
+      /** للتوافق: أول عنصر حسب الفلتر */
+      exam: examRes.rows[0],
+      exams,
+      assignments,
+      items: examRes.rows,
+    });
   }),
 );
 

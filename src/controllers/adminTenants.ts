@@ -4,6 +4,7 @@ import { requireDefaultTenantMiddleware } from '../middleware/tenantContext';
 import { validate } from '../middleware/validateReq';
 import { asyncWrapper, HttpError } from '../utils';
 import { TenantService } from '../services/tenants';
+import { AdminPlatformStudentsService } from '../services/adminPlatformStudents';
 import { TenantSeoSettingsService } from '../services/seo/tenantSeoSettings';
 import { TenantSitemapService } from '../services/seo/sitemap';
 import { seoCacheDeletePrefix } from '../services/seo/cache';
@@ -68,6 +69,88 @@ router.get(
     const tenant = await TenantService.getTenantForAdmin(parseTenantId(req.params.id));
     if (!tenant) throw new HttpError(404, 'المنصة غير موجودة');
     res.json({ success: true, data: tenant });
+  }),
+);
+
+/**
+ * طلاب منصة معينة (مستر / tenant)
+ * GET /api/admin/tenants/:id/students
+ */
+router.get(
+  '/:id/students',
+  asyncWrapper(async (req, res) => {
+    const tenantId = parseTenantId(req.params.id);
+    const limit = Number(req.query.limit ?? 50);
+    const offset = Number(req.query.offset ?? 0);
+    const search = typeof req.query.search === 'string' ? req.query.search : undefined;
+    const accountStatus =
+      typeof req.query.account_status === 'string' ? req.query.account_status : undefined;
+    const isSubscribed = parseBooleanQuery(req.query.is_subscribed);
+
+    const result = await AdminPlatformStudentsService.listStudentsByTenant(tenantId, {
+      limit: Number.isFinite(limit) ? limit : 50,
+      offset: Number.isFinite(offset) ? offset : 0,
+      search,
+      account_status: accountStatus,
+      is_subscribed: isSubscribed,
+    });
+
+    res.json({
+      success: true,
+      data: result,
+    });
+  }),
+);
+
+/**
+ * تغيير كلمة سر طالب على منصة معينة
+ * PATCH /api/admin/tenants/:id/students/:studentId/password
+ */
+router.patch(
+  '/:id/students/:studentId/password',
+  asyncWrapper(async (req, res) => {
+    const tenantId = parseTenantId(req.params.id);
+    const studentId = Number(req.params.studentId);
+    if (!studentId || Number.isNaN(studentId)) {
+      throw new HttpError(400, 'معرف الطالب غير صحيح');
+    }
+
+    const body = z
+      .object({
+        new_password: z.string().min(6).optional(),
+        password: z.string().min(6).optional(),
+        must_change_password: z.boolean().optional(),
+      })
+      .refine((d) => Boolean(d.new_password || d.password), {
+        message: 'new_password مطلوب (6 أحرف على الأقل)',
+        path: ['new_password'],
+      })
+      .safeParse(req.body);
+
+    if (!body.success) {
+      return res.status(400).json({
+        success: false,
+        message: 'Validation failed',
+        errors: body.error.errors,
+      });
+    }
+
+    const newPassword = (body.data.new_password || body.data.password)!.trim();
+
+    const data = await AdminPlatformStudentsService.changeStudentPassword(
+      tenantId,
+      studentId,
+      {
+        new_password: newPassword,
+        must_change_password: body.data.must_change_password,
+      },
+    );
+
+    res.json({
+      success: true,
+      message: 'تم تغيير كلمة سر الطالب بنجاح',
+      data,
+    });
   }),
 );
 

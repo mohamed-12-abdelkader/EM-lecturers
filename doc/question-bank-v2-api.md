@@ -1153,7 +1153,7 @@ function BulkAddQuestions({ lessonId, token }: { lessonId: number; token: string
 - `questions`: مطلوب، مصفوفة تحتوي على سؤال واحد على الأقل
 - كل سؤال يجب أن يحتوي على:
   - `question_text`: نص غير فارغ
-  - `options`: 4 خيارات بالضبط، جميعها نصية
+  - `options`: من 2 إلى 5 خيارات نصية (مثلاً 3 أو 5)
   - `correct_answer_index`: رقم بين 0 و 3
   - `difficulty_level`: `easy`, `medium`, أو `hard`
   - `points`: رقم صحيح موجب

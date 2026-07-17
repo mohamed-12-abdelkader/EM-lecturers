@@ -11,6 +11,7 @@ import { TeacherDailyCourseReportService } from '../services/teacherDailyCourseR
 import { TeacherGradesService } from '../services/users';
 import { ExamFlowService } from '../services/examFlow';
 import { CourseLevelExamsService } from '../services/courseLevelExams';
+import { AdminPlatformStudentsService } from '../services/adminPlatformStudents';
 import { parseNumberInput } from '../utils/requestParsers';
 
 export const router = Router();
@@ -78,75 +79,45 @@ router.get(
   }),
 );
 
-// جلب كل الطلاب المسجلين في منصة المدرّس (نفس tenant)
+// جلب كل الطلاب المسجلين في منصة المدرّس (مشترك + غير مشترك)
 router.get(
   '/platform-students',
   authMiddleware(['teacher']),
   asyncWrapper(async (req, res) => {
     const tenantId = req.tenant!.id;
+    const limit = Number(req.query.limit ?? 100);
+    const offset = Number(req.query.offset ?? 0);
+    const search = typeof req.query.search === 'string' ? req.query.search : undefined;
+    const accountStatus =
+      typeof req.query.account_status === 'string' ? req.query.account_status : undefined;
 
-    const studentsRes = await pool.query(
-      `SELECT
-         u.id,
-         u.name,
-         u.phone,
-         u.email,
-         u.parent_phone,
-         u.avatar,
-         u.created_at
-       FROM users u
-       WHERE u.role = 'student' AND u.tenant_id = $1
-       ORDER BY u.created_at DESC`,
-      [tenantId],
-    );
-
-    const studentIds = studentsRes.rows.map((r) => Number(r.id));
-    let gradesByStudent: Record<number, { id: number; name: string; slug: string | null }[]> = {};
-
-    if (studentIds.length) {
-      const gradesRes = await pool.query(
-        `SELECT
-           ug.user_id,
-           g.id,
-           g.name,
-           g.slug
-         FROM user_grades ug
-         JOIN grades g ON g.id = ug.grade_id
-         WHERE ug.user_id = ANY($1::int[])
-         ORDER BY g.id ASC`,
-        [studentIds],
-      );
-
-      gradesByStudent = gradesRes.rows.reduce(
-        (acc, row) => {
-          const studentId = Number(row.user_id);
-          if (!acc[studentId]) acc[studentId] = [];
-          acc[studentId].push({
-            id: Number(row.id),
-            name: String(row.name),
-            slug: row.slug ?? null,
-          });
-          return acc;
-        },
-        {} as Record<number, { id: number; name: string; slug: string | null }[]>,
-      );
+    const isSubscribedRaw = req.query.is_subscribed;
+    let isSubscribed: boolean | null = null;
+    if (isSubscribedRaw === true || isSubscribedRaw === 'true' || isSubscribedRaw === '1') {
+      isSubscribed = true;
+    } else if (isSubscribedRaw === false || isSubscribedRaw === 'false' || isSubscribedRaw === '0') {
+      isSubscribed = false;
     }
+
+    const result = await AdminPlatformStudentsService.listStudentsByTenant(tenantId, {
+      limit: Number.isFinite(limit) ? limit : 100,
+      offset: Number.isFinite(offset) ? offset : 0,
+      search,
+      account_status: accountStatus,
+      is_subscribed: isSubscribed,
+    });
 
     return res.status(200).json({
       success: true,
       data: {
-        tenant_id: tenantId,
-        total_students: studentsRes.rows.length,
-        students: studentsRes.rows.map((s) => ({
-          id: s.id,
-          name: s.name,
-          phone: s.phone,
-          email: s.email,
-          parent_phone: s.parent_phone,
-          avatar: s.avatar,
-          created_at: s.created_at,
-          grades: gradesByStudent[Number(s.id)] || [],
-        })),
+        tenant_id: result.tenant.id,
+        tenant: result.tenant,
+        summary: result.summary,
+        total_students: result.summary.total,
+        total: result.total,
+        limit: result.limit,
+        offset: result.offset,
+        students: result.students,
       },
     });
   }),

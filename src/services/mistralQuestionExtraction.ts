@@ -13,6 +13,16 @@ import { expandMultiPartQuestions } from '../utils/expandMultiPartQuestions';
 import { MistralOcrService, parsePdfPageRange, type MistralOcrResult } from './mistralOcr';
 
 const ARABIC_OPTION_LABELS = ['أ', 'ب', 'ج', 'د', 'هـ', 'و', 'ز', 'ح', 'ط', 'ي'];
+const ENGLISH_OPTION_LABELS = ['a', 'b', 'c', 'd', 'e'];
+
+function defaultOptionLabels(count: number, existing: Array<{ label?: string }>): string[] {
+  const raw = existing.map((o) => (o.label ?? '').trim().toLowerCase()).filter(Boolean);
+  const englishHits = raw.filter((l) => /^[a-e]$/.test(l)).length;
+  const arabicHits = raw.filter((l) => /^[أابجده]$/.test(l)).length;
+  const pool =
+    englishHits > arabicHits ? ENGLISH_OPTION_LABELS : ARABIC_OPTION_LABELS;
+  return Array.from({ length: count }, (_, i) => pool[i] ?? String(i + 1));
+}
 
 type InternalQuestionImage = MistralQuestionImage & {
   image_base64?: string;
@@ -82,9 +92,11 @@ function resolveCorrectIndex(
 }
 
 function normalizeQuestion(q: MistralExtractedQuestion): MistralExtractedQuestion {
-  const options = (q.options ?? [])
+  const rawOptions = q.options ?? [];
+  const fallbackLabels = defaultOptionLabels(rawOptions.length, rawOptions);
+  const options = rawOptions
     .map((opt, i) => ({
-      label: opt.label?.trim() || ARABIC_OPTION_LABELS[i] || String(i + 1),
+      label: opt.label?.trim() || fallbackLabels[i] || String(i + 1),
       text: (opt.text ?? '').trim(),
     }))
     .filter((opt) => opt.label || opt.text);

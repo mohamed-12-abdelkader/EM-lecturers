@@ -6,7 +6,7 @@
 
 - استخراج النص الخام (OCR) من PDF أو صورة أو **صور متعددة**
 - تحديد **نطاق صفحات PDF** (`start_page` → `end_page`)
-- استخراج **أسئلة منظمة** (نص السؤال + 4 اختيارات + الإجابة الصحيحة)
+- استخراج **أسئلة منظمة** (نص السؤال + **2–5 اختيارات** حسب الملف + الإجابة الصحيحة)
 - استخراج **قطع قراءة مشتركة** (passages) مرتبطة بعدة أسئلة
 - ربط **صور داخل الملف** (رسوم، جداول، معادلات) بالأسئلة
 - استيراد النتيجة مباشرة إلى **بنك الأسئلة V2**
@@ -327,7 +327,7 @@ curl -X POST "http://localhost:8000/api/ocr/extract-questions" \
 | `number` | رقم تسلسلي |
 | `source_number` | الرقم كما في الملف الأصلي |
 | `question_text` | نص السؤال فقط (بدون القطعة) |
-| `options` | **إما فارغة** أو **بالضبط 4 اختيارات** |
+| `options` | **إما فارغة** أو **من 2 إلى 5 اختيارات** (مثلاً 3 أو 5 في امتحانات إنجليزية a–e) |
 | `correct_answer_index` | **يبدأ من 0**: أ=0، ب=1، ج=2، د=3 |
 | `correct_answer_inferred` | `true` إذا استنتجها AI وليست مكتوبة صراحة |
 | `question_images` | صور مرتبطة بالسؤال (رسم، جدول، معادلة) |
@@ -439,7 +439,7 @@ curl -X POST "http://localhost:8000/api/ocr/extract-questions" \
 ```txt
 question_passages    ← القطع المشتركة
 questions_v2         ← الأسئلة
-question_options     ← 4 اختيارات لكل سؤال
+question_options     ← 2–5 اختيارات لكل سؤال (حسب الملف)
 question_media       ← صورة السؤال (إن وُجدت)
 ```
 
@@ -535,7 +535,7 @@ for (const passage of passages) {
   "errors": [
     {
       "path": ["questions", 0, "options"],
-      "message": "options must be either empty or exactly 4 choices"
+      "message": "options must be empty or contain 2–5 choices"
     }
   ]
 }

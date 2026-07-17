@@ -1,5 +1,13 @@
 import { z } from 'zod';
 
+/** MCQ with choices: 2–5 options (e.g. 3 or 5 in English exams). Empty = no choices. */
+export const MIN_MCQ_OPTIONS = 2;
+export const MAX_MCQ_OPTIONS = 5;
+
+export function isValidMistralOptionCount(count: number): boolean {
+  return count === 0 || (count >= MIN_MCQ_OPTIONS && count <= MAX_MCQ_OPTIONS);
+}
+
 export const MistralExtractedOptionSchema = z.object({
   label: z.string(),
   text: z.string().default(''),
@@ -34,11 +42,11 @@ export const MistralExtractedQuestionSchema = z
     correct_answer_inferred: z.boolean().optional().default(false),
   })
   .superRefine((question, ctx) => {
-    if (question.options.length !== 0 && question.options.length !== 4) {
+    if (!isValidMistralOptionCount(question.options.length)) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         path: ['options'],
-        message: 'options must be either empty or exactly 4 choices',
+        message: `options must be empty or contain ${MIN_MCQ_OPTIONS}–${MAX_MCQ_OPTIONS} choices`,
       });
     }
 
