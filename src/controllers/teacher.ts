@@ -93,9 +93,9 @@ router.get(
 
     const isSubscribedRaw = req.query.is_subscribed;
     let isSubscribed: boolean | null = null;
-    if (isSubscribedRaw === true || isSubscribedRaw === 'true' || isSubscribedRaw === '1') {
+    if (isSubscribedRaw === 'true' || isSubscribedRaw === '1') {
       isSubscribed = true;
-    } else if (isSubscribedRaw === false || isSubscribedRaw === 'false' || isSubscribedRaw === '0') {
+    } else if (isSubscribedRaw === 'false' || isSubscribedRaw === '0') {
       isSubscribed = false;
     }
 
