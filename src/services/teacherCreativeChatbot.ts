@@ -4,6 +4,9 @@ import { Blob } from 'node:buffer';
 import pool from '../db/pool';
 import { config, logger, uploadBufferToCloudinary, uploadToCloudinary } from '../utils';
 import {
+  TEACHER_CREATIVE_CHAT_WELCOME_MESSAGE,
+  buildTeacherCreativeChatSystemPrompt,
+  buildTeacherCreativeChatUserPrompt,
   buildTeacherImagePrompt,
   buildTeacherPostSystemPrompt,
   buildTeacherPostUserPrompt,
@@ -54,6 +57,74 @@ type LatestImageGeneration = {
   id: number;
   generated_image_url: string;
   aspect_ratio: string | null;
+};
+
+type CreativeSuggestedAction = 'none' | 'generate_post' | 'generate_image';
+
+type CreativeChatPending = {
+  ideas?: string[];
+  draft_post?: string | null;
+  image_concept?: string | null;
+  suggested_action?: CreativeSuggestedAction;
+  execution_prompt?: string | null;
+  ready_to_execute?: boolean;
+  platform?: string | null;
+  tone?: string | null;
+  aspect_ratio?: string | null;
+  language_mode?: string | null;
+  preferred_output?: 'post' | 'image' | 'auto' | null;
+};
+
+type CreativeChatSession = {
+  id: number;
+  teacher_id: number;
+  status: 'active' | 'archived';
+  preferred_output: 'post' | 'image' | 'auto' | null;
+  platform: string | null;
+  tone: string | null;
+  aspect_ratio: string | null;
+  language_mode: string | null;
+  pending: CreativeChatPending;
+  created_at: Date;
+  updated_at: Date;
+};
+
+type CreativeChatMessage = {
+  id: number;
+  session_id: number;
+  teacher_id: number;
+  role: 'user' | 'assistant';
+  message: string;
+  payload: Record<string, unknown>;
+  created_at: Date;
+};
+
+type CreativeChatAiPayload = {
+  reply: string;
+  ideas: string[];
+  draft_post: string | null;
+  image_concept: string | null;
+  suggested_action: CreativeSuggestedAction;
+  execution_prompt: string | null;
+  needs_more_info: boolean;
+  ready_to_execute: boolean;
+};
+
+export type CreativeChatResult = {
+  reply: string;
+  session_id: number;
+  ideas: string[];
+  draft_post: string | null;
+  image_concept: string | null;
+  suggested_action: CreativeSuggestedAction;
+  ready_to_execute: boolean;
+  executed: boolean;
+  generation: TeacherCreativeGeneration | null;
+  actions: {
+    can_execute: boolean;
+    can_generate_post: boolean;
+    can_generate_image: boolean;
+  };
 };
 
 function normalizePrompt(prompt: string): string {
@@ -186,6 +257,94 @@ function isLikelyEditRequest(prompt: string): boolean {
 
 async function cleanupUploadedFiles(files: Express.Multer.File[]): Promise<void> {
   await Promise.all(files.map((file) => fs.promises.unlink(file.path).catch(() => undefined)));
+}
+
+function normalizePreferredOutput(value?: string | null): 'post' | 'image' | 'auto' {
+  const normalized = String(value || '')
+    .trim()
+    .toLowerCase();
+  if (normalized === 'post' || normalized === 'image') return normalized;
+  return 'auto';
+}
+
+function isExplicitExecuteRequest(message: string): boolean {
+  const value = message.trim().toLowerCase();
+  if (!value) return false;
+  const patterns = [
+    /^(نفذ|نفّذ|تنفيذ|يلا نفذ|يلا نفّذ|موافق|موافق نفذ|موافق نفّذ|اعمل|اعمله|اعملي|ولد|ولّد|انشئ|أنشئ|generate|execute|do it|go ahead)\b/i,
+    /(نفذ|نفّذ|تنفيذ|ولد|ولّد).{0,20}(البوست|المنشور|التصميم|الصورة|الفكرة|المسودة)/,
+    /(اعمل|اعمله|اعملي).{0,20}(البوست|المنشور|التصميم|الصورة|النهائي)/,
+    /\b(generate|create|make)\s+(it|the\s+)?(post|image|design|final)\b/i,
+  ];
+  return patterns.some((pattern) => pattern.test(value));
+}
+
+function parseCreativeChatAiPayload(raw: string): CreativeChatAiPayload {
+  const fallback: CreativeChatAiPayload = {
+    reply: raw.trim() || 'تمام، قولي أكتر عن هدفك عشان أقترح أفكار مناسبة.',
+    ideas: [],
+    draft_post: null,
+    image_concept: null,
+    suggested_action: 'none',
+    execution_prompt: null,
+    needs_more_info: false,
+    ready_to_execute: false,
+  };
+
+  try {
+    const start = raw.indexOf('{');
+    const end = raw.lastIndexOf('}');
+    if (start < 0 || end <= start) return fallback;
+    const parsed = JSON.parse(raw.slice(start, end + 1)) as Partial<CreativeChatAiPayload>;
+    const suggested = String(parsed.suggested_action || 'none').trim().toLowerCase();
+    const suggestedAction: CreativeSuggestedAction =
+      suggested === 'generate_post' || suggested === 'generate_image' ? suggested : 'none';
+
+    return {
+      reply: String(parsed.reply || fallback.reply).trim() || fallback.reply,
+      ideas: Array.isArray(parsed.ideas)
+        ? parsed.ideas.map((item) => String(item || '').trim()).filter(Boolean).slice(0, 8)
+        : [],
+      draft_post: parsed.draft_post ? String(parsed.draft_post).trim() : null,
+      image_concept: parsed.image_concept ? String(parsed.image_concept).trim() : null,
+      suggested_action: suggestedAction,
+      execution_prompt: parsed.execution_prompt ? String(parsed.execution_prompt).trim() : null,
+      needs_more_info: Boolean(parsed.needs_more_info),
+      ready_to_execute: Boolean(parsed.ready_to_execute),
+    };
+  } catch {
+    return fallback;
+  }
+}
+
+function summarizePending(pending: CreativeChatPending | null | undefined): string {
+  if (!pending || typeof pending !== 'object') return '';
+  const parts: string[] = [];
+  if (pending.draft_post) parts.push(`مسودة منشور:\n${pending.draft_post}`);
+  if (pending.image_concept) parts.push(`فكرة تصميم:\n${pending.image_concept}`);
+  if (pending.execution_prompt) parts.push(`برومبت التنفيذ:\n${pending.execution_prompt}`);
+  if (pending.ideas?.length) parts.push(`أفكار:\n- ${pending.ideas.join('\n- ')}`);
+  if (pending.suggested_action && pending.suggested_action !== 'none') {
+    parts.push(`الإجراء المقترح: ${pending.suggested_action}`);
+  }
+  return parts.join('\n\n');
+}
+
+function buildActionsFromPending(pending: CreativeChatPending | null | undefined) {
+  const suggested = pending?.suggested_action || 'none';
+  const ready = Boolean(pending?.ready_to_execute);
+  const hasPrompt = Boolean(
+    pending?.execution_prompt || pending?.draft_post || pending?.image_concept,
+  );
+
+  const can_generate_post = ready && hasPrompt && suggested !== 'generate_image';
+  const can_generate_image = ready && hasPrompt && suggested !== 'generate_post';
+
+  return {
+    can_execute: can_generate_post || can_generate_image,
+    can_generate_post,
+    can_generate_image,
+  };
 }
 
 export class TeacherCreativeChatbotService {
@@ -782,5 +941,511 @@ Rules:
     );
 
     return { ...generation, references: refs.rows };
+  }
+
+  static getWelcomeMessage(): string {
+    return TEACHER_CREATIVE_CHAT_WELCOME_MESSAGE;
+  }
+
+  static async createChatSession(
+    teacherId: number,
+    input?: {
+      preferredOutput?: string;
+      platform?: string;
+      tone?: string;
+      aspectRatio?: string;
+      languageMode?: string;
+    },
+  ): Promise<CreativeChatSession> {
+    const preferredOutput = normalizePreferredOutput(input?.preferredOutput);
+    const platform = normalizeTeacherCreativePlatform(input?.platform);
+    const tone = normalizeTeacherCreativeTone(input?.tone);
+    const aspectRatio = normalizeTeacherCreativeAspectRatio(input?.aspectRatio);
+    const languageMode = normalizeTeacherCreativeLanguageMode(input?.languageMode);
+
+    const result = await pool.query<CreativeChatSession>(
+      `INSERT INTO teacher_creative_chat_sessions
+       (teacher_id, preferred_output, platform, tone, aspect_ratio, language_mode, pending)
+       VALUES ($1, $2, $3, $4, $5, $6, '{}'::jsonb)
+       RETURNING *`,
+      [teacherId, preferredOutput, platform, tone, aspectRatio, languageMode],
+    );
+    return result.rows[0];
+  }
+
+  static async getActiveChatSession(teacherId: number): Promise<CreativeChatSession | null> {
+    const result = await pool.query<CreativeChatSession>(
+      `SELECT * FROM teacher_creative_chat_sessions
+       WHERE teacher_id = $1 AND status = 'active'
+       ORDER BY updated_at DESC
+       LIMIT 1`,
+      [teacherId],
+    );
+    return result.rows[0] || null;
+  }
+
+  static async getChatSessionById(
+    teacherId: number,
+    sessionId: number,
+  ): Promise<CreativeChatSession | null> {
+    if (!Number.isInteger(sessionId) || sessionId <= 0) return null;
+    const result = await pool.query<CreativeChatSession>(
+      `SELECT * FROM teacher_creative_chat_sessions
+       WHERE teacher_id = $1 AND id = $2
+       LIMIT 1`,
+      [teacherId, sessionId],
+    );
+    return result.rows[0] || null;
+  }
+
+  static async archiveChatSession(teacherId: number, sessionId: number): Promise<void> {
+    await pool.query(
+      `UPDATE teacher_creative_chat_sessions
+       SET status = 'archived', updated_at = NOW()
+       WHERE teacher_id = $1 AND id = $2`,
+      [teacherId, sessionId],
+    );
+  }
+
+  static async getChatMessages(
+    teacherId: number,
+    sessionId: number,
+    limit = 100,
+  ): Promise<CreativeChatMessage[]> {
+    const safeLimit = Math.min(Math.max(Number(limit) || 100, 1), 200);
+    const result = await pool.query<CreativeChatMessage>(
+      `SELECT * FROM teacher_creative_chat_messages
+       WHERE teacher_id = $1 AND session_id = $2
+       ORDER BY created_at ASC
+       LIMIT $3`,
+      [teacherId, sessionId, safeLimit],
+    );
+    return result.rows;
+  }
+
+  private static async saveChatMessage(input: {
+    sessionId: number;
+    teacherId: number;
+    role: 'user' | 'assistant';
+    message: string;
+    payload?: Record<string, unknown>;
+  }): Promise<CreativeChatMessage> {
+    const result = await pool.query<CreativeChatMessage>(
+      `INSERT INTO teacher_creative_chat_messages
+       (session_id, teacher_id, role, message, payload)
+       VALUES ($1, $2, $3, $4, $5::jsonb)
+       RETURNING *`,
+      [
+        input.sessionId,
+        input.teacherId,
+        input.role,
+        input.message,
+        JSON.stringify(input.payload || {}),
+      ],
+    );
+    return result.rows[0];
+  }
+
+  private static async updateChatSession(
+    sessionId: number,
+    teacherId: number,
+    patch: {
+      preferredOutput?: string;
+      platform?: string;
+      tone?: string;
+      aspectRatio?: string;
+      languageMode?: string;
+      pending?: CreativeChatPending;
+    },
+  ): Promise<CreativeChatSession> {
+    const result = await pool.query<CreativeChatSession>(
+      `UPDATE teacher_creative_chat_sessions
+       SET preferred_output = COALESCE($3, preferred_output),
+           platform = COALESCE($4, platform),
+           tone = COALESCE($5, tone),
+           aspect_ratio = COALESCE($6, aspect_ratio),
+           language_mode = COALESCE($7, language_mode),
+           pending = COALESCE($8::jsonb, pending),
+           updated_at = NOW()
+       WHERE id = $1 AND teacher_id = $2
+       RETURNING *`,
+      [
+        sessionId,
+        teacherId,
+        patch.preferredOutput || null,
+        patch.platform || null,
+        patch.tone || null,
+        patch.aspectRatio || null,
+        patch.languageMode || null,
+        patch.pending ? JSON.stringify(patch.pending) : null,
+      ],
+    );
+    return result.rows[0];
+  }
+
+  private static async callDeepSeekForChat(input: {
+    message: string;
+    history: Array<{ role: 'user' | 'assistant'; content: string }>;
+    platform?: string;
+    tone?: string;
+    preferredOutput?: string;
+    aspectRatio?: string;
+    languageMode?: string;
+    pendingSummary?: string;
+  }): Promise<{ payload: CreativeChatAiPayload; response: Record<string, unknown> }> {
+    if (!config.DEEPSEEK_API_KEY) throw new Error('DEEPSEEK_API_KEY is required');
+
+    const messages = [
+      { role: 'system' as const, content: buildTeacherCreativeChatSystemPrompt() },
+      ...input.history.slice(-12).map((item) => ({
+        role: item.role === 'assistant' ? ('assistant' as const) : ('user' as const),
+        content: item.content,
+      })),
+      {
+        role: 'user' as const,
+        content: buildTeacherCreativeChatUserPrompt({
+          message: input.message,
+          platform: input.platform,
+          tone: input.tone,
+          preferredOutput: input.preferredOutput,
+          aspectRatio: input.aspectRatio,
+          languageMode: input.languageMode,
+          pendingSummary: input.pendingSummary,
+        }),
+      },
+    ];
+
+    const response = await fetch(`${config.DEEPSEEK_API_URL}/v1/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${config.DEEPSEEK_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: 'deepseek-chat',
+        messages,
+        temperature: 0.7,
+        max_tokens: 1200,
+        response_format: { type: 'json_object' },
+      }),
+    });
+
+    if (!response.ok) {
+      throw new Error(
+        `DeepSeek creative chat failed: ${response.status} ${await response.text()}`,
+      );
+    }
+
+    const body = (await response.json()) as any;
+    const content = String(body.choices?.[0]?.message?.content || '').trim();
+    return {
+      payload: parseCreativeChatAiPayload(content),
+      response: {
+        id: body.id,
+        model: body.model,
+        usage: body.usage,
+      },
+    };
+  }
+
+  private static resolveExecutionPrompt(
+    pending: CreativeChatPending,
+    preferredOutput: 'post' | 'image' | 'auto',
+  ): { action: 'generate_post' | 'generate_image'; prompt: string } | null {
+    const suggested = pending.suggested_action || 'none';
+    const prompt =
+      pending.execution_prompt ||
+      pending.draft_post ||
+      pending.image_concept ||
+      null;
+    if (!prompt || !pending.ready_to_execute) return null;
+
+    if (suggested === 'generate_post') return { action: 'generate_post', prompt };
+    if (suggested === 'generate_image') return { action: 'generate_image', prompt };
+
+    if (preferredOutput === 'image') return { action: 'generate_image', prompt };
+    if (preferredOutput === 'post') return { action: 'generate_post', prompt };
+
+    // auto: draft_post prefers text, otherwise image
+    if (pending.draft_post && !pending.image_concept) {
+      return { action: 'generate_post', prompt: pending.draft_post };
+    }
+    if (pending.image_concept) {
+      return { action: 'generate_image', prompt: pending.image_concept };
+    }
+    return { action: 'generate_post', prompt };
+  }
+
+  static async executePendingChat(
+    teacherId: number,
+    input: {
+      sessionId: number;
+      requestType?: 'post' | 'image';
+      referenceFiles?: Express.Multer.File[];
+      editLastDesign?: boolean | string;
+    },
+  ): Promise<CreativeChatResult> {
+    const session = await this.getChatSessionById(teacherId, input.sessionId);
+    if (!session || session.status !== 'active') {
+      throw new Error('جلسة المحادثة غير موجودة أو غير نشطة');
+    }
+
+    const pending = (session.pending || {}) as CreativeChatPending;
+    const preferredOutput = normalizePreferredOutput(
+      input.requestType || session.preferred_output || pending.preferred_output,
+    );
+    const resolved = this.resolveExecutionPrompt(
+      {
+        ...pending,
+        ready_to_execute: true,
+        suggested_action:
+          input.requestType === 'post'
+            ? 'generate_post'
+            : input.requestType === 'image'
+              ? 'generate_image'
+              : pending.suggested_action,
+      },
+      preferredOutput,
+    );
+
+    if (!resolved) {
+      throw new Error('لا توجد مسودة جاهزة للتنفيذ. ناقش الفكرة أولاً ثم أكد التنفيذ.');
+    }
+
+    const platform = normalizeTeacherCreativePlatform(pending.platform || session.platform || undefined);
+    const tone = normalizeTeacherCreativeTone(pending.tone || session.tone || undefined);
+    const aspectRatio = normalizeTeacherCreativeAspectRatio(
+      pending.aspect_ratio || session.aspect_ratio || undefined,
+    );
+    const languageMode = normalizeTeacherCreativeLanguageMode(
+      pending.language_mode || session.language_mode || undefined,
+    );
+
+    let generation: TeacherCreativeGeneration;
+    if (resolved.action === 'generate_image') {
+      generation = await this.generateImage(
+        teacherId,
+        {
+          prompt: resolved.prompt,
+          platform,
+          aspect_ratio: aspectRatio,
+          language_mode: languageMode,
+          edit_last_design: input.editLastDesign,
+        },
+        input.referenceFiles || [],
+      );
+    } else {
+      generation = await this.generatePost(teacherId, {
+        prompt: resolved.prompt,
+        platform,
+        tone,
+      });
+    }
+
+    const reply =
+      resolved.action === 'generate_image'
+        ? 'تم تنفيذ التصميم حسب المسودة المتفق عليها. تقدر تعدّل الفكرة أو تطلب نسخة تانية.'
+        : 'تم تنفيذ المنشور حسب المسودة المتفق عليها. تقدر تنسخه أو نعدّله سوا.';
+
+    const clearedPending: CreativeChatPending = {
+      ...pending,
+      ready_to_execute: false,
+      suggested_action: 'none',
+    };
+
+    await this.updateChatSession(session.id, teacherId, { pending: clearedPending });
+    await this.saveChatMessage({
+      sessionId: session.id,
+      teacherId,
+      role: 'assistant',
+      message: reply,
+      payload: {
+        executed: true,
+        generation_id: generation.id,
+        suggested_action: resolved.action,
+      },
+    });
+
+    return {
+      reply,
+      session_id: session.id,
+      ideas: pending.ideas || [],
+      draft_post: pending.draft_post || null,
+      image_concept: pending.image_concept || null,
+      suggested_action: 'none',
+      ready_to_execute: false,
+      executed: true,
+      generation,
+      actions: {
+        can_execute: false,
+        can_generate_post: false,
+        can_generate_image: false,
+      },
+    };
+  }
+
+  static async chat(
+    teacherId: number,
+    input: {
+      message: string;
+      sessionId?: number;
+      preferredOutput?: string;
+      platform?: string;
+      tone?: string;
+      aspectRatio?: string;
+      languageMode?: string;
+      forceExecute?: boolean;
+      referenceFiles?: Express.Multer.File[];
+      editLastDesign?: boolean | string;
+    },
+  ): Promise<CreativeChatResult> {
+    const message = String(input.message || '').trim();
+    if (!message) throw new Error('الرسالة مطلوبة');
+    if (message.length > 4000) throw new Error('الرسالة طويلة جداً');
+
+    let session =
+      (input.sessionId
+        ? await this.getChatSessionById(teacherId, input.sessionId)
+        : null) ||
+      (await this.getActiveChatSession(teacherId)) ||
+      (await this.createChatSession(teacherId, input));
+
+    session = await this.updateChatSession(session.id, teacherId, {
+      preferredOutput: input.preferredOutput
+        ? normalizePreferredOutput(input.preferredOutput)
+        : undefined,
+      platform: input.platform
+        ? normalizeTeacherCreativePlatform(input.platform)
+        : undefined,
+      tone: input.tone ? normalizeTeacherCreativeTone(input.tone) : undefined,
+      aspectRatio: input.aspectRatio
+        ? normalizeTeacherCreativeAspectRatio(input.aspectRatio)
+        : undefined,
+      languageMode: input.languageMode
+        ? normalizeTeacherCreativeLanguageMode(input.languageMode)
+        : undefined,
+    });
+
+    await this.saveChatMessage({
+      sessionId: session.id,
+      teacherId,
+      role: 'user',
+      message,
+      payload: {
+        preferred_output: session.preferred_output,
+        platform: session.platform,
+        tone: session.tone,
+      },
+    });
+
+    const pending = (session.pending || {}) as CreativeChatPending;
+    const shouldExecute =
+      input.forceExecute === true ||
+      (isExplicitExecuteRequest(message) && Boolean(pending.ready_to_execute));
+
+    if (shouldExecute) {
+      try {
+        return await this.executePendingChat(teacherId, {
+          sessionId: session.id,
+          requestType:
+            pending.suggested_action === 'generate_image'
+              ? 'image'
+              : pending.suggested_action === 'generate_post'
+                ? 'post'
+                : normalizePreferredOutput(session.preferred_output) === 'image'
+                  ? 'image'
+                  : normalizePreferredOutput(session.preferred_output) === 'post'
+                    ? 'post'
+                    : undefined,
+          referenceFiles: input.referenceFiles,
+          editLastDesign: input.editLastDesign,
+        });
+      } catch (error) {
+        const reply =
+          error instanceof Error
+            ? error.message
+            : 'تعذر التنفيذ الآن. خلينا نضبط المسودة أولاً.';
+        await this.saveChatMessage({
+          sessionId: session.id,
+          teacherId,
+          role: 'assistant',
+          message: reply,
+          payload: { executed: false, error: true },
+        });
+        const actions = buildActionsFromPending(pending);
+        return {
+          reply,
+          session_id: session.id,
+          ideas: pending.ideas || [],
+          draft_post: pending.draft_post || null,
+          image_concept: pending.image_concept || null,
+          suggested_action: pending.suggested_action || 'none',
+          ready_to_execute: Boolean(pending.ready_to_execute),
+          executed: false,
+          generation: null,
+          actions,
+        };
+      }
+    }
+
+    const historyRows = await this.getChatMessages(teacherId, session.id, 20);
+    const history = historyRows
+      .filter((row) => row.message && row.role)
+      .slice(0, -1) // exclude the just-saved user message; we pass it separately
+      .map((row) => ({
+        role: row.role,
+        content: row.message,
+      }));
+
+    const ai = await this.callDeepSeekForChat({
+      message,
+      history,
+      platform: session.platform || undefined,
+      tone: session.tone || undefined,
+      preferredOutput: session.preferred_output || undefined,
+      aspectRatio: session.aspect_ratio || undefined,
+      languageMode: session.language_mode || undefined,
+      pendingSummary: summarizePending(pending),
+    });
+
+    const nextPending: CreativeChatPending = {
+      ideas: ai.payload.ideas,
+      draft_post: ai.payload.draft_post,
+      image_concept: ai.payload.image_concept,
+      suggested_action: ai.payload.suggested_action,
+      execution_prompt: ai.payload.execution_prompt,
+      ready_to_execute: ai.payload.ready_to_execute,
+      platform: session.platform,
+      tone: session.tone,
+      aspect_ratio: session.aspect_ratio,
+      language_mode: session.language_mode,
+      preferred_output: session.preferred_output,
+    };
+
+    await this.updateChatSession(session.id, teacherId, { pending: nextPending });
+    await this.saveChatMessage({
+      sessionId: session.id,
+      teacherId,
+      role: 'assistant',
+      message: ai.payload.reply,
+      payload: {
+        ...ai.payload,
+        provider_response: ai.response,
+      },
+    });
+
+    const actions = buildActionsFromPending(nextPending);
+    return {
+      reply: ai.payload.reply,
+      session_id: session.id,
+      ideas: nextPending.ideas || [],
+      draft_post: nextPending.draft_post || null,
+      image_concept: nextPending.image_concept || null,
+      suggested_action: nextPending.suggested_action || 'none',
+      ready_to_execute: Boolean(nextPending.ready_to_execute),
+      executed: false,
+      generation: null,
+      actions,
+    };
   }
 }

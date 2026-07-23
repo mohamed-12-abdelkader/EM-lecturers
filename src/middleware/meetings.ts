@@ -1,6 +1,7 @@
 import { Request, Response, NextFunction } from 'express';
 import pool from '../db/pool';
 import { authMiddleware } from './authentication';
+import { CourseAccessService } from '../services/courseAccess';
 
 /**
  * Middleware to check if the current user is the meeting owner or an admin.
@@ -97,15 +98,22 @@ export const isMeetingOwnerOrAdminOrGroupManager = [
 ];
 
 /**
- * قائمة اجتماعات كورس: أدمن، أو مدرّس صاحب الكورس، أو طالب مشترك في الكورس.
+ * قائمة اجتماعات كورس: أدمن، أو مدرّس صاحب الكورس، أو طالب مشترك / كورس مجاني.
  */
 const checkMeetingCourseMeetingsListAccess = async (req: Request, res: Response, next: NextFunction) => {
   const user = req.user!;
   const { courseId } = req.params;
 
   try {
-    const { rows, rowCount } = await pool.query<{ id: number; teacher_id: number }>(
-      `SELECT id, teacher_id FROM courses WHERE id = $1 LIMIT 1`,
+    const { rows, rowCount } = await pool.query<{
+      id: number;
+      teacher_id: number;
+      is_free: boolean;
+    }>(
+      `SELECT id, teacher_id, COALESCE(is_free, FALSE) AS is_free
+       FROM courses
+       WHERE id = $1
+       LIMIT 1`,
       [courseId],
     );
 
@@ -124,11 +132,12 @@ const checkMeetingCourseMeetingsListAccess = async (req: Request, res: Response,
     }
 
     if (user.role === 'student') {
-      const { rowCount: enrollmentCount } = await pool.query(
-        `SELECT 1 FROM enrollments WHERE user_id = $1 AND course_id = $2 LIMIT 1`,
-        [user.id, courseId],
-      );
-      if (enrollmentCount && enrollmentCount > 0) {
+      if (course.is_free === true) {
+        return next();
+      }
+
+      const access = await CourseAccessService.checkStudentAccess(user.id, Number(courseId));
+      if (access.hasAccess) {
         return next();
       }
       return res.status(403).json({ message: 'You are not enrolled in this course' });
@@ -179,19 +188,15 @@ export const checkMeetingAccess = async (req: Request, res: Response, next: Next
       });
     }
 
-    // ✅ 3b. كورس عادي: التحقق من الاشتراك
-    const { rowCount } = await pool.query(
-      `SELECT 1 
-       FROM enrollments e
-       JOIN courses c ON c.id = e.course_id
-       JOIN meeting m ON m.course_id = c.id
-       WHERE e.user_id = $1 AND m.id = $2
-       LIMIT 1`,
-      [user.id, meetingId],
-    );
-
-    if (rowCount && rowCount > 0) {
-      return next();
+    // ✅ 3b. كورس عادي: تحقق من الاشتراك أو أن الكورس مجاني
+    // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+    // @ts-ignore
+    const courseId = meeting.course_id as number | undefined;
+    if (courseId) {
+      const access = await CourseAccessService.checkStudentAccess(user.id, courseId);
+      if (access.hasAccess) {
+        return next();
+      }
     }
 
     return res.status(403).json({

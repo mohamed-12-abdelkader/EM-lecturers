@@ -71,7 +71,7 @@ router.get(
       let duration = null;
       try {
         const examRes = await pool.query(
-          "SELECT duration FROM exams WHERE id = $1 AND type = 'exam'",
+          `SELECT duration FROM exams WHERE id = $1 AND type IN ('exam', 'assignment')`,
           [examId],
         );
         if (!examRes.rowCount) {
@@ -372,7 +372,7 @@ router.post(
   }),
 );
 
-// جلب تفاصيل امتحان محاضرة (بيانات الامتحان + الأسئلة)
+// جلب تفاصيل امتحان/واجب محاضرة (بيانات الامتحان + الأسئلة)
 router.get(
   '/lecture-exam/:examId/details',
   authMiddleware(['teacher', 'admin', 'student']),
@@ -381,10 +381,11 @@ router.get(
     if (isNaN(examId)) {
       return res.status(400).json({ message: 'Invalid exam ID' });
     }
-    // جلب بيانات الامتحان
-    const examRes = await pool.query("SELECT * FROM exams WHERE id = $1 AND type = 'exam'", [
-      examId,
-    ]);
+    // يقبل امتحان المحاضرة والواجب (type = exam | assignment)
+    const examRes = await pool.query(
+      `SELECT * FROM exams WHERE id = $1 AND type IN ('exam', 'assignment')`,
+      [examId],
+    );
     if (!examRes.rowCount) {
       return res.status(404).json({ message: 'امتحان المحاضرة غير موجود' });
     }
@@ -400,11 +401,12 @@ router.get(
       exam: {
         id: exam.id,
         title: exam.title,
+        type: exam.type,
         duration: exam.duration ?? null,
         total_grade: exam.total_grade ?? null,
         created_at: exam.created_at,
         lecture_id: exam.lecture_id,
-        // أضف أي حقول أخرى تحتاجها
+        lock_next_lectures: exam.lock_next_lectures ?? null,
       },
       questions,
     });

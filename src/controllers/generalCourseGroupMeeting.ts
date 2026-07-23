@@ -5,7 +5,7 @@ import { asyncWrapper } from '../utils';
 import pool from '../db/pool';
 import { config } from '../utils';
 import { z } from 'zod';
-import { generateParticipantToken, getParticipantsCount } from '../services/meetings-room-services';
+import { generateParticipantToken, getParticipantsCount, resolveMeetingTeacherDisplay } from '../services/meetings-room-services';
 import { enforceTeacherLiveCreationLimit } from '../services/teacherLivePackagePolicy';
 
 const router = Router();
@@ -415,6 +415,10 @@ router.get(
     }
 
     const isOwner = meeting.created_by === user.id;
+    const { teacherName, teacherIcon } = await resolveMeetingTeacherDisplay(
+      meeting.created_by,
+      req.tenant as any,
+    );
 
     // عند دخول المحاضر نحدّث الحالة إلى started فوراً حتى يظهر للطلاب أن الجلسة نشطة
     if (isOwner && meeting.status === 'idle') {
@@ -453,6 +457,9 @@ router.get(
       screenShareToken,
       serverUrl: LIVEKIT_SERVER_URL,
       roomName: meetingId,
+      meetingName: meeting.title,
+      teacherName,
+      teacherIcon,
       participantName,
       isOwner,
     });

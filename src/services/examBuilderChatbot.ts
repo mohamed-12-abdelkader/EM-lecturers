@@ -111,7 +111,24 @@ export interface ExamBuilderChatResult {
   actions: {
     can_approve: boolean;
     can_regenerate: boolean;
+    can_adjust: boolean;
   };
+}
+
+export interface ExamAdjustInput {
+  remove_ids?: number[];
+  replace_ids?: number[];
+  remove_positions?: number[]; // 1-based index in current proposal
+  replace_positions?: number[];
+  refill_removed?: boolean;
+}
+
+export interface ParsedExamAdjustRequest {
+  remove_positions: number[];
+  replace_positions: number[];
+  remove_ids: number[];
+  replace_ids: number[];
+  refill_removed: boolean;
 }
 
 export interface ApproveExamPayload {
@@ -245,16 +262,132 @@ const ACCESSIBLE_LESSONS_CTE = `
     WHERE q.teacher_id = $1 AND q.lesson_id IS NOT NULL
   )`;
 
+function uniquePositiveInts(values: unknown[]): number[] {
+  const out: number[] = [];
+  const seen = new Set<number>();
+  for (const value of values) {
+    const n = Number(value);
+    if (!Number.isInteger(n) || n <= 0 || seen.has(n)) continue;
+    seen.add(n);
+    out.push(n);
+  }
+  return out;
+}
+
+function extractNumbersFromChunk(chunk: string): number[] {
+  const matches = String(chunk || '').match(/\d+/g) || [];
+  return uniquePositiveInts(matches);
+}
+
+function looksLikeExamAdjustRequest(message: string): boolean {
+  const value = message.trim();
+  if (!value) return false;
+  const hasAction =
+    /(شيل|احذف|حذف|ازل|أزل|استبدل|بدّل|بدل|غير|غيّر|remove|replace|swap)/i.test(value);
+  const hasQuestion =
+    /(سؤال|اسألة|أسئلة|اسئلة|question)/i.test(value) ||
+    /(أول|اول|آخر|اخر)\s*سؤال/i.test(value);
+  return hasAction && hasQuestion;
+}
+
+export function parseExamAdjustRequest(message: string): ParsedExamAdjustRequest | null {
+  if (!looksLikeExamAdjustRequest(message)) return null;
+
+  const value = message.trim();
+  const remove_positions: number[] = [];
+  const replace_positions: number[] = [];
+  const remove_ids: number[] = [];
+  const replace_ids: number[] = [];
+
+  const pushPositions = (target: number[], chunk: string) => {
+    target.push(...extractNumbersFromChunk(chunk));
+  };
+
+  const replacePatterns = [
+    /(استبدل|بدّل|بدل|غير|غيّر|replace|swap)\s*(?:السؤال|الأسئلة|الاسئلة|سؤال)?\s*(?:رقم|أرقام|ارقام|ids?)?\s*([#\d\sووو,،\-]+)/gi,
+  ];
+  const removePatterns = [
+    /(شيل|احذف|حذف|ازل|أزل|remove)\s*(?:السؤال|الأسئلة|الاسئلة|سؤال)?\s*(?:رقم|أرقام|ارقام|ids?)?\s*([#\d\sووو,،\-]+)/gi,
+  ];
+
+  for (const pattern of replacePatterns) {
+    let match: RegExpExecArray | null;
+    while ((match = pattern.exec(value)) !== null) {
+      pushPositions(replace_positions, match[2] || '');
+    }
+  }
+  for (const pattern of removePatterns) {
+    let match: RegExpExecArray | null;
+    while ((match = pattern.exec(value)) !== null) {
+      pushPositions(remove_positions, match[2] || '');
+    }
+  }
+
+  if (/(استبدل|بدّل|بدل|غير|غيّر).{0,20}(أول|اول)\s*سؤال/i.test(value)) {
+    replace_positions.push(1);
+  }
+  if (/(استبدل|بدّل|بدل|غير|غيّر).{0,20}(آخر|اخر)\s*سؤال/i.test(value)) {
+    replace_positions.push(-1);
+  }
+  if (/(شيل|احذف|حذف|ازل|أزل).{0,20}(أول|اول)\s*سؤال/i.test(value)) {
+    remove_positions.push(1);
+  }
+  if (/(شيل|احذف|حذف|ازل|أزل).{0,20}(آخر|اخر)\s*سؤال/i.test(value)) {
+    remove_positions.push(-1);
+  }
+
+  const idMatches = value.matchAll(/(?:id\s*|#)\s*(\d+)/gi);
+  for (const match of idMatches) {
+    const id = Number(match[1]);
+    if (!Number.isInteger(id) || id <= 0) continue;
+    if (/(استبدل|بدّل|بدل|غير|غيّر|replace)/i.test(value)) replace_ids.push(id);
+    else remove_ids.push(id);
+  }
+
+  const refill_removed = /(عوض|بدلهم|عوضهم|كمّل|كمل|نفس العدد|ارجع العدد)/i.test(value);
+
+  const cleanedRemove = uniquePositiveInts(remove_positions.filter((n) => n !== -1));
+  const finalRemove = [...cleanedRemove, ...(remove_positions.includes(-1) ? [-1] : [])];
+  const cleanedReplace = uniquePositiveInts(replace_positions.filter((n) => n !== -1));
+  const finalReplace = [...cleanedReplace, ...(replace_positions.includes(-1) ? [-1] : [])];
+
+  if (!finalRemove.length && !finalReplace.length && !remove_ids.length && !replace_ids.length) {
+    return null;
+  }
+
+  return {
+    remove_positions: finalRemove,
+    replace_positions: finalReplace,
+    remove_ids: uniquePositiveInts(remove_ids),
+    replace_ids: uniquePositiveInts(replace_ids),
+    refill_removed,
+  };
+}
+
+function resolvePositionList(positions: number[], selectedCount: number): number[] {
+  const resolved: number[] = [];
+  for (const pos of positions) {
+    if (pos === -1) {
+      if (selectedCount > 0) resolved.push(selectedCount);
+      continue;
+    }
+    if (pos >= 1 && pos <= selectedCount) resolved.push(pos);
+  }
+  return uniquePositiveInts(resolved);
+}
+
 export class ExamBuilderChatbotService {
   static getBotInfo() {
     return {
       name: 'مساعد إنشاء الامتحانات',
-      description: 'يختار أسئلة عشوائية من بنك أسئلتك بناءً على طلبك باللغة الطبيعية',
+      description:
+        'يختار أسئلة عشوائية من بنك أسئلتك، ويمكنك حذف أو استبدال أسئلة معينة حتى تعتمد النسخة النهائية',
       welcome_message: EXAM_BUILDER_WELCOME_MESSAGE,
       quick_examples: EXAM_BUILDER_QUICK_EXAMPLES,
       max_questions: MAX_QUESTIONS,
       supported_question_types: ['text_only', 'text_with_image', 'image_choices'],
       supported_difficulties: ['easy', 'medium', 'hard'],
+      supports_adjust: true,
     };
   }
 
@@ -933,7 +1066,10 @@ export class ExamBuilderChatbotService {
     }
 
     lines.push('');
-    lines.push('راجع الأسئلة أدناه، ثم **اعتماد** أو **إعادة اختيار**.');
+    lines.push(
+      'راجع الأسئلة أدناه. يمكنك **حذف** أو **استبدال** سؤال معيّن، أو **إعادة اختيار** الكل، ثم **اعتماد** النسخة النهائية.',
+    );
+    lines.push('مثال من الشات: «شيل السؤال 3» أو «استبدل السؤال 1 و2».');
     return lines.join('\n');
   }
 
@@ -1199,14 +1335,23 @@ export class ExamBuilderChatbotService {
     return this.mergeSessionWithSelectedQuestions(result.rows[0], selected);
   }
 
-  static async handleChatMessage(teacherId: number, message: string): Promise<ExamBuilderChatResult> {
+  static async handleChatMessage(
+    teacherId: number,
+    message: string,
+    sessionId?: string | null,
+  ): Promise<ExamBuilderChatResult> {
     const started = Date.now();
     const trimmed = message.trim();
+    const emptyActions = {
+      can_approve: false,
+      can_regenerate: false,
+      can_adjust: false,
+    };
     if (!trimmed) {
       return {
         reply: EXAM_BUILDER_WELCOME_MESSAGE,
         session: null,
-        actions: { can_approve: false, can_regenerate: false },
+        actions: emptyActions,
       };
     }
 
@@ -1217,7 +1362,7 @@ export class ExamBuilderChatbotService {
           'لا توجد مواد مسندة إليك في بنك الأسئلة. تواصل مع الإدارة لإسناد المواد (نفس قائمة /api/teacher/subjects).',
         session: null,
         thinking_ms: Date.now() - started,
-        actions: { can_approve: false, can_regenerate: false },
+        actions: emptyActions,
       };
     }
 
@@ -1228,7 +1373,31 @@ export class ExamBuilderChatbotService {
           'لديك مواد ودروس متاحة، لكن لا توجد أسئلة بعد في هذه الدروس. أضف أسئلة من بنك الأسئلة ثم عد للمحاولة.',
         session: null,
         thinking_ms: Date.now() - started,
-        actions: { can_approve: false, can_regenerate: false },
+        actions: emptyActions,
+      };
+    }
+
+    // Follow-up adjustments on an existing proposal
+    const parsedAdjust = parseExamAdjustRequest(trimmed);
+    if (parsedAdjust) {
+      let targetSessionId = sessionId || null;
+      if (!targetSessionId) {
+        const latest = await this.getLatestProposedSession(teacherId);
+        targetSessionId = latest?.id ?? null;
+      }
+      if (targetSessionId) {
+        const adjusted = await this.adjustSession(targetSessionId, teacherId, parsedAdjust);
+        return {
+          ...adjusted,
+          thinking_ms: Date.now() - started,
+        };
+      }
+      return {
+        reply:
+          'لم أجد مقترحاً نشطاً لتعديله. اطلب إنشاء امتحان أولاً، ثم قل مثلاً: «شيل السؤال 2» أو «استبدل السؤال 1».',
+        session: null,
+        thinking_ms: Date.now() - started,
+        actions: emptyActions,
       };
     }
 
@@ -1243,7 +1412,7 @@ export class ExamBuilderChatbotService {
         reply,
         session: null,
         thinking_ms: Date.now() - started,
-        actions: { can_approve: false, can_regenerate: false },
+        actions: emptyActions,
       };
     }
 
@@ -1265,7 +1434,170 @@ export class ExamBuilderChatbotService {
       reply,
       session,
       thinking_ms: Date.now() - started,
-      actions: { can_approve: true, can_regenerate: true },
+      actions: { can_approve: true, can_regenerate: true, can_adjust: true },
+    };
+  }
+
+  static async getLatestProposedSession(teacherId: number): Promise<ExamBuilderSession | null> {
+    const result = await pool.query(
+      `SELECT * FROM exam_builder_chatbot_sessions
+       WHERE teacher_id = $1 AND status = 'proposed'
+       ORDER BY updated_at DESC
+       LIMIT 1`,
+      [teacherId],
+    );
+    if (!result.rowCount) return null;
+    return this.mapSessionRow(result.rows[0]);
+  }
+
+  static async adjustSession(
+    sessionId: string,
+    teacherId: number,
+    input: ExamAdjustInput,
+  ): Promise<ExamBuilderChatResult> {
+    const started = Date.now();
+    const session = await this.getSession(sessionId, teacherId);
+    if (session.status !== 'proposed') {
+      throw new HttpError(400, 'لا يمكن تعديل الأسئلة بعد اعتماد المقترح');
+    }
+
+    const selected = [...(session.selected_questions || [])];
+    if (!selected.length) {
+      throw new HttpError(400, 'لا توجد أسئلة في هذا المقترح');
+    }
+
+    const removePositions = resolvePositionList(input.remove_positions || [], selected.length);
+    const replacePositions = resolvePositionList(input.replace_positions || [], selected.length);
+    const removeIds = new Set(uniquePositiveInts(input.remove_ids || []));
+    const replaceIds = new Set(uniquePositiveInts(input.replace_ids || []));
+
+    for (const pos of removePositions) {
+      const q = selected[pos - 1];
+      if (q) removeIds.add(q.id);
+    }
+    for (const pos of replacePositions) {
+      const q = selected[pos - 1];
+      if (q) replaceIds.add(q.id);
+    }
+
+    // Replace takes precedence over remove for the same id
+    for (const id of replaceIds) removeIds.delete(id);
+
+    if (!removeIds.size && !replaceIds.size) {
+      throw new HttpError(
+        400,
+        'حدد أرقام الأسئلة للتعديل. مثال: شيل السؤال 3 أو استبدل السؤال 1 و2',
+      );
+    }
+
+    const removedLabels: string[] = [];
+    const replacedLabels: string[] = [];
+    let next = [...selected];
+    const excludeBase = [
+      ...new Set([...(session.shown_question_ids || []), ...selected.map((q) => q.id)]),
+    ];
+
+    if (replaceIds.size) {
+      const needed = replaceIds.size;
+      let { questions: replacements } = await this.selectRandomQuestions(
+        teacherId,
+        { ...session.parsed_filters, question_count: needed },
+        excludeBase,
+      );
+      if (replacements.length < needed) {
+        ({ questions: replacements } = await this.selectRandomQuestions(
+          teacherId,
+          { ...session.parsed_filters, question_count: needed },
+          next.map((q) => q.id),
+        ));
+      }
+      if (!replacements.length) {
+        throw new HttpError(400, 'لا توجد أسئلة بديلة متاحة للاستبدال بنفس الفلاتر');
+      }
+
+      let replacementIndex = 0;
+      next = next.map((q, index) => {
+        if (!replaceIds.has(q.id)) return q;
+        const replacement = replacements[replacementIndex++];
+        if (!replacement) {
+          replacedLabels.push(`#${index + 1} (تعذر البديل)`);
+          return q;
+        }
+        replacedLabels.push(`#${index + 1}`);
+        return replacement;
+      });
+    }
+
+    if (removeIds.size) {
+      next = next.filter((q, index) => {
+        if (!removeIds.has(q.id)) return true;
+        // index may shift; label by original position when possible
+        const originalIndex = selected.findIndex((item) => item.id === q.id);
+        removedLabels.push(`#${(originalIndex >= 0 ? originalIndex : index) + 1}`);
+        return false;
+      });
+    }
+
+    const refill =
+      input.refill_removed === true && removeIds.size > 0 && !replaceIds.size;
+    if (refill) {
+      const deficit = Math.max(0, session.requested_count - next.length);
+      if (deficit > 0) {
+        const exclude = [
+          ...new Set([
+            ...(session.shown_question_ids || []),
+            ...selected.map((q) => q.id),
+            ...next.map((q) => q.id),
+          ]),
+        ];
+        let { questions: fillers } = await this.selectRandomQuestions(
+          teacherId,
+          { ...session.parsed_filters, question_count: deficit },
+          exclude,
+        );
+        if (!fillers.length) {
+          ({ questions: fillers } = await this.selectRandomQuestions(
+            teacherId,
+            { ...session.parsed_filters, question_count: deficit },
+            next.map((q) => q.id),
+          ));
+        }
+        next = [...next, ...fillers];
+      }
+    }
+
+    if (!next.length) {
+      throw new HttpError(400, 'لا يمكن حذف كل الأسئلة. أبقِ سؤالاً واحداً على الأقل أو اعتمد مقترحاً جديداً');
+    }
+
+    const newShown = [
+      ...new Set([...(session.shown_question_ids || []), ...selected.map((q) => q.id), ...next.map((q) => q.id)]),
+    ];
+    const available_count = session.available_count;
+    const updated = await this.updateSessionProposal(
+      sessionId,
+      teacherId,
+      next,
+      available_count,
+      newShown,
+    );
+
+    const parts: string[] = ['✏️ **تم تعديل المقترح.**', ''];
+    if (removedLabels.length) {
+      parts.push(`حُذف: ${removedLabels.join('، ')}`);
+    }
+    if (replacedLabels.length) {
+      parts.push(`استُبدل: ${replacedLabels.join('، ')}`);
+    }
+    parts.push(`الآن لديك **${next.length}** سؤالاً.`);
+    parts.push('');
+    parts.push('يمكنك طلب تعديلات أخرى، أو **اعتماد** النسخة النهائية.');
+
+    return {
+      reply: parts.join('\n'),
+      session: updated,
+      thinking_ms: Date.now() - started,
+      actions: { can_approve: true, can_regenerate: true, can_adjust: true },
     };
   }
 
@@ -1316,7 +1648,7 @@ export class ExamBuilderChatbotService {
       reply,
       session: updated,
       thinking_ms: Date.now() - started,
-      actions: { can_approve: true, can_regenerate: true },
+      actions: { can_approve: true, can_regenerate: true, can_adjust: true },
     };
   }
 

@@ -256,11 +256,11 @@ export class QuestionsManagementService {
     };
   }
 
-  // جلب أسئلة امتحان محاضرة معين
+  // جلب أسئلة امتحان/واجب محاضرة معين
   static async getLectureExamQuestions(examId: number) {
-    // التحقق من وجود الامتحان
+    // التحقق من وجود الامتحان أو الواجب
     const examCheck = await pool.query(
-      `SELECT e.* FROM exams e WHERE e.id = $1 AND e.type = 'exam'`,
+      `SELECT e.* FROM exams e WHERE e.id = $1 AND e.type IN ('exam', 'assignment')`,
       [examId],
     );
 
@@ -624,9 +624,10 @@ export class QuestionsManagementService {
     grade: number = 1,
   ) {
     // التحقق من وجود الامتحان
-    const examCheck = await pool.query(`SELECT id FROM exams WHERE id = $1 AND type = 'exam'`, [
-      examId,
-    ]);
+    const examCheck = await pool.query(
+      `SELECT id FROM exams WHERE id = $1 AND type IN ('exam', 'assignment')`,
+      [examId],
+    );
 
     if (!examCheck.rowCount) {
       throw new Error('امتحان المحاضرة غير موجود');
@@ -722,10 +723,11 @@ export class QuestionsManagementService {
 
       // إذا تم تمرير examId، قم بربط السؤال بالامتحان
       if (examId) {
-        // التحقق من وجود الامتحان
-        const examCheck = await pool.query(`SELECT id FROM exams WHERE id = $1 AND type = 'exam'`, [
-          examId,
-        ]);
+        // التحقق من وجود الامتحان أو الواجب
+        const examCheck = await pool.query(
+          `SELECT id FROM exams WHERE id = $1 AND type IN ('exam', 'assignment')`,
+          [examId],
+        );
 
         if (!examCheck.rowCount) {
           throw new Error('امتحان المحاضرة غير موجود');

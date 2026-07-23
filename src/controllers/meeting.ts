@@ -28,7 +28,7 @@ import {
   isMeetingOwnerOrAdminOrGroupManager,
   singleActiveMeetingLimit,
 } from '../middleware/meetings';
-import { generateParticipantToken, getParticipantsCount } from '../services/meetings-room-services';
+import { generateParticipantToken, getParticipantsCount, resolveMeetingTeacherDisplay } from '../services/meetings-room-services';
 import { uploadToYouTube } from '../services/uploadToYoutube';
 import { enforceTeacherLiveCreationLimit } from '../services/teacherLivePackagePolicy';
 
@@ -319,6 +319,10 @@ router.get(
       const meetingSource = (req as any).meetingSource as 'course' | 'general_course_group' | undefined;
 
       const isOwner = user.id === meeting.created_by;
+      const { teacherName, teacherIcon } = await resolveMeetingTeacherDisplay(
+        meeting.created_by,
+        req.tenant as any,
+      );
 
       // عند دخول المحاضر (صاحب الجلسة) نحدّث الحالة إلى started فوراً حتى يظهر للطلاب أن الجلسة نشطة (بدون الاعتماد على webhook LiveKit)
       if (isOwner && (meeting as any).status === 'idle') {
@@ -392,6 +396,9 @@ router.get(
         screenShareToken,
         serverUrl: LIVEKIT_SERVER_URL,
         roomName: meetingId,
+        meetingName: meeting.title,
+        teacherName,
+        teacherIcon,
         participantName,
         isOwner,
       });

@@ -15,6 +15,7 @@ const planGateExamBuilder = requireTeacherPlanFeature('exam_builder_ai');
 
 const MessageSchema = z.object({
   message: z.string().min(1).max(4000),
+  session_id: z.string().uuid().optional(),
 });
 
 const ApproveSchema = z.object({
@@ -26,6 +27,14 @@ const ApproveSchema = z.object({
   duration: z.number().int().positive().nullable().optional(),
   duration_minutes: z.number().int().positive().optional(),
   total_grade: z.number().positive().optional(),
+});
+
+const AdjustSchema = z.object({
+  remove_ids: z.array(z.number().int().positive()).optional(),
+  replace_ids: z.array(z.number().int().positive()).optional(),
+  remove_positions: z.array(z.number().int()).optional(),
+  replace_positions: z.array(z.number().int()).optional(),
+  refill_removed: z.boolean().optional(),
 });
 
 router.get(
@@ -149,14 +158,21 @@ router.post(
     }
 
     const teacherId = req.user!.id;
-    const result = await ExamBuilderChatbotService.handleChatMessage(teacherId, parsed.data.message);
+    const result = await ExamBuilderChatbotService.handleChatMessage(
+      teacherId,
+      parsed.data.message,
+      parsed.data.session_id,
+    );
 
     const teacherMessage = await ExamBuilderChatbotService.saveMessage(
       teacherId,
       'teacher',
       parsed.data.message,
       result.session?.id ?? null,
-      { action: 'request', session_id: result.session?.id ?? null },
+      {
+        action: result.session ? 'request_or_adjust' : 'request',
+        session_id: result.session?.id ?? null,
+      },
     );
 
     const assistantMessage = await ExamBuilderChatbotService.saveMessage(
@@ -234,6 +250,59 @@ router.post(
         session: result.session,
         questions: result.session?.selected_questions ?? [],
         actions: result.actions,
+      },
+    );
+
+    res.json({
+      success: true,
+      status: 'proposal_ready',
+      reply: result.reply,
+      thinking_ms: result.thinking_ms,
+      session: result.session,
+      questions: result.session?.selected_questions ?? [],
+      actions: result.actions,
+      assistant_message: assistantMessage,
+    });
+  }),
+);
+
+router.post(
+  '/sessions/:sessionId/adjust',
+  authMiddleware(['teacher']),
+  planGateExamBuilder,
+  asyncWrapper(async (req, res) => {
+    const parsed = AdjustSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      return res.status(400).json({
+        success: false,
+        message: 'Validation failed',
+        errors: parsed.error.errors,
+      });
+    }
+
+    const teacherId = req.user!.id;
+    const result = await ExamBuilderChatbotService.adjustSession(
+      req.params.sessionId,
+      teacherId,
+      parsed.data,
+    );
+
+    const assistantMessage = await ExamBuilderChatbotService.saveMessage(
+      teacherId,
+      'assistant',
+      result.reply,
+      result.session?.id ?? null,
+      {
+        action: 'adjust',
+        session_id: result.session?.id ?? null,
+        status: 'proposal_ready',
+        thinking_ms: result.thinking_ms,
+        questions_count: result.session?.selected_questions.length ?? 0,
+        reply: result.reply,
+        session: result.session,
+        questions: result.session?.selected_questions ?? [],
+        actions: result.actions,
+        adjust: parsed.data,
       },
     );
 

@@ -114,6 +114,85 @@ export function normalizeTeacherCreativeLanguageMode(language?: string): Teacher
     : DEFAULT_TEACHER_CREATIVE_LANGUAGE;
 }
 
+export const TEACHER_CREATIVE_CHAT_WELCOME_MESSAGE = `أهلاً! أنا مساعد التسويق والسوشيال ميديا بتاعك.
+
+نقدر نتناقش سوا قبل أي تنفيذ:
+- أفكار تسويقية لمنصتك
+- أفكار بوستات وكابشنات
+- أفكار تصميمات وصور
+
+قولّي هدفك أو المادة أو الجمهور، وأنا أقترح وأعدّل معاك. لما توافق على مسودة جاهزة قول «نفّذ» أو اضغط زر التنفيذ.`;
+
+export function buildTeacherCreativeChatSystemPrompt(): string {
+  return `أنت مستشار تسويق وسوشيال ميديا للمدرسين على منصة تعليمية عربية.
+أسلوبك مثل ChatGPT: تناقش، تقترح، تعدّل، ولا تنفّذ توليد منشور نهائي أو صورة إلا بعد موافقة واضحة من المدرس.
+
+مهمتك الأساسية في المحادثة:
+1) افهم هدف المدرس والجمهور والمنصة.
+2) اعرض أفكاراً تسويقية عملية (3 إلى 5 أفكار قصيرة إن أمكن).
+3) اقترح مسودات بوستات / كابشنات / مفاهيم تصميم للنقاش والتعديل.
+4) اسأل سؤالاً واحداً مفيداً فقط إذا كانت معلومة ناقصة تؤثر على الجودة.
+5) لا تدّعِ أنك نفّذت إنشاء صورة أو نشر محتوى. التنفيذ يتم لاحقاً عبر النظام بعد التأكيد.
+
+قواعد ثابتة:
+- رد بالعربية الفصحى المبسطة أو العامية المصرية الواضحة حسب أسلوب المدرس.
+- لا تخترع أسعاراً أو مواعيد أو أرقام تواصل إن لم يذكرها المدرس.
+- لا تستخدم وعوداً مبالغاً فيها مثل "اضمن الدرجة النهائية".
+- لا تذكر أنك ذكاء اصطناعي.
+- لا تستخدم Markdown ثقيل؛ فقرات ونقاط قصيرة فقط داخل reply.
+
+يجب أن ترد JSON فقط بهذا الشكل:
+{
+  "reply": "رد المحادثة للمدرس",
+  "ideas": ["فكرة 1", "فكرة 2"],
+  "draft_post": "مسودة منشور للنقاش أو null",
+  "image_concept": "وصف فكرة تصميم للنقاش أو null",
+  "suggested_action": "none" | "generate_post" | "generate_image",
+  "execution_prompt": "برومبت جاهز للتنفيذ لاحقاً أو null",
+  "needs_more_info": true أو false,
+  "ready_to_execute": true أو false
+}
+
+معنى الحقول:
+- suggested_action = none أثناء النقاش فقط.
+- suggested_action = generate_post عندما تكون مسودة نص جاهزة ويعرض المدرس تنفيذ منشور نصي.
+- suggested_action = generate_image عندما تكون فكرة تصميم جاهزة للتنفيذ كصورة.
+- ready_to_execute = true فقط إذا كانت المسودة/الفكرة واضحة ويمكن تنفيذها الآن بعد موافقة المدرس.
+- execution_prompt يجب أن يكون وصفاً واضحاً وكاملاً لما سيُولَّد عند التنفيذ.
+- لا تجعل ready_to_execute=true من أول رسالة إلا إذا طلب المدرس صراحة محتوى جاهزاً فوراً وقدم تفاصيل كافية؛ الأفضل عادة النقاش أولاً.`;
+}
+
+export function buildTeacherCreativeChatUserPrompt(input: {
+  message: string;
+  platform?: string;
+  tone?: string;
+  preferredOutput?: string;
+  aspectRatio?: string;
+  languageMode?: string;
+  pendingSummary?: string;
+}): string {
+  const platform = normalizeTeacherCreativePlatform(input.platform);
+  const tone = normalizeTeacherCreativeTone(input.tone);
+  const preferred = String(input.preferredOutput || 'auto').trim().toLowerCase();
+  const aspectRatio = normalizeTeacherCreativeAspectRatio(input.aspectRatio);
+  const languageMode = normalizeTeacherCreativeLanguageMode(input.languageMode);
+
+  return `رسالة المدرس الحالية:
+${input.message.trim()}
+
+سياق الإعدادات:
+- المنصة المفضلة: ${platform} — ${PLATFORM_GUIDANCE[platform]}
+- النبرة: ${tone} — ${TONE_GUIDANCE[tone]}
+- نوع المخرج المفضل: ${preferred}
+- مقاس الصورة إن لزم: ${aspectRatio}
+- لغة نصوص التصميم إن لزم: ${languageMode}
+
+ملخص المسودة الحالية في الجلسة (إن وجدت):
+${input.pendingSummary?.trim() || 'لا توجد مسودة بعد.'}
+
+ناقش واقترح فقط. لا تدّعِ التنفيذ.`;
+}
+
 export function buildTeacherPostSystemPrompt(): string {
   return `أنت مساعد تسويق عربي للمدرسين على منصة تعليمية.
 

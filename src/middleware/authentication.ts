@@ -11,6 +11,27 @@ type UserRow = User & {
   account_status?: 'active' | 'inactive' | 'suspended' | null;
 };
 
+/** استخراج التوكن من Authorization أو X-Access-Token بشكل متسامح */
+function extractAccessToken(req: Request): string | null {
+  const authHeader = req.headers.authorization || req.headers.Authorization;
+  if (typeof authHeader === 'string' && authHeader.trim()) {
+    const trimmed = authHeader.trim();
+    const bearerMatch = trimmed.match(/^Bearer\s+(.+)$/i);
+    if (bearerMatch?.[1]?.trim()) return bearerMatch[1].trim();
+    // بعض العملاء يرسلون التوكن خامًا بدون Bearer
+    if (!trimmed.includes(' ') && trimmed.length > 20) return trimmed;
+  }
+
+  const xAccess =
+    req.headers['x-access-token'] ||
+    req.headers['X-Access-Token'] ||
+    req.headers['x-accessToken'];
+  if (typeof xAccess === 'string' && xAccess.trim()) return xAccess.trim();
+  if (Array.isArray(xAccess) && xAccess[0]?.trim()) return xAccess[0].trim();
+
+  return null;
+}
+
 /**
  * مدرّس يملك كورسًا في المسار (/api/course/:id/...) وكل الطلاب المشتركين من نفس tenant الـ Host
  * (أو لا يوجد مشتركون بعد): يُسمح بالعمل حتى لو tid في التوكن أو users.tenant_id غير متزامنين.
@@ -99,15 +120,42 @@ async function assertRequestTenantMatchesUserAndToken(
   return true;
 }
 
+async function refreshSessionToken(
+  res: Response,
+  req: Request,
+  user: UserRow,
+): Promise<string> {
+  const newToken = await generateToken(user, pool, {
+    sessionTenantId: (req as Request & { tenant?: { id: number } }).tenant?.id,
+  });
+  res.setHeader('X-Access-Token', newToken);
+  // Allow browsers / axios to read refreshed token across origins when CORS exposes it.
+  const existing = res.getHeader('Access-Control-Expose-Headers');
+  const expose = typeof existing === 'string' ? existing : Array.isArray(existing) ? existing.join(',') : '';
+  if (!/x-access-token/i.test(expose)) {
+    res.setHeader(
+      'Access-Control-Expose-Headers',
+      expose ? `${expose}, X-Access-Token` : 'X-Access-Token',
+    );
+  }
+  return newToken;
+}
+
 export function authMiddleware(roles: Roles[] = []): RequestHandler {
   return async (req, res, next) => {
-    const token = req.headers.authorization?.split(' ')[1];
+    const token = extractAccessToken(req);
 
-    if (!token) return res.status(401).json({ message: 'Unauthorized' });
+    if (!token) {
+      return res.status(401).json({
+        message: 'Unauthorized',
+        code: 'MISSING_TOKEN',
+        hint: 'أضف Authorization: Bearer <token> أو أعد تسجيل الدخول',
+      });
+    }
 
     try {
       const decoded = jwt.verify(token, config.SECRET_KEY) as any;
-      const { id, jti } = decoded;
+      const { id } = decoded;
 
       // التحقق من أن id موجود وصحيح
       if (!id || isNaN(Number(id))) {
@@ -154,11 +202,11 @@ export function authMiddleware(roles: Roles[] = []): RequestHandler {
       req.user = user;
       next();
     } catch (error: any) {
-      // Auto-refresh for students if token is expired
+      // Auto-refresh for students/teachers if token is expired (keep session alive)
       if (error?.name === 'TokenExpiredError') {
         try {
           const decoded = jwt.verify(token, config.SECRET_KEY, { ignoreExpiration: true }) as any;
-          const { id, jti } = decoded || {};
+          const { id } = decoded || {};
 
           if (!id || isNaN(Number(id))) {
             return res.status(401).json({ message: 'Invalid token: invalid user id' });
@@ -181,20 +229,12 @@ export function authMiddleware(roles: Roles[] = []): RequestHandler {
 
           if (!(await assertRequestTenantMatchesUserAndToken(req, res, decoded, user))) return;
 
-          // Only students are auto-refreshed, and only if JTI matches current session
-          if (user.role === 'student') {
-            // لا نتحقق من JTI للطلاب (يسمح بتسجيل الدخول من أجهزة متعددة)
-
-            const newToken = await generateToken(user, pool, {
-              sessionTenantId: (req as Request & { tenant?: { id: number } }).tenant?.id,
-            });
-            res.setHeader('X-Access-Token', newToken);
-
+          if (user.role === 'student' || user.role === 'teacher') {
+            await refreshSessionToken(res, req, user);
             req.user = user;
             return next();
           }
 
-          // Non-students must reauthenticate when token expires
           return res.status(401).json({ message: 'Token expired' });
         } catch (innerErr) {
           console.error('JWT refresh error:', innerErr);
@@ -220,206 +260,15 @@ export function studentTeacherAuthMiddleware(): RequestHandler {
 
 // Middleware بدون قيود على الأدوار (للمصادقة فقط)
 export function authOnlyMiddleware(): RequestHandler {
-  return async (req, res, next) => {
-    const token = req.headers.authorization?.split(' ')[1];
-
-    if (!token) return res.status(401).json({ message: 'Unauthorized' });
-
-    try {
-      const decoded = jwt.verify(token, config.SECRET_KEY) as any;
-      const { id, jti } = decoded;
-
-      // التحقق من أن id موجود وصحيح
-      if (!id || isNaN(Number(id))) {
-        return res.status(401).json({
-          message: 'Invalid token: invalid user id',
-        });
-      }
-
-      // Fetch user from DB
-      const result = await pool.query<UserRow>('SELECT id, role, jti, tenant_id FROM users WHERE id = $1', [id]);
-
-      if (!result.rowCount) {
-        return res.status(401).json({ message: 'User not found' });
-      }
-
-      const user = result.rows[0];
-
-      if (!(await assertRequestTenantMatchesUserAndToken(req, res, decoded, user))) return;
-
-      // لا نتحقق من JTI للطلاب (يسمح بتسجيل الدخول من أجهزة متعددة)
-
-      req.user = user;
-      next();
-    } catch (error: any) {
-      // Auto-refresh for students if token is expired
-      if (error?.name === 'TokenExpiredError') {
-        try {
-          const decoded = jwt.verify(token, config.SECRET_KEY, { ignoreExpiration: true }) as any;
-          const { id, jti } = decoded || {};
-
-          if (!id || isNaN(Number(id))) {
-            return res.status(401).json({ message: 'Invalid token: invalid user id' });
-          }
-
-          const result = await pool.query<UserRow>('SELECT id, role, jti, tenant_id FROM users WHERE id = $1', [
-            id,
-          ]);
-          if (!result.rowCount) return res.status(401).json({ message: 'User not found' });
-
-          const user = result.rows[0];
-
-          if (!(await assertRequestTenantMatchesUserAndToken(req, res, decoded, user))) return;
-
-          // Only students are auto-refreshed, and only if JTI matches current session
-          if (user.role === 'student') {
-            // لا نتحقق من JTI للطلاب (يسمح بتسجيل الدخول من أجهزة متعددة)
-
-            const newToken = await generateToken(user, pool, {
-              sessionTenantId: (req as Request & { tenant?: { id: number } }).tenant?.id,
-            });
-            res.setHeader('X-Access-Token', newToken);
-
-            req.user = user;
-            return next();
-          }
-
-          // Non-students must reauthenticate when token expires
-          return res.status(401).json({ message: 'Token expired' });
-        } catch (innerErr) {
-          console.error('JWT refresh error:', innerErr);
-          return res.status(401).json({ message: 'Invalid token' });
-        }
-      }
-
-      console.error('JWT verification error:', error);
-      return res.status(401).json({ message: 'Invalid token' });
-    }
-  };
+  return authMiddleware([]);
 }
 
 // Middleware خاص للطلاب فقط
 export function studentOnlyMiddleware(): RequestHandler {
-  return async (req, res, next) => {
-    const token = req.headers.authorization?.split(' ')[1];
-
-    if (!token) return res.status(401).json({ message: 'Unauthorized' });
-
-    try {
-      const decoded = jwt.verify(token, config.SECRET_KEY) as any;
-      const { id, jti } = decoded;
-
-      // التحقق من أن id موجود وصحيح
-      if (!id || isNaN(Number(id))) {
-        return res.status(401).json({
-          message: 'Invalid token: invalid user id',
-        });
-      }
-
-      // Fetch user from DB
-      const result = await pool.query<UserRow>('SELECT id, role, jti, tenant_id FROM users WHERE id = $1', [id]);
-
-      if (!result.rowCount) {
-        return res.status(401).json({ message: 'User not found' });
-      }
-
-      const user = result.rows[0];
-
-      if (!(await assertRequestTenantMatchesUserAndToken(req, res, decoded, user))) return;
-
-      // التحقق من أن المستخدم طالب
-      if (user.role !== 'student') {
-        return res.status(403).json({
-          message: 'Forbidden: Student access required',
-          details: {
-            user_role: user.role,
-            required_role: 'student',
-            user_id: user.id,
-          },
-        });
-      }
-
-      // لا نتحقق من JTI للطلاب (يسمح بتسجيل الدخول من أجهزة متعددة)
-
-      req.user = user;
-      next();
-    } catch (error: any) {
-      // Auto-refresh for students if token is expired
-      if (error?.name === 'TokenExpiredError') {
-        try {
-          const decoded = jwt.verify(token, config.SECRET_KEY, { ignoreExpiration: true }) as any;
-          const { id, jti } = decoded || {};
-
-          if (!id || isNaN(Number(id))) {
-            return res.status(401).json({ message: 'Invalid token: invalid user id' });
-          }
-
-          const result = await pool.query<UserRow>('SELECT id, role, jti, tenant_id FROM users WHERE id = $1', [
-            id,
-          ]);
-          if (!result.rowCount) return res.status(401).json({ message: 'User not found' });
-
-          const user = result.rows[0];
-
-          if (!(await assertRequestTenantMatchesUserAndToken(req, res, decoded, user))) return;
-
-          // Only students are auto-refreshed (لا نتحقق من JTI)
-          if (user.role === 'student') {
-            const newToken = await generateToken(user, pool, {
-              sessionTenantId: (req as Request & { tenant?: { id: number } }).tenant?.id,
-            });
-            res.setHeader('X-Access-Token', newToken);
-
-            req.user = user;
-            return next();
-          }
-
-          // Non-students must reauthenticate when token expires
-          return res.status(401).json({ message: 'Token expired' });
-        } catch (innerErr) {
-          console.error('JWT refresh error:', innerErr);
-          return res.status(401).json({ message: 'Invalid token' });
-        }
-      }
-
-      console.error('JWT verification error:', error);
-      return res.status(401).json({ message: 'Invalid token' });
-    }
-  };
+  return authMiddleware(['student']);
 }
 
 // Middleware بدون قيود على الأدوار (للمصادقة فقط) - نسخة محسنة
 export function simpleAuthMiddleware(): RequestHandler {
-  return async (req, res, next) => {
-    const token = req.headers.authorization?.split(' ')[1];
-
-    if (!token) return res.status(401).json({ message: 'Unauthorized' });
-
-    try {
-      const decoded = jwt.verify(token, config.SECRET_KEY) as any;
-      const { id, jti } = decoded;
-
-      if (!id || isNaN(Number(id))) {
-        return res.status(401).json({ message: 'Invalid token: invalid user id' });
-      }
-
-      const result = await pool.query<UserRow>('SELECT id, role, jti, tenant_id FROM users WHERE id = $1', [id]);
-
-      if (!result.rowCount) {
-        return res.status(401).json({ message: 'User not found' });
-      }
-
-      const user = result.rows[0];
-
-      if (!(await assertRequestTenantMatchesUserAndToken(req, res, decoded, user))) return;
-
-      // لا نتحقق من JTI للطلاب (يسمح بتسجيل الدخول من أجهزة متعددة)
-
-      req.user = user;
-      next();
-    } catch (error: any) {
-      console.error('JWT verification error:', error);
-      return res.status(401).json({ message: 'Invalid token' });
-    }
-  };
+  return authMiddleware([]);
 }

@@ -62,10 +62,56 @@ arabic | english | mixed
 
 ```http
 GET  /options
+POST /chat
+POST /chat/execute
+POST /chat/new
+GET  /chat/messages?session_id=
 POST /posts
 POST /images
 GET  /history
 GET  /generations/:id
+```
+
+### Conversational mode (recommended)
+
+The chatbot now discusses marketing ideas and draft posts **before** generating.
+
+1. `POST /chat` — discuss, get ideas/drafts (`executed: false`)
+2. Confirm with `نفّذ` in chat, or call `POST /chat/execute`
+3. Only then a post/image generation is created
+
+Direct `POST /posts` and `POST /images` remain available for immediate generation.
+
+#### Chat request
+
+```http
+POST /chat
+Authorization: Bearer <TEACHER_TOKEN>
+Content-Type: multipart/form-data
+```
+
+Fields: `message`, optional `session_id`, `preferred_output` (`post|image|auto`), `platform`, `tone`, `aspect_ratio`, `language_mode`, `force_execute`, `references[]`
+
+#### Chat response (discussion)
+
+```json
+{
+  "message": "تم الرد بنجاح",
+  "reply": "ممكن نبدأ بثلاث أفكار...",
+  "session_id": 12,
+  "ideas": ["فكرة 1", "فكرة 2"],
+  "draft_post": "مسودة للمنشور...",
+  "image_concept": null,
+  "suggested_action": "generate_post",
+  "ready_to_execute": true,
+  "executed": false,
+  "generation": null,
+  "actions": {
+    "can_execute": true,
+    "can_generate_post": true,
+    "can_generate_image": false
+  }
+}
 ```
 
 ---
