@@ -463,7 +463,6 @@ npm run migrate up
 
 | المسار | الفرق |
 |--------|--------|
-| `POST /api/support/teacher/messages` | شات دعم المدرس (تقارير مبسطة + تسويق + تصعيد للإدارة) |
 | `GET /api/analytics/*` | APIs تحليلية خام (JSON structured) بدون شات |
 | `GET /api/course/.../students/.../report` | تقرير طالب REST مباشر بدون AI |
 

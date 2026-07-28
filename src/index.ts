@@ -6,8 +6,6 @@ import { config, logger } from './utils';
 import { getServerInfo, isCorsOriginAllowed } from './config/appUrls';
 import pool from './db/pool';
 import { ChatService } from './services/chat';
-import { SupportChatService } from './services/supportChat';
-import { SupportChatSocketService } from './services/supportChatSocket';
 import { GameService } from './services/GameService';
 import { ScientificChatbotService } from './services/scientificChatbot';
 import { router as packageSubjectLessonsRouter } from './controllers/packageSubjectLessons';
@@ -138,6 +136,9 @@ const startServer = async () => {
     const { startNotificationPushWorker } = await import('./workers/notificationPushWorker.js');
     startNotificationPushWorker();
 
+    const { startWhatsAppWorker } = await import('./modules/whatsapp/workers/whatsappWorker.js');
+    startWhatsAppWorker();
+
     io.use(async (socket, next) => {
       try {
         const token =
@@ -182,8 +183,6 @@ const startServer = async () => {
           [user.id],
         );
         for (const row of res.rows as any[]) socket.join(`group:${row.id}`);
-        // شات دعم فني المدرس
-        socket.join(`support:teacher:${user.id}`);
       }
 
       socket.on('chat:send', async (payload: { groupId: any; text?: string; message?: string; replyTo?: number | null }) => {
@@ -395,160 +394,6 @@ const startServer = async () => {
         },
       );
 
-
-      // الانضمام لشات
-      socket.on('support:join-chat', async (chatId: number) => {
-        try {
-          let isTeacherChat = false;
-          // التحقق من الصلاحيات
-          if (user.role === 'admin') {
-            const chatTypeRes = await pool.query(
-              `SELECT 'teacher' AS type FROM teacher_support_chats WHERE id = $1
-               UNION ALL
-               SELECT 'student' FROM support_chats WHERE id = $1`,
-              [chatId, chatId],
-            );
-            isTeacherChat = chatTypeRes.rows.some((r: any) => r.type === 'teacher');
-            const room = isTeacherChat ? `support:teacher-chat:${chatId}` : `support:chat:${chatId}`;
-            socket.join(room);
-            socket.emit('support:joined-chat', { chat_id: chatId, chat_type: isTeacherChat ? 'teacher' : 'student' });
-
-            if (!isTeacherChat) {
-              io.to(`support:chat:${chatId}`).emit('support:admin-viewing', {
-                chat_id: chatId,
-                admin_id: user.id,
-              });
-            } else {
-              io.to(`support:teacher-chat:${chatId}`).emit('support:admin-viewing', {
-                chat_id: chatId,
-                admin_id: user.id,
-              });
-            }
-          } else if (user.role === 'student') {
-            // للطالب: التحقق من أن الشات خاص به
-            const chat = await SupportChatService.getOrCreateStudentChat(user.id);
-            if (chat.id === chatId) {
-              socket.join(`support:chat:${chatId}`);
-              socket.emit('support:joined-chat', { chat_id: chatId });
-            }
-          } else if (user.role === 'teacher') {
-            const chat = await SupportChatService.getTeacherChatByTeacherId(user.id);
-            if (chat && chat.id === chatId) {
-              socket.join(`support:teacher-chat:${chatId}`);
-              socket.emit('support:joined-chat', { chat_id: chatId });
-            }
-          }
-
-          if (user.role === 'student' || (user.role === 'admin' && !isTeacherChat)) {
-            await pool.query(
-              `UPDATE support_messages 
-               SET delivered_at = COALESCE(delivered_at, NOW())
-               WHERE chat_id = $1 AND sender_id != $2 AND delivered_at IS NULL`,
-              [chatId, user.id],
-            );
-            await SupportChatService.markChatAsRead(chatId, user.id);
-          } else if (user.role === 'teacher' || (user.role === 'admin' && isTeacherChat)) {
-            const chat =
-              user.role === 'teacher'
-                ? await SupportChatService.getTeacherChatByTeacherId(user.id)
-                : { id: chatId };
-            if (chat && chat.id === chatId) {
-              await pool.query(
-                `UPDATE teacher_support_messages 
-                 SET delivered_at = COALESCE(delivered_at, NOW()), read_at = COALESCE(read_at, NOW())
-                 WHERE chat_id = $1 AND sender_id != $2`,
-                [chatId, user.id],
-              );
-            }
-          }
-
-          socket.emit('chat:ready', {
-            chat_id: chatId,
-            timestamp: Date.now(),
-          });
-        } catch (error) {
-          console.error('Error in support:join-chat:', error);
-        }
-      });
-
-      // مغادرة الشات
-      socket.on('support:leave-chat', (chatId: number) => {
-        socket.leave(`support:chat:${chatId}`);
-      });
-
-      // Typing indicator
-      socket.on('support:typing', (payload: { chat_id: number; is_typing: boolean }) => {
-        const { chat_id, is_typing } = payload;
-        const userResult = pool
-          .query('SELECT name FROM users WHERE id = $1', [user.id])
-          .then((r) => r.rows[0]);
-        userResult.then((userData) => {
-          socket.to(`support:chat:${chat_id}`).emit('support:user-typing', {
-            chat_id,
-            user_id: user.id,
-            user_role: user.role,
-            user_name: userData?.name || 'مستخدم',
-            is_typing,
-          });
-        });
-      });
-
-      // تحديد رسالة كمستلمة
-      socket.on('support:mark-delivered', async (messageId: number) => {
-        try {
-          await SupportChatService.updateMessageStatus(messageId, 'delivered');
-          const result = await pool.query(
-            'SELECT delivered_at FROM support_messages WHERE id = $1',
-            [messageId],
-          );
-          if (result.rowCount) {
-            SupportChatSocketService.emitMessageStatusUpdate(
-              io,
-              messageId,
-              'delivered',
-              result.rows[0].delivered_at,
-            );
-          }
-        } catch (error) {
-          console.error('Error marking message as delivered:', error);
-        }
-      });
-
-      // تحديد رسالة كمقروءة
-      socket.on('support:mark-read', async (messageId: number) => {
-        try {
-          await SupportChatService.updateMessageStatus(messageId, 'read');
-          const result = await pool.query('SELECT read_at FROM support_messages WHERE id = $1', [
-            messageId,
-          ]);
-          if (result.rowCount) {
-            SupportChatSocketService.emitMessageStatusUpdate(
-              io,
-              messageId,
-              'read',
-              result.rows[0].read_at,
-            );
-          }
-        } catch (error) {
-          console.error('Error marking message as read:', error);
-        }
-      });
-
-      // تحديد جميع رسائل الشات كمقروءة
-      socket.on('support:mark-chat-read', async (chatId: number) => {
-        try {
-          await SupportChatService.markChatAsRead(chatId, user.id);
-          SupportChatSocketService.emitChatRead(io, chatId, user.id);
-        } catch (error) {
-          console.error('Error marking chat as read:', error);
-        }
-      });
-
-      // Event جديد: message:send (للتوافق مع المطلوب)
-      socket.on('message:send', async (payload: { chat_id?: number; text: string }) => {
-        // نفس منطق support:send-message
-        socket.emit('support:send-message', payload);
-      });
 
     });
 
@@ -783,40 +628,6 @@ const startServer = async () => {
         console.error('Error cleaning up expired invitations:', error);
       }
     }, 60 * 1000); // Every minute
-
-    // يومياً 7 مساءً: إرسال التقرير اليومي تلقائياً (محاضرات وامتحانات متراكمة) في شات الدعم الفني لكل طالب
-    setInterval(async () => {
-      try {
-          // eslint-disable-next-line @typescript-eslint/ban-ts-comment
-          const { runSupportDailyReportJob, isDailyReportTime } = await import(
-          // eslint-disable-next-line @typescript-eslint/ban-ts-comment
-          // @ts-expect-error
-          './services/supportDailyReportJob'
-        );
-        if (isDailyReportTime()) {
-          await runSupportDailyReportJob(globalIO);
-        }
-      } catch (err) {
-        logger.error('Support daily report job error:', err);
-      }
-    }, 60 * 1000);
-
-    // يومياً 8 صباحاً: إرسال التحية اليومية للمدرسين في شات الدعم الفني
-    setInterval(async () => {
-      try {
-        const {
-          runTeacherDailyGreetingJob,
-          isTeacherDailyGreetingTime,
-            // eslint-disable-next-line @typescript-eslint/ban-ts-comment
-  // @ts-expect-error
-        } = await import('./services/supportDailyReportJob');
-        if (isTeacherDailyGreetingTime()) {
-          await runTeacherDailyGreetingJob(globalIO);
-        }
-      } catch (err) {
-        logger.error('Teacher daily greeting job error:', err);
-      }
-    }, 60 * 1000);
 
     // يومياً 8 صباحاً: تذكير المدرسين باستخدام مساعد توليد المنشورات والتصميمات
     setInterval(async () => {

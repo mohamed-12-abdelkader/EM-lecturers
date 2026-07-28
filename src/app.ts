@@ -7,6 +7,9 @@ import cors from 'cors';
 import { getCorsOriginDelegate, getServerInfo } from './config/appUrls';
 import { router } from './routes';
 import { tenantContextMiddleware } from './middleware/tenantContext';
+import { whatsappWebhookRouter } from './modules/whatsapp/controllers/whatsappWebhook.controller';
+// Register WhatsApp chatbot handlers (side-effect)
+import './modules/whatsapp/automations/technicalSupport';
 
 export const app = express();
 export const server = createServer(app);
@@ -17,7 +20,17 @@ server.requestTimeout = 0;
 server.headersTimeout = 0;
 
 // Parse JSON bodies; include text/plain because some clients (e.g. Postman "raw" default) send JSON with Content-Type: text/plain
-app.use(express.json({ type: ['application/json', 'text/plain'] }));
+// Capture rawBody for WhatsApp webhook HMAC verification
+// Limit raised for wwebjs inbound media (base64 images up to ~5MB)
+app.use(
+  express.json({
+    limit: '8mb',
+    type: ['application/json', 'text/plain'],
+    verify: (req, _res, buf) => {
+      (req as express.Request & { rawBody?: Buffer }).rawBody = buf;
+    },
+  }),
+);
 app.use(express.urlencoded({ extended: true }));
 app.use(cors(getCorsOriginDelegate()));
 // Expose refreshed token header to the browser
@@ -40,6 +53,9 @@ app.use(absoluteUrlResponseMiddleware);
 app.get('/api/server-info', (_req, res) => {
   res.json(getServerInfo());
 });
+
+// WhatsApp webhook — no tenant Host header; mount before tenant middleware
+app.use('/api/webhooks/whatsapp', whatsappWebhookRouter);
 
 // Routes
 app.use('/api', tenantContextMiddleware);

@@ -48,7 +48,6 @@ import { router as booksAdminRouter } from './controllers/booksAdmin';
 import { router as lessonsAdminRouter } from './controllers/lessonsAdmin';
 import { router as lectureCommentsRouter } from './controllers/lectureComments';
 import { router as chatRouter } from './controllers/chat';
-import { router as supportChatRouter } from './controllers/supportChat';
 import { router as socialRouter } from './controllers/social';
 import { router as teacherPermissionsAdminRouter } from './controllers/teacherPermissionsAdmin';
 import { router as leaguesRouter } from './controllers/leagues';
@@ -81,6 +80,7 @@ import { router as examBuilderChatbotRouter } from './controllers/examBuilderCha
 import { router as teacherStudentsRouter } from './controllers/teacherStudents';
 import { teacherFilesRouter, teacherFileCategoriesRouter } from './modules/myFiles/controllers/teacherMyFiles.controller';
 import { centerRouter } from './modules/centerMgmt';
+import { whatsappAdminRouter } from './modules/whatsapp/controllers/whatsappAdmin.controller';
 
 export const router = Router();
 
@@ -95,12 +95,12 @@ router.use('/student', studentRouter);
 router.use('/utils', utilsRouter);
 router.use('/course', coursesRouter);
 router.use('/chat', chatRouter);
-router.use('/support', supportChatRouter);
 router.use('/social', socialRouter);
 // دعم المسار /api/v1/social المستخدم من التطبيق (نفس راوتر السوشيال)
 router.use('/v1/social', socialRouter);
 router.use('/admin/teachers', adminTeachersRouter);
 router.use('/admin/tenants', adminTenantsRouter);
+router.use('/whatsapp', whatsappAdminRouter);
 router.use('/analytics', analyticsRouter);
 router.use('/analytics/tracking', analyticsTrackingRouter);
 router.use('/notifications', notificationsRouter);
