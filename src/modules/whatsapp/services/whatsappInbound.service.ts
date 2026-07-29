@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import pool from '../../../db/pool';
 import {
   normalizePhone,
@@ -85,7 +86,7 @@ export class WhatsAppInboundService {
     const sessionSlug = String(payload.session_id || '').trim();
     const fromRaw = String(payload.from || '').trim();
     const body = String(payload.body || '');
-    const waMessageId = String(payload.wa_message_id || '').trim();
+    let waMessageId = String(payload.wa_message_id || '').trim();
     const eventType = String(payload.type || 'message.inbound');
     const baseMetadata =
       payload.metadata && typeof payload.metadata === 'object' ? payload.metadata : {};
@@ -99,12 +100,25 @@ export class WhatsAppInboundService {
       ...mediaSummary(media, mediaError),
     };
 
-    if (!sessionSlug || !fromRaw || !waMessageId) {
+    if (!sessionSlug || !fromRaw) {
       logger.warn({ payload: { sessionSlug, fromRaw, waMessageId } }, 'WhatsApp webhook missing required fields');
       return { ok: false };
     }
 
     const fromPhone = normalizePhone(fromRaw);
+
+    // Some WhatsApp Web messages arrive without _serialized id — synthesize one for idempotency.
+    if (!waMessageId) {
+      const stamp = payload.received_at || new Date().toISOString();
+      const digest = crypto
+        .createHash('sha1')
+        .update(`${sessionSlug}|${fromPhone}|${body}|${stamp}|${media?.mimetype || ''}`)
+        .digest('hex')
+        .slice(0, 20);
+      waMessageId = `fallback:${sessionSlug}:${fromPhone}:${digest}`;
+      metadata.wa_message_id_fallback = true;
+      logger.warn({ sessionSlug, fromPhone, waMessageId }, 'WhatsApp webhook missing wa_message_id; using fallback');
+    }
 
     // Idempotent insert
     const insert = await pool.query<{ id: number }>(
