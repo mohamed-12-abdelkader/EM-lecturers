@@ -22,6 +22,16 @@ async function onInbound(ctx: InboundContext): Promise<HandlerResult> {
     return { handled: true };
   }
 
+  // Chat-open / protocol noise often arrives as empty bodies with distinct wa_message_ids.
+  // Replying to each produces 3–4 greetings when a user first starts chatting.
+  if (!ctx.body?.trim() && !ctx.media) {
+    logger.info(
+      { waMessageId: ctx.waMessageId, fromPhone: ctx.fromPhone },
+      'support bot skipped (empty non-media inbound)',
+    );
+    return { handled: true };
+  }
+
   try {
     const result = await runTechnicalSupportAgent(ctx);
     return {

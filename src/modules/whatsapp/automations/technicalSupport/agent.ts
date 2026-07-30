@@ -164,7 +164,8 @@ export async function runTechnicalSupportAgent(ctx: InboundContext): Promise<Age
   if (ctx.body?.trim()) currentParts.push(ctx.body.trim());
   if (imageDescription) currentParts.push(`[وصف الصورة المرفقة الآن]\n${imageDescription}`);
   if (!currentParts.length) {
-    currentParts.push(ctx.media ? '[أرسل الطالب صورة بدون نص]' : '[رسالة فارغة]');
+    // Empty non-media turns are skipped in the handler; only image-without-caption remains.
+    currentParts.push('[أرسل الطالب صورة بدون نص]');
   }
   const currentUserText = currentParts.join('\n\n');
 
