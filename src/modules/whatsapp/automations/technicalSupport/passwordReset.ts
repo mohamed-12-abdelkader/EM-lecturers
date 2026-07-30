@@ -1,41 +1,62 @@
-import crypto from 'node:crypto';
 import bcrypt from 'bcrypt';
 import pool from '../../../../db/pool';
 import { phonesMatch } from './phoneMatch';
 import { logger } from '../../../../utils';
 
 const MAX_RESETS_PER_PHONE_24H = 3;
-
-function generateTempPassword(): string {
-  // Readable alphanumeric, no ambiguous chars
-  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  const bytes = crypto.randomBytes(10);
-  let out = '';
-  for (let i = 0; i < 10; i++) {
-    out += alphabet[bytes[i]! % alphabet.length];
-  }
-  return out;
-}
+const MIN_PASSWORD_LEN = 6;
+const MAX_PASSWORD_LEN = 72;
 
 export type PasswordResetResult =
   | {
       ok: true;
-      temporary_password: string;
+      password_set: true;
       student_user_id: number;
       student_code: string | null;
       student_name: string;
       tenant_id: number | null;
-      must_change_password: true;
+      must_change_password: false;
     }
   | { ok: false; error: string; code: string };
+
+function validateNewPassword(raw: unknown): { ok: true; password: string } | { ok: false; error: string; code: string } {
+  if (typeof raw !== 'string') {
+    return { ok: false, code: 'invalid_password', error: 'الباسورد الجديدة مطلوبة.' };
+  }
+  const password = raw.trim();
+  if (!password) {
+    return { ok: false, code: 'invalid_password', error: 'الباسورد ماينفعش تكون فاضية.' };
+  }
+  if (password.length < MIN_PASSWORD_LEN) {
+    return {
+      ok: false,
+      code: 'invalid_password',
+      error: `الباسورد لازم تكون ${MIN_PASSWORD_LEN} حروف على الأقل.`,
+    };
+  }
+  if (password.length > MAX_PASSWORD_LEN) {
+    return {
+      ok: false,
+      code: 'invalid_password',
+      error: `الباسورد طويلة أوي (حد أقصى ${MAX_PASSWORD_LEN}).`,
+    };
+  }
+  return { ok: true, password };
+}
 
 export async function resetStudentPasswordSecure(input: {
   fromPhone: string;
   studentUserId: number;
+  newPassword: string;
   tenantId?: number | null;
   conversationId?: number | null;
 }): Promise<PasswordResetResult> {
   const { fromPhone, studentUserId, tenantId, conversationId } = input;
+
+  const pwdCheck = validateNewPassword(input.newPassword);
+  if (!pwdCheck.ok) {
+    return { ok: false, code: pwdCheck.code, error: pwdCheck.error };
+  }
 
   // Rate limit by WhatsApp contact phone
   const rate = await pool.query<{ c: string }>(
@@ -93,11 +114,10 @@ export async function resetStudentPasswordSecure(input: {
     };
   }
 
-  const temporary = generateTempPassword();
-  const hashed = await bcrypt.hash(temporary, 10);
+  const hashed = await bcrypt.hash(pwdCheck.password, 10);
 
   await pool.query(
-    `UPDATE users SET password = $1, must_change_password = TRUE WHERE id = $2`,
+    `UPDATE users SET password = $1, must_change_password = FALSE WHERE id = $2`,
     [hashed, user.id],
   );
 
@@ -111,7 +131,7 @@ export async function resetStudentPasswordSecure(input: {
         user.id,
         user.tenant_id,
         conversationId ?? null,
-        JSON.stringify({ student_code: user.student_code }),
+        JSON.stringify({ student_code: user.student_code, password_chosen_by_student: true }),
       ],
     );
   } catch (err) {
@@ -141,11 +161,11 @@ export async function resetStudentPasswordSecure(input: {
 
   return {
     ok: true,
-    temporary_password: temporary,
+    password_set: true,
     student_user_id: user.id,
     student_code: user.student_code,
     student_name: user.name,
     tenant_id: user.tenant_id,
-    must_change_password: true,
+    must_change_password: false,
   };
 }
