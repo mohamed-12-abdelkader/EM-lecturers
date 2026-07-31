@@ -210,19 +210,11 @@ export async function runTechnicalSupportAgent(ctx: InboundContext): Promise<Age
             conversationId,
           });
 
-          // Never log plaintext passwords / credentials
-          const sensitiveTools = new Set([
-            'reset_student_password',
-            'create_student_account',
-          ]);
-          const safeForLog = sensitiveTools.has(call.function.name)
-            ? {
-                tool: call.function.name,
-                ok: (toolResult as { ok?: boolean })?.ok,
-                // redact args that may contain passwords
-                args_keys: Object.keys(args).filter((k) => !/password/i.test(k)),
-              }
-            : { tool: call.function.name };
+          // Never log temporary passwords
+          const safeForLog =
+            call.function.name === 'reset_student_password'
+              ? { tool: call.function.name, ok: (toolResult as { ok?: boolean })?.ok }
+              : { tool: call.function.name };
           logger.info(safeForLog, 'support bot tool executed');
 
           messages.push({
