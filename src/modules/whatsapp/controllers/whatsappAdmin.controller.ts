@@ -219,6 +219,46 @@ whatsappAdminRouter.get(
 );
 
 whatsappAdminRouter.get(
+  '/conversations/:id',
+  asyncWrapper(async (req, res) => {
+    const id = Number(req.params.id);
+    if (!id) throw new HttpError(400, 'معرف المحادثة غير صحيح');
+    const conversation = await WhatsAppServiceAdmin.getConversation(id);
+    res.json({ success: true, data: conversation });
+  }),
+);
+
+whatsappAdminRouter.get(
+  '/conversations/:id/messages',
+  asyncWrapper(async (req, res) => {
+    const id = Number(req.params.id);
+    if (!id) throw new HttpError(400, 'معرف المحادثة غير صحيح');
+    const data = await WhatsAppServiceAdmin.listMessages(id, {
+      limit: Number(req.query.limit) || 100,
+    });
+    res.json({ success: true, data });
+  }),
+);
+
+const PatchConversationBody = z.object({
+  status: z.enum(['bot', 'waiting_human', 'human', 'closed']),
+});
+
+whatsappAdminRouter.patch(
+  '/conversations/:id',
+  validate(PatchConversationBody),
+  asyncWrapper(async (req, res) => {
+    const id = Number(req.params.id);
+    if (!id) throw new HttpError(400, 'معرف المحادثة غير صحيح');
+    const conversation = await WhatsAppServiceAdmin.updateConversationStatus(
+      id,
+      req.body.status,
+    );
+    res.json({ success: true, data: conversation });
+  }),
+);
+
+whatsappAdminRouter.get(
   '/queue/stats',
   asyncWrapper(async (_req, res) => {
     const stats = await WhatsAppOutboundQueue.getStats();
@@ -226,11 +266,30 @@ whatsappAdminRouter.get(
   }),
 );
 
-const SendMessageBody = z.object({
-  service_key: z.string().min(1),
-  to: z.string().min(8),
-  body: z.string().min(1).max(4000),
-});
+const SendMessageBody = z
+  .object({
+    service_key: z.string().min(1).optional(),
+    to: z.string().min(8).optional(),
+    body: z.string().min(1).max(4000),
+    conversation_id: z.number().int().positive().optional(),
+  })
+  .superRefine((data, ctx) => {
+    if (data.conversation_id) return;
+    if (!data.service_key) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'service_key مطلوب بدون conversation_id',
+        path: ['service_key'],
+      });
+    }
+    if (!data.to) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'to مطلوب بدون conversation_id',
+        path: ['to'],
+      });
+    }
+  });
 
 whatsappAdminRouter.post(
   '/messages/send',
@@ -239,13 +298,54 @@ whatsappAdminRouter.post(
     if (!isWhatsAppConfigured()) {
       throw new HttpError(503, 'WhatsApp gateway is not configured.');
     }
+
+    const conversationId = req.body.conversation_id
+      ? Number(req.body.conversation_id)
+      : null;
+
+    if (conversationId) {
+      const conversation = await WhatsAppServiceAdmin.getConversation(conversationId);
+      const status = String(conversation.status || '');
+      if (!['bot', 'waiting_human', 'human'].includes(status)) {
+        throw new HttpError(400, 'لا يمكن الإرسال في محادثة مغلقة');
+      }
+      if (!conversation.session_slug || !conversation.contact_phone) {
+        throw new HttpError(400, 'بيانات المحادثة غير مكتملة');
+      }
+
+      const jobId = await WhatsAppOutboundQueue.enqueue({
+        sessionSlug: conversation.session_slug,
+        to: conversation.contact_phone,
+        body: req.body.body,
+        serviceId: conversation.service_id ?? null,
+        conversationId,
+        tenantId: conversation.tenant_id ?? null,
+        triggerType: 'admin_reply',
+        metadata: { source: 'admin_inbox' },
+      });
+
+      await WhatsAppServiceAdmin.markConversationHumanAndTouch(conversationId);
+
+      res.status(202).json({
+        success: true,
+        message: 'تم إدراج الرسالة في قائمة الإرسال',
+        data: {
+          job_id: jobId,
+          session_slug: conversation.session_slug,
+          service_id: conversation.service_id ?? null,
+          conversation_id: conversationId,
+        },
+      });
+      return;
+    }
+
     const { sessionSlug, serviceId } = await SessionPoolService.pickSession(
-      req.body.service_key,
-      req.body.to,
+      req.body.service_key!,
+      req.body.to!,
     );
     const jobId = await WhatsAppOutboundQueue.enqueue({
       sessionSlug,
-      to: req.body.to,
+      to: req.body.to!,
       body: req.body.body,
       serviceId,
       triggerType: 'admin_test',

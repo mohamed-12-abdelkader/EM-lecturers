@@ -1,5 +1,5 @@
 import pool from '../../../db/pool';
-import type { WaServiceRow } from '../automations/types';
+import type { WaConversationStatus, WaServiceRow } from '../automations/types';
 import { HttpError } from '../../../utils';
 
 function parseJson(raw: unknown): Record<string, unknown> {
@@ -12,6 +12,47 @@ function parseJson(raw: unknown): Record<string, unknown> {
     }
   }
   return raw as Record<string, unknown>;
+}
+
+const CONVERSATION_STATUSES: WaConversationStatus[] = [
+  'bot',
+  'waiting_human',
+  'human',
+  'closed',
+];
+
+export type AdminInboxMessage = {
+  id: string;
+  direction: 'inbound' | 'outbound';
+  body: string;
+  at: Date;
+  status: string;
+  trigger_type?: string | null;
+  has_media?: boolean;
+  media_note?: string | null;
+};
+
+function inboundDisplay(body: string | null, metadata: Record<string, unknown>) {
+  let text = (body || '').trim();
+  let hasMedia = false;
+  let mediaNote: string | null = null;
+
+  if (metadata.image_description && typeof metadata.image_description === 'string') {
+    hasMedia = true;
+    mediaNote = `وصف صورة: ${metadata.image_description}`;
+    text = text ? `${text}\n[${mediaNote}]` : `[${mediaNote}]`;
+  } else if (metadata.has_media) {
+    hasMedia = true;
+    mediaNote = 'أرسل الطالب صورة/مرفقاً';
+    text = text || `[${mediaNote}]`;
+  }
+  if (metadata.media_error) {
+    const errNote = `تعذر قراءة المرفق: ${metadata.media_error}`;
+    mediaNote = mediaNote ? `${mediaNote} — ${errNote}` : errNote;
+    text = `${text}\n[${errNote}]`.trim();
+  }
+
+  return { text, hasMedia, mediaNote };
 }
 
 export interface ServiceListItem extends WaServiceRow {
@@ -222,5 +263,131 @@ export class WhatsAppServiceAdmin {
       })),
       total: Number(countRes.rows[0]?.total || 0),
     };
+  }
+
+  static async getConversation(id: number) {
+    const result = await pool.query(
+      `SELECT c.*, sv.key AS service_key, sv.name AS service_name
+       FROM wa_conversations c
+       LEFT JOIN wa_services sv ON sv.id = c.service_id
+       WHERE c.id = $1`,
+      [id],
+    );
+    if (!result.rowCount) throw new HttpError(404, 'المحادثة غير موجودة');
+    const row = result.rows[0];
+    return { ...row, metadata: parseJson(row.metadata) };
+  }
+
+  static async listMessages(
+    conversationId: number,
+    params?: { limit?: number },
+  ): Promise<{ messages: AdminInboxMessage[]; conversation_id: number }> {
+    const exists = await pool.query(`SELECT id FROM wa_conversations WHERE id = $1`, [
+      conversationId,
+    ]);
+    if (!exists.rowCount) throw new HttpError(404, 'المحادثة غير موجودة');
+
+    const limit = Math.min(200, Math.max(1, Number(params?.limit) || 100));
+
+    const inbound = await pool.query<{
+      id: number;
+      body: string | null;
+      processed_at: Date;
+      metadata: unknown;
+    }>(
+      `SELECT id, body, processed_at, metadata
+       FROM wa_inbound_events
+       WHERE conversation_id = $1
+       ORDER BY processed_at ASC`,
+      [conversationId],
+    );
+
+    const outbound = await pool.query<{
+      id: number;
+      body: string;
+      created_at: Date;
+      status: string;
+      trigger_type: string | null;
+    }>(
+      `SELECT id, body, created_at, status, trigger_type
+       FROM wa_outbound_jobs
+       WHERE conversation_id = $1
+         AND status IN ('pending', 'processing', 'sent', 'failed', 'dead')
+       ORDER BY created_at ASC`,
+      [conversationId],
+    );
+
+    const merged: AdminInboxMessage[] = [];
+
+    for (const row of inbound.rows) {
+      const meta = parseJson(row.metadata);
+      const { text, hasMedia, mediaNote } = inboundDisplay(row.body, meta);
+      if (!text) continue;
+      merged.push({
+        id: `in-${row.id}`,
+        direction: 'inbound',
+        body: text,
+        at: row.processed_at,
+        status: 'received',
+        has_media: hasMedia,
+        media_note: mediaNote,
+      });
+    }
+
+    for (const row of outbound.rows) {
+      const text = (row.body || '').trim();
+      if (!text) continue;
+      merged.push({
+        id: `out-${row.id}`,
+        direction: 'outbound',
+        body: text,
+        at: row.created_at,
+        status: row.status,
+        trigger_type: row.trigger_type,
+      });
+    }
+
+    merged.sort((a, b) => new Date(a.at).getTime() - new Date(b.at).getTime());
+    const messages = merged.length > limit ? merged.slice(merged.length - limit) : merged;
+
+    return { conversation_id: conversationId, messages };
+  }
+
+  static async updateConversationStatus(id: number, status: WaConversationStatus) {
+    if (!CONVERSATION_STATUSES.includes(status)) {
+      throw new HttpError(400, 'حالة المحادثة غير صحيحة');
+    }
+
+    const result = await pool.query(
+      `UPDATE wa_conversations SET
+         status = $2,
+         assigned_at = CASE WHEN $2 = 'human' THEN NOW() ELSE assigned_at END,
+         updated_at = NOW()
+       WHERE id = $1
+       RETURNING *`,
+      [id, status],
+    );
+    if (!result.rowCount) throw new HttpError(404, 'المحادثة غير موجودة');
+
+    const detail = await this.getConversation(id);
+    return detail;
+  }
+
+  static async markConversationHumanAndTouch(id: number): Promise<void> {
+    await pool.query(
+      `UPDATE wa_conversations SET
+         status = CASE
+           WHEN status IN ('bot', 'waiting_human') THEN 'human'
+           ELSE status
+         END,
+         assigned_at = CASE
+           WHEN status IN ('bot', 'waiting_human') THEN NOW()
+           ELSE assigned_at
+         END,
+         last_message_at = NOW(),
+         updated_at = NOW()
+       WHERE id = $1`,
+      [id],
+    );
   }
 }
