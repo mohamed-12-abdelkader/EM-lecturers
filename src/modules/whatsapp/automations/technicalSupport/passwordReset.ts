@@ -17,15 +17,37 @@ function generateTempPassword(): string {
   return out;
 }
 
+const MIN_PASSWORD_LEN = 6;
+const MAX_PASSWORD_LEN = 64;
+
+/** Validate a student-chosen password. Returns error message or null if ok. */
+export function validateChosenPassword(raw: string | null | undefined): string | null {
+  if (raw == null) return null;
+  const password = String(raw).trim();
+  if (!password) return 'الباسورد فاضي. ابعت باسورد صالح أو سيبني أولّد واحد.';
+  if (password.length < MIN_PASSWORD_LEN) {
+    return `الباسورد قصير أوي. لازم على الأقل ${MIN_PASSWORD_LEN} حروف/أرقام.`;
+  }
+  if (password.length > MAX_PASSWORD_LEN) {
+    return `الباسورد طويل أوي. خلّيه أقل من ${MAX_PASSWORD_LEN} حرف.`;
+  }
+  if (/\s/.test(password)) {
+    return 'متحطش مسافات في الباسورد.';
+  }
+  return null;
+}
+
 export type PasswordResetResult =
   | {
       ok: true;
+      password: string;
       temporary_password: string;
+      password_source: 'student' | 'generated';
       student_user_id: number;
       student_code: string | null;
       student_name: string;
       tenant_id: number | null;
-      must_change_password: true;
+      must_change_password: boolean;
     }
   | { ok: false; error: string; code: string };
 
@@ -34,8 +56,10 @@ export async function resetStudentPasswordSecure(input: {
   studentUserId: number;
   tenantId?: number | null;
   conversationId?: number | null;
+  /** If set (and valid), use this password; otherwise generate one. */
+  newPassword?: string | null;
 }): Promise<PasswordResetResult> {
-  const { fromPhone, studentUserId, tenantId, conversationId } = input;
+  const { fromPhone, studentUserId, tenantId, conversationId, newPassword } = input;
 
   // Rate limit by WhatsApp contact phone
   const rate = await pool.query<{ c: string }>(
@@ -93,12 +117,28 @@ export async function resetStudentPasswordSecure(input: {
     };
   }
 
-  const temporary = generateTempPassword();
-  const hashed = await bcrypt.hash(temporary, 10);
+  const chosen = newPassword != null ? String(newPassword).trim() : '';
+  let passwordSource: 'student' | 'generated' = 'generated';
+  let plainPassword: string;
+
+  if (chosen) {
+    const validationError = validateChosenPassword(chosen);
+    if (validationError) {
+      return { ok: false, code: 'invalid_password', error: validationError };
+    }
+    plainPassword = chosen;
+    passwordSource = 'student';
+  } else {
+    plainPassword = generateTempPassword();
+  }
+
+  // Student-chosen passwords can be used immediately; generated ones must be changed on first login.
+  const mustChangePassword = passwordSource === 'generated';
+  const hashed = await bcrypt.hash(plainPassword, 10);
 
   await pool.query(
-    `UPDATE users SET password = $1, must_change_password = TRUE WHERE id = $2`,
-    [hashed, user.id],
+    `UPDATE users SET password = $1, must_change_password = $2 WHERE id = $3`,
+    [hashed, mustChangePassword, user.id],
   );
 
   try {
@@ -111,7 +151,10 @@ export async function resetStudentPasswordSecure(input: {
         user.id,
         user.tenant_id,
         conversationId ?? null,
-        JSON.stringify({ student_code: user.student_code }),
+        JSON.stringify({
+          student_code: user.student_code,
+          password_source: passwordSource,
+        }),
       ],
     );
   } catch (err) {
@@ -141,11 +184,14 @@ export async function resetStudentPasswordSecure(input: {
 
   return {
     ok: true,
-    temporary_password: temporary,
+    password: plainPassword,
+    // Keep alias for older prompt/tool consumers
+    temporary_password: plainPassword,
+    password_source: passwordSource,
     student_user_id: user.id,
     student_code: user.student_code,
     student_name: user.name,
     tenant_id: user.tenant_id,
-    must_change_password: true,
+    must_change_password: mustChangePassword,
   };
 }

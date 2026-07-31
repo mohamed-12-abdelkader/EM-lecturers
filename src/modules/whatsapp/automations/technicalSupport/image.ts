@@ -19,7 +19,7 @@ export async function describeInboundImage(
   }
 
   const dataUrl = `data:${media.mimetype};base64,${media.data}`;
-  const prompt = `أنت مساعد دعم فني لمنصة تعليمية مصرية.
+  const prompt = `أنت أحمد، مساعد الدعم الفني لمنصة تعليمية مصرية.
 وصف السكرين/الصورة دي باختصار بالعامية المصرية (مش فصحى):
 - أنهي صفحة ظاهرة (دخول، تسجيل، خطأ، حاجة تانية)
 - نص رسالة الخطأ لو موجودة

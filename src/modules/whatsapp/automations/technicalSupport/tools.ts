@@ -78,12 +78,17 @@ export const SUPPORT_TOOL_DEFINITIONS = [
     function: {
       name: 'reset_student_password',
       description:
-        'Reset password ONLY when WhatsApp number matches the student account phone. Requires student_user_id from lookup. Returns temporary password to send to the student.',
+        'Reset password ONLY when WhatsApp number matches the student account phone. Requires student_user_id from lookup. Pass new_password if the student chose one; omit it to auto-generate. Returns the password to send to the student.',
       parameters: {
         type: 'object',
         properties: {
           student_user_id: { type: 'integer' },
           tenant_id: { type: 'integer', description: 'Optional tenant filter' },
+          new_password: {
+            type: 'string',
+            description:
+              'Optional password chosen by the student (min 6 chars, no spaces). Omit to generate a temporary password.',
+          },
         },
         required: ['student_user_id'],
       },
@@ -256,11 +261,16 @@ export async function executeSupportTool(
         args.tenant_id != null && Number.isFinite(Number(args.tenant_id))
           ? Number(args.tenant_id)
           : null;
+      const newPassword =
+        args.new_password != null && String(args.new_password).trim()
+          ? String(args.new_password).trim()
+          : null;
       return resetStudentPasswordSecure({
         fromPhone: ctx.fromPhone,
         studentUserId,
         tenantId,
         conversationId: ctx.conversationId,
+        newPassword,
       });
     }
     default:
