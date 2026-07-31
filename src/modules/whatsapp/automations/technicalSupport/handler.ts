@@ -24,7 +24,8 @@ async function onInbound(ctx: InboundContext): Promise<HandlerResult> {
 
   // Chat-open / protocol noise often arrives as empty bodies with distinct wa_message_ids.
   // Replying to each produces 3–4 greetings when a user first starts chatting.
-  if (!ctx.body?.trim() && !ctx.media) {
+  // Keep media_error events — gateway failed to download the image; agent should ask to resend.
+  if (!ctx.body?.trim() && !ctx.media && !ctx.mediaError) {
     logger.info(
       { waMessageId: ctx.waMessageId, fromPhone: ctx.fromPhone },
       'support bot skipped (empty non-media inbound)',
