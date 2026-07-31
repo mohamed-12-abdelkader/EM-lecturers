@@ -34,7 +34,7 @@ export const SUPPORT_TOOL_DEFINITIONS = [
     function: {
       name: 'lookup_students_by_whatsapp',
       description:
-        'Find student accounts whose stored phone matches the current WhatsApp caller. Use for password reset and account info.',
+        'Find student accounts whose stored phone matches ONLY the current WhatsApp caller number from context. Never search a phone the student typed in the message. Required before password reset.',
       parameters: {
         type: 'object',
         properties: {},
@@ -47,7 +47,7 @@ export const SUPPORT_TOOL_DEFINITIONS = [
     function: {
       name: 'lookup_student_by_code',
       description:
-        'Look up a student by student_code. Returns tenant URL, masked phone, and whether WhatsApp matches.',
+        'Look up a student by student_code for non-password help (e.g. find tenant URL). Do NOT use for password reset or identity proof when WhatsApp number differs from account phone. Never search phone numbers from message text.',
       parameters: {
         type: 'object',
         properties: {
@@ -78,7 +78,7 @@ export const SUPPORT_TOOL_DEFINITIONS = [
     function: {
       name: 'reset_student_password',
       description:
-        'Reset password ONLY when WhatsApp number matches the student account phone. Requires student_user_id from lookup. Pass new_password if the student chose one; omit it to auto-generate. Returns the password to send to the student.',
+        'Reset password ONLY when current WhatsApp caller matches that student account phone (from lookup_students_by_whatsapp). Never use a different phone from the message. Requires student_user_id. Pass new_password if the student chose one; omit to auto-generate.',
       parameters: {
         type: 'object',
         properties: {

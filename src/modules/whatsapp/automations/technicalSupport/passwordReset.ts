@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import bcrypt from 'bcrypt';
 import pool from '../../../../db/pool';
 import { phonesMatch } from './phoneMatch';
+import { HUMAN_SUPPORT_WHATSAPP } from './prompts';
 import { logger } from '../../../../utils';
 
 const MAX_RESETS_PER_PHONE_24H = 3;
@@ -105,7 +106,7 @@ export async function resetStudentPasswordSecure(input: {
       ok: false,
       code: 'phone_mismatch',
       error:
-        'مش هقدر أعمل ريست للباسورد غير من رقم الواتساب المسجّل على الحساب. ابعتلنا من الرقم المسجّل أو كلّم المدرس.',
+        `مش هقدر أعمل ريست للباسورد غير من رقم الواتساب المسجّل على الحساب. متطلبش إيميل ولا كود — وجّه الطالب للدعم البشري على واتساب: ${HUMAN_SUPPORT_WHATSAPP} عشان يتأكدوا من هويته.`,
     };
   }
 
