@@ -15,7 +15,7 @@ export const SUPPORT_TOOL_DEFINITIONS = [
     function: {
       name: 'search_tenants',
       description:
-        'Search active teacher platforms/tenants by teacher name, display name, or subdomain. Returns public URLs.',
+        'Search active teacher platforms by teacher name/display name/subdomain. Also checks whether the CURRENT WhatsApp caller already has a student account on each matched tenant. Returns login_url, signup_url, and caller_has_account_on_this_tenant. Use this when the student asks for a teacher platform / wants to join or subscribe.',
       parameters: {
         type: 'object',
         properties: {
@@ -96,7 +96,7 @@ export const SUPPORT_TOOL_DEFINITIONS = [
   },
 ];
 
-async function searchTenants(query: string, limitRaw?: number) {
+async function searchTenants(query: string, fromPhone: string, limitRaw?: number) {
   const q = query.trim();
   if (!q || q.length < 2) {
     return { ok: false, error: 'query too short' };
@@ -128,17 +128,60 @@ async function searchTenants(query: string, limitRaw?: number) {
     [like, limit],
   );
 
+  const callerLookup = await lookupStudentsByWhatsapp(fromPhone);
+  const callerStudents = Array.isArray(
+    (callerLookup as { students?: unknown[] }).students,
+  )
+    ? (
+        callerLookup as {
+          students: Array<{
+            student_user_id: number;
+            name: string;
+            account_status: string;
+            tenant_id: number | null;
+          }>;
+        }
+      ).students
+    : [];
+
+  const byTenantId = new Map(
+    callerStudents
+      .filter((s) => s.tenant_id != null)
+      .map((s) => [s.tenant_id as number, s]),
+  );
+
   return {
     ok: true,
     count: result.rowCount,
-    tenants: result.rows.map((row) => ({
-      tenant_id: row.id,
-      display_name: row.display_name,
-      subdomain: row.subdomain,
-      specialty: row.specialty,
-      teacher_name: row.owner_name,
-      public_url: buildTenantPublicUrl(row.subdomain),
-    })),
+    checked_whatsapp_caller: true,
+    reply_hint: {
+      if_caller_has_account:
+        'Tell the student they already have an account on this teacher platform. Give login_url and public_url. Login with their WhatsApp/mobile number + password.',
+      if_caller_has_no_account:
+        'Tell the student they can create a new account. Give signup_url + public_url and simple Arabic steps (open signup link → enter name + same mobile as WhatsApp → set password → login).',
+    },
+    tenants: result.rows.map((row) => {
+      const publicUrl = buildTenantPublicUrl(row.subdomain);
+      const callerStudent = byTenantId.get(row.id) || null;
+      return {
+        tenant_id: row.id,
+        display_name: row.display_name,
+        subdomain: row.subdomain,
+        specialty: row.specialty,
+        teacher_name: row.owner_name,
+        public_url: publicUrl,
+        login_url: `${publicUrl}/login`,
+        signup_url: `${publicUrl}/signup`,
+        caller_has_account_on_this_tenant: Boolean(callerStudent),
+        caller_student: callerStudent
+          ? {
+              student_user_id: callerStudent.student_user_id,
+              name: callerStudent.name,
+              account_status: callerStudent.account_status,
+            }
+          : null,
+      };
+    }),
   };
 }
 
@@ -245,7 +288,7 @@ export async function executeSupportTool(
 ): Promise<unknown> {
   switch (name) {
     case 'search_tenants':
-      return searchTenants(String(args.query || ''), Number(args.limit));
+      return searchTenants(String(args.query || ''), ctx.fromPhone, Number(args.limit));
     case 'lookup_students_by_whatsapp':
       return lookupStudentsByWhatsapp(ctx.fromPhone);
     case 'lookup_student_by_code':
