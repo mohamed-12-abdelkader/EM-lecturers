@@ -15,7 +15,7 @@ export const SUPPORT_TOOL_DEFINITIONS = [
     function: {
       name: 'search_tenants',
       description:
-        'Search active teacher platforms by teacher name/display name/subdomain. Also checks whether the CURRENT WhatsApp caller already has a student account on each matched tenant. Returns login_url, signup_url, and caller_has_account_on_this_tenant. Use this when the student asks for a teacher platform / wants to join or subscribe.',
+        'Search active teacher platforms by teacher name/display name/subdomain. Also checks whether the CURRENT WhatsApp caller already has a student account on each matched tenant. Returns public_url and caller_has_account_on_this_tenant (no separate login/signup URLs). Use when the student asks for a teacher platform / wants to join or subscribe.',
       parameters: {
         type: 'object',
         properties: {
@@ -61,13 +61,22 @@ export const SUPPORT_TOOL_DEFINITIONS = [
     type: 'function' as const,
     function: {
       name: 'get_platform_help',
-      description: 'Get curated help text for login, signup, password, wrong URL, locked account.',
+      description:
+        'Get curated help text for login, signup, password, wrong URL, locked account, or course activation.',
       parameters: {
         type: 'object',
         properties: {
           topic: {
             type: 'string',
-            enum: ['login', 'signup', 'forgot_password', 'wrong_url', 'account_locked', 'general'],
+            enum: [
+              'login',
+              'signup',
+              'forgot_password',
+              'wrong_url',
+              'account_locked',
+              'activate_course',
+              'general',
+            ],
           },
         },
       },
@@ -154,12 +163,8 @@ async function searchTenants(query: string, fromPhone: string, limitRaw?: number
     ok: true,
     count: result.rowCount,
     checked_whatsapp_caller: true,
-    reply_hint: {
-      if_caller_has_account:
-        'Tell the student they already have an account on this teacher platform. Give login_url and public_url. Login with their WhatsApp/mobile number + password.',
-      if_caller_has_no_account:
-        'Tell the student they can create a new account. Give signup_url + public_url and simple Arabic steps (open signup link → enter name + same mobile as WhatsApp → set password → login).',
-    },
+    account_check_note:
+      'caller_has_account_on_this_tenant is based on the current WhatsApp caller phone vs student accounts on that tenant. Prefer public_url only (do not invent separate /login or /signup links).',
     tenants: result.rows.map((row) => {
       const publicUrl = buildTenantPublicUrl(row.subdomain);
       const callerStudent = byTenantId.get(row.id) || null;
@@ -170,8 +175,6 @@ async function searchTenants(query: string, fromPhone: string, limitRaw?: number
         specialty: row.specialty,
         teacher_name: row.owner_name,
         public_url: publicUrl,
-        login_url: `${publicUrl}/login`,
-        signup_url: `${publicUrl}/signup`,
         caller_has_account_on_this_tenant: Boolean(callerStudent),
         caller_student: callerStudent
           ? {
