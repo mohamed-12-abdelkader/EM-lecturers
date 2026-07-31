@@ -15,7 +15,7 @@ export const SUPPORT_TOOL_DEFINITIONS = [
     function: {
       name: 'search_tenants',
       description:
-        'Search teacher platforms and check if the CURRENT WhatsApp caller already has an account on each match. Each tenant includes recommended_reply_ar — you MUST base your WhatsApp reply on that text (keep signup/login steps and links). Use when the student asks for a teacher platform or wants to subscribe/join.',
+        'Search active teacher platforms by teacher name/display name/subdomain. Also checks whether the CURRENT WhatsApp caller already has a student account on each matched tenant. Returns login_url, signup_url, and caller_has_account_on_this_tenant. Use this when the student asks for a teacher platform / wants to join or subscribe.',
       parameters: {
         type: 'object',
         properties: {
@@ -154,43 +154,15 @@ async function searchTenants(query: string, fromPhone: string, limitRaw?: number
     ok: true,
     count: result.rowCount,
     checked_whatsapp_caller: true,
-    instruction:
-      'REQUIRED: For the chosen tenant, reply using recommended_reply_ar (you may lightly polish tone, but keep all links and numbered signup/login steps). Never reply with only the homepage link.',
+    reply_hint: {
+      if_caller_has_account:
+        'Tell the student they already have an account on this teacher platform. Give login_url and public_url. Login with their WhatsApp/mobile number + password.',
+      if_caller_has_no_account:
+        'Tell the student they can create a new account. Give signup_url + public_url and simple Arabic steps (open signup link → enter name + same mobile as WhatsApp → set password → login).',
+    },
     tenants: result.rows.map((row) => {
       const publicUrl = buildTenantPublicUrl(row.subdomain);
-      const loginUrl = `${publicUrl}/login`;
-      const signupUrl = `${publicUrl}/signup`;
       const callerStudent = byTenantId.get(row.id) || null;
-      const hasAccount = Boolean(callerStudent);
-      const teacherLabel = row.display_name || row.owner_name || 'المدرس';
-      const specialtyNote = row.specialty ? ` (${row.specialty})` : '';
-
-      const signupSteps = [
-        `افتح لينك التسجيل ده: ${signupUrl}`,
-        'اكتب اسمك ورقم موبايلك (يفضّل نفس رقم الواتساب اللي بتتكلم منه)',
-        'اختار باسورد وادوس تسجيل / إنشاء حساب',
-        `بعد التسجيل ادخل من لينك الدخول: ${loginUrl} بنفس رقم الموبايل والباسورد`,
-      ];
-
-      const recommended_reply_ar = hasAccount
-        ? [
-            `تمام، لقيت منصة ${teacherLabel}${specialtyNote}.`,
-            'وحضرتك عندك حساب بالفعل على المنصة دي ✅',
-            `لينك المنصة: ${publicUrl}`,
-            `لينك الدخول: ${loginUrl}`,
-            'دخل برقم الموبايل + الباسورد. لو نسيت الباسورد قولّي.',
-          ].join('\n')
-        : [
-            `تمام، لقيت منصة ${teacherLabel}${specialtyNote}.`,
-            'مفيش حساب مربوط برقم واتسابك على المنصة دي لسه، تقدر تعمل حساب جديد بسهولة:',
-            `1) ${signupSteps[0]}`,
-            `2) ${signupSteps[1]}`,
-            `3) ${signupSteps[2]}`,
-            `4) ${signupSteps[3]}`,
-            `لينك المنصة كمان: ${publicUrl}`,
-            'لو وقفت معاك خطوة، ابعتلي سكرين شوت.',
-          ].join('\n');
-
       return {
         tenant_id: row.id,
         display_name: row.display_name,
@@ -198,9 +170,9 @@ async function searchTenants(query: string, fromPhone: string, limitRaw?: number
         specialty: row.specialty,
         teacher_name: row.owner_name,
         public_url: publicUrl,
-        login_url: loginUrl,
-        signup_url: signupUrl,
-        caller_has_account_on_this_tenant: hasAccount,
+        login_url: `${publicUrl}/login`,
+        signup_url: `${publicUrl}/signup`,
+        caller_has_account_on_this_tenant: Boolean(callerStudent),
         caller_student: callerStudent
           ? {
               student_user_id: callerStudent.student_user_id,
@@ -208,8 +180,6 @@ async function searchTenants(query: string, fromPhone: string, limitRaw?: number
               account_status: callerStudent.account_status,
             }
           : null,
-        signup_steps_ar: hasAccount ? null : signupSteps,
-        recommended_reply_ar,
       };
     }),
   };
