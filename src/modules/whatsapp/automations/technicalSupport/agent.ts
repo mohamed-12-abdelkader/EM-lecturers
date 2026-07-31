@@ -52,6 +52,41 @@ function wantsEscalate(text: string): boolean {
   );
 }
 
+type TenantSearchHit = {
+  login_url?: string;
+  signup_url?: string;
+  caller_has_account_on_this_tenant?: boolean;
+  recommended_reply_ar?: string;
+};
+
+/** If the model soft-replies with only a homepage link, use the tool's ready Arabic reply. */
+function ensureTenantJoinReply(
+  reply: string,
+  tenants: TenantSearchHit[] | null | undefined,
+): string {
+  if (!tenants || tenants.length !== 1) return reply;
+  const t = tenants[0];
+  const recommended = t.recommended_reply_ar?.trim();
+  if (!recommended) return reply;
+
+  if (t.caller_has_account_on_this_tenant) {
+    const hasLogin =
+      (t.login_url && reply.includes(t.login_url)) || reply.includes('/login');
+    return hasLogin ? reply : recommended;
+  }
+
+  const hasSignup =
+    (t.signup_url && reply.includes(t.signup_url)) || reply.includes('/signup');
+  const hasNumberedSteps = /(?:^|\n)\s*[1١][)\].\-،]/.test(reply);
+  const mentionsSignupFlow =
+    reply.includes('تسجيل') ||
+    reply.includes('حساب جديد') ||
+    reply.includes('إنشاء حساب');
+
+  if (hasSignup && hasNumberedSteps && mentionsSignupFlow) return reply;
+  return recommended;
+}
+
 async function callDeepSeek(messages: ChatMessage[]): Promise<{
   content: string | null;
   tool_calls?: ToolCall[];
@@ -190,6 +225,7 @@ export async function runTechnicalSupportAgent(ctx: InboundContext): Promise<Age
   let escalate = false;
   let finalReply =
     'حصل خطأ مؤقت في الدعم الفني. جرّب تاني بعد شوية، أو كلّم المدرس.';
+  let lastSearchTenants: TenantSearchHit[] | null = null;
 
   try {
     for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
@@ -209,6 +245,11 @@ export async function runTechnicalSupportAgent(ctx: InboundContext): Promise<Age
             fromPhone: ctx.fromPhone,
             conversationId,
           });
+
+          if (call.function.name === 'search_tenants') {
+            const tenants = (toolResult as { tenants?: TenantSearchHit[] })?.tenants;
+            if (Array.isArray(tenants)) lastSearchTenants = tenants;
+          }
 
           // Never log temporary passwords
           const safeForLog =
@@ -235,6 +276,15 @@ export async function runTechnicalSupportAgent(ctx: InboundContext): Promise<Age
     logger.error({ err }, 'technical support agent failed');
     finalReply =
       'معلش، مقدرتش أرد على رسالتك دلوقتي. جرّب تاني بعد شوية، أو كلّم المدرس على طول.';
+  }
+
+  const beforeJoinGuard = finalReply;
+  finalReply = ensureTenantJoinReply(finalReply, lastSearchTenants);
+  if (finalReply !== beforeJoinGuard) {
+    logger.info(
+      { conversationId },
+      'support bot replaced soft tenant reply with recommended_reply_ar',
+    );
   }
 
   // WhatsApp-friendly length
