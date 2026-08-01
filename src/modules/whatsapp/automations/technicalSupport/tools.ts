@@ -1,5 +1,6 @@
 import pool from '../../../../db/pool';
 import { buildTenantPublicUrl } from '../../../../config/appUrls';
+import { getActivationCodeDetails } from '../../../../services/activationCodeLookup';
 import { getPlatformHelp } from './faq';
 import { maskPhone, phoneMatchVariants, phonesMatch } from './phoneMatch';
 import { resetStudentPasswordSecure } from './passwordReset';
@@ -85,6 +86,24 @@ export const SUPPORT_TOOL_DEFINITIONS = [
   {
     type: 'function' as const,
     function: {
+      name: 'lookup_activation_code',
+      description:
+        'Look up a teacher course activation code (usually 8 digits) to see if it exists, is expired, or already used, and whether the redeeming account phone matches the current WhatsApp caller. Use when the student has activation problems and sends/shares their code. Do NOT redeem/activate with this tool — lookup only.',
+      parameters: {
+        type: 'object',
+        properties: {
+          code: {
+            type: 'string',
+            description: 'Activation code from the student (8 digits typical)',
+          },
+        },
+        required: ['code'],
+      },
+    },
+  },
+  {
+    type: 'function' as const,
+    function: {
       name: 'reset_student_password',
       description:
         'Reset password ONLY when current WhatsApp caller matches that student account phone (from lookup_students_by_whatsapp). Never use a different phone from the message. Requires student_user_id. Pass new_password if the student chose one; omit to auto-generate.',
@@ -104,6 +123,61 @@ export const SUPPORT_TOOL_DEFINITIONS = [
     },
   },
 ];
+
+function normalizeActivationCodeInput(raw: string): string {
+  const trimmed = String(raw || '').trim();
+  if (!trimmed) return '';
+  // Prefer an 8-digit sequence if present in messy paste text
+  const eight = trimmed.match(/\b\d{8}\b/);
+  if (eight) return eight[0];
+  return trimmed.replace(/\s+/g, '');
+}
+
+async function lookupActivationCode(codeRaw: string, fromPhone: string) {
+  const code = normalizeActivationCodeInput(codeRaw);
+  if (!code || code.length < 4) {
+    return { ok: false, error: 'code_too_short' };
+  }
+
+  const details = await getActivationCodeDetails(code);
+  if (!details) {
+    return {
+      ok: false,
+      error: 'not_found',
+      code,
+      guidance:
+        'Code not found. Ask the student to double-check the digits. If still wrong, they should ask their teacher for a valid code.',
+    };
+  }
+
+  const matchesCaller = details.used_by.some((u) => phonesMatch(fromPhone, u.phone));
+
+  let status: 'available' | 'used' | 'expired' = 'available';
+  if (details.is_expired) status = 'expired';
+  else if (details.is_used) status = 'used';
+
+  return {
+    ok: true,
+    code: details.code,
+    status,
+    is_used: details.is_used,
+    is_expired: details.is_expired,
+    uses: details.uses,
+    max_uses: details.max_uses,
+    course_title: details.course.title,
+    teacher_name: details.teacher.name,
+    used_by_matches_whatsapp_caller: matchesCaller,
+    used_by_phone_masked: details.used_by.map((u) => maskPhone(u.phone)),
+    guidance:
+      status === 'available'
+        ? 'Code is still available. Tell the student they can activate from the platform with QR scan or by typing this code manually.'
+        : status === 'expired'
+          ? 'Code is expired. Student should ask their teacher for a new code.'
+          : matchesCaller
+            ? 'Code already used on an account matching this WhatsApp number. Tell them to log in with that same account (mobile + password). Offer password help if needed.'
+            : 'Code already used on another account. If this code is theirs, they must log in with the account it was activated on. If not theirs / they do not have that account, they should go back to the teacher and get a new personal code.',
+  };
+}
 
 async function searchTenants(query: string, fromPhone: string, limitRaw?: number) {
   const q = query.trim();
@@ -298,6 +372,8 @@ export async function executeSupportTool(
       return lookupStudentByCode(String(args.student_code || ''), ctx.fromPhone);
     case 'get_platform_help':
       return getPlatformHelp(args.topic != null ? String(args.topic) : null);
+    case 'lookup_activation_code':
+      return lookupActivationCode(String(args.code || ''), ctx.fromPhone);
     case 'reset_student_password': {
       const studentUserId = Number(args.student_user_id);
       if (!Number.isFinite(studentUserId) || studentUserId <= 0) {

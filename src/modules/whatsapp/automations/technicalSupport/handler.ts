@@ -5,6 +5,39 @@ import { runTechnicalSupportAgent } from './agent';
 
 export const TECHNICAL_SUPPORT_BOT_KEY = 'technical_support_bot';
 
+const VOICE_UNSUPPORTED_REPLY =
+  'معلش، الرسائل الصوتية مش مدعومة هنا 🙏 لو سمحت اكتب رسالتك نص عشان أقدر أساعدك.';
+
+function isVoiceOrAudioInbound(ctx: InboundContext): boolean {
+  const mimeCandidates = [
+    ctx.media?.mimetype,
+    typeof ctx.metadata?.media_mimetype === 'string'
+      ? ctx.metadata.media_mimetype
+      : null,
+  ];
+  for (const raw of mimeCandidates) {
+    if (!raw) continue;
+    const mime = raw.toLowerCase();
+    if (
+      mime.startsWith('audio/') ||
+      mime.includes('ogg') ||
+      mime.includes('opus')
+    ) {
+      return true;
+    }
+  }
+  // Gateway may mark voice notes as type ptt even when media download fails
+  const mediaType =
+    ctx.metadata?.wa_message_type ??
+    ctx.metadata?.media_type ??
+    ctx.metadata?.type;
+  if (typeof mediaType === 'string') {
+    const t = mediaType.toLowerCase();
+    if (t === 'ptt' || t === 'audio' || t === 'voice' || t === 'voip') return true;
+  }
+  return false;
+}
+
 async function onInbound(ctx: InboundContext): Promise<HandlerResult> {
   if (!ctx.service?.is_enabled) {
     return { handled: false };
@@ -31,6 +64,22 @@ async function onInbound(ctx: InboundContext): Promise<HandlerResult> {
       'support bot skipped (empty non-media inbound)',
     );
     return { handled: true };
+  }
+
+  if (isVoiceOrAudioInbound(ctx)) {
+    logger.info(
+      {
+        waMessageId: ctx.waMessageId,
+        fromPhone: ctx.fromPhone,
+        mime: ctx.media?.mimetype || ctx.metadata?.media_mimetype || null,
+      },
+      'support bot rejected voice/audio inbound',
+    );
+    return {
+      handled: true,
+      reply: VOICE_UNSUPPORTED_REPLY,
+      metadata: { voice_unsupported: true },
+    };
   }
 
   try {
