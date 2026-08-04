@@ -16,13 +16,14 @@ export const SUPPORT_TOOL_DEFINITIONS = [
     function: {
       name: 'search_tenants',
       description:
-        'Search active teacher platforms by teacher name/display name/subdomain. Also checks whether the CURRENT WhatsApp caller already has a student account on each matched tenant. Returns public_url and caller_has_account_on_this_tenant (no separate login/signup URLs). Use when the student asks for a teacher platform / wants to join or subscribe.',
+        'Search teacher platforms by the name the student typed (handles Arabic spelling variants like أحمد/احمد and يحيى/يحي). Pass the student wording as-is — do not “correct” Arabic spelling before calling. Also checks whether the CURRENT WhatsApp caller already has an account on each match. Returns public_url and caller_has_account_on_this_tenant.',
       parameters: {
         type: 'object',
         properties: {
           query: {
             type: 'string',
-            description: 'Teacher name, specialty keyword, or subdomain fragment',
+            description:
+              'Teacher name and/or specialty as the student wrote it (e.g. "دكتور احمد يحي" or "أحمد يحيى احياء")',
           },
           limit: { type: 'integer', description: 'Max results (default 8, max 15)' },
         },
@@ -179,13 +180,123 @@ async function lookupActivationCode(codeRaw: string, fromPhone: string) {
   };
 }
 
+/** Normalize Arabic so أ/ا and ى/ي (and similar) match across spelling variants. */
+function normalizeArabicForSearch(input: string): string {
+  return input
+    .normalize('NFKC')
+    .replace(/[\u064B-\u065F\u0670]/g, '')
+    .replace(/[أإآٱ]/g, 'ا')
+    .replace(/ة/g, 'ه')
+    .replace(/ى/g, 'ي')
+    .replace(/ؤ/g, 'و')
+    .replace(/ئ/g, 'ي')
+    .replace(/[^\u0600-\u06FFa-zA-Z0-9\s-]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+
+const ARABIC_SEARCH_STOPWORDS = new Set([
+  'دكتور',
+  'د',
+  'مستر',
+  'استاذ',
+  'استاذه',
+  'مع',
+  'عايز',
+  'عايزه',
+  'عايزة',
+  'اشترك',
+  'منصه',
+  'منصة',
+  'مدرس',
+  'مدرسه',
+  'في',
+  'على',
+  'علي',
+  'او',
+  'و',
+  'يا',
+  'بتاع',
+  'بتاعة',
+]);
+
+/** SQL expression: normalize Arabic alef/ya/ta-marbuta variants (same idea as JS helper). */
+const SQL_NORM_AR = (expr: string) =>
+  `translate(lower(COALESCE(${expr}, '')), 'أإآٱةىؤئ', 'ااااهييوي')`;
+
+/**
+ * Spelling variants for one token (يحي ↔ يحيى, الـ prefix, latin slug bits).
+ * Students / the model often “correct” names differently than DB storage.
+ */
+function arabicTokenVariants(token: string): string[] {
+  const base = normalizeArabicForSearch(token);
+  if (!base) return [];
+  const set = new Set<string>([base]);
+
+  // يحيى → يحيي after ى→ي; DB often stores يحي
+  if (base.endsWith('يي') && base.length > 3) set.add(base.slice(0, -1));
+  if (base.endsWith('ي') && !base.endsWith('يي') && base.length >= 3) set.add(`${base}ي`);
+
+  // الـ definite article optional
+  if (base.startsWith('ال') && base.length > 3) set.add(base.slice(2));
+  else set.add(`ال${base}`);
+
+  return [...set].filter((t) => t.length >= 2);
+}
+
+function extractSearchTokens(query: string): string[] {
+  const normalized = normalizeArabicForSearch(query);
+  const tokens = normalized
+    .split(/\s+/)
+    .map((t) => t.trim())
+    .filter((t) => t.length >= 2 && !ARABIC_SEARCH_STOPWORDS.has(t));
+  if (tokens.length) return tokens;
+  return normalized ? [normalized] : [];
+}
+
 async function searchTenants(query: string, fromPhone: string, limitRaw?: number) {
   const q = query.trim();
   if (!q || q.length < 2) {
     return { ok: false, error: 'query too short' };
   }
   const limit = Math.min(Math.max(Number(limitRaw) || 8, 1), 15);
-  const like = `%${q}%`;
+  const tokens = extractSearchTokens(q);
+  if (!tokens.length) {
+    return { ok: false, error: 'query too short after normalization', tenants: [] };
+  }
+
+  // For each student token, ANY spelling variant may match a field.
+  // Score = how many tokens matched (name/specialty/subdomain). Prefer higher scores.
+  const scoreParts: string[] = [];
+  const whereParts: string[] = [];
+  const params: Array<string | number> = [];
+
+  tokens.forEach((token) => {
+    const variants = arabicTokenVariants(token);
+    const variantLikes: string[] = [];
+    for (const v of variants) {
+      params.push(`%${v}%`);
+      variantLikes.push(`$${params.length}`);
+    }
+    const tokenMatch = `(
+      ${variantLikes
+        .map(
+          (p) => `(
+            ${SQL_NORM_AR('t.display_name')} LIKE ${p}
+            OR ${SQL_NORM_AR('u.name')} LIKE ${p}
+            OR ${SQL_NORM_AR('t.specialty')} LIKE ${p}
+            OR lower(COALESCE(t.subdomain, '')) LIKE ${p}
+          )`,
+        )
+        .join(' OR ')}
+    )`;
+    scoreParts.push(`(CASE WHEN ${tokenMatch} THEN 1 ELSE 0 END)`);
+    whereParts.push(tokenMatch);
+  });
+
+  // Fetch a wider candidate set, then keep best score / full token matches in JS.
+  params.push(Math.max(limit * 5, 40));
 
   const result = await pool.query<{
     id: number;
@@ -193,22 +304,30 @@ async function searchTenants(query: string, fromPhone: string, limitRaw?: number
     display_name: string;
     specialty: string | null;
     owner_name: string | null;
+    match_score: number;
   }>(
-    `SELECT t.id, t.subdomain, t.display_name, t.specialty, u.name AS owner_name
+    `SELECT t.id, t.subdomain, t.display_name, t.specialty, u.name AS owner_name,
+            (${scoreParts.join(' + ')})::int AS match_score
      FROM tenants t
      LEFT JOIN users u ON u.id = t.owner_user_id
      WHERE t.is_active = TRUE
        AND t.subdomain <> 'default'
        AND t.subdomain NOT LIKE 'deleted-%'
-       AND (
-         t.display_name ILIKE $1
-         OR t.subdomain ILIKE $1
-         OR COALESCE(t.specialty, '') ILIKE $1
-         OR COALESCE(u.name, '') ILIKE $1
-       )
-     ORDER BY t.display_name ASC
-     LIMIT $2`,
-    [like, limit],
+       AND (${whereParts.join(' OR ')})
+     ORDER BY match_score DESC, t.display_name ASC
+     LIMIT $${params.length}`,
+    params,
+  );
+
+  const scored = result.rows;
+  const maxScore = scored.reduce((m, r) => Math.max(m, Number(r.match_score) || 0), 0);
+  const fullMatches = scored.filter((r) => Number(r.match_score) === tokens.length);
+  // Prefer full token hits; else keep top score (at least 2 tokens when student typed 2+ name parts)
+  const minKeep =
+    tokens.length >= 2 ? Math.max(2, Math.min(tokens.length, maxScore)) : Math.max(1, maxScore);
+  const picked = (fullMatches.length ? fullMatches : scored.filter((r) => Number(r.match_score) >= minKeep)).slice(
+    0,
+    limit,
   );
 
   const callerLookup = await lookupStudentsByWhatsapp(fromPhone);
@@ -235,11 +354,14 @@ async function searchTenants(query: string, fromPhone: string, limitRaw?: number
 
   return {
     ok: true,
-    count: result.rowCount,
+    count: picked.length,
+    query_original: q,
+    query_tokens: tokens,
+    query_token_variants: Object.fromEntries(tokens.map((t) => [t, arabicTokenVariants(t)])),
     checked_whatsapp_caller: true,
     account_check_note:
       'caller_has_account_on_this_tenant is based on the current WhatsApp caller phone vs student accounts on that tenant. Prefer public_url only (do not invent separate /login or /signup links).',
-    tenants: result.rows.map((row) => {
+    tenants: picked.map((row) => {
       const publicUrl = buildTenantPublicUrl(row.subdomain);
       const callerStudent = byTenantId.get(row.id) || null;
       return {
@@ -249,6 +371,7 @@ async function searchTenants(query: string, fromPhone: string, limitRaw?: number
         specialty: row.specialty,
         teacher_name: row.owner_name,
         public_url: publicUrl,
+        match_score: Number(row.match_score) || 0,
         caller_has_account_on_this_tenant: Boolean(callerStudent),
         caller_student: callerStudent
           ? {
