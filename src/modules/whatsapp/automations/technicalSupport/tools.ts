@@ -180,7 +180,6 @@ async function lookupActivationCode(codeRaw: string, fromPhone: string) {
   };
 }
 
-/** Normalize Arabic so أ/ا and ى/ي (and similar) match across spelling variants. */
 function normalizeArabicForSearch(input: string): string {
   return input
     .normalize('NFKC')
@@ -221,24 +220,17 @@ const ARABIC_SEARCH_STOPWORDS = new Set([
   'بتاعة',
 ]);
 
-/** SQL expression: normalize Arabic alef/ya/ta-marbuta variants (same idea as JS helper). */
 const SQL_NORM_AR = (expr: string) =>
   `translate(lower(COALESCE(${expr}, '')), 'أإآٱةىؤئ', 'ااااهييوي')`;
 
-/**
- * Spelling variants for one token (يحي ↔ يحيى, الـ prefix, latin slug bits).
- * Students / the model often “correct” names differently than DB storage.
- */
 function arabicTokenVariants(token: string): string[] {
   const base = normalizeArabicForSearch(token);
   if (!base) return [];
   const set = new Set<string>([base]);
 
-  // يحيى → يحيي after ى→ي; DB often stores يحي
   if (base.endsWith('يي') && base.length > 3) set.add(base.slice(0, -1));
   if (base.endsWith('ي') && !base.endsWith('يي') && base.length >= 3) set.add(`${base}ي`);
 
-  // الـ definite article optional
   if (base.startsWith('ال') && base.length > 3) set.add(base.slice(2));
   else set.add(`ال${base}`);
 
@@ -266,8 +258,6 @@ async function searchTenants(query: string, fromPhone: string, limitRaw?: number
     return { ok: false, error: 'query too short after normalization', tenants: [] };
   }
 
-  // For each student token, ANY spelling variant may match a field.
-  // Score = how many tokens matched (name/specialty/subdomain). Prefer higher scores.
   const scoreParts: string[] = [];
   const whereParts: string[] = [];
   const params: Array<string | number> = [];
@@ -295,7 +285,6 @@ async function searchTenants(query: string, fromPhone: string, limitRaw?: number
     whereParts.push(tokenMatch);
   });
 
-  // Fetch a wider candidate set, then keep best score / full token matches in JS.
   params.push(Math.max(limit * 5, 40));
 
   const result = await pool.query<{
@@ -322,7 +311,6 @@ async function searchTenants(query: string, fromPhone: string, limitRaw?: number
   const scored = result.rows;
   const maxScore = scored.reduce((m, r) => Math.max(m, Number(r.match_score) || 0), 0);
   const fullMatches = scored.filter((r) => Number(r.match_score) === tokens.length);
-  // Prefer full token hits; else keep top score (at least 2 tokens when student typed 2+ name parts)
   const minKeep =
     tokens.length >= 2 ? Math.max(2, Math.min(tokens.length, maxScore)) : Math.max(1, maxScore);
   const picked = (fullMatches.length ? fullMatches : scored.filter((r) => Number(r.match_score) >= minKeep)).slice(
