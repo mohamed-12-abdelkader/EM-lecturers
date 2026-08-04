@@ -278,11 +278,16 @@ export class WhatsAppInboundService {
       conversation: ctx.conversation,
     });
 
-    if (handlerResult.reply && ctx.conversation && ctx.service) {
+    if (
+      (handlerResult.reply || handlerResult.mediaUrl) &&
+      ctx.conversation &&
+      ctx.service
+    ) {
       await WhatsAppOutboundQueue.enqueue({
         sessionSlug: ctx.conversation.session_slug,
         to: ctx.fromPhone,
-        body: handlerResult.reply,
+        body: handlerResult.reply || '',
+        mediaUrl: handlerResult.mediaUrl ?? null,
         serviceId: ctx.service.id,
         conversationId: ctx.conversation.id,
         tenantId: ctx.conversation.tenant_id,

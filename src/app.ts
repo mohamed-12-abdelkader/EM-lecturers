@@ -10,6 +10,7 @@ import { tenantContextMiddleware } from './middleware/tenantContext';
 import { whatsappWebhookRouter } from './modules/whatsapp/controllers/whatsappWebhook.controller';
 // Register WhatsApp chatbot handlers (side-effect)
 import './modules/whatsapp/automations/technicalSupport';
+import './modules/whatsapp/automations/teacherCreative';
 
 export const app = express();
 export const server = createServer(app);

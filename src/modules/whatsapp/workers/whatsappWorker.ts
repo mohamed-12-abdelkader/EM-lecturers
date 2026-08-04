@@ -56,7 +56,8 @@ async function processBatch(): Promise<void> {
           await sendMessage({
             sessionId: job.session_slug,
             to: job.to_phone,
-            body: job.body,
+            body: job.body || undefined,
+            media: job.media_url ? { url: job.media_url } : undefined,
             metadata: {
               ...(job.metadata || {}),
               job_id: job.id,

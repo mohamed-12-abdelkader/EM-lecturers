@@ -69,6 +69,8 @@ export interface InboundContext {
 export interface HandlerResult {
   handled: boolean;
   reply?: string;
+  /** Public image URL to send as WhatsApp media (caption = reply). */
+  mediaUrl?: string;
   escalate?: boolean;
   metadata?: Record<string, unknown>;
 }

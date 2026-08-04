@@ -105,19 +105,24 @@ export async function reconnectSession(id: string): Promise<GatewaySession> {
 export async function sendMessage(params: {
   sessionId: string;
   to: string;
-  body: string;
+  body?: string;
+  media?: { url?: string; data?: string; mimetype?: string; filename?: string };
   metadata?: Record<string, unknown>;
 }): Promise<unknown> {
-  const { data } = await getClient().post(
-    '/v1/messages',
-    {
-      session_id: params.sessionId,
-      to: normalizePhone(params.to),
-      body: params.body,
-      metadata: params.metadata ?? {},
-    },
-    { headers: { 'Content-Type': 'application/json' } },
-  );
+  const payload: Record<string, unknown> = {
+    session_id: params.sessionId,
+    to: normalizePhone(params.to),
+    metadata: params.metadata ?? {},
+  };
+  if (params.body != null && params.body !== '') {
+    payload.body = params.body;
+  }
+  if (params.media) {
+    payload.media = params.media;
+  }
+  const { data } = await getClient().post('/v1/messages', payload, {
+    headers: { 'Content-Type': 'application/json' },
+  });
   return data;
 }
 

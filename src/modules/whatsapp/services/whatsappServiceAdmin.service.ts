@@ -374,6 +374,22 @@ export class WhatsAppServiceAdmin {
   }
 
   static async markConversationHumanAndTouch(id: number): Promise<void> {
+    const muteResult = await pool.query<{ mute_minutes: string | null }>(
+      `SELECT COALESCE(
+         NULLIF(s.config->>'human_mute_minutes', '')::int,
+         60
+       )::text AS mute_minutes
+       FROM wa_conversations c
+       LEFT JOIN wa_services s ON s.id = c.service_id
+       WHERE c.id = $1`,
+      [id],
+    );
+    const muteMinutes = Math.max(
+      1,
+      Number(muteResult.rows[0]?.mute_minutes || 60) || 60,
+    );
+    const humanMuteUntil = new Date(Date.now() + muteMinutes * 60_000).toISOString();
+
     await pool.query(
       `UPDATE wa_conversations SET
          status = CASE
@@ -384,10 +400,11 @@ export class WhatsAppServiceAdmin {
            WHEN status IN ('bot', 'waiting_human') THEN NOW()
            ELSE assigned_at
          END,
+         metadata = COALESCE(metadata, '{}'::jsonb) || $2::jsonb,
          last_message_at = NOW(),
          updated_at = NOW()
        WHERE id = $1`,
-      [id],
+      [id, JSON.stringify({ human_mute_until: humanMuteUntil })],
     );
   }
 }
