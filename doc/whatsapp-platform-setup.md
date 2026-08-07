@@ -76,14 +76,14 @@ Log in as **admin** on tenant **default** (`X-Tenant-Subdomain: default` on loca
 | `/admin/whatsapp/services` | Enable services, assign multiple numbers (pool + weights) |
 | `/admin/whatsapp/monitor` | Queue stats, conversations, test send |
 
-Suggested first session slugs: `support-01`, `support-02`, …
+Suggested session slugs: `support-01`, `support-02`, … for support; `creative-01`, … for creative; `analyst-01`, … for data analyst.
 
 1. Create sessions and scan QR until status is **ready**
-2. Open **Services** → select `الدعم الفني` (`technical_support_bot`)
-3. Assign 1+ ready sessions to the pool and save
-4. **Enable** the service so the DeepSeek support bot replies
+2. Open **Services** → select the service (`الدعم الفني` or `مساعد السوشيال`)
+3. Assign 1+ ready sessions to that service’s pool and save (keep pools separate)
+4. **Enable** the service so the bot replies
 5. Use **Monitor** → test send to verify outbound queue + gateway
-6. Message the support WhatsApp number from a student phone to test the bot
+6. Message the WhatsApp number from an allowed phone to test the bot
 
 ## 5) Technical support bot (`technical_support_bot`)
 
@@ -102,6 +102,47 @@ Handler is registered at API startup under `src/modules/whatsapp/automations/tec
 **Inbound media**
 - wwebjs downloads image media (max ~5MB) and posts `media: { mimetype, data, filename }` on the webhook.
 - EM does not store base64 in Postgres long-term; only a summary + optional image description.
+
+## 5b) Teacher creative bot (`teacher_creative_bot`)
+
+Handler: `src/modules/whatsapp/automations/teacherCreative/`. Reuses `TeacherCreativeChatbotService` (same as the web مساعد السوشيال).
+
+**Access**
+- Teachers message a **shared** creative WhatsApp number from their **personal** phone (no login).
+- Identity: match WhatsApp `from` to `users.phone` or `users.whatsapp_number` where `role = 'teacher'`.
+- Unknown numbers get a denial reply.
+- Requires plan feature `creative_social` (diamond); otherwise plan-denied Arabic reply.
+
+**Capabilities**
+- Text chat + inbound reference images (passed into creative generate/execute).
+- Outbound generated images via queue `media_url` → gateway `media.url`.
+- Human handoff: when an admin replies from the inbox, conversation becomes `human` and `metadata.human_mute_until` is set (default **60 minutes** from service `config.human_mute_minutes`). Bot stays silent until mute expires, then auto-resumes `bot` on the next inbound.
+
+**Ops**
+1. Run migration that seeds `teacher_creative_bot` (disabled by default).
+2. Create session e.g. `creative-01`, scan QR, assign to `مساعد السوشيال` pool, enable service.
+3. Ensure each teacher’s `phone` / `whatsapp_number` matches the WhatsApp they will use.
+
+## 5c) Teacher data analyst bot (`teacher_data_analyst_bot`)
+
+Handler: `src/modules/whatsapp/automations/teacherDataAnalyst/`. Reuses `DataAnalystChatbotService` (same as the web محلل البيانات).
+
+**Access**
+- Teachers message a **shared** analyst WhatsApp number from their **personal** phone (no login).
+- Identity: match WhatsApp `from` to `users.phone` or `users.whatsapp_number` where `role = 'teacher'`.
+- Unknown numbers get a denial reply.
+- Requires plan feature `data_analyst` (diamond / باقة التميز); otherwise plan-denied Arabic reply.
+
+**Capabilities**
+- Text-only reports (student / course / general / exam-homework analysis) via existing SQL + DeepSeek formatting.
+- Long reports are split into sequential WhatsApp chunks (~3500 chars).
+- Voice and images are rejected with a short Arabic guidance reply.
+- Human handoff: admin inbox reply sets `metadata.human_mute_until` (default **60 minutes**). Bot stays silent until mute expires, then auto-resumes `bot` on the next inbound.
+
+**Ops**
+1. Run migration that seeds `teacher_data_analyst_bot` (disabled by default).
+2. Create session e.g. `analyst-01`, scan QR, assign to `محلل البيانات` pool, enable service.
+3. Ensure each teacher’s `phone` / `whatsapp_number` matches the WhatsApp they will use.
 
 ## 6) Admin API summary
 
@@ -135,6 +176,10 @@ Webhook (no JWT; HMAC only):
 | Webhook 401 | Secret mismatch; rawBody capture working |
 | Test send 503 | No ready sessions in the service pool; enable service |
 | Messages stuck pending | Worker enabled; gateway reachable from API |
-| Bot silent | Service `technical_support_bot` enabled + session in pool + handler loaded |
+| Bot silent | Service enabled + session in pool + handler loaded; or conversation still in `human` mute |
+| Creative bot denies number | Teacher `phone`/`whatsapp_number` must match WhatsApp from; diamond plan required |
+| Analyst bot denies number | Teacher `phone`/`whatsapp_number` must match WhatsApp from; diamond (`data_analyst`) required |
+| Analyst ignores images/voice | Text-only channel by design; ask for report commands in text |
 | Images ignored | Restart wwebjs with media forwarding; check `media_error` in inbound metadata |
+| Generated image not sent | Outbound job has `media_url`; gateway `/v1/messages` media support; worker running |
 | Password reset refused | Student must message from the same phone stored on the account |

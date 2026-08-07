@@ -11,6 +11,7 @@ import { whatsappWebhookRouter } from './modules/whatsapp/controllers/whatsappWe
 // Register WhatsApp chatbot handlers (side-effect)
 import './modules/whatsapp/automations/technicalSupport';
 import './modules/whatsapp/automations/teacherCreative';
+import './modules/whatsapp/automations/teacherDataAnalyst';
 
 export const app = express();
 export const server = createServer(app);

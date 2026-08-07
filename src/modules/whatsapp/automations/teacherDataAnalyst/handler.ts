@@ -2,17 +2,20 @@ import pool from '../../../../db/pool';
 import { HttpError, logger } from '../../../../utils';
 import { enforcePlanFeature } from '../../../../services/teacherPlanPolicy';
 import { registerWhatsAppHandler } from '../registry';
-import type { HandlerResult, InboundContext, WaConversationRow } from '../types';
-import { runTeacherCreativeBridge } from './bridge';
 import { resolveTeacherByPhone } from '../resolveTeacher';
+import type { HandlerResult, InboundContext, WaConversationRow } from '../types';
+import { runTeacherDataAnalystBridge } from './bridge';
 
-export const TEACHER_CREATIVE_BOT_KEY = 'teacher_creative_bot';
+export const TEACHER_DATA_ANALYST_BOT_KEY = 'teacher_data_analyst_bot';
 
 const NOT_TEACHER_REPLY =
   'هذا الرقم غير مسجل كمدرس على المنصة. لو عندك حساب مدرس، تأكد إن رقم الواتساب مسجل في بياناتك.';
 
 const VOICE_UNSUPPORTED_REPLY =
-  'معلش، الرسائل الصوتية مش مدعومة هنا 🙏 لو سمحت اكتب رسالتك أو ابعت صورة.';
+  'معلش، الرسائل الصوتية مش مدعومة هنا 🙏 لو سمحت اكتب طلب التقرير نصاً.';
+
+const IMAGE_UNSUPPORTED_REPLY =
+  'محلل البيانات عبر واتساب يدعم الرسائل النصية فقط. اكتب طلبك مثل: تقرير عام أو تقرير الطالب أحمد.';
 
 const DEFAULT_HUMAN_MUTE_MINUTES = 60;
 
@@ -43,6 +46,23 @@ function isVoiceOrAudioInbound(ctx: InboundContext): boolean {
     if (t === 'ptt' || t === 'audio' || t === 'voice' || t === 'voip') return true;
   }
   return false;
+}
+
+function isImageInbound(ctx: InboundContext): boolean {
+  const mime =
+    ctx.media?.mimetype ||
+    (typeof ctx.metadata?.media_mimetype === 'string'
+      ? ctx.metadata.media_mimetype
+      : null);
+  if (mime && mime.toLowerCase().startsWith('image/')) return true;
+  const mediaType =
+    ctx.metadata?.wa_message_type ??
+    ctx.metadata?.media_type ??
+    ctx.metadata?.type;
+  if (typeof mediaType === 'string' && mediaType.toLowerCase() === 'image') {
+    return true;
+  }
+  return Boolean(ctx.media && !isVoiceOrAudioInbound(ctx));
 }
 
 function getHumanMuteMinutes(ctx: InboundContext): number {
@@ -101,7 +121,7 @@ async function maybeResumeFromHumanMute(
 
   logger.info(
     { conversationId: conversation.id },
-    'teacher_creative_bot resumed after human mute expired',
+    'teacher_data_analyst_bot resumed after human mute expired',
   );
 
   return {
@@ -133,7 +153,7 @@ async function onInbound(ctx: InboundContext): Promise<HandlerResult> {
           status: conversation.status,
           humanMuteUntil: conversation.metadata?.human_mute_until ?? null,
         },
-        'teacher_creative_bot skipped (human mute active)',
+        'teacher_data_analyst_bot skipped (human mute active)',
       );
       return { handled: true };
     }
@@ -142,7 +162,7 @@ async function onInbound(ctx: InboundContext): Promise<HandlerResult> {
   if (!ctx.body?.trim() && !ctx.media && !ctx.mediaError) {
     logger.info(
       { waMessageId: ctx.waMessageId, fromPhone: ctx.fromPhone },
-      'teacher_creative_bot skipped (empty non-media inbound)',
+      'teacher_data_analyst_bot skipped (empty non-media inbound)',
     );
     return { handled: true };
   }
@@ -152,6 +172,14 @@ async function onInbound(ctx: InboundContext): Promise<HandlerResult> {
       handled: true,
       reply: VOICE_UNSUPPORTED_REPLY,
       metadata: { voice_unsupported: true },
+    };
+  }
+
+  if (isImageInbound(ctx) || ctx.mediaError) {
+    return {
+      handled: true,
+      reply: IMAGE_UNSUPPORTED_REPLY,
+      metadata: { image_unsupported: true },
     };
   }
 
@@ -165,12 +193,12 @@ async function onInbound(ctx: InboundContext): Promise<HandlerResult> {
   }
 
   try {
-    await enforcePlanFeature(teacher.id, 'creative_social');
+    await enforcePlanFeature(teacher.id, 'data_analyst');
   } catch (err) {
     const message =
       err instanceof HttpError
         ? err.message
-        : 'مساعد السوشيال متاح في باقة الماسي أو أعلى';
+        : 'محلل مستوى الطلاب بالـ AI متاح في باقة التميز أو أعلى';
     return {
       handled: true,
       reply: message,
@@ -182,15 +210,17 @@ async function onInbound(ctx: InboundContext): Promise<HandlerResult> {
   }
 
   try {
-    const result = await runTeacherCreativeBridge(ctx, teacher.id);
+    const result = await runTeacherDataAnalystBridge(ctx, teacher);
     return {
       handled: true,
       reply: result.reply,
-      mediaUrl: result.mediaUrl,
       metadata: result.metadata,
     };
   } catch (err) {
-    logger.error({ err, teacherId: teacher.id }, 'teacher_creative_bot handler error');
+    logger.error(
+      { err, teacherId: teacher.id },
+      'teacher_data_analyst_bot handler error',
+    );
     const message =
       err instanceof Error && err.message
         ? err.message
@@ -203,10 +233,10 @@ async function onInbound(ctx: InboundContext): Promise<HandlerResult> {
   }
 }
 
-export function registerTeacherCreativeBot(): void {
+export function registerTeacherDataAnalystBot(): void {
   registerWhatsAppHandler({
-    key: TEACHER_CREATIVE_BOT_KEY,
+    key: TEACHER_DATA_ANALYST_BOT_KEY,
     onInbound,
   });
-  logger.info('Registered WhatsApp handler: teacher_creative_bot');
+  logger.info('Registered WhatsApp handler: teacher_data_analyst_bot');
 }

@@ -9,3 +9,4 @@ export { isWhatsAppConfigured, normalizePhone, sendMessage } from './gateway/wha
 // Register chatbot handlers (side effects)
 import './automations/technicalSupport';
 import './automations/teacherCreative';
+import './automations/teacherDataAnalyst';
