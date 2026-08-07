@@ -76,7 +76,7 @@ Log in as **admin** on tenant **default** (`X-Tenant-Subdomain: default` on loca
 | `/admin/whatsapp/services` | Enable services, assign multiple numbers (pool + weights) |
 | `/admin/whatsapp/monitor` | Queue stats, conversations, test send |
 
-Suggested session slugs: `support-01`, `support-02`, … for support; `creative-01`, … for creative; `analyst-01`, … for data analyst.
+Suggested session slugs: `support-01`, `support-02`, … for support; `creative-01`, … for creative; `analyst-01`, … for data analyst; `scientific-01`, … for student scientific; `exam-builder-01`, … for exam builder.
 
 1. Create sessions and scan QR until status is **ready**
 2. Open **Services** → select the service (`الدعم الفني` or `مساعد السوشيال`)
@@ -144,6 +144,56 @@ Handler: `src/modules/whatsapp/automations/teacherDataAnalyst/`. Reuses `DataAna
 2. Create session e.g. `analyst-01`, scan QR, assign to `محلل البيانات` pool, enable service.
 3. Ensure each teacher’s `phone` / `whatsapp_number` matches the WhatsApp they will use.
 
+## 5d) Student scientific bot (`student_scientific_bot`)
+
+Handler: `src/modules/whatsapp/automations/studentScientific/`. Reuses `ScientificChatbotService.answerTeacherQuestion` (same as web المساعد العلمي / كل مواد المدرس).
+
+**Access**
+- Students message a **shared** platform WhatsApp number from their **personal** phone (no login).
+- Identity: match WhatsApp `from` to `users.phone` where `role = 'student'`.
+- Unknown numbers get a denial reply.
+- Student must be enrolled with a teacher who has plan feature `scientific_support` (Gold+) **and** uploaded scientific content.
+
+**Teacher selection**
+- One eligible teacher → auto-selected.
+- Multiple → numbered list; student replies with a number; stored in conversation `metadata.teacher_id`.
+- `تغيير المدرس` clears selection and re-lists.
+
+**Capabilities**
+- Text + inbound images (Pixtral path via existing service).
+- Voice rejected.
+- Long answers split into sequential WhatsApp chunks (~3500 chars).
+- Human handoff: admin inbox reply sets `metadata.human_mute_until` (default **60 minutes**).
+
+**Ops**
+1. Run migration that seeds `student_scientific_bot` (disabled by default).
+2. Create session e.g. `scientific-01`, scan QR, assign to `المساعد العلمي` pool, enable service.
+3. Ensure each student’s `phone` matches the WhatsApp they will use.
+
+## 5e) Teacher exam builder bot (`teacher_exam_builder_bot`)
+
+Handler: `src/modules/whatsapp/automations/teacherExamBuilder/`. Reuses `ExamBuilderChatbotService` (same as web مساعد الامتحانات).
+
+**Access**
+- Teachers message a **shared** exam-builder WhatsApp number from their **personal** phone (no login).
+- Identity: match WhatsApp `from` to `users.phone` or `users.whatsapp_number` where `role = 'teacher'`.
+- Requires plan feature `exam_builder_ai` (Gold+).
+
+**Capabilities (WhatsApp)**
+- Propose question lists from natural language (e.g. أنشئ امتحان 10 أسئلة…).
+- Adjust via NL (e.g. شيل السؤال 3).
+- Regenerate: `أعد` / `إعادة اختيار` / `مجموعة جديدة`.
+- **Approve list only:** `موافق` / `اعتماد` → `approveSession({ create_exam: false })`.
+- Finish creating the exam (course/lecture/title) in the **web UI**.
+- Text only; voice/images rejected.
+- Long replies chunked (~3500 chars).
+- Human handoff mute default **60 minutes**.
+
+**Ops**
+1. Run migration that seeds `teacher_exam_builder_bot` (disabled by default).
+2. Create session e.g. `exam-builder-01`, scan QR, assign to `مساعد الامتحانات` pool, enable service.
+3. Ensure each teacher’s `phone` / `whatsapp_number` matches the WhatsApp they will use.
+
 ## 6) Admin API summary
 
 All under `/api/whatsapp` — require admin JWT + default tenant:
@@ -180,6 +230,9 @@ Webhook (no JWT; HMAC only):
 | Creative bot denies number | Teacher `phone`/`whatsapp_number` must match WhatsApp from; diamond plan required |
 | Analyst bot denies number | Teacher `phone`/`whatsapp_number` must match WhatsApp from; diamond (`data_analyst`) required |
 | Analyst ignores images/voice | Text-only channel by design; ask for report commands in text |
+| Scientific bot denies number | Student `phone` must match WhatsApp from; enrollment + teacher Gold scientific content required |
+| Scientific asks to pick teacher | Student enrolled with multiple eligible teachers; reply with list number or `تغيير المدرس` |
+| Exam builder approve then what? | WhatsApp only approves the list; open web مساعد الامتحانات to attach course/lecture |
 | Images ignored | Restart wwebjs with media forwarding; check `media_error` in inbound metadata |
 | Generated image not sent | Outbound job has `media_url`; gateway `/v1/messages` media support; worker running |
 | Password reset refused | Student must message from the same phone stored on the account |

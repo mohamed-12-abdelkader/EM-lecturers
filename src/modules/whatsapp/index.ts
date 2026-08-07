@@ -10,3 +10,5 @@ export { isWhatsAppConfigured, normalizePhone, sendMessage } from './gateway/wha
 import './automations/technicalSupport';
 import './automations/teacherCreative';
 import './automations/teacherDataAnalyst';
+import './automations/studentScientific';
+import './automations/teacherExamBuilder';

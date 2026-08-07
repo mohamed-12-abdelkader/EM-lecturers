@@ -12,6 +12,8 @@ import { whatsappWebhookRouter } from './modules/whatsapp/controllers/whatsappWe
 import './modules/whatsapp/automations/technicalSupport';
 import './modules/whatsapp/automations/teacherCreative';
 import './modules/whatsapp/automations/teacherDataAnalyst';
+import './modules/whatsapp/automations/studentScientific';
+import './modules/whatsapp/automations/teacherExamBuilder';
 
 export const app = express();
 export const server = createServer(app);
