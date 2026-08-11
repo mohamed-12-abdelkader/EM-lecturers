@@ -2,14 +2,12 @@ import { Router } from 'express';
 import { z } from 'zod';
 import axios from 'axios';
 import { authMiddleware } from '../../../middleware/authentication';
-import { requireDefaultTenantMiddleware } from '../../../middleware/tenantContext';
 import { validate } from '../../../middleware/validateReq';
 import { asyncWrapper, HttpError } from '../../../utils';
 import { TeacherWhatsAppService } from '../services/teacherWhatsApp.service';
 
 export const whatsappTeacherRouter = Router();
 
-whatsappTeacherRouter.use(requireDefaultTenantMiddleware());
 whatsappTeacherRouter.use(authMiddleware(['teacher']));
 
 function gatewayError(err: unknown): never {
