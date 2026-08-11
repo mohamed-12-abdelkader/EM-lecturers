@@ -18,6 +18,8 @@ export type MergedSession = GatewaySession & {
   last_ready_at: Date | null;
   last_error: string | null;
   local_id: number | null;
+  teacher_id: number | null;
+  teacher_name: string | null;
 };
 
 async function upsertLocalFromGateway(gw: GatewaySession): Promise<void> {
@@ -52,8 +54,13 @@ export class WhatsAppSessionService {
       await upsertLocalFromGateway(gw);
     }
 
-    const local = await pool.query<WaSessionRow>(
-      `SELECT * FROM wa_sessions ORDER BY created_at DESC`,
+    const local = await pool.query<
+      WaSessionRow & { teacher_name: string | null }
+    >(
+      `SELECT s.*, u.name AS teacher_name
+       FROM wa_sessions s
+       LEFT JOIN users u ON u.id = s.teacher_id
+       ORDER BY s.created_at DESC`,
     );
     const localBySlug = new Map(local.rows.map((r) => [r.slug, r]));
     const gwById = new Map(gatewaySessions.map((g) => [g.id, g]));
@@ -70,6 +77,8 @@ export class WhatsAppSessionService {
         last_ready_at: loc?.last_ready_at ?? null,
         last_error: loc?.last_error ?? null,
         local_id: loc?.id ?? null,
+        teacher_id: loc?.teacher_id ?? null,
+        teacher_name: loc?.teacher_name ?? null,
       });
     }
 
@@ -87,6 +96,8 @@ export class WhatsAppSessionService {
           last_ready_at: loc.last_ready_at,
           last_error: loc.last_error,
           local_id: loc.id,
+          teacher_id: loc.teacher_id ?? null,
+          teacher_name: loc.teacher_name ?? null,
         });
       }
     }
@@ -119,6 +130,8 @@ export class WhatsAppSessionService {
         last_ready_at: null,
         last_error: null,
         local_id: null,
+        teacher_id: null,
+        teacher_name: null,
       }
     );
   }
@@ -129,8 +142,11 @@ export class WhatsAppSessionService {
     }
     const gw = await getSession(slug);
     await upsertLocalFromGateway(gw);
-    const local = await pool.query<WaSessionRow>(
-      `SELECT * FROM wa_sessions WHERE slug = $1`,
+    const local = await pool.query<WaSessionRow & { teacher_name: string | null }>(
+      `SELECT s.*, u.name AS teacher_name
+       FROM wa_sessions s
+       LEFT JOIN users u ON u.id = s.teacher_id
+       WHERE s.slug = $1`,
       [slug],
     );
     const loc = local.rows[0];
@@ -142,6 +158,8 @@ export class WhatsAppSessionService {
       last_ready_at: loc?.last_ready_at ?? null,
       last_error: loc?.last_error ?? null,
       local_id: loc?.id ?? null,
+      teacher_id: loc?.teacher_id ?? null,
+      teacher_name: loc?.teacher_name ?? null,
     };
   }
 

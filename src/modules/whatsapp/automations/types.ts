@@ -26,6 +26,7 @@ export interface WaSessionRow {
   max_messages_per_minute: number;
   last_ready_at: Date | null;
   last_error: string | null;
+  teacher_id: number | null;
   created_at: Date;
   updated_at: Date;
 }

@@ -81,6 +81,7 @@ import { router as teacherStudentsRouter } from './controllers/teacherStudents';
 import { teacherFilesRouter, teacherFileCategoriesRouter } from './modules/myFiles/controllers/teacherMyFiles.controller';
 import { centerRouter } from './modules/centerMgmt';
 import { whatsappAdminRouter } from './modules/whatsapp/controllers/whatsappAdmin.controller';
+import { whatsappTeacherRouter } from './modules/whatsapp/controllers/whatsappTeacher.controller';
 
 export const router = Router();
 
@@ -101,6 +102,7 @@ router.use('/v1/social', socialRouter);
 router.use('/admin/teachers', adminTeachersRouter);
 router.use('/admin/tenants', adminTenantsRouter);
 router.use('/whatsapp', whatsappAdminRouter);
+router.use('/teacher/whatsapp', whatsappTeacherRouter);
 router.use('/analytics', analyticsRouter);
 router.use('/analytics/tracking', analyticsTrackingRouter);
 router.use('/notifications', notificationsRouter);

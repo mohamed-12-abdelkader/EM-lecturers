@@ -173,8 +173,13 @@ export class WhatsAppServiceAdmin {
   }
 
   static async replacePool(serviceId: number, members: PoolMemberInput[]): Promise<void> {
-    const exists = await pool.query(`SELECT id FROM wa_services WHERE id = $1`, [serviceId]);
+    const exists = await pool.query<{ id: number; config: unknown }>(
+      `SELECT id, config FROM wa_services WHERE id = $1`,
+      [serviceId],
+    );
     if (!exists.rowCount) throw new HttpError(404, 'الخدمة غير موجودة');
+    const serviceConfig = parseJson(exists.rows[0].config);
+    const isTeacherService = serviceConfig.owner === 'teacher';
 
     const client = await pool.connect();
     try {
@@ -184,11 +189,25 @@ export class WhatsAppServiceAdmin {
       for (const m of members) {
         const slug = String(m.session_slug || '').trim();
         if (!slug) continue;
-        const sessionExists = await client.query(`SELECT 1 FROM wa_sessions WHERE slug = $1`, [
-          slug,
-        ]);
+        const sessionExists = await client.query<{ teacher_id: number | null }>(
+          `SELECT teacher_id FROM wa_sessions WHERE slug = $1`,
+          [slug],
+        );
         if (!sessionExists.rowCount) {
           throw new HttpError(400, `الجلسة غير موجودة: ${slug}`);
+        }
+        const teacherId = sessionExists.rows[0].teacher_id;
+        if (!isTeacherService && teacherId != null) {
+          throw new HttpError(
+            400,
+            `الجلسة ${slug} تابعة لمدرس ولا يمكن إضافتها لخدمات المنصة`,
+          );
+        }
+        if (isTeacherService && teacherId == null) {
+          throw new HttpError(
+            400,
+            `الجلسة ${slug} ليست تابعة لمدرس ولا تصلح لخدمات المدرسين`,
+          );
         }
         await client.query(
           `INSERT INTO wa_service_sessions

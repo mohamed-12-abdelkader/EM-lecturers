@@ -228,6 +228,14 @@ export class WhatsAppInboundService {
       [inboundEventId, service?.id ?? null, conversation?.id ?? null],
     );
 
+    const sessionOwner = await pool.query<{ teacher_id: number | null }>(
+      `SELECT teacher_id FROM wa_sessions WHERE slug = $1`,
+      [sessionSlug],
+    );
+    const teacherId = sessionOwner.rows[0]?.teacher_id ?? null;
+    const isTeacherOwned =
+      teacherId != null || service?.config?.owner === 'teacher';
+
     // Background bot dispatch (do not block webhook ACK)
     setImmediate(() => {
       void this.dispatchAndReply({
@@ -241,6 +249,7 @@ export class WhatsAppInboundService {
         mediaError,
         service,
         conversation,
+        isTeacherOwned,
       }).catch((err) => {
         logger.error({ err, waMessageId, sessionSlug }, 'WhatsApp async inbound dispatch failed');
       });
@@ -264,7 +273,33 @@ export class WhatsAppInboundService {
     mediaError: string | null;
     service: WaServiceRow | null;
     conversation: WaConversationRow | null;
+    isTeacherOwned: boolean;
   }): Promise<void> {
+    // Teacher outbound channels: log inbound only; no platform chatbot auto-reply.
+    if (ctx.isTeacherOwned) {
+      if (ctx.conversation && !ctx.conversation.metadata?.outbound_only_notified) {
+        await WhatsAppOutboundQueue.enqueue({
+          sessionSlug: ctx.conversation.session_slug,
+          to: ctx.fromPhone,
+          body: 'هذه القناة للإرسال فقط. للاستفسارات استخدم قنوات الدعم الرسمية.',
+          serviceId: ctx.service?.id ?? null,
+          conversationId: ctx.conversation.id,
+          tenantId: ctx.conversation.tenant_id,
+          triggerType: 'outbound_only_notice',
+          triggerRef: ctx.waMessageId,
+          metadata: { owner: 'teacher' },
+        });
+        await pool.query(
+          `UPDATE wa_conversations
+           SET metadata = COALESCE(metadata, '{}'::jsonb) || '{"outbound_only_notified":true}'::jsonb,
+               updated_at = NOW()
+           WHERE id = $1`,
+          [ctx.conversation.id],
+        );
+      }
+      return;
+    }
+
     const handlerResult = await dispatchInbound({
       sessionSlug: ctx.sessionSlug,
       fromPhone: ctx.fromPhone,
