@@ -1153,65 +1153,7 @@ export class NotificationService {
     const items: any[] = [];
 
     try {
-      // 1) إشعارات الدعم الفني (مقروء = دخل الشات وشاف الرسالة)
-      // eslint-disable-next-line @typescript-eslint/ban-ts-comment
-      // @ts-ignore
-      const { SupportChatService } = await import('./supportChat');
-      if (userRole === 'student') {
-        const support = await SupportChatService.getMessageNotifications(userId, 'student', 50, 0, false);
-        for (const n of support.notifications) {
-          const created = n.created_at ? new Date(n.created_at).toISOString() : new Date().toISOString();
-          const isRead = !n.is_unread;
-          items.push({
-            id: `support_student_${n.chat_id}_${n.message_id}`,
-            type: 'student_support',
-            title: 'دعم فني',
-            body: (n.text || '').slice(0, 120) + (n.text && n.text.length > 120 ? '...' : ''),
-            sender_name: n.sender_name || 'رد تلقائي',
-            created_at: created,
-            unread_count: isRead ? 0 : 1,
-            is_unread: n.is_unread,
-            is_read: isRead,
-            read_at: n.read_at ? new Date(n.read_at).toISOString() : null,
-            data: {
-              type: 'student_support_chat',
-              chat_id: n.chat_id,
-              message_id: n.message_id,
-              sender_id: n.sender_id,
-            },
-            chat_id: n.chat_id,
-            message_id: n.message_id,
-          });
-        }
-      } else {
-        const support = await SupportChatService.getTeacherSupportNotifications(userId, 50, 0, false);
-        for (const n of support.notifications) {
-          const created = n.created_at ? new Date(n.created_at).toISOString() : new Date().toISOString();
-          const isRead = !n.is_unread;
-          items.push({
-            id: `support_teacher_${n.chat_id}_${n.message_id}`,
-            type: 'teacher_support',
-            title: n.sender_name || 'دعم فني',
-            body: (n.text || '').slice(0, 120) + (n.text && n.text.length > 120 ? '...' : ''),
-            sender_name: n.sender_name,
-            created_at: created,
-            unread_count: isRead ? 0 : 1,
-            is_unread: n.is_unread,
-            is_read: isRead,
-            read_at: n.read_at ? new Date(n.read_at).toISOString() : null,
-            data: {
-              type: 'teacher_support_chat',
-              chat_id: n.chat_id,
-              message_id: n.message_id,
-              sender_id: n.sender_id,
-            },
-            chat_id: n.chat_id,
-            message_id: n.message_id,
-          });
-        }
-      }
-
-      // 2) إشعارات الدردشة (مباشرة + جروب) — متوافقة مع Expo group_message
+      // 1) إشعارات الدردشة (مباشرة + جروب) — متوافقة مع Expo group_message
       // eslint-disable-next-line @typescript-eslint/ban-ts-comment
       // @ts-ignore
       const { ChatService } = await import('./chat');

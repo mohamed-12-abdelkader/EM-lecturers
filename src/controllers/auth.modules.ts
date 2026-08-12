@@ -24,6 +24,7 @@ export const RegisterStudent = z
       .transform((s) => s.trim()),
     grade_id: z.number().optional(),
     student_level_id: z.number().optional(),
+    course_group_id: z.coerce.number().int().positive().optional(),
     device_ip: z.string().optional(),
     course_category: z.enum(['برمجة', 'لغات', 'إدارة وتسويق', 'بيزنس', 'مهارات متنوعة']).optional(),
     /** عند استدعاء API من host افتراضي (مثل 127.0.0.1) يحدد منصة المدرّس؛ نفس الرقم على منصة أخرى = حساب جديد (tenant_id مختلف). */
@@ -79,6 +80,15 @@ export const RegisterAdminOrTeacher = z
     message: 'Either email or phone must be provided',
   });
 
+const booleanish = z.preprocess((value) => {
+  if (value === undefined || value === null || value === '') return undefined;
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'string') {
+    return ['1', 'true', 'yes', 'y', 'on'].includes(value.trim().toLowerCase());
+  }
+  return value;
+}, z.boolean().optional());
+
 export const Login = z
   .object({
     email: z.string().email().optional(),
@@ -94,6 +104,8 @@ export const Login = z
       .optional(),
     password: z.string().optional(),
     device_ip: z.string().optional(),
+    /** إبقاء الجلسة سنة كاملة (Refresh Cookie). الافتراضي: 7 أيام */
+    remember_me: booleanish,
     /** للطالب عند تسجيل الدخول من host افتراضي (localhost / ngrok). المدرس لا يحتاجه — يُكتشف تلقائياً. */
     subdomain: z.string().min(2).max(63).optional(),
     tenant_subdomain: z.string().min(2).max(63).optional(),

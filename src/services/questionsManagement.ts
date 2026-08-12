@@ -72,10 +72,10 @@ export class QuestionsManagementService {
   static async createBulkQuestionsForLectureExam(examId: number, bulkText: string) {
     // التحقق من وجود الامتحان وأنه يخص المدرس
     const examCheck = await pool.query(
-      `SELECT e.*, l.course_id, c.teacher_id 
+      `SELECT e.*, COALESCE(e.course_id, l.course_id) AS course_id, c.teacher_id 
        FROM exams e 
-       JOIN lectures l ON e.lecture_id = l.id 
-       JOIN courses c ON l.course_id = c.id 
+       LEFT JOIN lectures l ON e.lecture_id = l.id 
+       JOIN courses c ON c.id = COALESCE(e.course_id, l.course_id)
        WHERE e.id = $1`,
       [examId],
     );
@@ -191,8 +191,8 @@ export class QuestionsManagementService {
   ) {
     const examCheck = await pool.query(
       `SELECT e.id, c.teacher_id FROM exams e
-       JOIN lectures l ON e.lecture_id = l.id
-       JOIN courses c ON l.course_id = c.id
+       LEFT JOIN lectures l ON e.lecture_id = l.id
+       JOIN courses c ON c.id = COALESCE(e.course_id, l.course_id)
        WHERE e.id = $1 AND e.type IN ('exam', 'assignment')`,
       [examId],
     );

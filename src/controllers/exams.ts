@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { authMiddleware } from '../middleware/authentication';
+import { COURSE_CONTENT_ROLES, CourseAccessControl } from '../services/courseAccessControl';
 import { asyncWrapper, uploadToCloudinary } from '../utils';
 import { ExamFlowService } from '../services/examFlow';
 import { CourseLevelExamsService } from '../services/courseLevelExams';
@@ -86,7 +87,7 @@ const parseRequiredPositiveNumber = (value: any, field: string): number => {
 
 router.post(
   '/',
-  authMiddleware(['teacher']),
+  authMiddleware(COURSE_CONTENT_ROLES),
   asyncWrapper(async (req, res) => {
     const rawCourseId = pickBodyValue(req.body, 'courseId', 'course_id');
     const rawLectureId = pickBodyValue(req.body, 'lectureId', 'lecture_id');
@@ -295,7 +296,7 @@ router.get(
 
 router.get(
   '/teacher',
-  authMiddleware(['teacher']),
+  authMiddleware(COURSE_CONTENT_ROLES),
   asyncWrapper(async (req, res) => {
     const exams = await CourseLevelExamsService.getExamsByTeacher(req.user!.id);
     res.json({ success: true, total: exams.length, exams });
@@ -305,7 +306,7 @@ router.get(
 // POST /api/exams/lecture/:examId/questions/bulk — إضافة مجموعة أسئلة بنص واحد لامتحان المحاضرة (نفس صيغة امتحان الكورس: سؤال ثم a. b. c. d.)
 router.post(
   '/lecture/:examId/questions/bulk',
-  authMiddleware(['teacher']),
+  authMiddleware(COURSE_CONTENT_ROLES),
   asyncWrapper(async (req, res) => {
     const examId = Number(req.params.examId);
     if (Number.isNaN(examId)) {
@@ -365,7 +366,7 @@ router.post(
 // }
 router.post(
   '/lecture/:examId/questions/passage/bulk',
-  authMiddleware(['teacher']),
+  authMiddleware(COURSE_CONTENT_ROLES),
   asyncWrapper(async (req, res) => {
     const examId = Number(req.params.examId);
     if (Number.isNaN(examId)) {
@@ -550,7 +551,7 @@ router.get(
 
 router.patch(
   '/:examId',
-  authMiddleware(['teacher']),
+  authMiddleware(COURSE_CONTENT_ROLES),
   asyncWrapper(async (req, res) => {
     const examId = Number(req.params.examId);
     if (Number.isNaN(examId)) {
@@ -666,7 +667,7 @@ router.patch(
 
 router.delete(
   '/:examId',
-  authMiddleware(['teacher']),
+  authMiddleware(COURSE_CONTENT_ROLES),
   asyncWrapper(async (req, res) => {
     const examId = Number(req.params.examId);
     if (Number.isNaN(examId)) {
@@ -691,7 +692,7 @@ router.delete(
 // Body: { questionIds: number[], type?: "course-exam" } — إذا type = "course-exam" يعامل كامتحان كورس، وإلا امتحان محاضرة
 router.post(
   '/:examId/questions/from-bank',
-  authMiddleware(['teacher']),
+  authMiddleware(COURSE_CONTENT_ROLES),
   asyncWrapper(async (req, res) => {
     const examId = Number(req.params.examId);
     if (Number.isNaN(examId) || examId <= 0) {
@@ -784,7 +785,10 @@ router.post(
       return res.status(404).json({ message: 'Exam not found' });
     }
     if (lectureExam.teacher_id !== req.user!.id) {
-      return res.status(403).json({ message: 'You do not own this exam' });
+      await CourseAccessControl.assertOwnsJoinedCourse(req.user!, {
+        courseTeacherId: lectureExam.teacher_id,
+        courseId: (lectureExam as { course_id?: number }).course_id,
+      });
     }
 
     const existingRes = await pool.query(
@@ -858,7 +862,7 @@ async function resolveTeacherLibraryQuestionIds(
 // POST /api/exams/lecture/:examId/questions/from-teacher-library — امتحان المحاضرة
 router.post(
   '/lecture/:examId/questions/from-teacher-library',
-  authMiddleware(['teacher']),
+  authMiddleware(COURSE_CONTENT_ROLES),
   asyncWrapper(async (req, res) => {
     const examId = Number(req.params.examId);
     if (Number.isNaN(examId) || examId <= 0) {
@@ -903,7 +907,7 @@ router.post(
 // POST /api/exams/course-level/:examId/questions/from-teacher-library — امتحان الكورس العام
 router.post(
   '/course-level/:examId/questions/from-teacher-library',
-  authMiddleware(['teacher']),
+  authMiddleware(COURSE_CONTENT_ROLES),
   asyncWrapper(async (req, res) => {
     const examId = Number(req.params.examId);
     if (Number.isNaN(examId) || examId <= 0) {
@@ -960,7 +964,7 @@ router.post(
 // Body: { questionIds?: number[], lessonId?: number, passageId?: number, type?: "course-exam" }
 router.post(
   '/:examId/questions/from-teacher-library',
-  authMiddleware(['teacher']),
+  authMiddleware(COURSE_CONTENT_ROLES),
   asyncWrapper(async (req, res) => {
     const examId = Number(req.params.examId);
     if (Number.isNaN(examId) || examId <= 0) {
@@ -1050,7 +1054,7 @@ router.post(
 // Body: { passageId: number }
 router.post(
   '/:examId/questions/from-passage',
-  authMiddleware(['teacher']),
+  authMiddleware(COURSE_CONTENT_ROLES),
   asyncWrapper(async (req, res) => {
     const examId = Number(req.params.examId);
     const passageId = Number(req.body?.passageId ?? req.body?.passage_id);
@@ -1079,7 +1083,7 @@ router.post(
 // POST /api/exams/:examId/questions/passage — إنشاء قطعة بأسئلتها وإضافتها مباشرة لامتحان المحاضرة
 router.post(
   '/:examId/questions/passage',
-  authMiddleware(['teacher']),
+  authMiddleware(COURSE_CONTENT_ROLES),
   asyncWrapper(async (req, res) => {
     const examId = Number(req.params.examId);
     if (Number.isNaN(examId) || examId <= 0) {
@@ -1159,7 +1163,7 @@ router.post(
 // Body: { text: "سؤال؟\na. خيار\nb. خيار\nc. خيار\nd. خيار\n\nسؤال ثاني؟\na. ..." } أو questionText، اختياري: correctAnswers: ['A','B',...]
 router.post(
   '/:examId/questions/bulk',
-  authMiddleware(['teacher']),
+  authMiddleware(COURSE_CONTENT_ROLES),
   asyncWrapper(async (req, res) => {
     const examId = Number(req.params.examId);
     if (Number.isNaN(examId)) {
@@ -1203,7 +1207,7 @@ router.post(
 // POST /api/exams/:examId/questions - Create text-based question (واحد) أو مجموعة أسئلة
 router.post(
   '/:examId/questions',
-  authMiddleware(['teacher']),
+  authMiddleware(COURSE_CONTENT_ROLES),
   uploadQuestionImage.single('questionImage'),
   asyncWrapper(async (req, res) => {
     const examId = Number(req.params.examId);
@@ -1327,7 +1331,7 @@ router.post(
 // DELETE /api/exams/:examId/questions/:questionId - Remove question from exam (teacher only, lecture exams - يدعم الأسئلة المضافة من البنك)
 router.delete(
   '/:examId/questions/:questionId',
-  authMiddleware(['teacher']),
+  authMiddleware(COURSE_CONTENT_ROLES),
   asyncWrapper(async (req, res) => {
     const examId = Number(req.params.examId);
     const questionId = Number(req.params.questionId);
@@ -1352,7 +1356,7 @@ router.delete(
 // PATCH /api/exams/:examId/questions/:questionId/correct-answer - Set correct answer for question in lecture exam (أسئلة من البنك - التعديل للامتحان فقط)
 router.patch(
   '/:examId/questions/:questionId/correct-answer',
-  authMiddleware(['teacher']),
+  authMiddleware(COURSE_CONTENT_ROLES),
   asyncWrapper(async (req, res) => {
     const examId = Number(req.params.examId);
     const questionId = Number(req.params.questionId);
@@ -1384,7 +1388,7 @@ router.patch(
 // PATCH /api/exams/:examId/questions/:questionId/visibility - إخفاء أو إظهار سؤال في امتحان المحاضرة (بدون حذفه)
 router.patch(
   '/:examId/questions/:questionId/visibility',
-  authMiddleware(['teacher']),
+  authMiddleware(COURSE_CONTENT_ROLES),
   asyncWrapper(async (req, res) => {
     const examId = Number(req.params.examId);
     const questionId = Number(req.params.questionId);
@@ -1418,7 +1422,7 @@ router.patch(
 // POST /api/exams/:examId/questions/images - Create image-based questions (bulk)
 router.post(
   '/:examId/questions/images',
-  authMiddleware(['teacher']),
+  authMiddleware(COURSE_CONTENT_ROLES),
   uploadQuestionImage.any(),
   asyncWrapper(async (req, res) => {
     const examId = Number(req.params.examId);
@@ -1483,7 +1487,7 @@ router.post(
 // GET /api/exams/:examId/questions - Get all questions for an exam (teacher only)
 router.get(
   '/:examId/questions',
-  authMiddleware(['teacher']),
+  authMiddleware(COURSE_CONTENT_ROLES),
   asyncWrapper(async (req, res) => {
     const examId = Number(req.params.examId);
     if (Number.isNaN(examId)) {

@@ -13,14 +13,16 @@ export const UserUpdate = z.object({
   email: z.string().email().optional(),
   password: z.string().min(6).optional(),
   name: z.string().optional(),
-  role: z.enum(['student', 'admin', 'teacher', 'employee']).optional(),
+  role: z.enum(['student', 'admin', 'teacher', 'employee', 'academy', 'academy_teacher']).optional(),
 });
 
 export const User = UserBase.extend({
   id: z.number(),
-  role: z.enum(['student', 'admin', 'teacher', 'employee']),
+  role: z.enum(['student', 'admin', 'teacher', 'employee', 'academy', 'academy_teacher']),
   jti: z.string(),
   created_at: z.string(),
+  tenant_id: z.number().nullable().optional(),
+  account_status: z.string().optional(),
 });
 
 export type User = z.infer<typeof User>;

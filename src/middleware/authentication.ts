@@ -4,7 +4,7 @@ import { config, generateToken } from '../utils';
 import pool from '../db/pool';
 import { User } from '../db/types';
 
-type Roles = 'student' | 'teacher' | 'admin' | 'employee';
+type Roles = 'student' | 'teacher' | 'admin' | 'employee' | 'academy' | 'academy_teacher';
 
 type UserRow = User & {
   tenant_id?: number | null;
@@ -176,10 +176,24 @@ export function authMiddleware(roles: Roles[] = []): RequestHandler {
 
       const user = result.rows[0];
 
-      if (user.role === 'teacher' && user.account_status && user.account_status !== 'active') {
+      if (
+        (user.role === 'teacher' || user.role === 'academy' || user.role === 'academy_teacher') &&
+        user.account_status &&
+        user.account_status !== 'active'
+      ) {
         return res.status(403).json({
-          message: 'Teacher account is not active',
-          code: 'TEACHER_ACCOUNT_INACTIVE',
+          message:
+            user.role === 'academy'
+              ? 'Academy account is not active'
+              : user.role === 'academy_teacher'
+                ? 'Academy teacher account is not active'
+                : 'Teacher account is not active',
+          code:
+            user.role === 'academy'
+              ? 'ACADEMY_ACCOUNT_INACTIVE'
+              : user.role === 'academy_teacher'
+                ? 'ACADEMY_TEACHER_ACCOUNT_INACTIVE'
+                : 'TEACHER_ACCOUNT_INACTIVE',
         });
       }
 
@@ -202,8 +216,16 @@ export function authMiddleware(roles: Roles[] = []): RequestHandler {
       req.user = user;
       next();
     } catch (error: any) {
-      // Auto-refresh for students/teachers if token is expired (keep session alive)
+      // توافق خلفي: تجديد تلقائي للتوكن المنتهي عبر X-Access-Token (للعملاء القدامى فقط).
+      // العملاء الجدد يعتمدون على POST /auth/refresh + HttpOnly Cookie.
       if (error?.name === 'TokenExpiredError') {
+        if (!config.AUTH_LEGACY_AUTO_REFRESH) {
+          return res.status(401).json({
+            message: 'Access token expired',
+            code: 'TOKEN_EXPIRED',
+            hint: 'Call POST /api/auth/refresh',
+          });
+        }
         try {
           const decoded = jwt.verify(token, config.SECRET_KEY, { ignoreExpiration: true }) as any;
           const { id } = decoded || {};
@@ -220,22 +242,46 @@ export function authMiddleware(roles: Roles[] = []): RequestHandler {
 
           const user = result.rows[0];
 
-          if (user.role === 'teacher' && user.account_status && user.account_status !== 'active') {
+          if (
+            (user.role === 'teacher' ||
+              user.role === 'academy' ||
+              user.role === 'academy_teacher') &&
+            user.account_status &&
+            user.account_status !== 'active'
+          ) {
             return res.status(403).json({
-              message: 'Teacher account is not active',
-              code: 'TEACHER_ACCOUNT_INACTIVE',
+              message:
+                user.role === 'academy'
+                  ? 'Academy account is not active'
+                  : user.role === 'academy_teacher'
+                    ? 'Academy teacher account is not active'
+                    : 'Teacher account is not active',
+              code:
+                user.role === 'academy'
+                  ? 'ACADEMY_ACCOUNT_INACTIVE'
+                  : user.role === 'academy_teacher'
+                    ? 'ACADEMY_TEACHER_ACCOUNT_INACTIVE'
+                    : 'TEACHER_ACCOUNT_INACTIVE',
             });
           }
 
           if (!(await assertRequestTenantMatchesUserAndToken(req, res, decoded, user))) return;
 
-          if (user.role === 'student' || user.role === 'teacher') {
-            await refreshSessionToken(res, req, user);
-            req.user = user;
-            return next();
+          // Role-based access check (only if roles are specified)
+          if (roles.length > 0 && !roles.includes(user.role)) {
+            return res.status(403).json({
+              message: 'Forbidden: insufficient role',
+              details: {
+                user_role: user.role,
+                required_roles: roles,
+                user_id: user.id,
+              },
+            });
           }
 
-          return res.status(401).json({ message: 'Token expired' });
+          await refreshSessionToken(res, req, user);
+          req.user = user;
+          return next();
         } catch (innerErr) {
           console.error('JWT refresh error:', innerErr);
           return res.status(401).json({ message: 'Invalid token' });

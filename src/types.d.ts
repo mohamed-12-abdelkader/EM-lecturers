@@ -5,6 +5,7 @@ import type { ResolvedTenant } from './middleware/tenantContext';
 
 interface CompletedUser extends User {
   avatar?: string;
+  tenant_id?: number | null;
 }
 
 export interface Meeting {

@@ -52,6 +52,8 @@ export type CreateTenantInput = {
   og_image_url?: string | null;
   settings?: Record<string, unknown>;
   landing?: TenantLandingPage;
+  /** teacher (default) | academy */
+  platform_type?: 'teacher' | 'academy';
   owner?: {
     name: string;
     email: string;
@@ -341,12 +343,15 @@ export class TenantService {
 
   static async createWithDefaults(client: PoolClient, input: CreateTenantInput) {
     const subdomain = normalizeSubdomain(input.subdomain);
+    const platformType = input.platform_type === 'academy' ? 'academy' : 'teacher';
+    const ownerRole = platformType === 'academy' ? 'academy' : 'teacher';
+
     const t = await client.query(
       `INSERT INTO tenants (
          subdomain, display_name, specialty, bio, avatar_url, is_active,
-         seo_title, seo_meta_description, favicon_url, og_image_url
-       ) VALUES ($1, $2, $3, $4, $5, COALESCE($6, TRUE), $7, $8, $9, $10)
-       RETURNING id, subdomain, display_name, is_active, owner_user_id`,
+         seo_title, seo_meta_description, favicon_url, og_image_url, platform_type
+       ) VALUES ($1, $2, $3, $4, $5, COALESCE($6, TRUE), $7, $8, $9, $10, $11)
+       RETURNING id, subdomain, display_name, is_active, owner_user_id, platform_type`,
       [
         subdomain,
         input.display_name,
@@ -358,6 +363,7 @@ export class TenantService {
         input.seo_meta_description ?? null,
         input.favicon_url ?? null,
         input.og_image_url ?? null,
+        platformType,
       ],
     );
     const created = t.rows[0] as {
@@ -366,6 +372,7 @@ export class TenantService {
       display_name: string;
       is_active: boolean;
       owner_user_id: number | null;
+      platform_type: string;
     };
 
     await client.query(
@@ -388,15 +395,16 @@ export class TenantService {
       const u = await client.query(
         `INSERT INTO users (
            email, password, name, avatar, role, description, subject, tenant_id,
-           facebook_url, instagram_url, youtube_url, tiktok_url, whatsapp_number
+           facebook_url, instagram_url, youtube_url, tiktok_url, whatsapp_number, account_status
          )
-         VALUES ($1, $2, $3, $4, 'teacher', $5, $6, $7, $8, $9, $10, $11, $12)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'active')
          RETURNING id`,
         [
           input.owner.email,
           hashed,
           input.owner.name,
           input.avatar_url ?? null,
+          ownerRole,
           description,
           subject,
           created.id,

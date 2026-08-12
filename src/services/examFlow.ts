@@ -8,12 +8,14 @@ import {
   type AttemptSnapshot,
   type ReleaseDecision,
 } from './examPolicies';
+import { CourseAccessControl } from './courseAccessControl';
 
-type UserRole = 'student' | 'teacher' | 'admin' | 'employee';
+type UserRole = 'student' | 'teacher' | 'admin' | 'employee' | 'academy' | 'academy_teacher';
 
 interface RequestUser {
   id: number;
   role: UserRole;
+  tenant_id?: number | null;
 }
 
 interface AnswerPayload {
@@ -169,6 +171,17 @@ function parseLectureExamTypeFilter(value?: string): LectureExamRecordType | 'al
 }
 
 export class ExamFlowService {
+  private static async canUserManageCourse(userId: number, courseId: number): Promise<boolean> {
+    const u = await pool.query<{ role: string; tenant_id: number | null }>(
+      `SELECT role, tenant_id FROM users WHERE id = $1`,
+      [userId],
+    );
+    if (!u.rowCount) return false;
+    return CourseAccessControl.canManageCourse(
+      { id: userId, role: u.rows[0].role, tenant_id: u.rows[0].tenant_id },
+      courseId,
+    );
+  }
   /**
    * تحويل نص Bulk لأسئلة MCQ (يدعم: 1- ... + (أ)/(ب)/(ج)/(د) أو A/B/C/D)
    */
@@ -298,7 +311,7 @@ export class ExamFlowService {
     }
 
     const lectureRes = await pool.query(
-      `SELECT l.id, c.teacher_id
+      `SELECT l.id, l.course_id, c.teacher_id
        FROM lectures l
        JOIN courses c ON l.course_id = c.id
        WHERE l.id = $1`,
@@ -311,7 +324,10 @@ export class ExamFlowService {
       throw error;
     }
 
-    if (lectureRes.rows[0].teacher_id !== teacherId) {
+    if (
+      lectureRes.rows[0].teacher_id !== teacherId &&
+      !(await this.canUserManageCourse(teacherId, Number(lectureRes.rows[0].course_id)))
+    ) {
       const error: any = new Error('You do not own this lecture');
       error.status = 403;
       throw error;
@@ -426,7 +442,7 @@ export class ExamFlowService {
       throw error;
     }
 
-    if (exam.teacher_id !== teacherId) {
+    if (!(await this.canUserManageCourse(teacherId, Number(exam.course_id))) && exam.teacher_id !== teacherId) {
       const error: any = new Error('You do not own this exam');
       error.status = 403;
       throw error;
@@ -536,7 +552,7 @@ export class ExamFlowService {
       err.status = 404;
       throw err;
     }
-    if (exam.teacher_id !== teacherId) {
+    if (!(await this.canUserManageCourse(teacherId, Number(exam.course_id))) && exam.teacher_id !== teacherId) {
       const err: any = new Error('You do not own this exam');
       err.status = 403;
       throw err;
@@ -625,7 +641,7 @@ export class ExamFlowService {
       err.status = 404;
       throw err;
     }
-    if (exam.teacher_id !== teacherId) {
+    if (!(await this.canUserManageCourse(teacherId, Number(exam.course_id))) && exam.teacher_id !== teacherId) {
       const err: any = new Error('You do not own this exam');
       err.status = 403;
       throw err;
@@ -765,7 +781,7 @@ export class ExamFlowService {
       throw error;
     }
 
-    if (exam.teacher_id !== teacherId) {
+    if (!(await this.canUserManageCourse(teacherId, Number(exam.course_id))) && exam.teacher_id !== teacherId) {
       const error: any = new Error('You do not own this exam');
       error.status = 403;
       throw error;
@@ -802,7 +818,7 @@ export class ExamFlowService {
       error.status = 404;
       throw error;
     }
-    if (exam.teacher_id !== teacherId) {
+    if (!(await this.canUserManageCourse(teacherId, Number(exam.course_id))) && exam.teacher_id !== teacherId) {
       const error: any = new Error('You do not own this exam');
       error.status = 403;
       throw error;
@@ -849,7 +865,7 @@ export class ExamFlowService {
       error.status = 404;
       throw error;
     }
-    if (exam.teacher_id !== teacherId) {
+    if (!(await this.canUserManageCourse(teacherId, Number(exam.course_id))) && exam.teacher_id !== teacherId) {
       const error: any = new Error('You do not own this exam');
       error.status = 403;
       throw error;
@@ -888,7 +904,7 @@ export class ExamFlowService {
          FROM exams e
          INNER JOIN lectures l ON e.lecture_id = l.id
          INNER JOIN courses c ON l.course_id = c.id
-         WHERE c.teacher_id = $1 AND e.type = 'assignment'`,
+         WHERE (c.teacher_id = $1 OR EXISTS (SELECT 1 FROM course_managers cm WHERE cm.course_id = c.id AND cm.user_id = $1) OR EXISTS (SELECT 1 FROM tenants t WHERE t.id = c.tenant_id AND t.owner_user_id = $1 AND t.platform_type = $academy$)) AND e.type = 'assignment'`,
         [teacherId],
       );
       if ((assignmentCountRes.rows[0]?.c ?? 0) === 0) {
@@ -956,16 +972,17 @@ export class ExamFlowService {
       throw error;
     }
 
-    // eslint-disable-next-line @typescript-eslint/ban-ts-comment
-    // @ts-expect-error
-    if (user.role === 'teacher' && exam.teacher_id !== user.id && user.role !== 'admin') {
+    if (user.role !== 'admin' && user.role !== 'student' && !(await CourseAccessControl.canManageCourse(user, Number(exam.course_id))) && exam.teacher_id !== user.id) {
       const error: any = new Error('You do not own this exam');
       error.status = 403;
       throw error;
     }
 
     if (user.role === 'student') {
-      await this.ensureStudentEnrollment(exam.lecture_id, user.id);
+      await this.ensureStudentEnrollment(
+        { lectureId: exam.lecture_id, courseId: exam.course_id },
+        user.id,
+      );
 
       await this.expireOverdueAttempts(exam.id, user.id);
 
@@ -1041,7 +1058,10 @@ export class ExamFlowService {
       throw error;
     }
 
-    await this.ensureStudentEnrollment(exam.lecture_id, studentId);
+    await this.ensureStudentEnrollment(
+      { lectureId: exam.lecture_id, courseId: exam.course_id },
+      studentId,
+    );
 
     if (!exam.is_visible || !this.isWithinVisibilityWindow(exam)) {
       const error: any = new Error('This exam is not available right now');
@@ -1113,7 +1133,10 @@ export class ExamFlowService {
       throw error;
     }
 
-    await this.ensureStudentEnrollment(exam.lecture_id, studentId);
+    await this.ensureStudentEnrollment(
+      { lectureId: exam.lecture_id, courseId: exam.course_id },
+      studentId,
+    );
 
     if (!Array.isArray(answers) || answers.length === 0) {
       const error: any = new Error('answers array is required');
@@ -1226,9 +1249,7 @@ export class ExamFlowService {
       throw error;
     }
 
-    // eslint-disable-next-line @typescript-eslint/ban-ts-comment
-    // @ts-expect-error
-    if (user.role === 'teacher' && exam.teacher_id !== user.id && user.role !== 'admin') {
+    if (user.role !== 'admin' && user.role !== 'student' && !(await CourseAccessControl.canManageCourse(user, Number(exam.course_id))) && exam.teacher_id !== user.id) {
       const error: any = new Error('You do not own this exam');
       error.status = 403;
       throw error;
@@ -1265,7 +1286,10 @@ export class ExamFlowService {
       error.status = 404;
       throw error;
     }
-    await this.ensureStudentEnrollment(exam.lecture_id, studentId);
+    await this.ensureStudentEnrollment(
+      { lectureId: exam.lecture_id, courseId: exam.course_id },
+      studentId,
+    );
 
     const attempts = await this.getStudentAttempts(examId, studentId);
     const latestSubmitted = attempts.find((a) =>
@@ -1331,7 +1355,7 @@ export class ExamFlowService {
       throw error;
     }
 
-    if (user.role !== 'admin' && exam.teacher_id !== user.id) {
+    if (user.role !== 'admin' && !(await CourseAccessControl.canManageCourse(user, Number(exam.course_id))) && exam.teacher_id !== user.id) {
       const error: any = new Error('You do not own this exam');
       error.status = 403;
       throw error;
@@ -1416,26 +1440,40 @@ export class ExamFlowService {
     };
   }
 
-  /** Get lecture exam by id with course/teacher info. Returns null if not found. */
+  /** Get exam/assignment by id with course/teacher info (lecture-based أو course-based). */
   static async getExamWithCourse(examId: number) {
     const res = await pool.query(
-      `SELECT e.*, l.course_id, c.teacher_id
+      `SELECT e.*,
+              COALESCE(e.course_id, l.course_id) AS course_id,
+              c.teacher_id
        FROM exams e
-       JOIN lectures l ON e.lecture_id = l.id
-       JOIN courses c ON l.course_id = c.id
+       LEFT JOIN lectures l ON e.lecture_id = l.id
+       JOIN courses c ON c.id = COALESCE(e.course_id, l.course_id)
        WHERE e.id = $1`,
       [examId],
     );
     return res.rows[0] || null;
   }
 
-  private static async ensureStudentEnrollment(lectureId: number, studentId: number) {
+  private static async ensureStudentEnrollment(
+    lectureOrCourse: { lectureId?: number | null; courseId?: number | null },
+    studentId: number,
+  ) {
+    let courseId = lectureOrCourse.courseId ? Number(lectureOrCourse.courseId) : null;
+    if (!courseId && lectureOrCourse.lectureId) {
+      const lec = await pool.query(`SELECT course_id FROM lectures WHERE id = $1`, [
+        lectureOrCourse.lectureId,
+      ]);
+      courseId = lec.rowCount ? Number(lec.rows[0].course_id) : null;
+    }
+    if (!courseId) {
+      const error: any = new Error('You are not enrolled in this course');
+      error.status = 403;
+      throw error;
+    }
     const enrollment = await pool.query(
-      `SELECT 1
-       FROM enrollments en
-       JOIN lectures l ON l.course_id = en.course_id
-       WHERE l.id = $1 AND en.user_id = $2`,
-      [lectureId, studentId],
+      `SELECT 1 FROM enrollments WHERE course_id = $1 AND user_id = $2`,
+      [courseId, studentId],
     );
     if (!enrollment.rowCount) {
       const error: any = new Error('You are not enrolled in this course');
@@ -2038,35 +2076,145 @@ export class ExamFlowService {
         eq.image,
         q.text as bank_text,
         q.image as bank_image,
+        q2.question_text as bank_text_v2,
+        qm.media_url as bank_image_v2,
         ea.selected_choice_id,
         ea.is_correct,
         selected_choice.text as selected_choice_text,
+        selected_opt.text_content as selected_choice_text_v2,
         correct_choice.id as correct_choice_id,
-        correct_choice.text as correct_choice_text
+        correct_choice.text as correct_choice_text,
+        correct_opt.id as correct_choice_id_v2,
+        correct_opt.text_content as correct_choice_text_v2
        FROM exam_answers ea
        JOIN exam_questions eq ON ea.question_id = eq.id
        LEFT JOIN questions q ON eq.question_id = q.id
        LEFT JOIN question_choices selected_choice ON selected_choice.id = ea.selected_choice_id
        LEFT JOIN question_choices correct_choice 
          ON correct_choice.question_id = eq.question_id AND correct_choice.is_correct = true
+       LEFT JOIN questions_v2 q2 ON eq.question_id_v2 = q2.id
+       LEFT JOIN question_media qm ON q2.id = qm.question_id
+       LEFT JOIN question_options selected_opt ON selected_opt.id = ea.selected_choice_id
+       LEFT JOIN question_options correct_opt
+         ON correct_opt.question_id = q2.id
+        AND correct_opt.option_index = q2.correct_answer_index
        WHERE ea.submission_id = $1
        ORDER BY ea.question_id`,
       [attemptId],
     );
 
-    return res.rows.map((row) => ({
-      questionId: row.exam_question_id,
-      questionText: row.question_text || row.bank_text || null,
-      questionImage: row.image || row.bank_image || null,
-      selectedChoice: {
-        id: row.selected_choice_id,
-        text: row.selected_choice_text || null,
-      },
-      correctChoice: row.correct_choice_id
-        ? { id: row.correct_choice_id, text: row.correct_choice_text }
-        : null,
-      isCorrect: row.is_correct,
-    }));
+    return res.rows.map((row) => {
+      const selectedText = row.selected_choice_text || row.selected_choice_text_v2 || null;
+      const correctId = row.correct_choice_id ?? row.correct_choice_id_v2 ?? null;
+      const correctText = row.correct_choice_text || row.correct_choice_text_v2 || null;
+      return {
+        questionId: row.exam_question_id,
+        questionText: row.question_text || row.bank_text || row.bank_text_v2 || null,
+        questionImage: row.image || row.bank_image || row.bank_image_v2 || null,
+        selectedChoice: {
+          id: row.selected_choice_id,
+          text: selectedText,
+        },
+        correctChoice:
+          correctId != null || correctText ? { id: correctId, text: correctText } : null,
+        isCorrect: row.is_correct,
+      };
+    });
+  }
+
+  /**
+   * قائمة تسليمات امتحان المحاضرة للمدرس مع الأسئلة الخاطئة لكل طالب.
+   */
+  static async listLectureExamSubmissionsWithWrongQuestions(examId: number) {
+    const subsRes = await pool.query(
+      `SELECT s.id as submission_id, s.student_id, s.total_grade, s.submitted_at, s.passed,
+              s.status, s.attempt_number, u.name, u.email, u.phone
+       FROM exam_submissions s
+       JOIN users u ON s.student_id = u.id
+       WHERE s.exam_id = $1
+         AND COALESCE(s.status, 'submitted') IN ('submitted', 'late', 'expired')
+       ORDER BY s.submitted_at DESC NULLS LAST, s.id DESC`,
+      [examId],
+    );
+
+    if (!subsRes.rowCount) {
+      return [];
+    }
+
+    const submissionIds = subsRes.rows.map((r) => Number(r.submission_id));
+    const answersRes = await pool.query(
+      `SELECT 
+        ea.submission_id,
+        ea.question_id as exam_question_id,
+        eq.question_text,
+        eq.image,
+        q.text as bank_text,
+        q.image as bank_image,
+        q2.question_text as bank_text_v2,
+        qm.media_url as bank_image_v2,
+        ea.selected_choice_id,
+        ea.is_correct,
+        selected_choice.text as selected_choice_text,
+        selected_opt.text_content as selected_choice_text_v2,
+        correct_choice.id as correct_choice_id,
+        correct_choice.text as correct_choice_text,
+        correct_opt.id as correct_choice_id_v2,
+        correct_opt.text_content as correct_choice_text_v2
+       FROM exam_answers ea
+       JOIN exam_questions eq ON ea.question_id = eq.id
+       LEFT JOIN questions q ON eq.question_id = q.id
+       LEFT JOIN question_choices selected_choice ON selected_choice.id = ea.selected_choice_id
+       LEFT JOIN question_choices correct_choice 
+         ON correct_choice.question_id = eq.question_id AND correct_choice.is_correct = true
+       LEFT JOIN questions_v2 q2 ON eq.question_id_v2 = q2.id
+       LEFT JOIN question_media qm ON q2.id = qm.question_id
+       LEFT JOIN question_options selected_opt ON selected_opt.id = ea.selected_choice_id
+       LEFT JOIN question_options correct_opt
+         ON correct_opt.question_id = q2.id
+        AND correct_opt.option_index = q2.correct_answer_index
+       WHERE ea.submission_id = ANY($1::int[])
+         AND ea.is_correct = FALSE
+       ORDER BY ea.submission_id, ea.question_id`,
+      [submissionIds],
+    );
+
+    const wrongBySubmission = new Map<number, WrongQuestion[]>();
+    for (const row of answersRes.rows) {
+      const sid = Number(row.submission_id);
+      const list = wrongBySubmission.get(sid) || [];
+      const correctId = row.correct_choice_id ?? row.correct_choice_id_v2 ?? null;
+      const correctText = row.correct_choice_text || row.correct_choice_text_v2 || null;
+      list.push({
+        questionId: row.exam_question_id,
+        questionText: row.question_text || row.bank_text || row.bank_text_v2 || null,
+        questionImage: row.image || row.bank_image || row.bank_image_v2 || null,
+        correctChoice:
+          correctId != null || correctText ? { id: correctId, text: correctText } : null,
+        yourChoice: {
+          id: row.selected_choice_id,
+          text: row.selected_choice_text || row.selected_choice_text_v2 || null,
+        },
+      });
+      wrongBySubmission.set(sid, list);
+    }
+
+    return subsRes.rows.map((row) => {
+      const wrong = wrongBySubmission.get(Number(row.submission_id)) || [];
+      return {
+        submission_id: row.submission_id,
+        student_id: row.student_id,
+        total_grade: row.total_grade,
+        submitted_at: row.submitted_at,
+        passed: row.passed,
+        status: row.status,
+        attempt_number: row.attempt_number,
+        name: row.name,
+        email: row.email,
+        phone: row.phone,
+        wrong_questions: wrong,
+        wrong_questions_count: wrong.length,
+      };
+    });
   }
 
   private static async maybeAddStudentPoints(

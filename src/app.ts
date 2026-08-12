@@ -1,8 +1,10 @@
 import express from 'express';
 import { createServer } from 'http';
-import { config, loggerMiddleware } from './utils';
+import { loggerMiddleware } from './utils';
 import { errorHandlerMiddleware } from './middleware/errorHandler';
 import { absoluteUrlResponseMiddleware } from './middleware/absoluteUrlResponse';
+import { cookieParserMiddleware } from './middleware/cookieParser';
+import { securityHeadersMiddleware } from './middleware/securityHeaders';
 import cors from 'cors';
 import { getCorsOriginDelegate, getServerInfo } from './config/appUrls';
 import { router } from './routes';
@@ -11,14 +13,20 @@ import { tenantContextMiddleware } from './middleware/tenantContext';
 export const app = express();
 export const server = createServer(app);
 
+// خلف proxy (ngrok / nginx): مطلوب لقراءة IP الحقيقي و secure cookies
+app.set('trust proxy', 1);
+
 // Large OCR / file uploads can take a long time (multi-page PDF batches)
 server.timeout = 0;
 server.requestTimeout = 0;
 server.headersTimeout = 0;
 
+app.use(securityHeadersMiddleware);
+
 // Parse JSON bodies; include text/plain because some clients (e.g. Postman "raw" default) send JSON with Content-Type: text/plain
 app.use(express.json({ type: ['application/json', 'text/plain'] }));
 app.use(express.urlencoded({ extended: true }));
+app.use(cookieParserMiddleware);
 app.use(cors(getCorsOriginDelegate()));
 // Expose refreshed token header to the browser
 app.use((req, res, next) => {

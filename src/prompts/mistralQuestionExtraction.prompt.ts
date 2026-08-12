@@ -20,12 +20,18 @@ export function buildQuestionExtractionPrompt(
     : `4. correct_answer و correct_answer_index: فقط إن وُجدت إشارة صريحة في النص وإلا null.
 5. correct_answer_inferred: false دائماً (أو احذف الحقل).`;
 
-  const optionRules = `3. الاختيارات:
-   - إذا كان السؤال له اختيارات، استخرج **كل** الاختيارات كما في الملف (${MIN_MCQ_OPTIONS} إلى ${MAX_MCQ_OPTIONS} اختيارات).
-   - بعض الأسئلة 3 اختيارات فقط (a,b,c) وبعضها 5 (a,b,c,d,e) — لا تضف اختيارات ولا تحذف منها.
-   - إذا لم يكن للسؤال اختيارات، اجعل options = [].
-   - احتفظ بـ label كما في المصدر: عربي (أ، ب، ج، د، هـ) أو إنجليزي (a, b, c, d, e) أو أرقام.
-   - تخطيط أفقي مثل "a. seller b. driver c. customer" = 3 خيارات منفصلة في options[].`;
+  const optionRules = `3. الاختيارات (مهم جداً — لا تختصر):
+   - استخرج **كل** الاختيارات الظاهرة في الملف دون حذف.
+   - في الامتحانات العربية غالباً 4 اختيارات: أ، ب، ج، د — حتى لو كانت في شبكة 2×2 أفقياً/عمودياً. **ممنوع** إرجاع اختيارين فقط إذا وُجدت أربعة.
+   - بعض الأسئلة الإنجليزية 3 أو 5 اختيارات — التزم بعدد الملف فقط (${MIN_MCQ_OPTIONS}–${MAX_MCQ_OPTIONS}).
+   - إذا لم يكن للسؤال اختيارات نصية، اجعل options = [] (حالة اختيارات بالصور فقط بدون labels نصية واضحة).
+   - احتفظ بـ label كما في المصدر: أ/ب/ج/د أو a/b/c/d.
+   - تخطيط مثل "أ) 10 A    ب) 250 A" تحتها "ج) ...    د) ..." = أربعة خيارات منفصلة.
+   - إذا كانت الاختيارات **صوراً/رسوماً بيانية** (وليس نصاً):
+     * options[].text = "" أو وصف قصير جداً إن وُجد حرف أ/ب/ج/د بجانب الصورة.
+     * options[].image_id = معرف صورة الاختيار من IMAGE_CONTEXT (إلزامي لكل اختيار صورة).
+     * **لا تضع صور الاختيارات داخل question_images[]**.
+     * ضع صورة/رسم السؤال الأساسي فقط (الشكل المقابل في نص السؤال) داخل question_images[].`;
 
   const numberingNote = opts.inferCorrectAnswer ? '5' : '6';
   const noInventNote = opts.inferCorrectAnswer ? '6' : '7';
@@ -36,8 +42,8 @@ export function buildQuestionExtractionPrompt(
 مهمتك: تحليل النص أدناه المستخرج من الملف "${filename}" وإرجاع JSON فقط بدون أي نص خارج JSON.
 
 قواعد صارمة:
-1. اكتشف كل سؤال برقمه (١، 2، س1، Q1، …) ولا تدمج سؤالين في سؤال واحد.
-2. لكل سؤال: استخرج نص السؤال كاملاً مع الفراغات (....) والمعادلات (Unicode أو LaTeX بسيط).
+1. اكتشف كل سؤال برقمه (٦، 6، س1، Q1، …) ولا تدمج سؤالين في سؤال واحد.
+2. لكل سؤال: استخرج نص السؤال كاملاً مع الفراغات (....) والمعادلات (Unicode أو LaTeX بسيط مثل $$\\frac{I_x}{I_y}$$).
 ${optionRules}
 ${answerRules}
 ${numberingNote}. correct_answer_index: فهرس 0-based يطابق ترتيب options[] (الأول = 0).
@@ -47,64 +53,60 @@ ${emptyOptionsNote}. إن لم تجد اختيارات واضحة، options = []
    - إذا وجدت سؤالاً مرقماً بلا اختيارات مثل: "ميّز – ممّا يلي – ما يؤيد..." فاحتفظ به كسؤال حقيقي، ولا تحوله إلى passage.
    - إذا كان هذا السؤال ضمن أسئلة قطعة/فقرة، يجب أن يأخذ نفس passage_id الخاص ببقية أسئلة القطعة حتى لو لم تكن له اختيارات.
    - في هذه الحالة: options = [] و correct_answer = null و correct_answer_index = null.
-9. إذا كان نص السؤال يعتمد على صورة/رسم/شكل/جدول:
-   - استخدم مراجع الصور الموجودة في النص مثل ![img-0.jpeg](img-0.jpeg) أو وصف IMAGE_CONTEXT.
-   - أضف الصورة إلى question_images[] ولا تضعها إذا كانت مجرد شعار أو صورة غير مرتبطة بالسؤال.
+9. الصور المرتبطة بالسؤال (الشكل المقابل / الرسم البياني في رأس السؤال):
+   - استخدم مراجع الصور مثل ![img-0.jpeg](img-0.jpeg) و IMAGE_CONTEXT.
+   - أضف صورة السؤال الأساسية فقط إلى question_images[] (diagram/chart/graph/figure/question_figure).
    - image_id يجب أن يطابق معرف الصورة في IMAGE_CONTEXT.
-10. إذا وجدت قطعة/فقرة/نص قراءة/نص علمي واحد يتبعه أكثر من سؤال:
+   - **لا** تضف شعارات أو زخارف أو صور اختيارات أ/ب/ج/د إلى question_images[].
+   - إذا كان نوع الصورة في IMAGE_CONTEXT = choice_option فهي اختيار وليست صورة سؤال.
+10. سؤال باختيارات صور (image choices):
+   - question_images[] = صورة/رسم السؤال فقط إن وُجدت (مثل منحنى N–t في رأس السؤال).
+   - options = أربعة عناصر (أو حسب الملف) كل منها label أ/ب/ج/د و image_id لصورة الاختيار.
+   - عدد options يجب أن يساوي عدد صور الاختيارات، وليس عدد كل الصور في الصفحة.
+11. إذا وجدت قطعة/فقرة/نص قراءة واحد يتبعه أكثر من سؤال:
    - ضع نص القطعة كاملاً مرة واحدة في passages[].
    - أعطها passage_id ثابتاً مثل "passage_1".
    - في كل سؤال تابع لها ضع نفس passage_id.
-   - لا تكرر نص القطعة داخل question_text؛ question_text يحتوي نص السؤال فقط.
-   - إذا تغيّرت القطعة أو بدأ نص جديد، أنشئ passage_id جديداً.
-11. إذا وجدت سؤالاً رئيسياً/تمهيداً مرقماً ثم داخله أكثر من سؤال فرعي ولكل سؤال فرعي اختياراته:
-   - لا تجعل التمهيد سؤالاً مستقلاً.
-   - أنشئ سؤالاً مستقلاً في questions[] لكل فرع له اختيارات.
-   - question_text لكل فرع = التمهيد الكامل + نص الفرع معاً في سؤال واحد مكتمل.
-   - لا تضع التمهيد في passages[] ولا تستخدم passage_id لهذه الحالة؛ passage_id = null.
-   - استخدم source_number لرقم المصدر المركب مثل "2-1" و"2-2".
-   - number يجب أن يكون رقم ترتيب عالمي فريد ومتزايد داخل المخرجات.
-12. إذا كان السؤال مستقلاً ولا يعتمد على قطعة مشتركة، اجعل passage_id = null أو احذف الحقل.
+   - لا تكرر نص القطعة داخل question_text.
+12. إذا وجدت سؤالاً رئيسياً ثم فروعاً لكل منها اختيارات: أنشئ سؤالاً مستقلاً لكل فرع (تمهيد + نص الفرع) بدون passage_id.
+13. إذا كان السؤال مستقلاً، passage_id = null.
 
 صيغة الإخراج الإلزامية:
 {
-  "passages": [
-    {
-      "passage_id": "passage_1",
-      "title": "نصائح للذكاء الاجتماعي",
-      "content": "نص القطعة الكامل الذي تعتمد عليه عدة أسئلة..."
-    }
-  ],
+  "passages": [],
   "questions": [
     {
-      "number": 1,
-      "source_number": "1",
+      "number": 6,
+      "source_number": "6",
       "passage_id": null,
-      "question_text": "The .......... paid for the goods and left the shop happily.",
+      "question_text": "الشكل البياني المقابل يمثل العلاقة بين ... فتكون شدة التيار ...",
       "options": [
-        { "label": "a", "text": "seller" },
-        { "label": "b", "text": "driver" },
-        { "label": "c", "text": "customer" },
-        { "label": "d", "text": "buyer" },
-        { "label": "e", "text": "teacher" }
+        { "label": "أ", "text": "2 A" },
+        { "label": "ب", "text": "10 A" },
+        { "label": "ج", "text": "50 A" },
+        { "label": "د", "text": "250 A" }
       ],
-      "question_images": [],
+      "question_images": [
+        { "image_id": "img-0.jpeg", "page_index": 0, "image_type": "chart" }
+      ],
       "correct_answer": null,
       "correct_answer_index": null,
       "correct_answer_inferred": false
     },
     {
-      "number": 2,
-      "source_number": "2",
-      "passage_id": "passage_1",
-      "question_text": "حدِّد هدف الكاتب كما فهمت من الفقرة الأولى.",
+      "number": 8,
+      "source_number": "8",
+      "passage_id": null,
+      "question_text": "الشكل البياني المقابل يعبر عن العلاقة بين عدد الإلكترونات (N) ... فيكون الشكل الذي يمثل I مقابل t هو ...",
       "options": [
-        { "label": "أ", "text": "..." },
-        { "label": "ب", "text": "..." },
-        { "label": "ج", "text": "..." },
-        { "label": "د", "text": "..." }
+        { "label": "أ", "text": "", "image_id": "img-2.jpeg" },
+        { "label": "ب", "text": "", "image_id": "img-3.jpeg" },
+        { "label": "ج", "text": "", "image_id": "img-4.jpeg" },
+        { "label": "د", "text": "", "image_id": "img-5.jpeg" }
       ],
-      "question_images": [],
+      "question_images": [
+        { "image_id": "img-1.jpeg", "page_index": 0, "image_type": "chart" }
+      ],
       "correct_answer": null,
       "correct_answer_index": null,
       "correct_answer_inferred": false

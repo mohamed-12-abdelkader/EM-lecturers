@@ -150,7 +150,7 @@ async function main() {
         tid: Number(teacher.tenant_id),
       },
       secretKey,
-      { expiresIn: '7d' },
+      { expiresIn: '365d' },
     );
 
     if (args.raw) {

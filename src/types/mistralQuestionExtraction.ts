@@ -11,6 +11,8 @@ export function isValidMistralOptionCount(count: number): boolean {
 export const MistralExtractedOptionSchema = z.object({
   label: z.string(),
   text: z.string().default(''),
+  /** معرف صورة الاختيار من OCR (لأسئلة image_choices) */
+  image_id: z.string().optional(),
 });
 
 export const MistralQuestionImageSchema = z.object({

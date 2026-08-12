@@ -18,6 +18,7 @@ import { ExamsService } from '../services/exams';
 import * as ExpoPushService from '../services/expoPushService';
 import { NotificationTriggers } from '../services/notificationTriggers';
 import { VideoViewTrackingService } from '../services/videoViewTracking';
+import { TeacherVideoPlaybackService } from '../services/teacherVideoPlayback';
 import { SeoHooks } from '../services/seo/hooks';
 import {
   getCourseGradesMap,
@@ -25,6 +26,15 @@ import {
   syncCourseGrades,
   withCourseGrades,
 } from '../utils/courseGrades';
+import {
+  CourseAccessControl,
+  COURSE_CREATE_ROLES,
+  COURSE_CONTENT_ROLES,
+} from '../services/courseAccessControl';
+import { ExamFlowService } from '../services/examFlow';
+import { CourseFilesService } from '../services/courseFiles';
+import { LectureAccessService } from '../services/lectureAccess';
+import { CourseGroupAccessService } from '../services/courseGroupAccess';
 
 export const router = Router();
 
@@ -117,6 +127,7 @@ const CourseSchema = z.object({
       return false;
     }),
   description: z.string().optional(),
+  subject: z.string().max(200).optional().nullable(),
   grade_id: z
     .union([z.string(), z.number()])
     .optional()
@@ -151,10 +162,18 @@ const ActivateCourseSchema = z.object({
   course_id: z.number(),
 });
 
-// إنشاء كورس جديد (مدرس فقط)
+// تفعيل بالكود فقط (بدون course_id)
+const ActivateByCodeOnlySchema = z.object({
+  code: z
+    .union([z.string(), z.number()])
+    .transform((v) => String(v).trim())
+    .refine((v) => v.length > 0, { message: 'كود التفعيل مطلوب' }),
+});
+
+// إنشاء كورس جديد (مدرس / أكاديمية)
 router.post(
   '/',
-  authMiddleware(['teacher']),
+  authMiddleware(COURSE_CREATE_ROLES),
   uploadCourseImage.single('avatar'),
   asyncWrapper(async (req, res) => {
     try {
@@ -163,8 +182,19 @@ router.post(
         return res.status(400).json({ message: 'Validation failed', errors: parse.error.errors });
       }
 
-      const { title, description, price, is_free } = parse.data;
+      if (!CourseAccessControl.canCreateCourses(req.user!.role)) {
+        return res.status(403).json({ message: 'ليس لديك صلاحية إنشاء كورس' });
+      }
+
+      const { title, description, price, is_free, subject: subjectFromBody } = parse.data;
       const teacher_id = req.user!.id;
+      const tenantId = req.user!.tenant_id ?? req.tenant?.id ?? null;
+      const subject =
+        typeof subjectFromBody === 'string'
+          ? subjectFromBody.trim() || null
+          : typeof (req.body as { subject?: string }).subject === 'string'
+            ? String((req.body as { subject?: string }).subject).trim() || null
+            : null;
       const gradeIds = resolveCourseGradeIds(req.body as Record<string, unknown>);
       if (!gradeIds.length) {
         return res.status(400).json({
@@ -186,10 +216,20 @@ router.post(
       const primaryGradeId = gradeIds[0];
 
       const result = await pool.query(
-        `INSERT INTO courses (title, price, description, teacher_id, grade_id, avatar, is_free)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)
+        `INSERT INTO courses (title, price, description, teacher_id, grade_id, avatar, is_free, subject, tenant_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
          RETURNING *`,
-        [title, pricing.price, description, teacher_id, primaryGradeId, avatar, pricing.is_free],
+        [
+          title,
+          pricing.price,
+          description,
+          teacher_id,
+          primaryGradeId,
+          avatar,
+          pricing.is_free,
+          subject,
+          tenantId,
+        ],
       );
 
       const course = result.rows[0];
@@ -242,7 +282,7 @@ router.post(
 // إنشاء كود تفعيل للكورس (مدرس فقط)
 router.post(
   '/activation-code',
-  authMiddleware(['teacher']),
+  authMiddleware(COURSE_CONTENT_ROLES),
   asyncWrapper(async (req, res) => {
     const parse = CreateActivationCodeSchema.safeParse(req.body);
     if (!parse.success) {
@@ -254,7 +294,7 @@ router.post(
 
     // تحقق أن الكورس يخص المدرس
     const courseCheck = await pool.query(
-      'SELECT id FROM courses WHERE id = $1 AND teacher_id = $2',
+      'SELECT id FROM courses WHERE id = $1 AND (teacher_id = $2 OR EXISTS (SELECT 1 FROM course_managers cm WHERE cm.course_id = id AND cm.user_id = $2) OR EXISTS (SELECT 1 FROM tenants t WHERE t.id = tenant_id AND t.owner_user_id = $2 AND t.platform_type = $$academy$$))',
       [course_id, teacher_id],
     );
 
@@ -302,7 +342,7 @@ router.post(
 // عرض أكواد التفعيل الخاصة بالمدرس مع QR codes
 router.get(
   '/my-activation-codes',
-  authMiddleware(['teacher']),
+  authMiddleware(COURSE_CONTENT_ROLES),
   asyncWrapper(async (req, res) => {
     const teacher_id = req.user!.id;
     const { course_id } = req.query;
@@ -319,7 +359,7 @@ router.get(
      FROM teacher_invite_codes tic
      JOIN courses c ON tic.course_id = c.id
      JOIN grades g ON c.grade_id = g.id
-     WHERE tic.teacher_id = $1`;
+     WHERE (c.teacher_id = $1 OR EXISTS (SELECT 1 FROM course_managers cm WHERE cm.course_id = c.id AND cm.user_id = $1) OR EXISTS (SELECT 1 FROM tenants t WHERE t.id = c.tenant_id AND t.owner_user_id = $1 AND t.platform_type = $$academy$$))`;
     const values: any[] = [teacher_id];
     if (course_id) {
       query += ' AND tic.course_id = $2';
@@ -557,6 +597,131 @@ router.get(
         phone: u.user_phone,
         used_at: u.used_at,
       })),
+    });
+  }),
+);
+
+// تفعيل الكورس للطالب باستخدام كود التفعيل فقط (بدون course_id)
+router.post(
+  '/activate-by-code',
+  authMiddleware(['student']),
+  asyncWrapper(async (req, res) => {
+    const parse = ActivateByCodeOnlySchema.safeParse({
+      code: req.body?.code ?? req.body?.activation_code,
+    });
+    if (!parse.success) {
+      return res.status(400).json({
+        message: 'كود التفعيل مطلوب',
+        errors: parse.error.errors,
+      });
+    }
+
+    const { code } = parse.data;
+    const student_id = req.user!.id;
+
+    const codeCheck = await pool.query(
+      `SELECT 
+        tic.id,
+        tic.code,
+        tic.max_uses,
+        tic.uses,
+        tic.expires_at,
+        tic.course_id,
+        c.title as course_title,
+        c.teacher_id,
+        COALESCE(c.is_free, FALSE) AS is_free
+       FROM teacher_invite_codes tic
+       JOIN courses c ON tic.course_id = c.id
+       WHERE tic.code = $1`,
+      [code],
+    );
+
+    if (!codeCheck.rowCount) {
+      return res.status(404).json({ message: 'كود التفعيل غير صحيح' });
+    }
+
+    const activationCode = codeCheck.rows[0];
+
+    if (activationCode.is_free) {
+      return res.status(400).json({
+        message: 'هذا الكورس مجاني — المحتوى متاح مباشرة بدون كود تفعيل',
+        course: {
+          id: activationCode.course_id,
+          title: activationCode.course_title,
+          is_free: true,
+        },
+      });
+    }
+
+    if (activationCode.expires_at && new Date(activationCode.expires_at) < new Date()) {
+      return res.status(400).json({ message: 'كود التفعيل منتهي الصلاحية' });
+    }
+
+    if (Number(activationCode.uses) >= Number(activationCode.max_uses)) {
+      return res.status(400).json({ message: 'كود التفعيل مستنفذ بالكامل' });
+    }
+
+    const usageCheck = await pool.query(
+      'SELECT id FROM invite_code_usages WHERE user_id = $1 AND code_id = $2',
+      [student_id, activationCode.id],
+    );
+    if (usageCheck.rowCount && usageCheck.rowCount > 0) {
+      return res.status(400).json({ message: 'لقد استخدمت هذا الكود مسبقاً' });
+    }
+
+    const alreadyEnrolled = await pool.query(
+      'SELECT id FROM enrollments WHERE user_id = $1 AND course_id = $2',
+      [student_id, activationCode.course_id],
+    );
+    if (alreadyEnrolled.rowCount) {
+      return res.status(400).json({
+        message: 'أنت مشترك في هذا الكورس بالفعل',
+        course: {
+          id: activationCode.course_id,
+          title: activationCode.course_title,
+        },
+      });
+    }
+
+    await pool.query('INSERT INTO invite_code_usages (user_id, code_id) VALUES ($1, $2)', [
+      student_id,
+      activationCode.id,
+    ]);
+    await pool.query('UPDATE teacher_invite_codes SET uses = uses + 1 WHERE id = $1', [
+      activationCode.id,
+    ]);
+    await pool.query(
+      'INSERT INTO enrollments (user_id, course_id) VALUES ($1, $2) ON CONFLICT (user_id, course_id) DO NOTHING',
+      [student_id, activationCode.course_id],
+    );
+
+    try {
+      const gradeRes = await pool.query('SELECT grade_id, teacher_id FROM courses WHERE id = $1', [
+        activationCode.course_id,
+      ]);
+      if (gradeRes.rowCount) {
+        const gradeId = gradeRes.rows[0].grade_id as number;
+        const teacherId = gradeRes.rows[0].teacher_id as number;
+        const group = await ChatService.getOrCreateTeacherGradeGroup(gradeId, teacherId);
+        await ChatService.addMember(group.id, student_id, 'student');
+      }
+    } catch (err) {
+      console.warn('Failed to add student to chat group after activate-by-code:', err);
+    }
+
+    NotificationTriggers.onCoursePurchase(
+      student_id,
+      activationCode.course_title,
+      activationCode.course_id,
+    ).catch((err) => console.warn('Course purchase notification failed:', err));
+
+    res.status(200).json({
+      success: true,
+      message: 'تم تفعيل الكورس بنجاح',
+      course: {
+        id: activationCode.course_id,
+        title: activationCode.course_title,
+      },
     });
   }),
 );
@@ -907,23 +1072,20 @@ router.post(
   }),
 );
 
-// تعديل كورس (مدرس فقط)
+// تعديل كورس (مدرس / أكاديمية / مدرس أكاديمية مسند)
 router.put(
   '/:id',
-  authMiddleware(['teacher']),
+  authMiddleware(COURSE_CONTENT_ROLES),
   uploadCourseImage.single('avatar'),
   asyncWrapper(async (req, res) => {
     try {
-      const courseId = req.params.id;
+      const courseId = Number(req.params.id);
       const teacher_id = req.user!.id;
 
-      // تحقق أن الكورس يخص المدرس
-      const courseCheck = await pool.query(
-        'SELECT * FROM courses WHERE id = $1 AND teacher_id = $2',
-        [courseId, teacher_id],
-      );
-      if (!courseCheck.rowCount)
-        return res.status(404).json({ message: 'Course not found or not yours' });
+      await CourseAccessControl.assertCanManageCourse(req.user!, courseId);
+
+      const courseCheck = await pool.query('SELECT * FROM courses WHERE id = $1', [courseId]);
+      if (!courseCheck.rowCount) return res.status(404).json({ message: 'Course not found or not yours' });
 
       // تحقق من البيانات
       const parse = CourseSchema.partial().safeParse(req.body);
@@ -1005,9 +1167,9 @@ router.put(
 
       let course = courseCheck.rows[0];
       if (fields.length) {
-        values.push(courseId, teacher_id);
+        values.push(courseId);
         const result = await pool.query(
-          `UPDATE courses SET ${fields.join(', ')} WHERE id = $${i++} AND teacher_id = $${i} RETURNING *`,
+          `UPDATE courses SET ${fields.join(', ')} WHERE id = $${i} RETURNING *`,
           values,
         );
         course = result.rows[0];
@@ -1019,7 +1181,11 @@ router.put(
       const gradesMap = await getCourseGradesMap([course.id]);
 
       try {
-        await SeoHooks.onCourseChanged(teacher_id, course.id, parse.data.title ?? course.title);
+        await SeoHooks.onCourseChanged(
+          course.teacher_id || teacher_id,
+          course.id,
+          parse.data.title ?? course.title,
+        );
       } catch (seoError) {
         console.error('SEO hook after course update:', seoError);
       }
@@ -1027,6 +1193,10 @@ router.put(
       res.json({ course: withCourseGrades(course, gradesMap) });
     } catch (error: any) {
       console.error('Error updating course:', error);
+
+      if (error?.status) {
+        return res.status(error.status).json({ message: error.message });
+      }
 
       // حذف الصورة المرفوعة في حالة حدوث خطأ
       if (req.file && fs.existsSync(req.file.path)) {
@@ -1046,15 +1216,30 @@ router.put(
   }),
 );
 
-// حذف كورس (مدرس فقط)
+// حذف كورس (مالك المنصة فقط — ليس academy_teacher)
 router.delete(
   '/:id',
-  authMiddleware(['teacher']),
+  authMiddleware(COURSE_CREATE_ROLES),
   asyncWrapper(async (req, res) => {
-    const courseId = req.params.id;
+    const courseId = Number(req.params.id);
     const teacher_id = req.user!.id;
+
+    if (!CourseAccessControl.canDeleteCourses(req.user!.role)) {
+      return res.status(403).json({ message: 'ليس لديك صلاحية حذف الكورس' });
+    }
+
+    await CourseAccessControl.assertCanManageCourse(req.user!, courseId);
+
     const result = await pool.query(
-      'DELETE FROM courses WHERE id = $1 AND teacher_id = $2 RETURNING *',
+      `DELETE FROM courses WHERE id = $1 AND (
+         teacher_id = $2
+         OR EXISTS (
+           SELECT 1 FROM tenants t
+           WHERE t.id = courses.tenant_id
+             AND t.owner_user_id = $2
+             AND t.platform_type = $$academy$$
+         )
+       ) RETURNING *`,
       [courseId, teacher_id],
     );
     if (!result.rowCount) return res.status(404).json({ message: 'Course not found or not yours' });
@@ -1074,7 +1259,7 @@ router.delete(
 // يجب أن يكون قبل /teacher/:teacherId لتجنب التداخل
 router.get(
   '/teacher/students',
-  authMiddleware(['teacher']),
+  authMiddleware(COURSE_CONTENT_ROLES),
   asyncWrapper(async (req, res) => {
     const teacherId = req.user!.id;
 
@@ -1097,7 +1282,7 @@ router.get(
 // GET /api/course/teacher/students/report-by-name?name=... - تقرير طالب بالاسم (مدرس فقط)
 router.get(
   '/teacher/students/report-by-name',
-  authMiddleware(['teacher']),
+  authMiddleware(COURSE_CONTENT_ROLES),
   asyncWrapper(async (req, res) => {
     const teacherId = req.user!.id;
     const name = (req.query.name as string) || '';
@@ -1129,7 +1314,7 @@ router.get(
 // يجب أن يكون قبل /teacher/:teacherId لتجنب التداخل
 router.get(
   '/teacher/students/:studentId/report',
-  authMiddleware(['teacher']),
+  authMiddleware(COURSE_CONTENT_ROLES),
   asyncWrapper(async (req, res) => {
     const teacherId = req.user!.id;
     const studentId = Number(req.params.studentId);
@@ -1182,7 +1367,7 @@ router.get(
         CASE WHEN e.user_id IS NOT NULL THEN true ELSE false END as is_activated
        FROM courses c
        LEFT JOIN enrollments e ON c.id = e.course_id AND e.user_id = $1
-       WHERE c.teacher_id = $2
+       WHERE (c.teacher_id = $2 OR EXISTS (SELECT 1 FROM course_managers cm WHERE cm.course_id = c.id AND cm.user_id = $2) OR EXISTS (SELECT 1 FROM tenants t WHERE t.id = c.tenant_id AND t.owner_user_id = $2 AND t.platform_type = $$academy$$))
          AND c.is_visible = true
          AND (
            EXISTS (
@@ -1220,15 +1405,19 @@ router.get(
   }),
 );
 
-// عرض كل كورسات المدرس مع إمكانية الفلترة حسب الصف (grade_id)
+// عرض كل كورسات المدرس / الأكاديمية / المسندة لمدرس الأكاديمية
 router.get(
   '/my-courses',
-  authMiddleware(['teacher']),
+  authMiddleware(COURSE_CONTENT_ROLES),
   asyncWrapper(async (req, res) => {
-    const teacher_id = req.user!.id;
     const grade_id_raw = req.query.grade_id;
-    let query = 'SELECT *, is_visible FROM courses WHERE teacher_id = $1';
-    const values: any[] = [teacher_id];
+    const managedIds = await CourseAccessControl.listManagedCourseIds(req.user!);
+    if (!managedIds.length) {
+      return res.json({ courses: [] });
+    }
+
+    const values: any[] = [managedIds];
+    let query = 'SELECT *, is_visible FROM courses WHERE id = ANY($1::int[])';
     if (grade_id_raw !== undefined && grade_id_raw !== null && grade_id_raw !== '') {
       const grade_id = Number(grade_id_raw);
       if (isNaN(grade_id)) {
@@ -1242,6 +1431,7 @@ router.get(
       )`;
       values.push(grade_id);
     }
+    query += ' ORDER BY id DESC';
     const result = await pool.query(query, values);
     const gradesMap = await getCourseGradesMap(result.rows.map((r) => r.id));
 
@@ -1257,6 +1447,8 @@ router.get(
           created_at: row.created_at,
           is_visible: row.is_visible,
           is_free: row.is_free === true,
+          subject: row.subject ?? null,
+          tenant_id: row.tenant_id ?? null,
         },
         gradesMap,
       ),
@@ -1396,11 +1588,14 @@ const LectureSchema = z.object({
   title: z.string().min(2),
   description: z.string().optional(),
   position: z.number().optional(),
+  expires_at: z.string().optional().nullable(),
+  access_type: z.enum(['all', 'groups']).optional().default('all'),
+  group_ids: z.array(z.coerce.number().int().positive()).optional(),
 });
 
 router.post(
   '/:courseId/lectures',
-  authMiddleware(['teacher']),
+  authMiddleware(COURSE_CONTENT_ROLES),
   asyncWrapper(async (req, res) => {
     const courseId = Number(req.params.courseId);
     const teacherId = req.user!.id;
@@ -1410,12 +1605,34 @@ router.post(
     }
     // تحقق أن الكورس يخص المدرس
     const courseCheck = await pool.query(
-      'SELECT id, title FROM courses WHERE id = $1 AND teacher_id = $2',
+      `SELECT id, title,
+              COALESCE(lecture_access_mode, 'always_open') AS lecture_access_mode
+       FROM courses WHERE id = $1 AND (teacher_id = $2 OR EXISTS (SELECT 1 FROM course_managers cm WHERE cm.course_id = id AND cm.user_id = $2) OR EXISTS (SELECT 1 FROM tenants t WHERE t.id = tenant_id AND t.owner_user_id = $2 AND t.platform_type = $$academy$$))`,
       [courseId, teacherId],
     );
     if (!courseCheck.rowCount) {
       return res.status(404).json({ message: 'Course not found or not yours' });
     }
+
+    const mode = courseCheck.rows[0].lecture_access_mode as string;
+    let expiresAt: Date | null = null;
+    if (mode === 'time_limited') {
+      if (!parse.data.expires_at) {
+        return res.status(400).json({
+          message: 'expires_at مطلوب عندما يكون lecture_access_mode = time_limited',
+        });
+      }
+      expiresAt = new Date(parse.data.expires_at);
+      if (Number.isNaN(expiresAt.getTime())) {
+        return res.status(400).json({ message: 'expires_at غير صالح' });
+      }
+    } else if (parse.data.expires_at) {
+      expiresAt = new Date(parse.data.expires_at);
+      if (Number.isNaN(expiresAt.getTime())) {
+        return res.status(400).json({ message: 'expires_at غير صالح' });
+      }
+    }
+
     const { title, description, position } = parse.data;
     // احسب position تلقائياً إذا لم يُرسل
     let pos = position;
@@ -1427,18 +1644,36 @@ router.post(
       pos = posRes.rows[0].next_pos;
     }
     const result = await pool.query(
-      `INSERT INTO lectures (course_id, title, description, position, is_visible) VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-      [courseId, title, description, pos, true], // Default to visible
+      `INSERT INTO lectures (course_id, title, description, position, is_visible, expires_at, access_type)
+       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
+      [courseId, title, description, pos, true, expiresAt, parse.data.access_type ?? 'all'],
     );
+
+    const lecture = result.rows[0];
+
+    if (parse.data.access_type === 'groups' && parse.data.group_ids?.length) {
+      const teacherRow = await pool.query(`SELECT teacher_id FROM courses WHERE id = $1`, [courseId]);
+      const courseTeacherId = teacherRow.rows[0]?.teacher_id ?? teacherId;
+      await CourseGroupAccessService.attachGroupsToNewLecture(
+        lecture.id,
+        courseTeacherId,
+        'groups',
+        parse.data.group_ids,
+      );
+      const meta = await CourseGroupAccessService.getLectureAccessMeta(lecture.id);
+      if (meta) {
+        lecture.access_type = meta.access_type;
+        lecture.group_ids = meta.group_ids;
+      }
+    }
 
     // إرسال إشعار للطلاب المشتركين في الكورس فقط إذا كانت المحاضرة ظاهرة
     const courseTitle = courseCheck.rows[0].title;
-    const lecture = result.rows[0];
     if (lecture.is_visible !== false) {
       await NotificationService.notifyLectureAdded(courseId, lecture.id, title, courseTitle);
     }
 
-    res.status(201).json({ lecture: result.rows[0] });
+    res.status(201).json({ lecture });
   }),
 );
 
@@ -1451,7 +1686,7 @@ const LectureVideoSchema = z.object({
 
 router.post(
   '/lecture/:lectureId/videos',
-  authMiddleware(['teacher']),
+  authMiddleware(COURSE_CONTENT_ROLES),
   asyncWrapper(async (req, res) => {
     const lectureId = Number(req.params.lectureId);
     const teacherId = req.user!.id;
@@ -1462,7 +1697,7 @@ router.post(
     // تحقق أن المحاضرة تخص كورس يملكه المدرس
     const lectureCheck = await pool.query(
       `SELECT l.id, l.title as lecture_title, c.id as course_id, c.title as course_title 
-       FROM lectures l JOIN courses c ON l.course_id = c.id WHERE l.id = $1 AND c.teacher_id = $2`,
+       FROM lectures l JOIN courses c ON l.course_id = c.id WHERE l.id = $1 AND (c.teacher_id = $2 OR EXISTS (SELECT 1 FROM course_managers cm WHERE cm.course_id = c.id AND cm.user_id = $2) OR EXISTS (SELECT 1 FROM tenants t WHERE t.id = c.tenant_id AND t.owner_user_id = $2 AND t.platform_type = $$academy$$))`,
       [lectureId, teacherId],
     );
     if (!lectureCheck.rowCount) {
@@ -1501,7 +1736,7 @@ router.post(
 // تحديث فيديو محاضرة (للأستاذ فقط)
 router.put(
   '/lecture-video/:videoId',
-  authMiddleware(['teacher']),
+  authMiddleware(COURSE_CONTENT_ROLES),
   asyncWrapper(async (req, res) => {
     const videoId = Number(req.params.videoId);
     const teacherId = req.user!.id;
@@ -1516,7 +1751,7 @@ router.put(
        FROM lecture_videos lv 
        JOIN lectures l ON lv.lecture_id = l.id 
        JOIN courses c ON l.course_id = c.id 
-       WHERE lv.id = $1 AND c.teacher_id = $2`,
+       WHERE lv.id = $1 AND (c.teacher_id = $2 OR EXISTS (SELECT 1 FROM course_managers cm WHERE cm.course_id = c.id AND cm.user_id = $2) OR EXISTS (SELECT 1 FROM tenants t WHERE t.id = c.tenant_id AND t.owner_user_id = $2 AND t.platform_type = $$academy$$))`,
       [videoId, teacherId],
     );
     if (!videoCheck.rowCount) {
@@ -1558,7 +1793,7 @@ router.put(
 // حذف فيديو محاضرة (للأستاذ فقط)
 router.delete(
   '/lecture-video/:videoId',
-  authMiddleware(['teacher']),
+  authMiddleware(COURSE_CONTENT_ROLES),
   asyncWrapper(async (req, res) => {
     const videoId = Number(req.params.videoId);
     const teacherId = req.user!.id;
@@ -1569,7 +1804,7 @@ router.delete(
        FROM lecture_videos lv 
        JOIN lectures l ON lv.lecture_id = l.id 
        JOIN courses c ON l.course_id = c.id 
-       WHERE lv.id = $1 AND c.teacher_id = $2`,
+       WHERE lv.id = $1 AND (c.teacher_id = $2 OR EXISTS (SELECT 1 FROM course_managers cm WHERE cm.course_id = c.id AND cm.user_id = $2) OR EXISTS (SELECT 1 FROM tenants t WHERE t.id = c.tenant_id AND t.owner_user_id = $2 AND t.platform_type = $$academy$$))`,
       [videoId, teacherId],
     );
     if (!videoCheck.rowCount) {
@@ -1590,7 +1825,7 @@ const LectureFileSchema = z.object({
 
 router.post(
   '/lecture/:lectureId/files',
-  authMiddleware(['teacher']),
+  authMiddleware(COURSE_CONTENT_ROLES),
   asyncWrapper(async (req, res) => {
     const lectureId = Number(req.params.lectureId);
     const teacherId = req.user!.id;
@@ -1601,7 +1836,7 @@ router.post(
     // تحقق أن المحاضرة تخص كورس يملكه المدرس
     const lectureCheck = await pool.query(
       `SELECT l.id, l.title as lecture_title, c.id as course_id, c.title as course_title 
-       FROM lectures l JOIN courses c ON l.course_id = c.id WHERE l.id = $1 AND c.teacher_id = $2`,
+       FROM lectures l JOIN courses c ON l.course_id = c.id WHERE l.id = $1 AND (c.teacher_id = $2 OR EXISTS (SELECT 1 FROM course_managers cm WHERE cm.course_id = c.id AND cm.user_id = $2) OR EXISTS (SELECT 1 FROM tenants t WHERE t.id = c.tenant_id AND t.owner_user_id = $2 AND t.platform_type = $$academy$$))`,
       [lectureId, teacherId],
     );
     if (!lectureCheck.rowCount) {
@@ -1627,10 +1862,157 @@ router.post(
   }),
 );
 
+// ===== ملفات الكورس (مستوى الكورس — ليس محاضرة) =====
+
+const courseFileUpload = multer({
+  storage: multer.diskStorage({
+    destination: (_req, _file, cb) => {
+      // مسار ثابت من جذر المشروع ليتوافق مع app.use('/uploads', express.static('uploads'))
+      const uploadDir = path.join(process.cwd(), 'uploads', 'course-files');
+      fs.mkdirSync(uploadDir, { recursive: true });
+      cb(null, uploadDir);
+    },
+    filename: (_req, file, cb) => {
+      const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
+      const safeExt = path.extname(file.originalname || '').slice(0, 20);
+      cb(null, `course-file-${uniqueSuffix}${safeExt}`);
+    },
+  }),
+  limits: { fileSize: 50 * 1024 * 1024 }, // 50MB
+});
+
+/** رفع ملف للكورس — مدرس / أكاديمية / مدرس أكاديمية مسند */
+router.post(
+  '/:courseId/files',
+  authMiddleware(COURSE_CONTENT_ROLES),
+  courseFileUpload.single('file'),
+  asyncWrapper(async (req, res) => {
+    const courseId = Number(req.params.courseId);
+    if (!courseId || Number.isNaN(courseId)) {
+      return res.status(400).json({ message: 'معرف الكورس غير صحيح' });
+    }
+
+    await CourseAccessControl.assertCanManageCourse(req.user!, courseId);
+
+    const name = String(req.body?.name ?? req.body?.filename ?? '').trim();
+    if (!name) {
+      return res.status(400).json({ message: 'اسم الملف مطلوب (name)' });
+    }
+
+    const uploadedFile = req.file;
+    let fileUrl = typeof req.body?.file_url === 'string' ? String(req.body.file_url).trim() : '';
+
+    if (uploadedFile) {
+      // تخزين محلي على السيرفر (مطلوب) — يُخدم عبر /uploads
+      fileUrl = `/uploads/course-files/${uploadedFile.filename}`;
+    }
+
+    if (!fileUrl) {
+      return res.status(400).json({ message: 'أرسل الملف في الحقل file أو رابط file_url' });
+    }
+
+    const courseRes = await pool.query(`SELECT id, title FROM courses WHERE id = $1`, [courseId]);
+    if (!courseRes.rowCount) {
+      return res.status(404).json({ message: 'الكورس غير موجود' });
+    }
+
+    let created;
+    try {
+      created = await CourseFilesService.create(courseId, {
+        name,
+        file_url: fileUrl,
+        file_size: uploadedFile?.size ?? null,
+        file_type: uploadedFile?.mimetype ?? null,
+        uploaded_by: req.user!.id,
+      });
+    } catch (dbErr: any) {
+      console.error('Course file DB insert failed:', dbErr?.message || dbErr);
+      if (String(dbErr?.message || '').includes('course_files')) {
+        return res.status(500).json({
+          message: 'جدول course_files غير موجود — شغّل الـ migration: 1775700000000_create_course_files.sql',
+        });
+      }
+      throw dbErr;
+    }
+
+    try {
+      await NotificationService.notifyCourseStudents(courseId, {
+        title: 'ملف جديد في الكورس',
+        message: `تم إضافة ملف "${name}" في كورس "${courseRes.rows[0].title}"`,
+        type: 'file_added',
+        course_id: courseId,
+      });
+    } catch (notifErr) {
+      console.warn('Course file notification failed:', notifErr);
+    }
+
+    res.status(201).json({
+      success: true,
+      message: 'تم إضافة الملف بنجاح',
+      file: created,
+    });
+  }),
+);
+
+/** عرض ملفات الكورس — طالب مشترك أو من يدير الكورس */
+router.get(
+  '/:courseId/files',
+  authMiddleware(['student', 'teacher', 'academy', 'academy_teacher', 'admin']),
+  asyncWrapper(async (req, res) => {
+    const courseId = Number(req.params.courseId);
+    if (!courseId || Number.isNaN(courseId)) {
+      return res.status(400).json({ message: 'معرف الكورس غير صحيح' });
+    }
+
+    const courseRes = await pool.query(`SELECT id FROM courses WHERE id = $1`, [courseId]);
+    if (!courseRes.rowCount) {
+      return res.status(404).json({ message: 'الكورس غير موجود' });
+    }
+
+    const user = req.user!;
+    if (user.role === 'student') {
+      const access = await CourseAccessService.checkStudentAccess(user.id, courseId);
+      if (!access.hasAccess) {
+        return res.status(403).json({
+          message: access.message || 'ليس لديك صلاحية عرض ملفات هذا الكورس',
+          reason: access.reason,
+        });
+      }
+    } else if (user.role !== 'admin') {
+      await CourseAccessControl.assertCanManageCourse(user, courseId);
+    }
+
+    const files = await CourseFilesService.listByCourse(courseId);
+    res.json({ success: true, files });
+  }),
+);
+
+/** حذف ملف كورس — مدرس / أكاديمية */
+router.delete(
+  '/:courseId/files/:fileId',
+  authMiddleware(COURSE_CONTENT_ROLES),
+  asyncWrapper(async (req, res) => {
+    const courseId = Number(req.params.courseId);
+    const fileId = Number(req.params.fileId);
+    if (!courseId || !fileId || Number.isNaN(courseId) || Number.isNaN(fileId)) {
+      return res.status(400).json({ message: 'معرفات غير صحيحة' });
+    }
+
+    await CourseAccessControl.assertCanManageCourse(req.user!, courseId);
+
+    const deleted = await CourseFilesService.delete(fileId, courseId);
+    if (!deleted) {
+      return res.status(404).json({ message: 'الملف غير موجود' });
+    }
+
+    res.json({ success: true, message: 'تم حذف الملف', file: deleted });
+  }),
+);
+
 // تغيير حالة ظهور الكورس (إظهار/إخفاء للطلاب)
 router.patch(
   '/:courseId/visibility',
-  authMiddleware(['teacher']),
+  authMiddleware(COURSE_CONTENT_ROLES),
   asyncWrapper(async (req, res) => {
     const courseId = Number(req.params.courseId);
     const { is_visible } = req.body;
@@ -1641,7 +2023,7 @@ router.patch(
 
     // تحقق أن الكورس يخص المدرس
     const courseCheck = await pool.query(
-      'SELECT id, title FROM courses WHERE id = $1 AND teacher_id = $2',
+      'SELECT id, title FROM courses WHERE id = $1 AND (teacher_id = $2 OR EXISTS (SELECT 1 FROM course_managers cm WHERE cm.course_id = id AND cm.user_id = $2) OR EXISTS (SELECT 1 FROM tenants t WHERE t.id = tenant_id AND t.owner_user_id = $2 AND t.platform_type = $$academy$$))',
       [courseId, req.user!.id],
     );
 
@@ -1743,10 +2125,26 @@ router.get(
 
     if (courseInfo.type === 'regular') {
       // للكورسات العادية، استخدم جدول lectures
-      const lecturesRes = await pool.query(
-        `SELECT * FROM lectures WHERE course_id = $1 ORDER BY position, created_at`,
-        [courseId],
-      );
+      let lectureQuery = `SELECT * FROM lectures WHERE course_id = $1`;
+      const lectureParams: unknown[] = [courseId];
+
+      if (user.role === 'student') {
+        const courseTeacherId = await CourseGroupAccessService.resolveCourseTeacherId(courseId);
+        if (courseTeacherId) {
+          const filter = CourseGroupAccessService.buildStudentLectureFilterClause(
+            user.id,
+            courseTeacherId,
+            'l',
+            2,
+          );
+          lectureQuery = `SELECT l.* FROM lectures l
+            WHERE l.course_id = $1 AND ${filter.sql}`;
+          lectureParams.push(...filter.params);
+        }
+      }
+
+      lectureQuery += ` ORDER BY position, created_at`;
+      const lecturesRes = await pool.query(lectureQuery, lectureParams);
       lectures = lecturesRes.rows;
     } else {
       // للكورسات في المواد الدراسية، استخدم جدول course_lectures
@@ -1809,64 +2207,113 @@ router.get(
       for (let i = 0; i < lectures.length; i++) {
         const lec = lectures[i];
         const { exam, exams: examsList, assignments } = attachAssessments(lec, 'student');
-        // المحاضرة الأولى دائماً مفتوحة
-        if (i === 0) {
-          lectures[i] = {
-            ...lec,
-            videos: videos.filter((v) => v.lecture_id === lec.id),
-            files: files.filter((f) => f.lecture_id === lec.id),
-            exam,
-            exams: examsList,
-            assignments,
-            locked: false,
-            is_visible: lec.is_visible,
-          };
-          continue;
-        }
-        if (lockAll) {
-          lectures[i] = {
-            ...lec,
-            videos: videos.filter((v) => v.lecture_id === lec.id),
-            files: files.filter((f) => f.lecture_id === lec.id),
-            exam,
-            exams: examsList,
-            assignments,
-            locked: true,
-            is_visible: lec.is_visible,
-          };
-          continue;
-        }
-        // استخدام المنطق الجديد للتحقق من إمكانية الوصول للمحاضرة
+        const lecVideos = videos.filter((v) => v.lecture_id === lec.id);
+        const lecFiles = files.filter((f) => f.lecture_id === lec.id);
+
+        // أوضاع الوصول (activation_code / time_limited) تُطبَّق على كل المحاضرات بما فيها الأولى
         try {
+          const modeAccess = await LectureAccessService.checkStudentLectureAccess(lec.id, user.id);
+          if (!modeAccess.can_access) {
+            lectures[i] = {
+              ...lec,
+              // لا نُرجع روابط المحتوى والمحاضرة مقفولة بكود/انتهاء مدة
+              videos: [],
+              files: [],
+              exam: null,
+              exams: [],
+              assignments: [],
+              locked: true,
+              access_status: modeAccess.status,
+              lecture_access_mode: modeAccess.lecture_access_mode,
+              expires_at: modeAccess.expires_at ?? lec.expires_at ?? null,
+              activation: modeAccess.activation ?? null,
+              access_message: modeAccess.message,
+              is_visible: lec.is_visible,
+            };
+            continue;
+          }
+
+          // قفل متسلسل بسبب واجب/امتحان — المحاضرة الأولى تتخطاه فقط إذا الوضع يسمح بالدخول
+          if (i === 0) {
+            lectures[i] = {
+              ...lec,
+              videos: lecVideos,
+              files: lecFiles,
+              exam,
+              exams: examsList,
+              assignments,
+              locked: false,
+              access_status: modeAccess.status,
+              lecture_access_mode: modeAccess.lecture_access_mode,
+              expires_at: modeAccess.expires_at ?? lec.expires_at ?? null,
+              activation: modeAccess.activation ?? null,
+              is_visible: lec.is_visible,
+            };
+            continue;
+          }
+
+          if (lockAll) {
+            lectures[i] = {
+              ...lec,
+              videos: lecVideos,
+              files: lecFiles,
+              exam,
+              exams: examsList,
+              assignments,
+              locked: true,
+              access_status: 'locked',
+              lecture_access_mode: modeAccess.lecture_access_mode,
+              is_visible: lec.is_visible,
+            };
+            continue;
+          }
+
           const canAccess = await LectureExamService.canStudentAccessLecture(lec.id, user.id);
           if (!canAccess) {
             lockAll = true;
             lectures[i] = {
               ...lec,
-              videos: videos.filter((v) => v.lecture_id === lec.id),
-              files: files.filter((f) => f.lecture_id === lec.id),
+              videos: lecVideos,
+              files: lecFiles,
               exam,
               exams: examsList,
               assignments,
               locked: true,
+              access_status: 'locked',
+              lecture_access_mode: modeAccess.lecture_access_mode,
               is_visible: lec.is_visible,
             };
             continue;
           }
+
+          lectures[i] = {
+            ...lec,
+            videos: lecVideos,
+            files: lecFiles,
+            exam,
+            exams: examsList,
+            assignments,
+            locked: false,
+            access_status: modeAccess.status,
+            lecture_access_mode: modeAccess.lecture_access_mode,
+            expires_at: modeAccess.expires_at ?? lec.expires_at ?? null,
+            activation: modeAccess.activation ?? null,
+            is_visible: lec.is_visible,
+          };
         } catch (_err) {
-          // في حالة الخطأ، نعتبر المحاضرة مفتوحة
           console.log('Error checking lecture access:', _err);
+          lectures[i] = {
+            ...lec,
+            videos: [],
+            files: [],
+            exam: null,
+            exams: [],
+            assignments: [],
+            locked: true,
+            access_status: 'locked',
+            is_visible: lec.is_visible,
+          };
         }
-        lectures[i] = {
-          ...lec,
-          videos: videos.filter((v) => v.lecture_id === lec.id),
-          files: files.filter((f) => f.lecture_id === lec.id),
-          exam,
-          exams: examsList,
-          assignments,
-          locked: false,
-          is_visible: lec.is_visible,
-        };
       }
     } else {
       // المدرس يرى كل المحاضرات (لا فلترة)
@@ -1985,6 +2432,59 @@ router.get(
       });
     }
 
+    // واجبات الكورس (خارج المحاضرات) عند assignment_mode = course_based
+    let courseAssignments: any[] = [];
+    const modes = await LectureAccessService.getCourseModes(courseId);
+    if (modes.assignment_mode === 'course_based') {
+      const isStudent = user.role === 'student';
+      const courseAssignRes = await pool.query(
+        `SELECT e.*
+         FROM exams e
+         WHERE e.course_id = $1
+           AND e.lecture_id IS NULL
+           AND e.type = 'assignment'
+           ${
+             isStudent
+               ? `AND e.is_visible = TRUE
+                  AND (e.show_at IS NULL OR e.show_at <= NOW())
+                  AND (e.hide_at IS NULL OR e.hide_at >= NOW())`
+               : ''
+           }
+         ORDER BY e.created_at DESC`,
+        [courseId],
+      );
+      courseAssignments = courseAssignRes.rows;
+
+      if (isStudent && courseAssignments.length > 0) {
+        const ids = courseAssignments.map((a) => a.id);
+        const subsRes = await pool.query(
+          `SELECT DISTINCT ON (exam_id)
+             exam_id, id, total_grade, submitted_at, status, passed
+           FROM exam_submissions
+           WHERE student_id = $1 AND exam_id = ANY($2::int[])
+           ORDER BY exam_id, submitted_at DESC NULLS LAST, id DESC`,
+          [user.id, ids],
+        );
+        const byExam = new Map(subsRes.rows.map((s) => [s.exam_id, s]));
+        courseAssignments = courseAssignments.map((a) => {
+          const sub = byExam.get(a.id);
+          return {
+            ...a,
+            is_solved: !!sub,
+            student_submission: sub
+              ? {
+                  id: sub.id,
+                  total_grade: sub.total_grade,
+                  submitted_at: sub.submitted_at,
+                  status: sub.status,
+                  passed: sub.passed,
+                }
+              : null,
+          };
+        });
+      }
+    }
+
     res.json({
       course: {
         id: course.id,
@@ -1995,8 +2495,13 @@ router.get(
         teacher_id: course.teacher_id,
         avatar: course.avatar,
         created_at: course.created_at,
+        lecture_access_mode: modes.lecture_access_mode,
+        assignment_mode: modes.assignment_mode,
       },
       lectures,
+      /** قسم «واجب الكورس» — خارج المحاضرات */
+      course_assignments: courseAssignments,
+      assignments: courseAssignments,
     });
   }),
 );
@@ -2004,7 +2509,7 @@ router.get(
 // جلب امتحانات الكورس (course-level exams) - للمدرس صاحب الكورس فقط
 router.get(
   '/:courseId/course-exams',
-  authMiddleware(['teacher']),
+  authMiddleware(COURSE_CONTENT_ROLES),
   asyncWrapper(async (req, res) => {
     const courseId = Number(req.params.courseId);
     if (Number.isNaN(courseId)) {
@@ -2019,7 +2524,7 @@ router.get(
 // جلب أسئلة امتحان الكورس - للمدرس صاحب الكورس فقط
 router.get(
   '/course-exam/:examId/questions',
-  authMiddleware(['teacher']),
+  authMiddleware(COURSE_CONTENT_ROLES),
   asyncWrapper(async (req, res) => {
     const examId = Number(req.params.examId);
     if (Number.isNaN(examId)) {
@@ -2043,10 +2548,13 @@ router.get(
       const exam = examRes.rows[0];
 
       // Verify teacher owns the course
-      if (req.user!.role === 'teacher' && exam.teacher_id !== req.user!.id) {
-        return res
-          .status(403)
-          .json({ message: 'You are not allowed to view questions for this exam' });
+      if (req.user!.role !== 'admin') {
+        const allowed = await CourseAccessControl.canManageCourse(req.user!, Number(exam.course_id));
+        if (!allowed) {
+          return res
+            .status(403)
+            .json({ message: 'You are not allowed to view questions for this exam' });
+        }
       }
 
       // Get questions (with correct answers for teacher)
@@ -2121,7 +2629,7 @@ router.get(
 // حذف سؤال من امتحان الكورس الشامل
 router.delete(
   '/course-exam/question/:questionId',
-  authMiddleware(['teacher']),
+  authMiddleware(COURSE_CONTENT_ROLES),
   asyncWrapper(async (req, res) => {
     const questionId = Number(req.params.questionId);
     if (Number.isNaN(questionId)) {
@@ -2197,7 +2705,7 @@ router.delete(
                FROM course_level_exam_questions q
                JOIN course_level_exams e ON q.exam_id = e.id
                JOIN courses c ON e.course_id = c.id
-               WHERE c.teacher_id = $1
+               WHERE (c.teacher_id = $1 OR EXISTS (SELECT 1 FROM course_managers cm WHERE cm.course_id = c.id AND cm.user_id = $1) OR EXISTS (SELECT 1 FROM tenants t WHERE t.id = c.tenant_id AND t.owner_user_id = $1 AND t.platform_type = $$academy$$))
                  AND (q.question_id_v2 IS NULL OR q.question_id_v2 <> $2)
                  AND (q.question_id IS NULL OR q.question_id <> $2)
                  AND (
@@ -2246,7 +2754,7 @@ router.delete(
            JOIN exams e ON eq.exam_id = e.id
            JOIN lectures l ON e.lecture_id = l.id
            JOIN courses c ON l.course_id = c.id
-           WHERE eq.id = $1 AND c.teacher_id = $2`,
+           WHERE eq.id = $1 AND (c.teacher_id = $2 OR EXISTS (SELECT 1 FROM course_managers cm WHERE cm.course_id = c.id AND cm.user_id = $2) OR EXISTS (SELECT 1 FROM tenants t WHERE t.id = c.tenant_id AND t.owner_user_id = $2 AND t.platform_type = $$academy$$))`,
           [questionId, req.user!.id],
         );
         if (lectureExamCheck.rowCount) {
@@ -2263,9 +2771,11 @@ router.delete(
       const idToDelete = question.row_id;
 
       // التحقق من أن المدرس يملك الكورس
-      if (question.teacher_id !== req.user!.id) {
-        return res.status(403).json({ message: 'You are not allowed to delete this question' });
-      }
+      await CourseAccessControl.assertOwnsJoinedCourse(req.user!, {
+        courseTeacherId: question.teacher_id,
+        courseId: question.course_id,
+        examId: question.exam_id,
+      });
 
       // حذف السؤال حسب نوعه
       if (question.exam_type === 'course_level') {
@@ -2290,7 +2800,7 @@ router.delete(
 // تعديل سؤال نصي في امتحان الكورس الشامل
 router.put(
   '/course-exam/question/:questionId',
-  authMiddleware(['teacher']),
+  authMiddleware(COURSE_CONTENT_ROLES),
   asyncWrapper(async (req, res) => {
     const questionId = Number(req.params.questionId);
     if (Number.isNaN(questionId)) {
@@ -2330,9 +2840,11 @@ router.put(
       const question = questionCheck.rows[0];
 
       // التحقق من أن المدرس يملك الكورس
-      if (question.teacher_id !== req.user!.id) {
-        return res.status(403).json({ message: 'You are not allowed to edit this question' });
-      }
+      await CourseAccessControl.assertOwnsJoinedCourse(req.user!, {
+        courseTeacherId: question.teacher_id,
+        courseId: question.course_id,
+        examId: question.exam_id,
+      });
 
       // استخراج البيانات من الطلب
       const {
@@ -2467,7 +2979,7 @@ router.put(
 // إضافة/تحديث صورة لسؤال في امتحان الكورس (رفع ملف)
 router.patch(
   '/course-exam/question/:questionId/image',
-  authMiddleware(['teacher']),
+  authMiddleware(COURSE_CONTENT_ROLES),
   uploadQuestionImage.single('questionImage'),
   asyncWrapper(async (req, res) => {
     const questionId = Number(req.params.questionId);
@@ -2505,9 +3017,11 @@ router.patch(
       }
 
       const row = questionCheck.rows[0];
-      if (row.teacher_id !== req.user!.id) {
-        return res.status(403).json({ message: 'You are not allowed to update this question' });
-      }
+      await CourseAccessControl.assertOwnsJoinedCourse(req.user!, {
+        courseTeacherId: row.teacher_id,
+        courseId: row.course_id,
+        examId: row.exam_id,
+      });
 
       let uploadedUrl: string;
       try {
@@ -2556,7 +3070,7 @@ router.patch(
 // تحديد الإجابة الصحيحة لسؤال في امتحان الكورس الشامل (يُحدَّث في صف الامتحان فقط، ولا يُغيّر بنك الأسئلة)
 router.patch(
   '/course-exam/question/:questionId/correct-answer',
-  authMiddleware(['teacher']),
+  authMiddleware(COURSE_CONTENT_ROLES),
   asyncWrapper(async (req, res) => {
     const questionId = Number(req.params.questionId);
     if (Number.isNaN(questionId)) {
@@ -2608,9 +3122,11 @@ router.patch(
       const question = questionCheck.rows[0];
 
       // التحقق من أن المدرس يملك الكورس
-      if (question.teacher_id !== req.user!.id) {
-        return res.status(403).json({ message: 'You are not allowed to modify this question' });
-      }
+      await CourseAccessControl.assertOwnsJoinedCourse(req.user!, {
+        courseTeacherId: question.teacher_id,
+        courseId: question.course_id,
+        examId: question.exam_id,
+      });
 
       // تحديث الإجابة الصحيحة حسب نوع السؤال
       if (question.exam_type === 'course_level') {
@@ -2665,13 +3181,13 @@ router.patch(
 // عرض الطلاب المشتركين في كورس معين مع كود التفعيل المستخدم (للأستاذ فقط)
 router.get(
   '/:courseId/enrollments',
-  authMiddleware(['teacher']),
+  authMiddleware(COURSE_CONTENT_ROLES),
   asyncWrapper(async (req, res) => {
     const courseId = Number(req.params.courseId);
     const teacherId = req.user!.id;
     // تحقق أن الكورس يخص المدرس
     const courseCheck = await pool.query(
-      'SELECT id FROM courses WHERE id = $1 AND teacher_id = $2',
+      'SELECT id FROM courses WHERE id = $1 AND (teacher_id = $2 OR EXISTS (SELECT 1 FROM course_managers cm WHERE cm.course_id = id AND cm.user_id = $2) OR EXISTS (SELECT 1 FROM tenants t WHERE t.id = tenant_id AND t.owner_user_id = $2 AND t.platform_type = $$academy$$))',
       [courseId, teacherId],
     );
     if (!courseCheck.rowCount) {
@@ -2717,7 +3233,7 @@ router.get(
 // تغيير حالة ظهور محاضرة (إظهار/إخفاء) للمدرس
 router.patch(
   '/lecture/:lectureId/visibility',
-  authMiddleware(['teacher']),
+  authMiddleware(COURSE_CONTENT_ROLES),
   asyncWrapper(async (req, res) => {
     const lectureId = Number(req.params.lectureId);
     const { is_visible } = req.body;
@@ -2726,7 +3242,7 @@ router.patch(
     }
     // تحقق أن المحاضرة تخص المدرس
     const lecCheck = await pool.query(
-      `SELECT l.* FROM lectures l JOIN courses c ON l.course_id = c.id WHERE l.id = $1 AND c.teacher_id = $2`,
+      `SELECT l.* FROM lectures l JOIN courses c ON l.course_id = c.id WHERE l.id = $1 AND (c.teacher_id = $2 OR EXISTS (SELECT 1 FROM course_managers cm WHERE cm.course_id = c.id AND cm.user_id = $2) OR EXISTS (SELECT 1 FROM tenants t WHERE t.id = c.tenant_id AND t.owner_user_id = $2 AND t.platform_type = $$academy$$))`,
       [lectureId, req.user!.id],
     );
     if (!lecCheck.rowCount) {
@@ -2767,7 +3283,7 @@ router.patch(
 // إنشاء امتحان محاضرة مع الإعدادات المتقدمة
 router.post(
   '/lecture/:lectureId/exam',
-  authMiddleware(['teacher']),
+  authMiddleware(COURSE_CONTENT_ROLES),
   asyncWrapper(async (req, res) => {
     const lectureId = Number(req.params.lectureId);
     const {
@@ -2790,9 +3306,11 @@ router.post(
 
     // التحقق من أن المحاضرة تخص المدرس
     const lectureCheck = await pool.query(
-      `SELECT l.*, c.teacher_id FROM lectures l 
+      `SELECT l.*, c.teacher_id, c.id as course_id,
+              COALESCE(c.assignment_mode, 'lecture_based') AS assignment_mode
+       FROM lectures l 
        JOIN courses c ON l.course_id = c.id 
-       WHERE l.id = $1 AND c.teacher_id = $2`,
+       WHERE l.id = $1 AND (c.teacher_id = $2 OR EXISTS (SELECT 1 FROM course_managers cm WHERE cm.course_id = c.id AND cm.user_id = $2) OR EXISTS (SELECT 1 FROM tenants t WHERE t.id = c.tenant_id AND t.owner_user_id = $2 AND t.platform_type = $$academy$$))`,
       [lectureId, req.user!.id],
     );
 
@@ -2823,6 +3341,19 @@ router.post(
     const examTypeRaw = typeof type === 'string' ? type : typeof exam_type === 'string' ? exam_type : 'exam';
     const examType =
       examTypeRaw.trim().toLowerCase() === 'assignment' ? 'assignment' : 'exam';
+
+    if (
+      examType === 'assignment' &&
+      lectureCheck.rows[0].assignment_mode === 'course_based'
+    ) {
+      return res.status(400).json({
+        message:
+          'وضع الواجبات للكورس هو course_based — أنشئ الواجب عبر POST /api/course/:courseId/exam أو /assignments',
+        assignment_mode: 'course_based',
+        course_id: lectureCheck.rows[0].course_id,
+      });
+    }
+
     const lockNextLectures =
       examType === 'assignment'
         ? !(lock_next_lectures === false || lock_next_lectures === 'false')
@@ -2832,16 +3363,18 @@ router.post(
     const showAnswersAfterHours = show_answers_after_hours ? Number(show_answers_after_hours) : 0;
     const examTitle =
       title || (examType === 'assignment' ? 'Lecture Assignment' : 'Lecture Exam');
+    const courseIdForExam = Number(lectureCheck.rows[0].course_id);
 
     const exam = await pool.query(
       `INSERT INTO exams (
-        lecture_id, type, total_grade, created_by, title, duration, is_visible,
+        lecture_id, course_id, type, total_grade, created_by, title, duration, is_visible,
         show_at, hide_at, lock_next_lectures,
         show_answers_immediately, show_answers_after_hours
       )
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING *`,
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING *`,
       [
         lectureId,
+        courseIdForExam,
         examType,
         examTotalGrade,
         req.user!.id,
@@ -2896,7 +3429,7 @@ router.post(
 // تغيير حالة ظهور امتحان المحاضرة (إظهار/إخفاء للطلاب)
 router.patch(
   '/lecture/exam/:examId/visibility',
-  authMiddleware(['teacher']),
+  authMiddleware(COURSE_CONTENT_ROLES),
   asyncWrapper(async (req, res) => {
     const examId = Number(req.params.examId);
     const { is_visible } = req.body;
@@ -2905,12 +3438,12 @@ router.patch(
       return res.status(400).json({ message: 'is_visible (boolean) is required' });
     }
 
-    // تحقق أن الامتحان يخص المدرس
+    // تحقق أن الامتحان يخص المدرس (محاضرة أو واجب كورس)
     const examCheck = await pool.query(
       `SELECT e.* FROM exams e 
-       JOIN lectures l ON e.lecture_id = l.id 
-       JOIN courses c ON l.course_id = c.id 
-       WHERE e.id = $1 AND c.teacher_id = $2`,
+       LEFT JOIN lectures l ON e.lecture_id = l.id 
+       JOIN courses c ON c.id = COALESCE(e.course_id, l.course_id)
+       WHERE e.id = $1 AND (c.teacher_id = $2 OR EXISTS (SELECT 1 FROM course_managers cm WHERE cm.course_id = c.id AND cm.user_id = $2) OR EXISTS (SELECT 1 FROM tenants t WHERE t.id = c.tenant_id AND t.owner_user_id = $2 AND t.platform_type = $$academy$$))`,
       [examId, req.user!.id],
     );
 
@@ -2923,10 +3456,10 @@ router.patch(
 
       // تحقق من تفاصيل الامتحان للمساعدة في التصحيح
       const examDetails = await pool.query(
-        `SELECT e.id, e.lecture_id, e.type, l.course_id, c.teacher_id 
+        `SELECT e.id, e.lecture_id, e.type, COALESCE(e.course_id, l.course_id) AS course_id, c.teacher_id 
          FROM exams e 
          LEFT JOIN lectures l ON e.lecture_id = l.id 
-         LEFT JOIN courses c ON l.course_id = c.id 
+         LEFT JOIN courses c ON c.id = COALESCE(e.course_id, l.course_id)
          WHERE e.id = $1`,
         [examId],
       );
@@ -2959,8 +3492,8 @@ router.patch(
         const examInfo = await pool.query(
           `SELECT c.id as course_id, c.title as course_title, l.id as lecture_id, l.title as lecture_title, e.title as exam_title
            FROM exams e
-           JOIN lectures l ON e.lecture_id = l.id
-           JOIN courses c ON l.course_id = c.id
+           LEFT JOIN lectures l ON e.lecture_id = l.id
+           JOIN courses c ON c.id = COALESCE(e.course_id, l.course_id)
            WHERE e.id = $1`,
           [examId],
         );
@@ -2972,7 +3505,7 @@ router.patch(
             info.lecture_id,
             examId,
             info.exam_title || 'امتحان',
-            info.lecture_title,
+            info.lecture_title || 'واجب الكورس',
             info.course_title,
           );
           console.log(`✅ [Notification] Exam visibility notification sent for exam ${examId} in course ${info.course_id}`);
@@ -2994,7 +3527,7 @@ router.patch(
 // ?type=exam | assignment | all (افتراضي all للمدرس، وكلا النوعين للطالب حسب الظهور)
 router.get(
   '/lecture/:lectureId/exam',
-  authMiddleware(['teacher', 'student']),
+  authMiddleware(['teacher', 'academy', 'academy_teacher', 'student', 'admin']),
   asyncWrapper(async (req, res) => {
     const lectureId = Number(req.params.lectureId);
     const user = req.user!;
@@ -3006,14 +3539,21 @@ router.get(
 
     // تحقق من الصلاحية
     let isAllowed = false;
-    if (user.role === 'teacher') {
-      const lectureCheck = await pool.query(
-        `SELECT l.* FROM lectures l 
-         JOIN courses c ON l.course_id = c.id 
-         WHERE l.id = $1 AND c.teacher_id = $2`,
-        [lectureId, user.id],
-      );
-      if (lectureCheck.rowCount) isAllowed = true;
+    if (user.role === 'teacher' || user.role === 'academy' || user.role === 'academy_teacher' || user.role === 'admin') {
+      if (user.role === 'admin') {
+        isAllowed = true;
+      } else {
+        const lectureCheck = await pool.query(
+          `SELECT l.course_id FROM lectures l WHERE l.id = $1`,
+          [lectureId],
+        );
+        if (lectureCheck.rowCount) {
+          isAllowed = await CourseAccessControl.canManageCourse(
+            user,
+            Number(lectureCheck.rows[0].course_id),
+          );
+        }
+      }
     } else if (user.role === 'student') {
       const enrollCheck = await pool.query(
         `SELECT 1 FROM enrollments e 
@@ -3078,7 +3618,7 @@ router.get(
 // تحديث امتحان محاضرة
 router.patch(
   '/lecture/exam/:examId',
-  authMiddleware(['teacher']),
+  authMiddleware(COURSE_CONTENT_ROLES),
   asyncWrapper(async (req, res) => {
     const examId = Number(req.params.examId);
     const { title, total_grade, duration, is_visible } = req.body;
@@ -3087,13 +3627,13 @@ router.patch(
       return res.status(400).json({ message: 'Invalid exam ID' });
     }
 
-    // تحقق من أن الامتحان يخص محاضرة في كورس يملكه المدرس
+    // تحقق من أن الامتحان يخص محاضرة أو كورس يملكه المدرس
     const examCheck = await pool.query(
-      `SELECT e.*, l.title as lecture_title, c.id as course_id, c.title as course_title 
+      `SELECT e.*, l.title as lecture_title, COALESCE(e.course_id, l.course_id) AS course_id, c.title as course_title 
        FROM exams e 
-       JOIN lectures l ON e.lecture_id = l.id 
-       JOIN courses c ON l.course_id = c.id 
-       WHERE e.id = $1 AND c.teacher_id = $2`,
+       LEFT JOIN lectures l ON e.lecture_id = l.id 
+       JOIN courses c ON c.id = COALESCE(e.course_id, l.course_id)
+       WHERE e.id = $1 AND (c.teacher_id = $2 OR EXISTS (SELECT 1 FROM course_managers cm WHERE cm.course_id = c.id AND cm.user_id = $2) OR EXISTS (SELECT 1 FROM tenants t WHERE t.id = c.tenant_id AND t.owner_user_id = $2 AND t.platform_type = $$academy$$))`,
       [examId, req.user!.id],
     );
 
@@ -3140,7 +3680,7 @@ router.patch(
 // حذف امتحان محاضرة
 router.delete(
   '/lecture/exam/:examId',
-  authMiddleware(['teacher']),
+  authMiddleware(COURSE_CONTENT_ROLES),
   asyncWrapper(async (req, res) => {
     const examId = Number(req.params.examId);
 
@@ -3150,9 +3690,9 @@ router.delete(
 
     const examCheck = await pool.query(
       `SELECT e.* FROM exams e 
-       JOIN lectures l ON e.lecture_id = l.id 
-       JOIN courses c ON l.course_id = c.id 
-       WHERE e.id = $1 AND c.teacher_id = $2`,
+       LEFT JOIN lectures l ON e.lecture_id = l.id 
+       JOIN courses c ON c.id = COALESCE(e.course_id, l.course_id)
+       WHERE e.id = $1 AND (c.teacher_id = $2 OR EXISTS (SELECT 1 FROM course_managers cm WHERE cm.course_id = c.id AND cm.user_id = $2) OR EXISTS (SELECT 1 FROM tenants t WHERE t.id = c.tenant_id AND t.owner_user_id = $2 AND t.platform_type = $$academy$$))`,
       [examId, req.user!.id],
     );
 
@@ -3209,8 +3749,8 @@ router.get(
 
     // جلب معلومات المحاضرة والكورس
     let courseId: number | null = null;
+    let isRegularLecture = false;
 
-    // التحقق من course_lectures أولاً
     const courseLectureResult = await pool.query(
       'SELECT course_id FROM course_lectures WHERE id = $1',
       [lectureId],
@@ -3219,12 +3759,12 @@ router.get(
     if (courseLectureResult.rowCount) {
       courseId = courseLectureResult.rows[0].course_id;
     } else {
-      // التحقق من lectures
       const lectureResult = await pool.query('SELECT course_id FROM lectures WHERE id = $1', [
         lectureId,
       ]);
       if (lectureResult.rowCount) {
         courseId = lectureResult.rows[0].course_id;
+        isRegularLecture = true;
       }
     }
 
@@ -3232,35 +3772,57 @@ router.get(
       return res.status(404).json({ message: 'المحاضرة غير موجودة' });
     }
 
-    // التحقق من صلاحية الوصول للكورس (يدعم الكورسات العادية والكورسات في المواد الدراسية)
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const { canAccessCourseContent } = require('../utils/courseAccess');
     const hasAccess = await canAccessCourseContent(courseId, studentId, 'student');
 
     if (!hasAccess) {
       return res.status(403).json({
-        message: 'ليس لديك صلاحية للوصول إلى هذا الكورس. يجب أن تكون مشترك في الكورس أو مفعل للباقة التي تحتوي على هذه المادة'
+        can_access: false,
+        status: 'not_enrolled',
+        message:
+          'ليس لديك صلاحية للوصول إلى هذا الكورس. يجب أن تكون مشترك في الكورس أو مفعل للباقة التي تحتوي على هذه المادة',
       });
     }
 
-    // التحقق من إمكانية الوصول للمحاضرة بناءً على الامتحانات (للكورسات العادية فقط)
     let canAccess = true;
     let blockingExams: any[] = [];
+    let accessMeta: Record<string, unknown> = {
+      status: 'open',
+      lecture_access_mode: 'always_open',
+    };
 
-    // فقط للكورسات العادية (lectures)، نتحقق من الامتحانات
-    const lectureCheck = await pool.query('SELECT id FROM lectures WHERE id = $1', [lectureId]);
+    if (isRegularLecture) {
+      const modeAccess = await LectureAccessService.checkStudentLectureAccess(lectureId, studentId);
+      accessMeta = {
+        status: modeAccess.status,
+        lecture_access_mode: modeAccess.lecture_access_mode,
+        expires_at: modeAccess.expires_at ?? null,
+        activation: modeAccess.activation ?? null,
+        message: modeAccess.message,
+      };
+      canAccess = modeAccess.can_access;
 
-    if (lectureCheck.rowCount) {
-      canAccess = await LectureExamService.canStudentAccessLecture(lectureId, studentId);
-      blockingExams = await LectureExamService.getBlockingExamsForLecture(lectureId, studentId);
+      if (canAccess) {
+        canAccess = await LectureExamService.canStudentAccessLecture(lectureId, studentId);
+        blockingExams = await LectureExamService.getBlockingExamsForLecture(lectureId, studentId);
+        if (!canAccess) {
+          accessMeta.status = 'locked';
+          accessMeta.message =
+            'لا يمكن الوصول للمحاضرة - يجب النجاح في الامتحانات المطلوبة أولاً';
+        }
+      }
     }
 
     res.json({
       can_access: canAccess,
       blocking_exams: blockingExams,
-      message: canAccess
-        ? 'يمكن الوصول للمحاضرة'
-        : 'لا يمكن الوصول للمحاضرة - يجب النجاح في الامتحانات المطلوبة أولاً'
+      ...accessMeta,
+      message:
+        (accessMeta.message as string) ||
+        (canAccess
+          ? 'يمكن الوصول للمحاضرة'
+          : 'لا يمكن الوصول للمحاضرة - يجب النجاح في الامتحانات المطلوبة أولاً'),
     });
   }),
 );
@@ -3268,7 +3830,7 @@ router.get(
 // تحديث الإعدادات المتقدمة لامتحان المحاضرة
 router.patch(
   '/lecture/exam/:examId/advanced-settings',
-  authMiddleware(['teacher']),
+  authMiddleware(COURSE_CONTENT_ROLES),
   asyncWrapper(async (req, res) => {
     const examId = Number(req.params.examId);
     const {
@@ -3283,12 +3845,12 @@ router.patch(
       return res.status(400).json({ message: 'Invalid exam ID' });
     }
 
-    // تحقق من أن الامتحان يخص محاضرة في كورس يملكه المدرس
+    // تحقق من أن الامتحان يخص محاضرة أو كورس يملكه المدرس
     const examCheck = await pool.query(
       `SELECT e.* FROM exams e 
-       JOIN lectures l ON e.lecture_id = l.id 
-       JOIN courses c ON l.course_id = c.id 
-       WHERE e.id = $1 AND c.teacher_id = $2`,
+       LEFT JOIN lectures l ON e.lecture_id = l.id 
+       JOIN courses c ON c.id = COALESCE(e.course_id, l.course_id)
+       WHERE e.id = $1 AND (c.teacher_id = $2 OR EXISTS (SELECT 1 FROM course_managers cm WHERE cm.course_id = c.id AND cm.user_id = $2) OR EXISTS (SELECT 1 FROM tenants t WHERE t.id = c.tenant_id AND t.owner_user_id = $2 AND t.platform_type = $$academy$$))`,
       [examId, req.user!.id],
     );
 
@@ -3342,7 +3904,7 @@ router.patch(
 // تفعيل الطالب في كورس (مدرس أو أدمن) - Body: { courseId, studentId } أو { course_id, student_id }
 router.post(
   '/activate-student',
-  authMiddleware(['teacher', 'admin']),
+  authMiddleware(COURSE_CONTENT_ROLES),
   asyncWrapper(async (req, res) => {
     const courseId = Number(req.body.courseId ?? req.body.course_id);
     const studentId = Number(req.body.studentId ?? req.body.student_id);
@@ -3358,7 +3920,7 @@ router.post(
     const courseCheck = await pool.query(
       isAdmin
         ? 'SELECT id, title, teacher_id FROM courses WHERE id = $1'
-        : 'SELECT id, title, teacher_id FROM courses WHERE id = $1 AND teacher_id = $2',
+        : 'SELECT id, title, teacher_id FROM courses WHERE id = $1 AND (teacher_id = $2 OR EXISTS (SELECT 1 FROM course_managers cm WHERE cm.course_id = id AND cm.user_id = $2) OR EXISTS (SELECT 1 FROM tenants t WHERE t.id = tenant_id AND t.owner_user_id = $2 AND t.platform_type = $$academy$$))',
       isAdmin ? [courseId] : [courseId, teacherId],
     );
 
@@ -3465,7 +4027,7 @@ router.post(
 // حذف طالب من كورس (للأستاذ فقط)
 router.delete(
   '/:courseId/student/:studentId',
-  authMiddleware(['teacher']),
+  authMiddleware(COURSE_CONTENT_ROLES),
   asyncWrapper(async (req, res) => {
     const courseId = Number(req.params.courseId);
     const studentId = Number(req.params.studentId);
@@ -3477,7 +4039,7 @@ router.delete(
 
     // تحقق من أن الكورس يخص المدرس
     const courseCheck = await pool.query(
-      'SELECT id, title FROM courses WHERE id = $1 AND teacher_id = $2',
+      'SELECT id, title FROM courses WHERE id = $1 AND (teacher_id = $2 OR EXISTS (SELECT 1 FROM course_managers cm WHERE cm.course_id = id AND cm.user_id = $2) OR EXISTS (SELECT 1 FROM tenants t WHERE t.id = tenant_id AND t.owner_user_id = $2 AND t.platform_type = $$academy$$))',
       [courseId, teacherId],
     );
 
@@ -3569,7 +4131,7 @@ router.delete(
 // فتح كورس لطالب معين (للأستاذ فقط)
 router.post(
   '/:courseId/open-for-student/:studentId',
-  authMiddleware(['teacher']),
+  authMiddleware(COURSE_CONTENT_ROLES),
   asyncWrapper(async (req, res) => {
     const courseId = Number(req.params.courseId);
     const studentId = Number(req.params.studentId);
@@ -3581,7 +4143,7 @@ router.post(
 
     // تحقق من أن الكورس يخص المدرس
     const courseCheck = await pool.query(
-      'SELECT id, title FROM courses WHERE id = $1 AND teacher_id = $2',
+      'SELECT id, title FROM courses WHERE id = $1 AND (teacher_id = $2 OR EXISTS (SELECT 1 FROM course_managers cm WHERE cm.course_id = id AND cm.user_id = $2) OR EXISTS (SELECT 1 FROM tenants t WHERE t.id = tenant_id AND t.owner_user_id = $2 AND t.platform_type = $$academy$$))',
       [courseId, teacherId],
     );
 
@@ -3698,7 +4260,7 @@ router.post(
 // عرض قائمة الطلاب المشتركين في كورس (للأستاذ فقط)
 router.get(
   '/:courseId/students',
-  authMiddleware(['teacher']),
+  authMiddleware(COURSE_CONTENT_ROLES),
   asyncWrapper(async (req, res) => {
     const courseId = Number(req.params.courseId);
     const teacherId = req.user!.id;
@@ -3709,7 +4271,7 @@ router.get(
 
     // تحقق من أن الكورس يخص المدرس
     const courseCheck = await pool.query(
-      'SELECT id, title FROM courses WHERE id = $1 AND teacher_id = $2',
+      'SELECT id, title FROM courses WHERE id = $1 AND (teacher_id = $2 OR EXISTS (SELECT 1 FROM course_managers cm WHERE cm.course_id = id AND cm.user_id = $2) OR EXISTS (SELECT 1 FROM tenants t WHERE t.id = tenant_id AND t.owner_user_id = $2 AND t.platform_type = $$academy$$))',
       [courseId, teacherId],
     );
 
@@ -3888,7 +4450,7 @@ router.get(
 // إحصائيات وتفاصيل الطلاب في الكورس للمدرس
 router.get(
   '/:courseId/students-progress',
-  authMiddleware(['teacher', 'admin']),
+  authMiddleware(COURSE_CONTENT_ROLES),
   asyncWrapper(async (req, res) => {
     try {
       const courseId = Number(req.params.courseId);
@@ -3897,44 +4459,18 @@ router.get(
       }
 
       // تحقق من دور المستخدم
-      if (!['teacher', 'admin'].includes(req.user!.role)) {
+      if (!COURSE_CONTENT_ROLES.includes(req.user!.role as any)) {
         return res.status(403).json({
-          message: 'غير مصرح - مطلوب دور teacher أو admin',
+          message: 'غير مصرح',
           details: {
             user_id: req.user!.id,
             user_role: req.user!.role,
-            required_roles: ['teacher', 'admin'],
+            required_roles: COURSE_CONTENT_ROLES,
           },
         });
       }
-      // تحقق أن المدرس يملك الكورس أو admin
-      if (req.user!.role === 'teacher') {
-        const courseCheck = await pool.query('SELECT id, teacher_id FROM courses WHERE id = $1', [
-          courseId,
-        ]);
-        if (!courseCheck.rowCount) {
-          return res.status(404).json({
-            message: 'الكورس غير موجود',
-            details: {
-              user_id: req.user!.id,
-              user_role: req.user!.role,
-              course_id: courseId,
-            },
-          });
-        }
-
-        if (courseCheck.rows[0].teacher_id !== req.user!.id) {
-          return res.status(403).json({
-            message: 'غير مصرح - الكورس لا يخصك',
-            details: {
-              user_id: req.user!.id,
-              user_role: req.user!.role,
-              course_id: courseId,
-              course_owner: courseCheck.rows[0].teacher_id,
-              required_role: 'teacher أو admin',
-            },
-          });
-        }
+      if (req.user!.role !== 'admin') {
+        await CourseAccessControl.assertCanManageCourse(req.user!, courseId);
       }
       // استعلام واحد شامل لجلب جميع البيانات المطلوبة
       const comprehensiveDataRes = await pool.query(
@@ -4249,41 +4785,31 @@ router.get(
   }),
 );
 
-// جلب تفاصيل الطلاب الذين حلوا امتحان محاضرة معينة (للأستاذ فقط)
+// جلب تفاصيل الطلاب الذين حلوا امتحان محاضرة معينة + الأسئلة الخاطئة (للأستاذ فقط)
 router.get(
   '/lecture-exam/:examId/submissions',
-  authMiddleware(['teacher']),
+  authMiddleware(COURSE_CONTENT_ROLES),
   asyncWrapper(async (req, res) => {
     const examId = Number(req.params.examId);
     if (isNaN(examId)) {
       return res.status(400).json({ message: 'Invalid examId' });
     }
-    // تحقق أن الامتحان يخص المدرس
+    // تحقق أن الامتحان يخص المدرس (محاضرة أو واجب كورس)
     const examRes = await pool.query(
-      `SELECT e.*, l.course_id FROM exams e JOIN lectures l ON e.lecture_id = l.id WHERE e.id = $1`,
+      `SELECT e.*, COALESCE(e.course_id, l.course_id) AS course_id
+       FROM exams e
+       LEFT JOIN lectures l ON e.lecture_id = l.id
+       WHERE e.id = $1`,
       [examId],
     );
     if (!examRes.rowCount) {
       return res.status(404).json({ message: 'Lecture exam not found' });
     }
     const courseId = examRes.rows[0].course_id;
-    const courseCheck = await pool.query(
-      'SELECT id FROM courses WHERE id = $1 AND teacher_id = $2',
-      [courseId, req.user!.id],
-    );
-    if (!courseCheck.rowCount) {
-      return res.status(403).json({ message: 'Not allowed' });
-    }
-    // جلب تفاصيل الطلاب الذين حلوا الامتحان
-    const subsRes = await pool.query(
-      `SELECT s.id as submission_id, s.student_id, s.total_grade, s.submitted_at, s.passed, u.name, u.email, u.phone
-       FROM exam_submissions s
-       JOIN users u ON s.student_id = u.id
-       WHERE s.exam_id = $1
-       ORDER BY s.submitted_at DESC`,
-      [examId],
-    );
-    res.json({ submissions: subsRes.rows });
+    await CourseAccessControl.assertCanManageCourse(req.user!, Number(courseId));
+
+    const submissions = await ExamFlowService.listLectureExamSubmissionsWithWrongQuestions(examId);
+    res.json({ submissions });
   }),
 );
 
@@ -4416,7 +4942,7 @@ router.post(
 // جلب تفاصيل الطلاب الذين حلوا امتحان الكورس الشامل (للأستاذ فقط)
 router.get(
   '/course-exam/:examId/submissions',
-  authMiddleware(['teacher']),
+  authMiddleware(COURSE_CONTENT_ROLES),
   asyncWrapper(async (req, res) => {
     const examId = Number(req.params.examId);
     if (isNaN(examId)) {
@@ -4435,9 +4961,10 @@ router.get(
     }
     const exam = examRes.rows[0];
     // تحقق أن المدرس يملك الكورس
-    if (exam.teacher_id !== req.user!.id) {
-      return res.status(403).json({ message: 'Not allowed' });
-    }
+    await CourseAccessControl.assertOwnsJoinedCourse(req.user!, {
+      courseTeacherId: exam.teacher_id,
+      courseId: exam.course_id,
+    });
     // جلب تفاصيل الطلاب الذين حلوا الامتحان
     const subsRes = await pool.query(
       `SELECT 
@@ -4464,7 +4991,7 @@ router.get(
 // جلب تقرير تفصيلي عن امتحان الكورس الشامل (للأستاذ فقط)
 router.get(
   '/course-exam/:examId/report',
-  authMiddleware(['teacher']),
+  authMiddleware(COURSE_CONTENT_ROLES),
   asyncWrapper(async (req, res) => {
     const examId = Number(req.params.examId);
     if (isNaN(examId)) {
@@ -4539,8 +5066,22 @@ router.get(
       return res.status(403).json({ message: 'ليس لديك صلاحية لمشاهدة هذا الفيديو' });
     }
 
-    // للطالب: التحقق من أن المحاضرة غير مقفلة (امتحان سابق بـ "قفل المحاضرات التالية" لم يُنجَح فيه بعد)
+    // للطالب: أوضاع الوصول + قفل الواجبات
     if (userRole === 'student') {
+      const modeAccess = await LectureAccessService.checkStudentLectureAccess(
+        videoInfo.lecture_id,
+        userId,
+      );
+      if (!modeAccess.can_access) {
+        return res.status(403).json({
+          message: modeAccess.message,
+          status: modeAccess.status,
+          lecture_access_mode: modeAccess.lecture_access_mode,
+          expires_at: modeAccess.expires_at ?? null,
+          activation: modeAccess.activation ?? null,
+        });
+      }
+
       const canAccessLecture = await LectureExamService.canStudentAccessLecture(
         videoInfo.lecture_id,
         userId,
@@ -4548,11 +5089,37 @@ router.get(
       if (!canAccessLecture) {
         return res.status(403).json({
           message: 'المحاضرة مقفولة حتى تنجح في الامتحان السابق',
+          status: 'locked',
         });
       }
     }
 
     const video = videoInfo;
+
+    // حماية: لو المدرس اختار عرض الفيديو في التطبيق فقط، لا نُرجع الرابط للموقع
+    const tenantId =
+      (req as any).tenant?.id ??
+      (
+        await pool.query<{ tenant_id: number | null }>(
+          `SELECT tenant_id FROM users WHERE id = $1 LIMIT 1`,
+          [video.teacher_id],
+        )
+      ).rows[0]?.tenant_id;
+
+    const { settings: playbackSettings, expose } =
+      await TeacherVideoPlaybackService.canExposeVideoUrl(req, tenantId);
+
+    if (!expose) {
+      return res.status(200).json({
+        video_url: null,
+        video_url_hidden: true,
+        video_playback_mode: playbackSettings.video_playback_mode,
+        player_app_only: true,
+        message:
+          'هذا الفيديو متاح للتشغيل عبر تطبيق عرض الفيديوهات فقط. افتح التطبيق لمشاهدة المحتوى.',
+        code: 'VIDEO_PLAYER_APP_REQUIRED',
+      });
+    }
 
     let viewTracking: {
       view_tracked: boolean;
@@ -4590,6 +5157,7 @@ router.get(
 
     res.json({
       video_url: video.video_url,
+      video_playback_mode: playbackSettings.video_playback_mode,
       message: 'تم جلب رابط الفيديو بنجاح',
       ...(viewTracking ?? {}),
     });
@@ -4672,7 +5240,7 @@ router.post(
 // إحصائيات سريعة للكورس (للمدرس أو الأدمن) - نسخة محسنة للأداء
 router.get(
   '/:courseId/students-progress-summary',
-  authMiddleware(['teacher', 'admin']),
+  authMiddleware(COURSE_CONTENT_ROLES),
   asyncWrapper(async (req, res) => {
     try {
       const courseId = Number(req.params.courseId);
@@ -4681,13 +5249,8 @@ router.get(
       }
 
       // تحقق من الصلاحيات
-      if (req.user!.role === 'teacher') {
-        const courseCheck = await pool.query('SELECT id, teacher_id FROM courses WHERE id = $1', [
-          courseId,
-        ]);
-        if (!courseCheck.rowCount || courseCheck.rows[0].teacher_id !== req.user!.id) {
-          return res.status(403).json({ message: 'ليس لديك صلاحية للوصول لهذا الكورس' });
-        }
+      if (req.user!.role !== 'admin') {
+        await CourseAccessControl.assertCanManageCourse(req.user!, courseId);
       }
 
       // استعلام واحد سريع للحصول على الإحصائيات الأساسية فقط
@@ -4788,7 +5351,7 @@ router.get(
 // تقرير مفصل لطالب معين في الكورس (للمدرس أو الأدمن)
 router.get(
   '/:courseId/student/:studentId/detailed-report',
-  authMiddleware(['teacher', 'admin']),
+  authMiddleware(COURSE_CONTENT_ROLES),
   asyncWrapper(async (req, res) => {
     try {
       const courseId = Number(req.params.courseId);
@@ -4901,11 +5464,23 @@ router.get(
         [studentId, lectureExams.map((e) => e.id)],
       );
 
-      // التحقق من قفل كل محاضرة (امتحان بـ "قفل المحاضرات التالية" - لا تُفتح حتى النجاح)
+      // قفل المحاضرة = أوضاع الوصول (كود تفعيل / مدة) + قفل الامتحان المتسلسل
       const lectureAccessChecks = await Promise.all(
-        lectures.map((lecture) =>
-          LectureExamService.canStudentAccessLecture(lecture.id, studentId),
-        ),
+        lectures.map(async (lecture) => {
+          const modeAccess = await LectureAccessService.checkStudentLectureAccess(
+            lecture.id,
+            studentId,
+          );
+          if (!modeAccess.can_access) {
+            return { canAccess: false, access_status: modeAccess.status, modeAccess };
+          }
+          const examOk = await LectureExamService.canStudentAccessLecture(lecture.id, studentId);
+          return {
+            canAccess: examOk,
+            access_status: examOk ? modeAccess.status : 'locked',
+            modeAccess,
+          };
+        }),
       );
       const lectureCanAccessMap = new Map(
         lectures.map((l, i) => [l.id, lectureAccessChecks[i]]),
@@ -4915,7 +5490,8 @@ router.get(
       const lecturesData = lectures.map((lecture) => {
         const isWatched = lectureViewsRes.rows.some((v) => v.lecture_id === lecture.id);
         const watchedAt = isWatched ? lectureViewsRes.rows.find((v) => v.lecture_id === lecture.id)?.viewed_at : null;
-        const isLocked = !(lectureCanAccessMap.get(lecture.id) ?? true);
+        const accessInfo = lectureCanAccessMap.get(lecture.id);
+        const isLocked = !(accessInfo?.canAccess ?? true);
 
         const lectureVideos = videos.filter((v) => v.lecture_id === lecture.id);
         const watchedVideos = videoViewsRes.rows.filter((v) => v.lecture_id === lecture.id);
@@ -4931,35 +5507,40 @@ router.get(
           description: lecture.description,
           position: lecture.position,
           is_locked: isLocked,
+          access_status: accessInfo?.access_status ?? 'open',
+          lecture_access_mode: accessInfo?.modeAccess?.lecture_access_mode ?? 'always_open',
           is_watched: isWatched,
           watched_at: watchedAt,
-          videos: lectureVideos.map((video) => {
-            const videoView = watchedVideos.find((v) => v.video_id === video.id);
-            // الطالب شاهد الفيديو إذا كان له أي سجل في video_views
-            const hasWatched = !!videoView;
-            return {
-              id: video.id,
-              title: video.title,
-              position: video.position,
-              video_url: video.video_url,
-              is_watched: hasWatched,
-              has_watched: hasWatched, // تأكيد إضافي
-              watch_duration: videoView?.watch_duration || 0,
-              completion_percentage: videoView?.completion_percentage || 0,
-              is_completed: videoView?.is_completed || false,
-              viewed_at: videoView?.viewed_at || null,
-            };
-          }),
-          exams: lectureExamsForLecture.map((exam) => {
-            const result = examResults.find((r) => r.exam_id === exam.id);
-            return {
-              id: exam.id,
-              title: exam.title,
-              is_solved: !!result,
-              grade: result?.total_grade || 0,
-              submitted_at: result?.submitted_at || null,
-            };
-          }),
+          videos: isLocked
+            ? []
+            : lectureVideos.map((video) => {
+                const videoView = watchedVideos.find((v) => v.video_id === video.id);
+                const hasWatched = !!videoView;
+                return {
+                  id: video.id,
+                  title: video.title,
+                  position: video.position,
+                  video_url: video.video_url,
+                  is_watched: hasWatched,
+                  has_watched: hasWatched,
+                  watch_duration: videoView?.watch_duration || 0,
+                  completion_percentage: videoView?.completion_percentage || 0,
+                  is_completed: videoView?.is_completed || false,
+                  viewed_at: videoView?.viewed_at || null,
+                };
+              }),
+          exams: isLocked
+            ? []
+            : lectureExamsForLecture.map((exam) => {
+                const result = examResults.find((r) => r.exam_id === exam.id);
+                return {
+                  id: exam.id,
+                  title: exam.title,
+                  is_solved: !!result,
+                  grade: result?.total_grade || 0,
+                  submitted_at: result?.submitted_at || null,
+                };
+              }),
         };
       });
 

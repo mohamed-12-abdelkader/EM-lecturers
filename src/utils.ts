@@ -92,6 +92,20 @@ export const config = cleanEnv(process.env, {
   SECRET_KEY: str({ devDefault: testOnly(crypto.randomBytes(32).toString('hex')) }),
   ACCESS_TOKEN_EXPIRE_MINUTES: num({ default: 60 * 24 * 8 }), // 8 days
   COMMON_TOKEN_EXPIRE_HOURS: num({ default: 8 }),
+
+  // Auth (Access/Refresh tokens)
+  /** مدة الـ Access Token (jsonwebtoken format) */
+  ACCESS_TOKEN_TTL: str({ default: '15m' }),
+  /** مدة Refresh Token بدون Remember Me (أيام) */
+  REFRESH_TOKEN_TTL_DAYS: num({ default: 7 }),
+  /** مدة Refresh Token مع Remember Me (أيام) */
+  REFRESH_TOKEN_REMEMBER_DAYS: num({ default: 365 }),
+  /** Domain للـ Refresh Cookie (فارغ = تلقائي: .TENANT_ROOT_DOMAIN في production) */
+  AUTH_COOKIE_DOMAIN: str({ default: '' }),
+  /** SameSite للـ Refresh Cookie (فارغ = تلقائي: lax في production و none في development) */
+  AUTH_COOKIE_SAMESITE: str({ default: '', choices: ['', 'lax', 'strict', 'none'] }),
+  /** توافق خلفي: تجديد التوكن المنتهي تلقائياً عبر X-Access-Token للعملاء القدامى */
+  AUTH_LEGACY_AUTO_REFRESH: bool({ default: true }),
   PORT: num({ default: 8000 }),
 
   // Database
@@ -141,6 +155,7 @@ export const config = cleanEnv(process.env, {
   // Deepseek
   DEEPSEEK_API_KEY: str(),
   DEEPSEEK_API_URL: str({ default: 'https://api.deepseek.com' }),
+  DEEPSEEK_MODEL: str({ default: 'deepseek-v4-flash' }),
 
   // Gemini
   GEMINI_API_KEY: str({ default: '' }),
@@ -185,6 +200,8 @@ export const config = cleanEnv(process.env, {
 export type GenerateTokenOptions = {
   /** When set (e.g. from `req.tenant.id` at login), JWT `tid` matches the session host tenant even if `users.tenant_id` is stale. */
   sessionTenantId?: number | null;
+  /** Override access token TTL (jsonwebtoken format, e.g. '15m'). Defaults to config.ACCESS_TOKEN_TTL. */
+  expiresIn?: string;
 };
 
 export async function generateToken(
@@ -212,7 +229,7 @@ export async function generateToken(
   }
 
   return jwt.sign(payload, config.SECRET_KEY, {
-    expiresIn: '7d',
+    expiresIn: (opts?.expiresIn || config.ACCESS_TOKEN_TTL) as jwt.SignOptions['expiresIn'],
   });
 }
 
@@ -269,6 +286,67 @@ cloudinary.config({
   api_secret: config.CLOUDINARY_API_SECRET,
 });
 
+function uploadsRootDir(): string {
+  return path.join(process.cwd(), 'uploads');
+}
+
+function isCloudinaryUnavailable(err: unknown): boolean {
+  const anyErr = err as { message?: string; http_code?: number; error?: { message?: string } };
+  const message = String(anyErr?.message || anyErr?.error?.message || err || '');
+  return (
+    message.includes('cloud_name is disabled') ||
+    message.includes('Unknown API key') ||
+    message.includes('Invalid cloud_name') ||
+    anyErr?.http_code === 401
+  );
+}
+
+/** Keep the file under /uploads and return a Cloudinary-compatible result. */
+function localUploadResult(filePath: string): UploadApiResponse {
+  const uploadsDir = uploadsRootDir();
+  fs.mkdirSync(uploadsDir, { recursive: true });
+
+  const ext = path.extname(filePath) || '';
+  const filename = path.basename(filePath);
+  const destName = filename.startsWith('tenant-') || filename.match(/^\d+-/)
+    ? filename
+    : `${Date.now()}-${Math.round(Math.random() * 1e9)}${ext}`;
+  const destPath = path.join(uploadsDir, destName);
+
+  if (path.resolve(filePath) !== path.resolve(destPath)) {
+    fs.copyFileSync(filePath, destPath);
+    try {
+      fs.unlinkSync(filePath);
+    } catch {
+      // ignore
+    }
+  }
+
+  const url = `/uploads/${destName}`;
+  return {
+    asset_id: destName,
+    public_id: destName,
+    version: 1,
+    version_id: destName,
+    signature: '',
+    width: 0,
+    height: 0,
+    format: ext.replace('.', ''),
+    resource_type: 'image',
+    created_at: new Date().toISOString(),
+    tags: [],
+    bytes: fs.existsSync(destPath) ? fs.statSync(destPath).size : 0,
+    type: 'upload',
+    etag: '',
+    placeholder: false,
+    url,
+    secure_url: url,
+    folder: 'uploads',
+    original_filename: destName,
+    api_key: '',
+  } as unknown as UploadApiResponse;
+}
+
 export const uploadToCloudinary = async (
   filePath: string,
   options?: {
@@ -298,14 +376,25 @@ export const uploadToCloudinary = async (
     uploadOptions.resource_type = 'auto';
   }
 
-  const result: UploadApiResponse = useLarge
-    ? ((await cloudinary.uploader.upload_large(filePath, {
-        ...uploadOptions,
-        chunk_size: 6_000_000,
-      })) as UploadApiResponse)
-    : await cloudinary.uploader.upload(filePath, uploadOptions);
-  await unlinkFile(filePath);
-  return result;
+  try {
+    const result: UploadApiResponse = useLarge
+      ? ((await cloudinary.uploader.upload_large(filePath, {
+          ...uploadOptions,
+          chunk_size: 6_000_000,
+        })) as UploadApiResponse)
+      : await cloudinary.uploader.upload(filePath, uploadOptions);
+    await unlinkFile(filePath);
+    return result;
+  } catch (err) {
+    if (!isCloudinaryUnavailable(err)) {
+      throw err;
+    }
+    logger.warn(
+      { err, filePath },
+      'Cloudinary unavailable — saving upload locally under /uploads',
+    );
+    return localUploadResult(filePath);
+  }
 };
 
 /** Delete a Cloudinary media by its delivered URL (best effort). */

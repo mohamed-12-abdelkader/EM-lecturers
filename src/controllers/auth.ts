@@ -2,21 +2,68 @@ import { Router } from 'express';
 import pool from '../db/pool';
 import bcrypt from 'bcrypt';
 import crypto from 'node:crypto';
-import { asyncWrapper, config, generateToken, sendEmail } from '../utils';
+import * as jwt from 'jsonwebtoken';
+import { ipKeyGenerator, rateLimit } from 'express-rate-limit';
+import { asyncWrapper, config, generateToken, sendEmail, HttpError } from '../utils';
 import { validate } from '../middleware/validateReq';
 import { ForgotPassword, Login, ResetPassword, RegisterAdminOrTeacher } from './auth.modules';
 import { TeacherManagedStudentsService } from '../services/teacherManagedStudents';
+import {
+  AuthSessionsService,
+  setRefreshCookie,
+  clearRefreshCookie,
+  readRefreshCookie,
+} from '../services/authSessions';
+import { authMiddleware } from '../middleware/authentication';
 
 export const router = Router();
 
+// ==================== Rate Limiting ====================
+
+const authLimiterOptions = {
+  standardHeaders: true as const,
+  legacyHeaders: false,
+  keyGenerator: (req: import('express').Request) => {
+    const fwd = req.headers['x-forwarded-for'];
+    const raw =
+      typeof fwd === 'string' && fwd.trim()
+        ? fwd.split(',')[0].trim()
+        : req.ip || req.socket?.remoteAddress || '127.0.0.1';
+    return ipKeyGenerator(raw);
+  },
+  validate: { xForwardedForHeader: false, trustProxy: false },
+};
+
+const loginLimiter = rateLimit({
+  ...authLimiterOptions,
+  windowMs: 15 * 60 * 1000,
+  limit: 30,
+  message: { message: 'محاولات تسجيل دخول كثيرة. حاول مرة أخرى بعد قليل.', code: 'RATE_LIMITED' },
+});
+
+const refreshLimiter = rateLimit({
+  ...authLimiterOptions,
+  windowMs: 15 * 60 * 1000,
+  limit: 120,
+  message: { message: 'Too many refresh attempts', code: 'RATE_LIMITED' },
+});
+
+const forgotPasswordLimiter = rateLimit({
+  ...authLimiterOptions,
+  windowMs: 15 * 60 * 1000,
+  limit: 5,
+  message: { message: 'محاولات كثيرة. حاول مرة أخرى لاحقاً.', code: 'RATE_LIMITED' },
+});
+
 router.post(
   '/login',
+  loginLimiter,
   validate(Login),
   asyncWrapper(async (req, res) => {
     const { email, phone, student_code, password, device_ip } = req.body;
     let effectiveTenantId = req.tenant!.id;
 
-    const staffRoles = ['teacher', 'admin', 'employee'];
+    const staffRoles = ['teacher', 'admin', 'employee', 'academy', 'academy_teacher'];
 
     if (student_code && !email && !phone) {
       const explicitSlug = (req.body.subdomain ?? req.body.tenant_subdomain) as
@@ -225,6 +272,22 @@ router.post(
 
     const token = await generateToken(user, pool, { sessionTenantId: effectiveTenantId });
 
+    // Device Session + Refresh Cookie (HttpOnly) — الـ Refresh Token لا يُرسل في الـ JSON
+    const rememberMe = req.body.remember_me === true;
+    const session = await AuthSessionsService.createDeviceSession({
+      userId: user.id,
+      tenantId: effectiveTenantId,
+      rememberMe,
+      req,
+    });
+    setRefreshCookie(req, res, session.refreshToken, rememberMe);
+    AuthSessionsService.logLogin(
+      user.id,
+      user.role,
+      student_code ? 'student_code' : email ? 'email' : 'phone',
+      req,
+    );
+
     const tenantResult = await pool.query(
       `SELECT id, subdomain, display_name FROM tenants WHERE id = $1 LIMIT 1`,
       [effectiveTenantId],
@@ -259,7 +322,11 @@ router.post(
         avatar: user.avatar,
         must_change_password: user.must_change_password === true,
       },
+      /** Access Token (قصير العمر) — احفظه في الذاكرة فقط، ليس LocalStorage */
       token,
+      token_type: 'Bearer',
+      expires_in: config.ACCESS_TOKEN_TTL,
+      /** الجلسة الطويلة محفوظة في HttpOnly Cookie (em_refresh) — لا تُرسل في JSON */
       tenant,
       employee_permissions: employeePermissions,
       employee_data: employeeData,
@@ -267,7 +334,218 @@ router.post(
   }),
 );
 
-router.post('/forgot-password', validate(ForgotPassword), async (req, res) => {
+// ==================== Auth Session Endpoints ====================
+
+function extractBearerToken(req: import('express').Request): string | null {
+  const authHeader = req.headers.authorization;
+  if (typeof authHeader === 'string' && authHeader.trim()) {
+    const match = authHeader.trim().match(/^Bearer\s+(.+)$/i);
+    if (match?.[1]?.trim()) return match[1].trim();
+  }
+  const xAccess = req.headers['x-access-token'];
+  if (typeof xAccess === 'string' && xAccess.trim()) return xAccess.trim();
+  return null;
+}
+
+const PUBLIC_USER_FIELDS = `id, name, email, phone, student_code, role, avatar, tenant_id, must_change_password, account_status`;
+
+/**
+ * POST /auth/refresh
+ * يقرأ الـ Refresh Token من HttpOnly Cookie فقط، يعمل Rotation، ويرجع Access Token جديد.
+ */
+router.post(
+  '/auth/refresh',
+  refreshLimiter,
+  asyncWrapper(async (req, res) => {
+    const rawToken = readRefreshCookie(req);
+    if (!rawToken) {
+      return res.status(401).json({
+        message: 'Refresh token missing',
+        code: 'MISSING_REFRESH_TOKEN',
+      });
+    }
+
+    let rotation;
+    try {
+      rotation = await AuthSessionsService.rotateDeviceSession(rawToken, req);
+    } catch (err) {
+      // أي فشل → امسح الكوكي (جلسة ملغاة / توكن معاد استخدامه / منتهي)
+      clearRefreshCookie(req, res);
+      if (err instanceof HttpError) {
+        return res.status(err.status).json({
+          message: err.message,
+          code: (err.details?.code as string) || 'INVALID_REFRESH_TOKEN',
+        });
+      }
+      throw err;
+    }
+
+    const { device, refreshToken } = rotation;
+
+    const userRes = await pool.query(
+      `SELECT ${PUBLIC_USER_FIELDS} FROM users WHERE id = $1 LIMIT 1`,
+      [device.user_id],
+    );
+    if (!userRes.rowCount) {
+      await AuthSessionsService.revokeDevice(device.id, 'user_not_found');
+      clearRefreshCookie(req, res);
+      return res.status(401).json({ message: 'User not found', code: 'USER_NOT_FOUND' });
+    }
+
+    const user = userRes.rows[0];
+    if (
+      (user.role === 'teacher' || user.role === 'student') &&
+      user.account_status &&
+      user.account_status !== 'active'
+    ) {
+      await AuthSessionsService.revokeDevice(device.id, 'account_inactive');
+      clearRefreshCookie(req, res);
+      return res.status(403).json({
+        message: 'Account is not active',
+        code: user.role === 'teacher' ? 'TEACHER_ACCOUNT_INACTIVE' : 'STUDENT_ACCOUNT_INACTIVE',
+      });
+    }
+
+    // Access Token جديد + تحديث الـ Refresh Cookie (Rotation)
+    const accessToken = await generateToken(user, pool, {
+      sessionTenantId: device.tenant_id ?? user.tenant_id,
+    });
+    setRefreshCookie(req, res, refreshToken, device.remember_me);
+
+    res.json({
+      token: accessToken,
+      user: {
+        id: user.id,
+        name: user.name,
+        email: user.email,
+        phone: user.phone,
+        student_code: user.student_code ?? null,
+        role: user.role,
+        avatar: user.avatar,
+        must_change_password: user.must_change_password === true,
+      },
+    });
+  }),
+);
+
+/**
+ * POST /auth/logout
+ * يلغي جلسة الجهاز الحالي ويمسح الـ Refresh Cookie.
+ */
+router.post(
+  '/auth/logout',
+  asyncWrapper(async (req, res) => {
+    const rawToken = readRefreshCookie(req);
+    let deviceId: string | null = null;
+    let userId: number | null = null;
+
+    if (rawToken) {
+      const revoked = await AuthSessionsService.revokeByToken(rawToken, 'logout');
+      if (revoked) {
+        deviceId = revoked.id;
+        userId = revoked.user_id;
+      }
+    }
+
+    clearRefreshCookie(req, res);
+    AuthSessionsService.logLogout(userId, deviceId, req);
+    res.json({ message: 'Logged out successfully' });
+  }),
+);
+
+/**
+ * POST /auth/logout-all
+ * يلغي جميع جلسات المستخدم على كل الأجهزة (يتطلب Access Token صالح).
+ */
+router.post(
+  '/auth/logout-all',
+  authMiddleware([]),
+  asyncWrapper(async (req, res) => {
+    const userId = req.user!.id;
+    const revokedCount = await AuthSessionsService.revokeAllForUser(userId, 'logout_all');
+    clearRefreshCookie(req, res);
+    res.json({ message: 'Logged out from all devices', revoked_sessions: revokedCount });
+  }),
+);
+
+/**
+ * GET /auth/me
+ * يتحقق من الـ Access Token فقط — بدون Refresh.
+ * منتهي؟ → 401 والـ Frontend يستدعي /auth/refresh.
+ */
+router.get(
+  '/auth/me',
+  asyncWrapper(async (req, res) => {
+    const token = extractBearerToken(req);
+    if (!token) {
+      return res.status(401).json({ message: 'Unauthorized', code: 'MISSING_TOKEN' });
+    }
+
+    let decoded: { id?: unknown; tid?: unknown };
+    try {
+      decoded = jwt.verify(token, config.SECRET_KEY) as { id?: unknown; tid?: unknown };
+    } catch (err: unknown) {
+      const name = (err as { name?: string })?.name;
+      if (name === 'TokenExpiredError') {
+        return res.status(401).json({ message: 'Access token expired', code: 'TOKEN_EXPIRED' });
+      }
+      return res.status(401).json({ message: 'Invalid token', code: 'INVALID_TOKEN' });
+    }
+
+    const userId = Number(decoded.id);
+    if (!Number.isInteger(userId) || userId <= 0) {
+      return res.status(401).json({ message: 'Invalid token', code: 'INVALID_TOKEN' });
+    }
+
+    const userRes = await pool.query(
+      `SELECT ${PUBLIC_USER_FIELDS} FROM users WHERE id = $1 LIMIT 1`,
+      [userId],
+    );
+    if (!userRes.rowCount) {
+      return res.status(401).json({ message: 'User not found', code: 'USER_NOT_FOUND' });
+    }
+
+    const user = userRes.rows[0];
+    const tenantId = decoded.tid != null ? Number(decoded.tid) : user.tenant_id;
+    let tenant = null;
+    if (tenantId != null && Number.isInteger(Number(tenantId))) {
+      const tenantRes = await pool.query(
+        `SELECT id, subdomain, display_name FROM tenants WHERE id = $1 LIMIT 1`,
+        [tenantId],
+      );
+      tenant = tenantRes.rowCount ? tenantRes.rows[0] : null;
+    }
+
+    res.json({
+      user: {
+        id: user.id,
+        name: user.name,
+        email: user.email,
+        phone: user.phone,
+        student_code: user.student_code ?? null,
+        role: user.role,
+        avatar: user.avatar,
+        must_change_password: user.must_change_password === true,
+      },
+      tenant,
+    });
+  }),
+);
+
+/**
+ * GET /auth/sessions
+ * قائمة أجهزة المستخدم النشطة (لإدارة الجلسات من الواجهة).
+ */
+router.get(
+  '/auth/sessions',
+  authMiddleware([]),
+  asyncWrapper(async (req, res) => {
+    const sessions = await AuthSessionsService.listActiveSessions(req.user!.id);
+    res.json({ sessions });
+  }),
+);
+
+router.post('/forgot-password', forgotPasswordLimiter, validate(ForgotPassword), async (req, res) => {
   const { email } = req.body;
   const tenantId = req.tenant!.id;
 
@@ -377,6 +655,16 @@ router.post(
 
     // إنشاء token
     const token = await generateToken(user, pool, { sessionTenantId: tenantId });
+
+    // Device Session + Refresh Cookie
+    const session = await AuthSessionsService.createDeviceSession({
+      userId: user.id,
+      tenantId,
+      rememberMe: false,
+      req,
+    });
+    setRefreshCookie(req, res, session.refreshToken, false);
+    AuthSessionsService.logLogin(user.id, user.role, 'register', req);
 
     res.status(201).json({
       message: 'Admin created successfully',

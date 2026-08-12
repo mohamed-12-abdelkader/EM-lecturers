@@ -7,8 +7,10 @@ import { Router } from 'express';
 import { ChangePassword, RegisterStudent } from './auth.modules';
 import { asyncWrapper, generateToken, uploadToCloudinary } from '../utils';
 import { studentOnlyMiddleware } from '../middleware/authentication';
+import { AuthSessionsService, setRefreshCookie } from '../services/authSessions';
 import { StudentPointsService } from '../services/studentPoints';
 import { TeacherManagedStudentsService } from '../services/teacherManagedStudents';
+import { CourseGroupAccessService } from '../services/courseGroupAccess';
 import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
@@ -70,6 +72,7 @@ router.post(
       course_category,
       subdomain: bodySubdomain,
       tenant_subdomain: bodyTenantSubdomain,
+      course_group_id,
     } = req.body;
 
     // منصة مختلفة = مستخدم مختلف: التحقق من التكرار فقط داخل نفس tenant_id.
@@ -134,7 +137,43 @@ router.post(
       }
     }
 
+    // ربط الطالب بمجموعة الكورسات (نظام مستقل عن السنتر)
+    if (course_group_id && course_group_id > 0) {
+      try {
+        const teacherId = await CourseGroupAccessService.resolveTenantOwnerTeacherId(tenantId);
+        if (teacherId) {
+          const settings = await CourseGroupAccessService.getTeacherSettings(teacherId);
+          if (settings.course_group_access_enabled) {
+            await CourseGroupAccessService.assignStudentToGroup(
+              user.id,
+              course_group_id,
+              teacherId,
+              { skipGradeCheck: !grade_id },
+            );
+          }
+        }
+      } catch (error) {
+        console.error('خطأ في ربط الطالب بمجموعة الكورس:', error);
+        return res.status(400).json({
+          message:
+            error instanceof Error ? error.message : 'تعذر ربط الطالب بالمجموعة المختارة',
+          code: 'COURSE_GROUP_ASSIGN_FAILED',
+        });
+      }
+    }
+
     const token = await generateToken(user, pool, { sessionTenantId: tenantId });
+
+    // Device Session + Refresh Cookie للطالب الجديد (نفس نظام /login)
+    const session = await AuthSessionsService.createDeviceSession({
+      userId: user.id,
+      tenantId,
+      rememberMe: false,
+      req,
+    });
+    setRefreshCookie(req, res, session.refreshToken, false);
+    AuthSessionsService.logLogin(user.id, 'student', 'register', req);
+
     res.status(201).json({
       user: {
         ...user,

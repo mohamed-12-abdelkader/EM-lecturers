@@ -1,12 +1,24 @@
 import { Router } from 'express';
-import { asyncWrapper, config } from '../utils';
+import { ipKeyGenerator, rateLimit } from 'express-rate-limit';
+import { asyncWrapper, config, HttpError } from '../utils';
 import { buildTenantPublicUrl, getProductionUrl } from '../config/appUrls';
 import { TenantService } from '../services/tenants';
+import { PublicPlatformSignupService } from '../services/publicPlatformSignup';
+import { validate } from '../middleware/validateReq';
+import {
+  PublicCreateTenantBodySchema,
+  buildCreateTenantFromMultipart,
+  isMultipartRequest,
+  uploadTenantFilesSafe,
+} from '../utils/tenantFormPayload';
+import type { CreateTenantInput } from '../services/tenants';
 import {
   getPublicCoursesBySubdomain,
   getPublicFreeLecturesBySubdomain,
 } from '../services/publicTeacherPlatform';
 import { TeacherManagedStudentsService } from '../services/teacherManagedStudents';
+import { TeacherVideoPlaybackService } from '../services/teacherVideoPlayback';
+import { CourseGroupAccessService } from '../services/courseGroupAccess';
 import { SeoMetadataService } from '../services/seo/metadata';
 import { PublicPagesService } from '../services/seo/publicPages';
 import { TenantRobotsService } from '../services/seo/robots';
@@ -15,6 +27,130 @@ import { TenantSitemapService } from '../services/seo/sitemap';
 import { TenantSeoSettingsService } from '../services/seo/tenantSeoSettings';
 
 export const router = Router();
+
+const signupLimiterOptions = {
+  standardHeaders: true as const,
+  legacyHeaders: false,
+  keyGenerator: (req: import('express').Request) => {
+    const fwd = req.headers['x-forwarded-for'];
+    const raw =
+      typeof fwd === 'string' && fwd.trim()
+        ? fwd.split(',')[0].trim()
+        : req.ip || req.socket?.remoteAddress || '127.0.0.1';
+    return ipKeyGenerator(raw);
+  },
+  validate: { xForwardedForHeader: false, trustProxy: false },
+};
+
+const platformRegisterLimiter = rateLimit({
+  ...signupLimiterOptions,
+  windowMs: 60 * 60 * 1000,
+  limit: 10,
+  message: {
+    success: false,
+    message: 'محاولات تسجيل كثيرة من هذا العنوان. حاول بعد ساعة.',
+    code: 'RATE_LIMITED',
+  },
+});
+
+const subdomainCheckLimiter = rateLimit({
+  ...signupLimiterOptions,
+  windowMs: 15 * 60 * 1000,
+  limit: 60,
+  message: {
+    success: false,
+    message: 'طلبات كثيرة. حاول بعد قليل.',
+    code: 'RATE_LIMITED',
+  },
+});
+
+/** التحقق من توفر subdomain قبل إنشاء المنصة (بدون تسجيل دخول) */
+router.get(
+  '/check-subdomain',
+  subdomainCheckLimiter,
+  asyncWrapper(async (req, res) => {
+    const subdomain = String(req.query.subdomain || '').trim();
+    if (!subdomain) {
+      return res.status(400).json({
+        success: false,
+        message: 'subdomain مطلوب',
+        code: 'SUBDOMAIN_REQUIRED',
+      });
+    }
+    const data = await PublicPlatformSignupService.checkSubdomainAvailability(subdomain);
+    res.json({ success: true, data });
+  }),
+);
+
+/** بيانات مساعدة لنموذج إنشاء المنصة (بدون تسجيل دخول) */
+router.get(
+  '/signup-info',
+  asyncWrapper(async (_req, res) => {
+    res.json({
+      success: true,
+      data: {
+        enabled: PublicPlatformSignupService.isEnabled(),
+        subdomain_rules: {
+          min_length: 2,
+          max_length: 63,
+          pattern: '^[a-z0-9]+(?:-[a-z0-9]+)*$',
+          example: 'ahmed-physics',
+        },
+        platform_url_example: buildTenantPublicUrl('your-name'),
+        tenant_root_domain: config.TENANT_ROOT_DOMAIN || null,
+        grades_endpoint: '/api/teacher/available-grades',
+        owner_password_min_length: 6,
+        body_same_as: 'POST /api/super/tenants',
+      },
+    });
+  }),
+);
+
+/** إنشاء منصة + حساب مدرس + تسجيل دخول تلقائي — نفس body الخاص بـ /api/super/tenants */
+router.post(
+  '/register',
+  platformRegisterLimiter,
+  (req, res, next) => {
+    if (isMultipartRequest(req)) {
+      return uploadTenantFilesSafe(req, res, next);
+    }
+    next();
+  },
+  (req, res, next) => {
+    if (!isMultipartRequest(req)) {
+      return validate(PublicCreateTenantBodySchema)(req, res, next);
+    }
+    next();
+  },
+  asyncWrapper(async (req, res) => {
+    try {
+      let payload: CreateTenantInput & { remember_me?: boolean };
+      if (isMultipartRequest(req)) {
+        const built = await buildCreateTenantFromMultipart(req, { requireOwner: true });
+        if ('error' in built) {
+          return res.status(400).json({ success: false, message: built.error });
+        }
+        payload = built.data;
+      } else {
+        payload = req.body as CreateTenantInput & { remember_me?: boolean };
+      }
+
+      const data = await PublicPlatformSignupService.register(payload, req, res);
+      res.status(201).json({ success: true, data });
+    } catch (e) {
+      if (e instanceof HttpError) throw e;
+      const err = e as { code?: string };
+      if (err.code === '23505') {
+        return res.status(409).json({
+          success: false,
+          message: 'هذا النطاق أو البريد مستخدم بالفعل',
+          code: 'CONFLICT',
+        });
+      }
+      throw e;
+    }
+  }),
+);
 
 function escapeXml(value: string): string {
   return value
@@ -269,6 +405,11 @@ router.get(
     }
 
     const data = await TeacherManagedStudentsService.getRegistrationSettings(tenant.id);
+    const teacherId = await CourseGroupAccessService.resolveTenantOwnerTeacherId(tenant.id);
+    const groupSettings = teacherId
+      ? await CourseGroupAccessService.getTeacherSettings(teacherId)
+      : { course_group_access_enabled: false };
+
     res.json({
       success: true,
       data: {
@@ -277,12 +418,81 @@ router.get(
         login_with_student_code: data.registration_mode === 'teacher_registration',
         login_with_code_only: data.registration_mode === 'teacher_registration',
         student_code_digits_only: true,
+        course_group_access_enabled: groupSettings.course_group_access_enabled,
+        requires_course_group_selection:
+          groupSettings.course_group_access_enabled &&
+          data.registration_mode === 'self_registration',
         message:
           data.registration_mode === 'teacher_registration'
             ? 'يتم إنشاء الحسابات بواسطة المدرس. سجّل الدخول برقم الطالب و subdomain المنصة فقط.'
             : null,
       },
     });
+  }),
+);
+
+/** Public course groups for student signup (when course_group_access_enabled) */
+router.get(
+  '/:subdomain/course-groups',
+  asyncWrapper(async (req, res) => {
+    const subdomain = String(req.params.subdomain || '')
+      .trim()
+      .toLowerCase();
+    const gradeId = Number(req.query.grade_id);
+    if (!subdomain) return res.status(400).json({ message: 'subdomain required' });
+    if (!gradeId || Number.isNaN(gradeId)) {
+      return res.status(400).json({ message: 'grade_id مطلوب' });
+    }
+
+    const tenant = await TenantService.getBySubdomain(subdomain);
+    if (!tenant || !tenant.is_active) {
+      return res.status(404).json({ success: false, code: 'TENANT_NOT_FOUND' });
+    }
+
+    const teacherId = await CourseGroupAccessService.resolveTenantOwnerTeacherId(tenant.id);
+    if (!teacherId) {
+      return res.json({ success: true, data: { course_group_access_enabled: false, groups: [] } });
+    }
+
+    const settings = await CourseGroupAccessService.getTeacherSettings(teacherId);
+    if (!settings.course_group_access_enabled) {
+      return res.json({ success: true, data: { course_group_access_enabled: false, groups: [] } });
+    }
+
+    const groups = await CourseGroupAccessService.listPublicGroupsByGrade(tenant.id, gradeId);
+    res.json({
+      success: true,
+      data: {
+        course_group_access_enabled: true,
+        grade_id: gradeId,
+        groups: groups.map((g) => ({
+          id: g.id,
+          name: g.name,
+          description: g.description,
+          grade_id: g.grade_id,
+          grade_name: g.grade_name,
+        })),
+      },
+    });
+  }),
+);
+
+/** إعداد عرض الفيديوهات (موقع / تطبيق) — عام بدون تسجيل دخول */
+router.get(
+  '/:subdomain/video-playback-settings',
+  asyncWrapper(async (req, res) => {
+    const subdomain = String(req.params.subdomain || '')
+      .trim()
+      .toLowerCase();
+    if (!subdomain) return res.status(400).json({ message: 'subdomain required' });
+
+    const tenant = await TenantService.getBySubdomain(subdomain);
+    if (!tenant || !tenant.is_active) {
+      return res.status(404).json({ success: false, code: 'TENANT_NOT_FOUND' });
+    }
+
+    const data = await TeacherVideoPlaybackService.getSettings(tenant.id);
+    res.json({ success: true, data });
   }),
 );
 

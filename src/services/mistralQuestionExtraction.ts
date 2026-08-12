@@ -98,8 +98,9 @@ function normalizeQuestion(q: MistralExtractedQuestion): MistralExtractedQuestio
     .map((opt, i) => ({
       label: opt.label?.trim() || fallbackLabels[i] || String(i + 1),
       text: (opt.text ?? '').trim(),
+      image_id: opt.image_id?.trim() || undefined,
     }))
-    .filter((opt) => opt.label || opt.text);
+    .filter((opt) => opt.label || opt.text || opt.image_id);
   const questionImages = (q.question_images ?? [])
     .map((image) => ({
       image_id: image.image_id?.trim(),
@@ -324,25 +325,46 @@ function attachOcrImages(
 ): MistralExtractedQuestion[] {
   const imagesById = new Map(ocrImages.map((image) => [image.image_id, image]));
 
-  return questions.map((question) => ({
-    ...question,
-    question_images: question.question_images
-      .map((ref) => {
-        const image = imagesById.get(ref.image_id);
-        if (!image) return ref;
-        return {
-          ...image,
-          ...ref,
-          image_base64: image.image_base64,
-          image_url: ref.image_url || image.image_url,
-          image_type: ref.image_type || image.image_type,
-          short_description: ref.short_description || image.short_description,
-          summary: ref.summary || image.summary,
-          educational_relevance: ref.educational_relevance || image.educational_relevance,
-        };
-      })
-      .filter((image) => image.image_id),
-  }));
+  return questions.map((question) => {
+    const refs = [...(question.question_images ?? [])];
+    const seen = new Set(refs.map((r) => r.image_id).filter(Boolean));
+
+    // أضف صور الاختيارات المشار إليها بـ options[].image_id حتى تُرفع وتُربط
+    for (const opt of question.options ?? []) {
+      const imageId = opt.image_id?.trim();
+      if (!imageId || seen.has(imageId)) continue;
+      const ocrImage = imagesById.get(imageId);
+      refs.push({
+        image_id: imageId,
+        page_index: ocrImage?.page_index ?? null,
+        image_type: ocrImage?.image_type || 'choice_option',
+        short_description: ocrImage?.short_description,
+        summary: ocrImage?.summary,
+        educational_relevance: ocrImage?.educational_relevance,
+      });
+      seen.add(imageId);
+    }
+
+    return {
+      ...question,
+      question_images: refs
+        .map((ref) => {
+          const image = imagesById.get(ref.image_id);
+          if (!image) return ref;
+          return {
+            ...image,
+            ...ref,
+            image_base64: image.image_base64,
+            image_url: ref.image_url || image.image_url,
+            image_type: ref.image_type || image.image_type,
+            short_description: ref.short_description || image.short_description,
+            summary: ref.summary || image.summary,
+            educational_relevance: ref.educational_relevance || image.educational_relevance,
+          };
+        })
+        .filter((image) => image.image_id),
+    };
+  });
 }
 
 function parseDataUri(dataUri: string): { buffer: Buffer; mime: string; ext: string } {
@@ -425,6 +447,57 @@ async function uploadQuestionImagesToCloudinary(
   );
 
   return { questions: out, warnings };
+}
+
+function extractArabicMcqOptionsFromSlice(slice: string): Array<{ label: string; text: string }> {
+  const found = new Map<string, string>();
+  const re =
+    /(?:^|[\s\n])([أابجده])\s*[)）\]\-.:：]\s*([^\nأابجده]{1,80}?)(?=(?:\s*[أابجده]\s*[)）\]\-.:：])|\n\n|$)/gu;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(slice)) !== null) {
+    let label = match[1];
+    if (label === 'ا') label = 'أ';
+    const text = match[2].replace(/\s+/g, ' ').trim();
+    if (!text || text.length < 1) continue;
+    if (!found.has(label)) found.set(label, text);
+  }
+
+  const order = ['أ', 'ب', 'ج', 'د', 'هـ'];
+  return order
+    .filter((label) => found.has(label))
+    .map((label) => ({ label, text: found.get(label)! }));
+}
+
+/**
+ * إذا رجّع النموذج اختيارين فقط بينما النص فيه أ/ب/ج/د — حاول استكمالها من مقطع OCR.
+ */
+function repairSparseTextOptions(
+  questions: MistralExtractedQuestion[],
+  documentText: string,
+): MistralExtractedQuestion[] {
+  return questions.map((question) => {
+    if ((question.options || []).some((o) => o.image_id)) return question;
+    const textOpts = (question.options || []).filter((o) => (o.text || '').trim());
+    if (textOpts.length >= 4) return question;
+
+    const needle = (question.question_text || '').slice(0, 40).trim();
+    const sourceNo = question.source_number || String(question.number);
+    let start = -1;
+    if (needle) start = documentText.indexOf(needle);
+    if (start < 0) {
+      const numRe = new RegExp(`(?:^|\\n)\\s*${sourceNo}\\s*[)）.\\-:]`);
+      const m = documentText.match(numRe);
+      start = m?.index ?? -1;
+    }
+    if (start < 0) return question;
+
+    const slice = documentText.slice(start, start + 1200);
+    const recovered = extractArabicMcqOptionsFromSlice(slice);
+    if (recovered.length > textOpts.length && recovered.length >= 3) {
+      return { ...question, options: recovered };
+    }
+    return question;
+  });
 }
 
 function collectQuestionImages(questions: MistralExtractedQuestion[]): MistralQuestionImage[] {
@@ -522,9 +595,10 @@ async function parseQuestionsWithChat(
     normalizePassages(validated.passages),
     dedupeByNumber(validated.questions),
   );
+  const repairedQuestions = repairSparseTextOptions(expanded.questions, documentText);
   return {
     passages: expanded.passages,
-    questions: expanded.questions,
+    questions: repairedQuestions,
     notes: validated.notes,
     chatModel,
   };

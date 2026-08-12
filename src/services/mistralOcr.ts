@@ -209,7 +209,8 @@ function buildImageAnnotationFormat() {
         properties: {
           image_type: {
             type: 'string',
-            description: 'Type of visual content, e.g. diagram, chart, table, graph, formula, map.',
+            description:
+              'Type of visual: question_figure (stem diagram/graph in the question), choice_option (answer choice A/B/C/D image), diagram, chart, graph, table, formula, map, other. Use choice_option for option thumbnails; use question_figure/chart/graph for the main figure referenced by the question text.',
           },
           short_description: {
             type: 'string',

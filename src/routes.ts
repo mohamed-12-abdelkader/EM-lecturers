@@ -8,6 +8,7 @@ import { router as teacherRouter } from './controllers/teacher';
 import { router as studentRouter } from './controllers/student';
 import { router as utilsRouter } from './controllers/utils';
 import { router as coursesRouter } from './controllers/courses';
+import { router as availableCourseRouter } from './controllers/availableCourse';
 import { router as teacherQuestionsRouter } from './controllers/teacherQuestions';
 import {
   publicRouter as teacherFreeLecturesPublicRouter,
@@ -36,6 +37,7 @@ import { router as tasksRouter } from './controllers/tasks';
 import { router as studentGradesRouter } from './controllers/studentGrades';
 import { router as meetingRouter } from './controllers/meeting';
 import { router as competitionsRouter } from './controllers/competitions';
+import { router as dailyQuizRouter } from './controllers/dailyQuiz';
 import { router as competitionQuestionsRouter } from './controllers/competitionQuestions';
 import lessonMcqQuestionsRouter from './controllers/lessonMcqQuestions';
 import { router as questionBankRouter } from './controllers/questionBank';
@@ -48,7 +50,6 @@ import { router as booksAdminRouter } from './controllers/booksAdmin';
 import { router as lessonsAdminRouter } from './controllers/lessonsAdmin';
 import { router as lectureCommentsRouter } from './controllers/lectureComments';
 import { router as chatRouter } from './controllers/chat';
-import { router as supportChatRouter } from './controllers/supportChat';
 import { router as socialRouter } from './controllers/social';
 import { router as teacherPermissionsAdminRouter } from './controllers/teacherPermissionsAdmin';
 import { router as leaguesRouter } from './controllers/leagues';
@@ -79,8 +80,12 @@ import { router as dataAnalystChatbotRouter } from './controllers/dataAnalystCha
 import { router as mistralOcrRouter } from './controllers/mistralOcr';
 import { router as examBuilderChatbotRouter } from './controllers/examBuilderChatbot';
 import { router as teacherStudentsRouter } from './controllers/teacherStudents';
+import { router as teacherVideoPlaybackRouter } from './controllers/teacherVideoPlayback';
 import { teacherFilesRouter, teacherFileCategoriesRouter } from './modules/myFiles/controllers/teacherMyFiles.controller';
 import { centerRouter } from './modules/centerMgmt';
+import { router as supportChatRouter } from './controllers/supportChat';
+import { router as academyRouter } from './controllers/academy';
+import { router as courseGroupsRouter } from './controllers/courseGroups';
 
 export const router = Router();
 
@@ -93,9 +98,9 @@ router.use('/user', userRouter);
 router.use('/teacher', teacherRouter);
 router.use('/student', studentRouter);
 router.use('/utils', utilsRouter);
+router.use('/course', availableCourseRouter);
 router.use('/course', coursesRouter);
 router.use('/chat', chatRouter);
-router.use('/support', supportChatRouter);
 router.use('/social', socialRouter);
 // دعم المسار /api/v1/social المستخدم من التطبيق (نفس راوتر السوشيال)
 router.use('/v1/social', socialRouter);
@@ -104,10 +109,14 @@ router.use('/admin/tenants', adminTenantsRouter);
 router.use('/analytics', analyticsRouter);
 router.use('/analytics/tracking', analyticsTrackingRouter);
 router.use('/notifications', notificationsRouter);
+router.use('/support', supportChatRouter);
+router.use('/academy', academyRouter);
 router.use('/teacher/creative-chatbot', teacherCreativeChatbotRouter);
 router.use('/teacher/data-analyst', dataAnalystChatbotRouter);
 router.use('/teacher/exam-builder', examBuilderChatbotRouter);
+router.use('/teacher/course-groups', courseGroupsRouter);
 router.use('/teacher/students', teacherStudentsRouter);
+router.use('/teacher/video-playback-settings', teacherVideoPlaybackRouter);
 router.use('/teacher/files', teacherFilesRouter);
 router.use('/teacher/file-categories', teacherFileCategoriesRouter);
 router.use('/teacher/center', centerRouter);
@@ -145,6 +154,7 @@ router.use('/tasks', tasksRouter);
 router.use('/student-grades', studentGradesRouter);
 router.use('/meeting', meetingRouter);
 router.use('/competitions', competitionsRouter);
+router.use('/daily-quizzes', dailyQuizRouter);
 router.use('/competition-questions', competitionQuestionsRouter);
 router.use('/leagues', leaguesRouter);
 

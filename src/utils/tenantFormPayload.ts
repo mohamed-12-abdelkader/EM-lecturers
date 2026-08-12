@@ -4,7 +4,7 @@ import path from 'node:path';
 import multer from 'multer';
 import { z } from 'zod';
 import { uploadToCloudinary } from '../utils';
-import type { PatchTenantInput } from '../services/tenants';
+import type { CreateTenantInput, PatchTenantInput } from '../services/tenants';
 
 export const SUBDOMAIN_REGEX = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 
@@ -135,6 +135,54 @@ export function normalizeTenantJsonBody(input: unknown): unknown {
   if (o.display_name == null && o.displayName != null) o.display_name = o.displayName;
   return o;
 }
+
+/** Owner عند إنشاء منصة — نفس شكل /api/super/tenants */
+export const CreateOwnerSchema = z.object({
+  name: z.string().min(1),
+  email: z.string().email(),
+  password: z.string().min(6),
+  description: z.string().optional(),
+  subject: z.string().optional(),
+  grade_ids: z.array(z.number().int().positive()).optional(),
+  facebook_url: z.string().optional().nullable(),
+  instagram_url: z.string().optional().nullable(),
+  youtube_url: z.string().optional().nullable(),
+  tiktok_url: z.string().optional().nullable(),
+  whatsapp_number: z.string().optional().nullable(),
+});
+
+const CreateTenantFieldsSchema = z.object({
+  subdomain: z.string().min(2).max(63).regex(SUBDOMAIN_REGEX),
+  display_name: z.string().min(1),
+  specialty: z.string().optional().nullable(),
+  bio: z.string().optional().nullable(),
+  avatar_url: z.string().optional().nullable(),
+  is_active: z.boolean().optional(),
+  seo_title: z.string().optional().nullable(),
+  seo_meta_description: z.string().optional().nullable(),
+  favicon_url: z.string().optional().nullable(),
+  og_image_url: z.string().optional().nullable(),
+  settings: z.record(z.string(), z.any()).optional(),
+  landing: z.record(z.string(), z.any()).optional(),
+  platform_type: z.enum(['teacher', 'academy']).optional().default('teacher'),
+  owner: CreateOwnerSchema.optional(),
+  /** جلسة طويلة بعد التسجيل العام فقط — يُتجاهل في super */
+  remember_me: z.boolean().optional(),
+});
+
+/** Body إنشاء منصة للأدمن (owner اختياري) — مطابق /api/super/tenants */
+export const CreateTenantBodySchema = z.preprocess(
+  normalizeTenantJsonBody,
+  CreateTenantFieldsSchema,
+);
+
+/** Body إنشاء منصة عام (owner إلزامي) — نفس الحقول + owner مطلوب */
+export const PublicCreateTenantBodySchema = z.preprocess(
+  normalizeTenantJsonBody,
+  CreateTenantFieldsSchema.extend({
+    owner: CreateOwnerSchema,
+  }),
+);
 
 const OwnerPatchSchema = z
   .object({
@@ -335,6 +383,118 @@ export async function buildPatchTenantFromMultipart(
   if (Object.keys(data).length === 0) {
     return { error: 'No fields to update' };
   }
+
+  return { data };
+}
+
+/** نفس multipart builder المستخدم في /api/super/tenants */
+export async function buildCreateTenantFromMultipart(
+  req: Request,
+  options?: { requireOwner?: boolean },
+): Promise<{ data: CreateTenantInput & { remember_me?: boolean } } | { error: string }> {
+  const b = req.body as Record<string, unknown>;
+  const subdomain =
+    formStr(b.subdomain)?.toLowerCase() ?? formStr(b.subDomain)?.toLowerCase();
+  const display_name = formStr(b.display_name) ?? formStr(b.displayName);
+  if (!subdomain) return { error: 'subdomain is required' };
+  if (!display_name) return { error: 'display_name is required' };
+  if (subdomain.length < 2 || subdomain.length > 63 || !SUBDOMAIN_REGEX.test(subdomain)) {
+    return { error: 'Invalid subdomain' };
+  }
+
+  const files = req.files as { [field: string]: Express.Multer.File[] } | undefined;
+
+  const avatar_url =
+    (await uploadFileField(files, 'avatar')) ?? (formStr(b.avatar_url) as string | null) ?? null;
+  const favicon_url =
+    (await uploadFileField(files, 'favicon')) ?? (formStr(b.favicon_url) as string | null) ?? null;
+  const og_image_url =
+    (await uploadFileField(files, 'og_image')) ?? (formStr(b.og_image_url) as string | null) ?? null;
+
+  let landing: Record<string, unknown> | undefined;
+  const landingRaw = formStr(b.landing);
+  if (landingRaw) {
+    const parsed = parseJsonObject(landingRaw, 'landing');
+    if (isPayloadError(parsed)) return parsed;
+    if (parsed) landing = parsed;
+  }
+
+  const heroImageUrl = await uploadFileField(files, 'hero_image');
+  if (heroImageUrl) {
+    landing = landing ?? {};
+    const hero =
+      landing.hero && typeof landing.hero === 'object' && !Array.isArray(landing.hero)
+        ? (landing.hero as Record<string, unknown>)
+        : {};
+    landing.hero = { ...hero, image_url: heroImageUrl };
+  }
+
+  let settings: Record<string, unknown> | undefined;
+  const settingsRaw = formStr(b.settings);
+  if (settingsRaw) {
+    const parsed = parseJsonObject(settingsRaw, 'settings');
+    if (isPayloadError(parsed)) return parsed;
+    if (parsed) settings = parsed;
+  }
+
+  let owner: CreateTenantInput['owner'];
+  const ownerRaw = formStr(b.owner);
+  if (ownerRaw) {
+    try {
+      const parsed = JSON.parse(ownerRaw) as unknown;
+      const o = CreateOwnerSchema.safeParse(parsed);
+      if (!o.success) return { error: 'Invalid owner JSON' };
+      owner = o.data;
+    } catch {
+      return { error: 'Invalid JSON in owner' };
+    }
+  } else {
+    const on = formStr(b.owner_name);
+    const oe = formStr(b.owner_email);
+    const op = formStr(b.owner_password);
+    if (on && oe && op) {
+      owner = {
+        name: on,
+        email: oe,
+        password: op,
+        description: formStr(b.owner_description),
+        subject: formStr(b.owner_subject),
+        grade_ids: parseGradeIdsInput(b.owner_grade_ids),
+        facebook_url: formStr(b.owner_facebook_url) ?? null,
+        instagram_url: formStr(b.owner_instagram_url) ?? null,
+        youtube_url: formStr(b.owner_youtube_url) ?? null,
+        tiktok_url: formStr(b.owner_tiktok_url) ?? null,
+        whatsapp_number: formStr(b.owner_whatsapp_number) ?? null,
+      };
+    }
+  }
+
+  if (options?.requireOwner && !owner) {
+    return { error: 'owner is required (name, email, password)' };
+  }
+
+  const data: CreateTenantInput & { remember_me?: boolean } = {
+    subdomain,
+    display_name,
+    specialty: formStr(b.specialty) ?? null,
+    bio: formStr(b.bio) ?? null,
+    avatar_url,
+    is_active: parseBooleanField(b.is_active),
+    seo_title: formStr(b.seo_title) ?? null,
+    seo_meta_description: formStr(b.seo_meta_description) ?? null,
+    favicon_url,
+    og_image_url,
+    settings,
+    landing,
+    platform_type:
+      formStr(b.platform_type) === 'academy'
+        ? 'academy'
+        : formStr(b.platform_type) === 'teacher'
+          ? 'teacher'
+          : undefined,
+    owner,
+    remember_me: parseBooleanField(b.remember_me),
+  };
 
   return { data };
 }

@@ -148,7 +148,16 @@ async function tokenTidTenantSlug(req: Request): Promise<string | null> {
   const token = auth.startsWith('Bearer ') ? auth.slice(7).trim() : '';
   if (!token) return null;
   try {
-    const decoded = jwt.verify(token, config.SECRET_KEY) as { tid?: unknown; id?: unknown };
+    let decoded: { tid?: unknown; id?: unknown };
+    try {
+      decoded = jwt.verify(token, config.SECRET_KEY) as { tid?: unknown; id?: unknown };
+    } catch (err: any) {
+      if (err?.name !== 'TokenExpiredError') return null;
+      decoded = jwt.verify(token, config.SECRET_KEY, { ignoreExpiration: true }) as {
+        tid?: unknown;
+        id?: unknown;
+      };
+    }
     const tid = decoded?.tid;
     if (tid !== undefined && tid !== null) {
       const tenantId = Number(tid);

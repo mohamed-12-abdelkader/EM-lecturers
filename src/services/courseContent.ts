@@ -2,6 +2,9 @@ import pool from '../db/pool';
 import { SubjectCourseService } from './subjectCourses';
 import { LectureExamService } from './lectureExam';
 import { CourseAccessService } from './courseAccess';
+import { CourseAccessControl } from './courseAccessControl';
+import { LectureAccessService } from './lectureAccess';
+import { CourseGroupAccessService } from './courseGroupAccess';
 
 export interface LectureData {
   course_id: number;
@@ -15,6 +18,20 @@ export interface LectureData {
 }
 
 export class CourseContentService {
+  /** ملكية الكورس للمدرس / الأكاديمية / المسند */
+  private static async userCanManageCourse(userId: number, courseId: number): Promise<boolean> {
+    const roleRes = await pool.query<{ role: string; tenant_id: number | null }>(
+      `SELECT role, tenant_id FROM users WHERE id = $1`,
+      [userId],
+    );
+    if (!roleRes.rowCount) return false;
+    const u = roleRes.rows[0];
+    return CourseAccessControl.canManageCourse(
+      { id: userId, role: u.role, tenant_id: u.tenant_id },
+      courseId,
+    );
+  }
+
   // ===== إدارة المحاضرات =====
 
   // التحقق من صلاحية الطالب للوصول لمحتوى الكورس
@@ -64,9 +81,7 @@ export class CourseContentService {
       throw new Error('الكورس غير موجود');
     }
 
-    const course = courseInfo.course;
-
-    if (course.teacher_id !== teacherId) {
+    if (!(await this.userCanManageCourse(teacherId, lectureData.course_id))) {
       throw new Error('لا يمكنك إضافة محاضرة لكورس مدرس آخر');
     }
 
@@ -134,7 +149,7 @@ export class CourseContentService {
       course = courseResult.rows[0];
     }
 
-    if (!course || course.teacher_id !== teacherId) {
+    if (!course || !(await this.userCanManageCourse(teacherId, lecture.course_id))) {
       throw new Error('لا يمكنك تعديل محاضرة لكورس مدرس آخر');
     }
 
@@ -212,7 +227,7 @@ export class CourseContentService {
       course = courseResult.rows[0];
     }
 
-    if (!course || course.teacher_id !== teacherId) {
+    if (!course || !(await this.userCanManageCourse(teacherId, lecture.course_id))) {
       throw new Error('لا يمكنك حذف محاضرة لكورس مدرس آخر');
     }
 
@@ -304,11 +319,37 @@ export class CourseContentService {
   // جلب محاضرات الكورس مع منطق القفل للطلاب (جدول lectures - كورسات عادية)
   // المحاضرات التالية لمحاضرة فيها امتحان بـ "قفل المحاضرات التالية" تظل مقفلة حتى نجاح الطالب
   static async getCourseLecturesWithLock(courseId: number, studentId?: number) {
-    const result = await pool.query(
-      `SELECT * FROM lectures WHERE course_id = $1 ORDER BY position, created_at`,
-      [courseId],
-    );
-    const lectures = result.rows;
+    let lectures: any[];
+    if (studentId) {
+      const courseTeacherId = await CourseGroupAccessService.resolveCourseTeacherId(courseId);
+      if (courseTeacherId) {
+        const filter = CourseGroupAccessService.buildStudentLectureFilterClause(
+          studentId,
+          courseTeacherId,
+          'l',
+          2,
+        );
+        const result = await pool.query(
+          `SELECT l.* FROM lectures l
+           WHERE l.course_id = $1 AND ${filter.sql}
+           ORDER BY l.position, l.created_at`,
+          [courseId, ...filter.params],
+        );
+        lectures = result.rows;
+      } else {
+        const result = await pool.query(
+          `SELECT * FROM lectures WHERE course_id = $1 ORDER BY position, created_at`,
+          [courseId],
+        );
+        lectures = result.rows;
+      }
+    } else {
+      const result = await pool.query(
+        `SELECT * FROM lectures WHERE course_id = $1 ORDER BY position, created_at`,
+        [courseId],
+      );
+      lectures = result.rows;
+    }
 
     if (!studentId) {
       return lectures.map((l: any) => ({ ...l, is_unlocked: true }));
@@ -316,8 +357,29 @@ export class CourseContentService {
 
     const withLock = await Promise.all(
       lectures.map(async (l: any) => {
+        const modeAccess = await LectureAccessService.checkStudentLectureAccess(l.id, studentId);
+        if (!modeAccess.can_access) {
+          return {
+            ...l,
+            is_unlocked: false,
+            locked: true,
+            access_status: modeAccess.status,
+            lecture_access_mode: modeAccess.lecture_access_mode,
+            access_message: modeAccess.message,
+            activation: modeAccess.activation ?? null,
+            expires_at: modeAccess.expires_at ?? l.expires_at ?? null,
+          };
+        }
         const canAccess = await LectureExamService.canStudentAccessLecture(l.id, studentId);
-        return { ...l, is_unlocked: canAccess };
+        return {
+          ...l,
+          is_unlocked: canAccess,
+          locked: !canAccess,
+          access_status: canAccess ? modeAccess.status : 'locked',
+          lecture_access_mode: modeAccess.lecture_access_mode,
+          activation: modeAccess.activation ?? null,
+          expires_at: modeAccess.expires_at ?? l.expires_at ?? null,
+        };
       }),
     );
     return withLock;
@@ -343,7 +405,7 @@ export class CourseContentService {
     }
 
     const course = await SubjectCourseService.getCourseById(lecture.course_id);
-    if (course.teacher_id !== teacherId) {
+    if (!course || !(await this.userCanManageCourse(teacherId, lecture.course_id))) {
       throw new Error('لا يمكنك إضافة ملف لكورس مدرس آخر');
     }
 

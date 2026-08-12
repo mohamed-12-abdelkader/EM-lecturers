@@ -1,12 +1,13 @@
 import { Router, Request, Response } from 'express';
 import { authMiddleware } from '../middleware/authentication';
 import { CourseContentService, LectureData } from '../services/courseContent';
-import { SubjectCourseService } from '../services/subjectCourses';
+import { LectureAccessService } from '../services/lectureAccess';
 import { logger } from '../utils';
 import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
 import pool from '../db/pool';
+import { CourseAccessControl } from '../services/courseAccessControl';
 
 const router = Router();
 
@@ -37,7 +38,7 @@ const upload = multer({
 // 1. إنشاء محاضرة جديدة
 router.post(
   '/lectures',
-  authMiddleware(['admin', 'teacher']),
+  authMiddleware(['admin', 'teacher', 'academy', 'academy_teacher']),
   async (req: Request, res: Response) => {
     try {
       const {
@@ -58,15 +59,11 @@ router.post(
       }
 
       // التحقق من ملكية الكورس (الأدمن لديه جميع الصلاحيات)
-      if (userRole === 'teacher') {
-        const course = await SubjectCourseService.getCourseById(parseInt(course_id));
-        if (!course) {
-          return res.status(404).json({ error: 'الكورس غير موجود' });
-        }
-
-        if (course.teacher_id !== teacherId) {
-          return res.status(403).json({ error: 'لا يمكنك إضافة محاضرة لكورس مدرس آخر' });
-        }
+      if (userRole !== 'admin') {
+        await CourseAccessControl.assertCanManageCourse(
+          { id: teacherId, role: userRole, tenant_id: (req as any).user?.tenant_id },
+          parseInt(course_id, 10),
+        );
       }
 
       const lectureData: LectureData = {
@@ -96,7 +93,7 @@ router.post(
 // 2. تحديث محاضرة
 router.put(
   '/lectures/:id',
-  authMiddleware(['admin', 'teacher']),
+  authMiddleware(['admin', 'teacher', 'academy', 'academy_teacher']),
   async (req: Request, res: Response) => {
     try {
       const { id } = req.params;
@@ -136,7 +133,7 @@ router.put(
 // 3. حذف محاضرة
 router.delete(
   '/lectures/:id',
-  authMiddleware(['admin', 'teacher']),
+  authMiddleware(['admin', 'teacher', 'academy', 'academy_teacher']),
   async (req: Request, res: Response) => {
     try {
       const { id } = req.params;
@@ -158,7 +155,7 @@ router.delete(
 // 4. جلب محاضرة بواسطة ID
 router.get(
   '/lectures/:id',
-  authMiddleware(['student', 'teacher', 'admin']),
+  authMiddleware(['student', 'teacher', 'academy', 'academy_teacher', 'admin']),
   async (req: Request, res: Response) => {
     try {
       const { id } = req.params;
@@ -176,6 +173,21 @@ router.get(
       const hasAccess = await canAccessLecture(parseInt(id), user.id, user.role);
 
       if (!hasAccess) {
+        if (user.role === 'student') {
+          const modeAccess = await LectureAccessService.checkStudentLectureAccess(
+            parseInt(id),
+            user.id,
+          );
+          return res.status(403).json({
+            error: modeAccess.message || 'ليس لديك صلاحية للوصول إلى هذه المحاضرة',
+            can_access: false,
+            status: modeAccess.status,
+            access_status: modeAccess.status,
+            lecture_access_mode: modeAccess.lecture_access_mode,
+            activation: modeAccess.activation ?? null,
+            expires_at: modeAccess.expires_at ?? null,
+          });
+        }
         return res.status(403).json({
           error: 'ليس لديك صلاحية للوصول إلى هذه المحاضرة',
         });
@@ -200,7 +212,7 @@ router.get(
 // 5. جلب جميع محاضرات الكورس
 router.get(
   '/courses/:courseId/lectures',
-  authMiddleware(['student', 'teacher', 'admin']),
+  authMiddleware(['student', 'teacher', 'academy', 'academy_teacher', 'admin']),
   async (req: Request, res: Response) => {
     try {
       const { courseId } = req.params;
@@ -286,7 +298,7 @@ router.get(
 // 13. إضافة ملف مرفق للمحاضرة
 router.post(
   '/lectures/:lectureId/attachments',
-  authMiddleware(['admin', 'teacher']),
+  authMiddleware(['admin', 'teacher', 'academy', 'academy_teacher']),
   upload.single('file'),
   async (req: Request, res: Response) => {
     try {

@@ -1,5 +1,7 @@
 import pool from '../db/pool';
 import { CourseContentService } from '../services/courseContent';
+import { LectureAccessService } from '../services/lectureAccess';
+import { LectureExamService } from '../services/lectureExam';
 
 /**
  * التحقق من صلاحية المستخدم للوصول لمحتوى الكورس
@@ -88,5 +90,26 @@ export async function canAccessLecture(
   }
 
   // استخدام canAccessCourseContent للتحقق من صلاحية الوصول للكورس
-  return await canAccessCourseContent(courseId, userId, userRole);
+  const hasCourseAccess = await canAccessCourseContent(courseId, userId, userRole);
+  if (!hasCourseAccess) {
+    return false;
+  }
+
+  // أدوار الإدارة تتخطى أوضاع الوصول الخاصة بالطالب
+  if (userRole !== 'student') {
+    return true;
+  }
+
+  // للكورسات العادية فقط (جدول lectures) — أوضاع الوصول الجديدة
+  if (lectureTable === 'lectures') {
+    const access = await LectureAccessService.checkStudentLectureAccess(lectureId, userId);
+    if (!access.can_access) {
+      return false;
+    }
+
+    // قفل الواجبات المتسلسل (النظام الحالي)
+    return LectureExamService.canStudentAccessLecture(lectureId, userId);
+  }
+
+  return true;
 }
