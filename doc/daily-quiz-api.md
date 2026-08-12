@@ -147,7 +147,7 @@ npm run migrate
 # أو حسب سكربت المشروع: node-pg-migrate up
 ```
 
-ملف: `migrations/1775400000000_create_daily_quiz_system.sql`
+ملف: `migrations/1776300000000_create_daily_quiz_system.sql`
 
 ---
 

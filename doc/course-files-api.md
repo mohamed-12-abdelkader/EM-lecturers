@@ -16,7 +16,7 @@ Auth: Bearer Token
 | `GET` | `/:courseId/files` | طالب مشترك أو مدير الكورس | عرض ملفات الكورس |
 | `DELETE` | `/:courseId/files/:fileId` | مدرس / أكاديمية / مدرس أكاديمية مسند | حذف ملف |
 
-**Migration:** `1775700000000_create_course_files.sql`
+**Migration:** `1776600000000_create_course_files.sql`
 
 ---
 

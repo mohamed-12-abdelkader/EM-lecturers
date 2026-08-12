@@ -5,7 +5,7 @@
 Base: `/api/course`  
 Auth: Bearer Token
 
-**Migration:** `1775800000000_available_course_lecture_access.sql`
+**Migration:** `1776700000000_available_course_lecture_access.sql`
 
 ---
 

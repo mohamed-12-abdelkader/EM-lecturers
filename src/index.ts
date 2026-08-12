@@ -137,6 +137,9 @@ const startServer = async () => {
     const { startNotificationPushWorker } = await import('./workers/notificationPushWorker.js');
     startNotificationPushWorker();
 
+    const { startWhatsAppWorker } = await import('./modules/whatsapp/workers/whatsappWorker.js');
+    startWhatsAppWorker();
+
     io.use(async (socket, next) => {
       try {
         const token =
@@ -425,7 +428,6 @@ const startServer = async () => {
       socket.on('message:send', async (payload: { chat_id?: number; text: string }) => {
         socket.emit('chat:send-message', payload);
       });
-
     });
 
     // Game System Socket Handlers

@@ -1929,7 +1929,7 @@ router.post(
       console.error('Course file DB insert failed:', dbErr?.message || dbErr);
       if (String(dbErr?.message || '').includes('course_files')) {
         return res.status(500).json({
-          message: 'جدول course_files غير موجود — شغّل الـ migration: 1775700000000_create_course_files.sql',
+          message: 'جدول course_files غير موجود — شغّل الـ migration: 1776600000000_create_course_files.sql',
         });
       }
       throw dbErr;

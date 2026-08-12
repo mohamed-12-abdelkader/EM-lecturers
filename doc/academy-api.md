@@ -137,8 +137,8 @@ Auth: دور `academy_teacher`
 
 Migrations:
 
-- `1775500000000_add_academy_roles.sql`
-- `1775600000000_create_academy_system.sql`
+- `1776400000000_add_academy_roles.sql`
+- `1776500000000_create_academy_system.sql`
 
 ---
 

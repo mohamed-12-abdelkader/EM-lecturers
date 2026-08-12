@@ -5,7 +5,7 @@
 Base teacher: `/api/teacher/course-groups`  
 Public: `/api/tenants/public/:subdomain/course-groups`
 
-Migration: `1775900000000_course_groups_system.sql`
+Migration: `1776800000000_course_groups_system.sql`
 
 ---
 

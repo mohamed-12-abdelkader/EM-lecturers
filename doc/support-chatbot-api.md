@@ -551,7 +551,7 @@ async function sendGuestMessage(text: string) {
 
 ## الجداول (Database)
 
-Migration: `1775200000000_create_support_assistant.sql`
+Migration: `1776100000000_create_support_assistant.sql`
 
 | الجدول | الدور |
 |--------|--------|

@@ -27,6 +27,8 @@ declare global {
       user?: CompletedUser;
       meeting?: Meeting;
       tenant?: ResolvedTenant;
+      /** Raw JSON body buffer for HMAC webhook verification */
+      rawBody?: Buffer;
     }
   }
 }

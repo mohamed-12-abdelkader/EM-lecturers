@@ -194,6 +194,15 @@ export const config = cleanEnv(process.env, {
   WEB_PUSH_WORKER_INTERVAL_MS: num({ default: 2000 }),
   WEB_PUSH_WORKER_BATCH_SIZE: num({ default: 50 }),
   WEB_PUSH_MAX_ATTEMPTS: num({ default: 5 }),
+
+  // WhatsApp gateway (wwebjs)
+  WHATSAPP_GATEWAY_URL: str({ default: 'http://localhost:3000' }),
+  WHATSAPP_API_KEY: str({ default: '' }),
+  WHATSAPP_WEBHOOK_SECRET: str({ default: '' }),
+  WHATSAPP_WORKER_ENABLED: bool({ default: true }),
+  WHATSAPP_WORKER_INTERVAL_MS: num({ default: 2000 }),
+  WHATSAPP_WORKER_BATCH_SIZE: num({ default: 20 }),
+  WHATSAPP_MAX_ATTEMPTS: num({ default: 5 }),
 });
 
 // Security

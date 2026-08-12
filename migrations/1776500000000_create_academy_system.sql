@@ -1,5 +1,5 @@
 -- Academy tables + tenant platform_type
--- Note: enum values for academy / academy_teacher are added in 1775500000000
+-- Note: enum values for academy / academy_teacher are added in 1776400000000
 
 BEGIN;
 

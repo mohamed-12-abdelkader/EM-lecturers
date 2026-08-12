@@ -573,8 +573,11 @@ router.post('/webhook', async (req, res) => {
         [sid, name],
       );
 
-      let isGroupMeeting = false;
-      if (updateResult.rowCount === 0) {
+      // Only the first idle→started transition should start egress.
+      // Reopen / room_started after ended|started would overwrite /recordings/{id}.mp4.
+      let shouldStartEgress = Boolean(updateResult.rowCount && updateResult.rowCount > 0);
+
+      if (!shouldStartEgress) {
         const groupUpdate = await pool.query(
           `UPDATE general_course_group_meeting SET status = 'started', room_sid = $1, updated_at = CURRENT_TIMESTAMP
            WHERE id = $2 AND status = 'idle'
@@ -582,8 +585,7 @@ router.post('/webhook', async (req, res) => {
           [sid, name],
         );
         if (groupUpdate.rowCount && groupUpdate.rowCount > 0) {
-          // eslint-disable-next-line @typescript-eslint/no-unused-vars
-          isGroupMeeting = true;
+          shouldStartEgress = true;
           try {
                   // eslint-disable-next-line @typescript-eslint/ban-ts-comment
       // @ts-ignore
@@ -632,24 +634,28 @@ router.post('/webhook', async (req, res) => {
         }
       }
 
-      // تسجيل البث (egress) للكورس العادي ومجموعات الكورس العام
-      const egressToken = await generateParticipantToken({
-        roomName: name,
-        identity: `recorder_${Date.now()}`,
-        name: 'egress',
-        role: 'egress',
-        ttl: '8760h',
-      });
+      if (shouldStartEgress) {
+        // تسجيل البث (egress) للكورس العادي ومجموعات الكورس العام — once per meeting
+        const egressToken = await generateParticipantToken({
+          roomName: name,
+          identity: `recorder_${Date.now()}`,
+          name: 'egress',
+          role: 'egress',
+          ttl: '8760h',
+        });
 
-      const outputFile = new EncodedFileOutput({
-        filepath: `/recordings/${name}.mp4`,
-      });
+        const outputFile = new EncodedFileOutput({
+          filepath: `/recordings/${name}.mp4`,
+        });
 
-      const egressOpt: RoomCompositeOptions = {
-        customBaseUrl: `https://lk-recording.next-edu.online?token=${egressToken}&url=${LIVEKIT_SERVER_URL}`,
-        layout: 'grid',
-      };
-      await egressClient.startRoomCompositeEgress(name, outputFile, egressOpt);
+        const egressOpt: RoomCompositeOptions = {
+          customBaseUrl: `https://lk-recording.next-edu.online?token=${egressToken}&url=${LIVEKIT_SERVER_URL}`,
+          layout: 'grid',
+        };
+        await egressClient.startRoomCompositeEgress(name, outputFile, egressOpt);
+      } else {
+        console.warn('Skipping egress restart for room (meeting not idle):', name);
+      }
     } else if (event.event === 'room_finished') {
       const sid = event.room!.sid;
       const meetingUpdated = await pool.query<{ id: string }>(
