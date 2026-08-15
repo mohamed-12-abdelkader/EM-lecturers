@@ -77,7 +77,7 @@ export async function uploadToBunnyStorage(
             AccessKey: BUNNY_ACCESS_KEY,
             'Content-Type': file.mime,
           },
-          timeout: 10000,
+          timeout: 60000,
           maxContentLength: Infinity,
           maxBodyLength: Infinity,
         });

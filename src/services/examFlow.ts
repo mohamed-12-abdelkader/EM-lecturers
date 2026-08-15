@@ -136,8 +136,11 @@ interface QuestionEvaluation extends WrongQuestion {
 interface QuestionReportStudent {
   studentId: number;
   studentName: string | null;
-  submissionId: number;
+  studentEmail?: string | null;
+  submissionId: number | null;
   attemptNumber: number | null;
+  selectedChoiceId?: number | null;
+  selectedAnswerText?: string | null;
 }
 
 interface QuestionReportEntry {
@@ -148,8 +151,10 @@ interface QuestionReportEntry {
   totalResponses: number;
   correctCount: number;
   incorrectCount: number;
+  unansweredCount?: number;
   correctStudents: QuestionReportStudent[];
   incorrectStudents: QuestionReportStudent[];
+  unansweredStudents?: QuestionReportStudent[];
 }
 
 function normalizeLectureExamType(
@@ -1355,7 +1360,11 @@ export class ExamFlowService {
       throw error;
     }
 
-    if (user.role !== 'admin' && !(await CourseAccessControl.canManageCourse(user, Number(exam.course_id))) && exam.teacher_id !== user.id) {
+    if (
+      user.role !== 'admin' &&
+      !(await CourseAccessControl.canManageCourse(user, Number(exam.course_id))) &&
+      exam.teacher_id !== user.id
+    ) {
       const error: any = new Error('You do not own this exam');
       error.status = 403;
       throw error;
@@ -1364,11 +1373,13 @@ export class ExamFlowService {
     const questionsRes = await pool.query(
       `SELECT
          eq.id AS exam_question_id,
-         COALESCE(NULLIF(eq.question_text, ''), q.text) AS question_text,
-         COALESCE(eq.image, q.image) AS question_image,
+         COALESCE(NULLIF(eq.question_text, ''), q.text, q2.question_text) AS question_text,
+         COALESCE(eq.image, q.image, qm.media_url) AS question_image,
          eq.grade
        FROM exam_questions eq
        LEFT JOIN questions q ON eq.question_id = q.id
+       LEFT JOIN questions_v2 q2 ON eq.question_id_v2 = q2.id
+       LEFT JOIN question_media qm ON q2.id = qm.question_id
        WHERE eq.exam_id = $1
        ORDER BY eq.id`,
       [exam.id],
@@ -1384,60 +1395,211 @@ export class ExamFlowService {
         totalResponses: 0,
         correctCount: 0,
         incorrectCount: 0,
+        unansweredCount: 0,
         correctStudents: [],
         incorrectStudents: [],
+        unansweredStudents: [],
       });
     });
 
+    const examMeta = {
+      ...this.mapExamRow(exam),
+      type: exam.type,
+      courseId: exam.course_id,
+      lectureTitle: exam.lecture_title || null,
+      scope: exam.lecture_id ? 'lecture' : 'course',
+    };
+
     if (!reportMap.size) {
       return {
-        exam: this.mapExamRow(exam),
+        exam: examMeta,
+        overallStatistics: {
+          totalStudents: 0,
+          totalQuestions: 0,
+          totalCorrect: 0,
+          totalWrong: 0,
+        },
         questions: [],
       };
     }
 
-    const answersRes = await pool.query(
-      `SELECT
-         ea.question_id AS exam_question_id,
-         ea.is_correct,
-         es.student_id,
+    const latestSubsRes = await pool.query(
+      `SELECT DISTINCT ON (es.student_id)
          es.id AS submission_id,
+         es.student_id,
          es.attempt_number,
-         u.name AS student_name
-       FROM exam_answers ea
-       JOIN exam_submissions es ON ea.submission_id = es.id
+         u.name AS student_name,
+         u.email AS student_email
+       FROM exam_submissions es
        JOIN users u ON es.student_id = u.id
        WHERE es.exam_id = $1
-         AND es.status IN ('submitted', 'late', 'expired')
-       ORDER BY ea.question_id, es.attempt_number, es.id`,
+         AND COALESCE(es.status, 'submitted') IN ('submitted', 'late', 'expired')
+       ORDER BY es.student_id, es.submitted_at DESC NULLS LAST, es.id DESC`,
       [exam.id],
     );
+    const latestSubs = latestSubsRes.rows;
+    const submissionIds = latestSubs.map((s) => Number(s.submission_id));
 
-    answersRes.rows.forEach((row) => {
-      const bucket = reportMap.get(row.exam_question_id);
-      if (!bucket) return;
+    const answersRes =
+      submissionIds.length === 0
+        ? { rows: [] as any[] }
+        : await pool.query(
+            `SELECT
+               ea.submission_id,
+               ea.question_id AS exam_question_id,
+               ea.is_correct,
+               ea.selected_choice_id,
+               selected_choice.text AS selected_choice_text,
+               selected_opt.text_content AS selected_choice_text_v2
+             FROM exam_answers ea
+             JOIN exam_questions eq ON ea.question_id = eq.id
+             LEFT JOIN question_choices selected_choice ON selected_choice.id = ea.selected_choice_id
+             LEFT JOIN question_options selected_opt ON selected_opt.id = ea.selected_choice_id
+             WHERE ea.submission_id = ANY($1::int[])`,
+            [submissionIds],
+          );
 
-      const student: QuestionReportStudent = {
-        studentId: row.student_id,
-        studentName: row.student_name,
-        submissionId: row.submission_id,
-        attemptNumber: row.attempt_number,
-      };
+    const answersByQuestion = new Map<number, any[]>();
+    for (const row of answersRes.rows) {
+      const qid = Number(row.exam_question_id);
+      const list = answersByQuestion.get(qid) || [];
+      list.push(row);
+      answersByQuestion.set(qid, list);
+    }
 
-      bucket.totalResponses += 1;
-      if (row.is_correct) {
-        bucket.correctCount += 1;
-        bucket.correctStudents.push(student);
-      } else {
-        bucket.incorrectCount += 1;
-        bucket.incorrectStudents.push(student);
+    const subById = new Map(latestSubs.map((s) => [Number(s.submission_id), s]));
+
+    reportMap.forEach((bucket, questionId) => {
+      const qAnswers = answersByQuestion.get(questionId) || [];
+      const answeredSubIds = new Set(qAnswers.map((a) => Number(a.submission_id)));
+
+      for (const row of qAnswers) {
+        const sub = subById.get(Number(row.submission_id));
+        const student: QuestionReportStudent = {
+          studentId: Number(sub?.student_id),
+          studentName: sub?.student_name ?? null,
+          studentEmail: sub?.student_email ?? null,
+          submissionId: row.submission_id,
+          attemptNumber: sub?.attempt_number ?? null,
+          selectedChoiceId: row.selected_choice_id ?? null,
+          selectedAnswerText: row.selected_choice_text || row.selected_choice_text_v2 || null,
+        };
+        bucket.totalResponses += 1;
+        if (row.is_correct) {
+          bucket.correctCount += 1;
+          bucket.correctStudents.push(student);
+        } else {
+          bucket.incorrectCount += 1;
+          bucket.incorrectStudents.push(student);
+        }
       }
+
+      const unanswered = latestSubs.filter((s) => !answeredSubIds.has(Number(s.submission_id)));
+      bucket.unansweredCount = unanswered.length;
+      bucket.unansweredStudents = unanswered.map((s) => ({
+        studentId: s.student_id,
+        studentName: s.student_name,
+        studentEmail: s.student_email,
+        submissionId: s.submission_id,
+        attemptNumber: s.attempt_number,
+        selectedChoiceId: null,
+        selectedAnswerText: null,
+      }));
+      bucket.incorrectCount += unanswered.length;
+      bucket.incorrectStudents.push(...(bucket.unansweredStudents || []));
     });
 
+    const questions = Array.from(reportMap.values());
+    const totalCorrect = questions.reduce((sum, q) => sum + q.correctCount, 0);
+    const totalWrong = questions.reduce((sum, q) => sum + q.incorrectCount, 0);
+
     return {
-      exam: this.mapExamRow(exam),
-      questions: Array.from(reportMap.values()),
+      exam: examMeta,
+      overallStatistics: {
+        totalStudents: latestSubs.length,
+        totalQuestions: questions.length,
+        totalCorrect,
+        totalWrong,
+      },
+      questions,
     };
+  }
+
+  /**
+   * تقارير واجبات/امتحانات المحاضرة + الواجبات المنفصلة على مستوى الكورس.
+   */
+  static async listCourseAssignmentReports(
+    courseId: number,
+    filters?: { type?: string; scope?: string },
+  ) {
+    const typeRaw = String(filters?.type || 'all').trim().toLowerCase();
+    const types =
+      typeRaw === 'exam'
+        ? ['exam']
+        : typeRaw === 'assignment'
+          ? ['assignment']
+          : ['exam', 'assignment'];
+
+    const scopeRaw = String(filters?.scope || 'all').trim().toLowerCase();
+    const scopeSql =
+      scopeRaw === 'lecture'
+        ? 'AND e.lecture_id IS NOT NULL'
+        : scopeRaw === 'course'
+          ? 'AND e.lecture_id IS NULL'
+          : '';
+
+    const result = await pool.query(
+      `WITH latest_subs AS (
+         SELECT DISTINCT ON (es.exam_id, es.student_id)
+           es.exam_id,
+           es.student_id,
+           es.total_grade,
+           es.passed
+         FROM exam_submissions es
+         WHERE COALESCE(es.status, 'submitted') IN ('submitted', 'late', 'expired')
+         ORDER BY es.exam_id, es.student_id, es.submitted_at DESC NULLS LAST, es.id DESC
+       )
+       SELECT
+         e.id,
+         e.title,
+         e.type,
+         e.lecture_id,
+         e.total_grade,
+         e.is_visible,
+         e.created_at,
+         l.title AS lecture_title,
+         CASE WHEN e.lecture_id IS NULL THEN 'course' ELSE 'lecture' END AS scope,
+         COUNT(DISTINCT eq.id)::int AS questions_count,
+         COUNT(DISTINCT ls.student_id)::int AS submissions_count,
+         COUNT(DISTINCT ls.student_id) FILTER (WHERE ls.passed IS TRUE)::int AS passed_count,
+         ROUND(AVG(ls.total_grade)::numeric, 2) AS average_grade
+       FROM exams e
+       LEFT JOIN lectures l ON e.lecture_id = l.id
+       LEFT JOIN exam_questions eq ON eq.exam_id = e.id
+       LEFT JOIN latest_subs ls ON ls.exam_id = e.id
+       WHERE COALESCE(e.course_id, l.course_id) = $1
+         AND e.type = ANY($2::text[])
+         ${scopeSql}
+       GROUP BY e.id, l.title
+       ORDER BY e.created_at DESC`,
+      [courseId, types],
+    );
+
+    return result.rows.map((row) => ({
+      id: row.id,
+      title: row.title,
+      type: row.type,
+      scope: row.scope,
+      lectureId: row.lecture_id,
+      lectureTitle: row.lecture_title,
+      totalGrade: row.total_grade,
+      isVisible: row.is_visible,
+      createdAt: row.created_at,
+      questionsCount: row.questions_count,
+      submissionsCount: row.submissions_count,
+      passedCount: row.passed_count,
+      averageGrade: row.average_grade != null ? Number(row.average_grade) : 0,
+    }));
   }
 
   /** Get exam/assignment by id with course/teacher info (lecture-based أو course-based). */
@@ -1445,7 +1607,8 @@ export class ExamFlowService {
     const res = await pool.query(
       `SELECT e.*,
               COALESCE(e.course_id, l.course_id) AS course_id,
-              c.teacher_id
+              c.teacher_id,
+              l.title AS lecture_title
        FROM exams e
        LEFT JOIN lectures l ON e.lecture_id = l.id
        JOIN courses c ON c.id = COALESCE(e.course_id, l.course_id)

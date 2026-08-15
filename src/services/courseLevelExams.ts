@@ -1,5 +1,6 @@
 import pool from '../db/pool';
 import { HttpError } from '../utils';
+import { CourseAccessControl } from './courseAccessControl';
 
 interface RequestUser {
   id: number;
@@ -1067,10 +1068,10 @@ export class CourseLevelExamsService {
   }
 
   /**
-   * Get detailed exam report with question statistics (teacher only)
+   * تقرير الامتحان الشامل للمدرس: لكل سؤال كام صح / كام غلط ومين اللي غلط.
+   * يعتمد آخر محاولة مسلَّمة لكل طالب.
    */
   static async getExamReport(examId: number, requester: RequestUser) {
-    // Verify exam exists and teacher owns it
     const examRes = await pool.query(
       `SELECT e.id, e.title, e.course_id, e.questions_count, c.teacher_id, c.title as course_title
        FROM course_level_exams e
@@ -1084,13 +1085,8 @@ export class CourseLevelExamsService {
     }
 
     const exam = examRes.rows[0];
+    await CourseAccessControl.assertCanManageCourse(requester, Number(exam.course_id));
 
-    // Verify teacher owns the course
-    if (requester.role === 'teacher' && exam.teacher_id !== requester.id) {
-      throw new HttpError(403, 'You are not allowed to view report for this exam');
-    }
-
-    // Get all questions
     const questionsRes = await pool.query(
       `SELECT id, type, question_text, question_image, option_a, option_b, option_c, option_d, correct_answer
        FROM course_level_exam_questions
@@ -1100,60 +1096,94 @@ export class CourseLevelExamsService {
     );
     const questions = questionsRes.rows;
 
-    // Get all submitted attempts
     const attemptsRes = await pool.query(
-      `SELECT id, student_id
-       FROM course_level_exam_attempts
-       WHERE exam_id = $1 AND status = 'submitted'`,
+      `SELECT DISTINCT ON (a.student_id)
+         a.id,
+         a.student_id,
+         u.name as student_name,
+         u.email as student_email
+       FROM course_level_exam_attempts a
+       JOIN users u ON a.student_id = u.id
+       WHERE a.exam_id = $1 AND a.status = 'submitted'
+       ORDER BY a.student_id, a.submitted_at DESC NULLS LAST, a.id DESC`,
       [examId],
     );
     const attempts = attemptsRes.rows;
     const totalAttempts = attempts.length;
+    const attemptIds = attempts.map((a) => Number(a.id));
 
-    // Get all answers for submitted attempts
-    const answersRes = await pool.query(
-      `SELECT 
-         a.question_id,
-         a.selected_answer,
-         a.is_correct,
-         att.student_id,
-         u.name as student_name
-       FROM course_level_exam_answers a
-       JOIN course_level_exam_attempts att ON a.attempt_id = att.id
-       JOIN users u ON att.student_id = u.id
-       WHERE att.exam_id = $1 AND att.status = 'submitted'
-       ORDER BY a.question_id ASC`,
-      [examId],
-    );
+    const answersRes =
+      attemptIds.length === 0
+        ? { rows: [] as any[] }
+        : await pool.query(
+            `SELECT
+               a.attempt_id,
+               a.question_id,
+               a.selected_answer,
+               a.is_correct,
+               att.student_id,
+               u.name as student_name,
+               u.email as student_email
+             FROM course_level_exam_answers a
+             JOIN course_level_exam_attempts att ON a.attempt_id = att.id
+             JOIN users u ON att.student_id = u.id
+             WHERE a.attempt_id = ANY($1::int[])
+             ORDER BY a.question_id ASC`,
+            [attemptIds],
+          );
     const answers = answersRes.rows;
 
-    // Process questions with statistics
+    const optionText = (question: any, letter: string | null) => {
+      if (!letter) return null;
+      const key = String(letter).trim().toUpperCase();
+      if (key === 'A') return question.option_a ?? null;
+      if (key === 'B') return question.option_b ?? null;
+      if (key === 'C') return question.option_c ?? null;
+      if (key === 'D') return question.option_d ?? null;
+      return null;
+    };
+
+    const mapStudent = (a: any, question: any) => {
+      const selected = a.selected_answer ? String(a.selected_answer).trim().toUpperCase() : null;
+      return {
+        studentId: a.student_id,
+        studentName: a.student_name,
+        studentEmail: a.student_email,
+        selectedAnswer: selected,
+        selectedAnswerText: optionText(question, selected),
+      };
+    };
+
     const questionsWithStats = questions.map((question) => {
       const questionAnswers = answers.filter((a) => a.question_id === question.id);
+      const answeredStudentIds = new Set(questionAnswers.map((a) => Number(a.student_id)));
       const correctAnswers = questionAnswers.filter((a) => a.is_correct);
       const wrongAnswers = questionAnswers.filter((a) => !a.is_correct);
+      const unansweredStudents = attempts
+        .filter((att) => !answeredStudentIds.has(Number(att.student_id)))
+        .map((att) => ({
+          studentId: att.student_id,
+          studentName: att.student_name,
+          studentEmail: att.student_email,
+          selectedAnswer: null,
+          selectedAnswerText: null,
+        }));
 
-      // Get students who answered correctly
-      const correctStudents = correctAnswers.map((a) => ({
-        studentId: a.student_id,
-        studentName: a.student_name,
-        selectedAnswer: a.selected_answer,
-      }));
+      const correctCount = correctAnswers.length;
+      const wrongCount = wrongAnswers.length + unansweredStudents.length;
+      const answeredCount = questionAnswers.length;
+      const totalStudents = totalAttempts;
 
-      // Get students who answered incorrectly
-      const wrongStudents = wrongAnswers.map((a) => ({
-        studentId: a.student_id,
-        studentName: a.student_name,
-        selectedAnswer: a.selected_answer,
-      }));
-
-      // Count answers by option
       const answerCounts = {
         A: questionAnswers.filter((a) => a.selected_answer === 'A').length,
         B: questionAnswers.filter((a) => a.selected_answer === 'B').length,
         C: questionAnswers.filter((a) => a.selected_answer === 'C').length,
         D: questionAnswers.filter((a) => a.selected_answer === 'D').length,
       };
+
+      const correctAnswer = question.correct_answer
+        ? String(question.correct_answer).trim().toUpperCase()
+        : null;
 
       return {
         questionId: question.id,
@@ -1164,32 +1194,34 @@ export class CourseLevelExamsService {
         optionB: question.option_b,
         optionC: question.option_c,
         optionD: question.option_d,
-        correctAnswer: question.correct_answer,
+        correctAnswer,
+        correctAnswerText: optionText(question, correctAnswer),
+        correctCount,
+        wrongCount,
+        unansweredCount: unansweredStudents.length,
         statistics: {
-          totalAnswers: questionAnswers.length,
-          correctAnswers: correctAnswers.length,
-          wrongAnswers: wrongAnswers.length,
+          totalStudents,
+          totalAnswers: answeredCount,
+          correctAnswers: correctCount,
+          wrongAnswers: wrongCount,
+          unanswered: unansweredStudents.length,
           correctPercentage:
-            questionAnswers.length > 0
-              ? Math.round((correctAnswers.length / questionAnswers.length) * 100 * 100) / 100
-              : 0,
+            totalStudents > 0 ? Math.round((correctCount / totalStudents) * 100 * 100) / 100 : 0,
           wrongPercentage:
-            questionAnswers.length > 0
-              ? Math.round((wrongAnswers.length / questionAnswers.length) * 100 * 100) / 100
-              : 0,
+            totalStudents > 0 ? Math.round((wrongCount / totalStudents) * 100 * 100) / 100 : 0,
           answerDistribution: answerCounts,
         },
-        correctStudents: correctStudents,
-        wrongStudents: wrongStudents,
+        correctStudents: correctAnswers.map((a) => mapStudent(a, question)),
+        wrongStudents: [
+          ...wrongAnswers.map((a) => mapStudent(a, question)),
+          ...unansweredStudents,
+        ],
+        unansweredStudents,
       };
     });
 
-    // Sort questions by wrong answers count (most wrong first)
-    const sortedQuestions = [...questionsWithStats].sort(
-      (a, b) => b.statistics.wrongAnswers - a.statistics.wrongAnswers,
-    );
+    const sortedQuestions = [...questionsWithStats].sort((a, b) => b.wrongCount - a.wrongCount);
 
-    // Calculate overall statistics
     const totalQuestions = questions.length;
     const totalAnswers = answers.length;
     const totalCorrect = answers.filter((a) => a.is_correct).length;
@@ -1197,14 +1229,13 @@ export class CourseLevelExamsService {
     const overallCorrectPercentage =
       totalAnswers > 0 ? Math.round((totalCorrect / totalAnswers) * 100 * 100) / 100 : 0;
 
-    // Get most problematic questions (top 5)
     const mostProblematicQuestions = sortedQuestions
-      .filter((q) => q.statistics.wrongAnswers > 0)
+      .filter((q) => q.wrongCount > 0)
       .slice(0, 5)
       .map((q) => ({
         questionId: q.questionId,
         questionText: q.questionText || 'Image Question',
-        wrongAnswers: q.statistics.wrongAnswers,
+        wrongAnswers: q.wrongCount,
         wrongPercentage: q.statistics.wrongPercentage,
       }));
 
@@ -1226,7 +1257,7 @@ export class CourseLevelExamsService {
         overallWrongPercentage: Math.round((100 - overallCorrectPercentage) * 100) / 100,
       },
       questions: questionsWithStats,
-      sortedQuestions: sortedQuestions, // Sorted by wrong answers
+      sortedQuestions,
       mostProblematicQuestions,
     };
   }
@@ -1750,5 +1781,98 @@ export class CourseLevelExamsService {
       });
       throw error;
     }
+  }
+
+  /**
+   * قائمة تسليمات الامتحان الشامل للمدرس مع الأسئلة الخاطئة وإجابة كل طالب.
+   */
+  static async listSubmissionsWithWrongQuestions(examId: number) {
+    const subsRes = await pool.query(
+      `SELECT
+         a.id as submission_id,
+         a.student_id,
+         a.attempt_number,
+         a.total_grade,
+         a.obtained_grade,
+         a.submitted_at,
+         CASE WHEN a.obtained_grade >= (a.total_grade * 0.5) THEN true ELSE false END as passed,
+         u.name,
+         u.email,
+         u.phone
+       FROM course_level_exam_attempts a
+       JOIN users u ON a.student_id = u.id
+       WHERE a.exam_id = $1 AND a.status = 'submitted'
+       ORDER BY a.submitted_at DESC`,
+      [examId],
+    );
+
+    if (!subsRes.rowCount) {
+      return [];
+    }
+
+    const attemptIds = subsRes.rows.map((r) => Number(r.submission_id));
+    const answersRes = await pool.query(
+      `SELECT
+         a.attempt_id,
+         a.question_id,
+         a.selected_answer,
+         a.is_correct,
+         q.question_text,
+         q.question_image,
+         q.type,
+         q.option_a,
+         q.option_b,
+         q.option_c,
+         q.option_d,
+         q.correct_answer
+       FROM course_level_exam_answers a
+       JOIN course_level_exam_questions q ON a.question_id = q.id
+       WHERE a.attempt_id = ANY($1::int[])
+         AND a.is_correct = FALSE
+       ORDER BY a.attempt_id, q.id`,
+      [attemptIds],
+    );
+
+    const optionText = (row: any, letter: string | null) => {
+      if (!letter) return null;
+      const key = String(letter).trim().toUpperCase();
+      if (key === 'A') return row.option_a ?? null;
+      if (key === 'B') return row.option_b ?? null;
+      if (key === 'C') return row.option_c ?? null;
+      if (key === 'D') return row.option_d ?? null;
+      return null;
+    };
+
+    const wrongByAttempt = new Map<number, any[]>();
+    for (const row of answersRes.rows) {
+      const attemptId = Number(row.attempt_id);
+      const list = wrongByAttempt.get(attemptId) || [];
+      const yourAnswer = row.selected_answer ? String(row.selected_answer).trim().toUpperCase() : null;
+      const correctAnswer = row.correct_answer ? String(row.correct_answer).trim().toUpperCase() : null;
+      list.push({
+        questionId: row.question_id,
+        questionText: row.question_text,
+        questionImage: row.question_image,
+        type: row.type,
+        correctAnswer,
+        correctAnswerText: optionText(row, correctAnswer),
+        yourAnswer,
+        yourAnswerText: optionText(row, yourAnswer),
+        optionA: row.option_a,
+        optionB: row.option_b,
+        optionC: row.option_c,
+        optionD: row.option_d,
+      });
+      wrongByAttempt.set(attemptId, list);
+    }
+
+    return subsRes.rows.map((row) => {
+      const wrong = wrongByAttempt.get(Number(row.submission_id)) || [];
+      return {
+        ...row,
+        wrong_questions: wrong,
+        wrong_questions_count: wrong.length,
+      };
+    });
   }
 }

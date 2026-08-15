@@ -35,6 +35,7 @@ import { ExamFlowService } from '../services/examFlow';
 import { CourseFilesService } from '../services/courseFiles';
 import { LectureAccessService } from '../services/lectureAccess';
 import { CourseGroupAccessService } from '../services/courseGroupAccess';
+import { uploadToBunnyStorage } from '../services/bunny';
 
 export const router = Router();
 
@@ -1905,26 +1906,42 @@ router.post(
     let fileType: string | null = uploadedFile?.mimetype ?? null;
 
     if (uploadedFile) {
+      const ext =
+        (path.extname(uploadedFile.originalname || uploadedFile.filename) || '.bin')
+          .replace('.', '')
+          .slice(0, 12) || 'bin';
+      const bunnyCopy = `${uploadedFile.path}.bunny`;
+
       try {
-        // رفع إلى Cloudinary (صور / PDF / مستندات) لعرضها داخل الموقع
-        const uploaded = await uploadToCloudinary(uploadedFile.path, {
-          resource_type: 'auto',
-          allowLocalFallback: false,
+        fs.copyFileSync(uploadedFile.path, bunnyCopy);
+        fileUrl = await uploadToBunnyStorage({
+          path: bunnyCopy,
+          ext,
+          mime: uploadedFile.mimetype || 'application/octet-stream',
+          originalname: uploadedFile.originalname,
         });
-        fileUrl = uploaded.secure_url;
-        fileSize = uploaded.bytes ?? fileSize;
-        if (uploaded.format && !fileType) {
-          fileType = uploaded.resource_type === 'image'
-            ? `image/${uploaded.format}`
-            : uploaded.format;
+        try {
+          fs.unlinkSync(uploadedFile.path);
+        } catch {
+          // ignore
         }
-      } catch (uploadErr: any) {
-        console.error('Course file Cloudinary upload failed:', uploadErr?.message || uploadErr);
-        return res.status(502).json({
-          message: 'فشل رفع الملف إلى Cloudinary',
-          error: uploadErr?.message || 'upload_failed',
-          code: 'CLOUDINARY_UPLOAD_FAILED',
-        });
+      } catch (bunnyErr: any) {
+        console.warn(
+          'Course file Bunny upload failed, using local /uploads:',
+          bunnyErr?.message || bunnyErr,
+        );
+        try {
+          if (fs.existsSync(bunnyCopy)) fs.unlinkSync(bunnyCopy);
+        } catch {
+          // ignore
+        }
+        if (!fs.existsSync(uploadedFile.path)) {
+          return res.status(502).json({
+            message: 'فشل رفع الملف',
+            code: 'UPLOAD_FAILED',
+          });
+        }
+        fileUrl = `/uploads/course-files/${uploadedFile.filename}`;
       }
     }
 
@@ -4806,6 +4823,49 @@ router.get(
   }),
 );
 
+// تقارير واجبات الكورس: امتحانات المحاضرة + الواجبات المنفصلة (للمدرس)
+router.get(
+  '/:courseId/assignment-reports',
+  authMiddleware(COURSE_CONTENT_ROLES),
+  asyncWrapper(async (req, res) => {
+    const courseId = Number(req.params.courseId);
+    if (!courseId || Number.isNaN(courseId)) {
+      return res.status(400).json({ message: 'معرف الكورس غير صحيح' });
+    }
+
+    await CourseAccessControl.assertCanManageCourse(req.user!, courseId);
+
+    const reports = await ExamFlowService.listCourseAssignmentReports(courseId, {
+      type: String(req.query.type || 'all'),
+      scope: String(req.query.scope || 'all'),
+    });
+
+    res.json({
+      courseId,
+      reports,
+    });
+  }),
+);
+
+// تقرير تفصيلي لواجب/امتحان محاضرة أو واجب كورس منفصل
+router.get(
+  '/lecture-exam/:examId/report',
+  authMiddleware(COURSE_CONTENT_ROLES),
+  asyncWrapper(async (req, res) => {
+    const examId = Number(req.params.examId);
+    if (isNaN(examId)) {
+      return res.status(400).json({ message: 'Invalid examId' });
+    }
+
+    const report = await ExamFlowService.getExamQuestionReport(examId, {
+      id: req.user!.id,
+      role: req.user!.role as any,
+      tenant_id: req.user!.tenant_id,
+    });
+    res.json(report);
+  }),
+);
+
 // جلب تفاصيل الطلاب الذين حلوا امتحان محاضرة معينة + الأسئلة الخاطئة (للأستاذ فقط)
 router.get(
   '/lecture-exam/:examId/submissions',
@@ -4986,26 +5046,8 @@ router.get(
       courseTeacherId: exam.teacher_id,
       courseId: exam.course_id,
     });
-    // جلب تفاصيل الطلاب الذين حلوا الامتحان
-    const subsRes = await pool.query(
-      `SELECT 
-         a.id as submission_id,
-         a.student_id,
-         a.attempt_number,
-         a.total_grade,
-         a.obtained_grade,
-         a.submitted_at,
-         CASE WHEN a.obtained_grade >= (a.total_grade * 0.5) THEN true ELSE false END as passed,
-         u.name,
-         u.email,
-         u.phone
-       FROM course_level_exam_attempts a
-       JOIN users u ON a.student_id = u.id
-       WHERE a.exam_id = $1 AND a.status = 'submitted'
-       ORDER BY a.submitted_at DESC`,
-      [examId],
-    );
-    res.json({ submissions: subsRes.rows });
+    const submissions = await CourseLevelExamsService.listSubmissionsWithWrongQuestions(examId);
+    res.json({ submissions });
   }),
 );
 
