@@ -51,6 +51,8 @@ Auth: Bearer Token
 
 \* إما `file` أو `file_url`
 
+**التخزين:** الملف يُرفع إلى **Cloudinary** (`resource_type: auto`) ويُحفظ `secure_url` في DB لعرضه داخل الموقع (صور / PDF / مستندات).
+
 ### مثال (cURL)
 
 ```bash

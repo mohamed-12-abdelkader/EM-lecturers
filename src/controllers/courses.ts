@@ -1867,7 +1867,7 @@ router.post(
 const courseFileUpload = multer({
   storage: multer.diskStorage({
     destination: (_req, _file, cb) => {
-      // مسار ثابت من جذر المشروع ليتوافق مع app.use('/uploads', express.static('uploads'))
+      // مؤقت قبل الرفع إلى Cloudinary
       const uploadDir = path.join(process.cwd(), 'uploads', 'course-files');
       fs.mkdirSync(uploadDir, { recursive: true });
       cb(null, uploadDir);
@@ -1901,10 +1901,31 @@ router.post(
 
     const uploadedFile = req.file;
     let fileUrl = typeof req.body?.file_url === 'string' ? String(req.body.file_url).trim() : '';
+    let fileSize: number | null = uploadedFile?.size ?? null;
+    let fileType: string | null = uploadedFile?.mimetype ?? null;
 
     if (uploadedFile) {
-      // تخزين محلي على السيرفر (مطلوب) — يُخدم عبر /uploads
-      fileUrl = `/uploads/course-files/${uploadedFile.filename}`;
+      try {
+        // رفع إلى Cloudinary (صور / PDF / مستندات) لعرضها داخل الموقع
+        const uploaded = await uploadToCloudinary(uploadedFile.path, {
+          resource_type: 'auto',
+          allowLocalFallback: false,
+        });
+        fileUrl = uploaded.secure_url;
+        fileSize = uploaded.bytes ?? fileSize;
+        if (uploaded.format && !fileType) {
+          fileType = uploaded.resource_type === 'image'
+            ? `image/${uploaded.format}`
+            : uploaded.format;
+        }
+      } catch (uploadErr: any) {
+        console.error('Course file Cloudinary upload failed:', uploadErr?.message || uploadErr);
+        return res.status(502).json({
+          message: 'فشل رفع الملف إلى Cloudinary',
+          error: uploadErr?.message || 'upload_failed',
+          code: 'CLOUDINARY_UPLOAD_FAILED',
+        });
+      }
     }
 
     if (!fileUrl) {
@@ -1921,8 +1942,8 @@ router.post(
       created = await CourseFilesService.create(courseId, {
         name,
         file_url: fileUrl,
-        file_size: uploadedFile?.size ?? null,
-        file_type: uploadedFile?.mimetype ?? null,
+        file_size: fileSize,
+        file_type: fileType,
         uploaded_by: req.user!.id,
       });
     } catch (dbErr: any) {

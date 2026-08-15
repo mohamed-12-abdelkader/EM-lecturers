@@ -95,6 +95,7 @@ Handler is registered at API startup under `src/modules/whatsapp/automations/tec
 - Screenshot understanding via **Mistral** vision (pixtral)
 - Full conversation history in DeepSeek context
 - Password reset **only** when WhatsApp `from` matches the student’s stored `users.phone` (normalized). Sends a temporary password and sets `must_change_password=true`. Rate limit: 3 resets / phone / 24h.
+- **App-only teacher:** students asking about **مصطفى نوفل** (`mr-nofal`) are never given the website URL (`https://mr-nofal.em-online.online`). The bot directs them to the mobile app (download link from the teacher) and helps with install, login, activation, and troubleshooting.
 
 **Webhook timing**
 - API acknowledges the webhook immediately, then runs the LLM agent asynchronously (wwebjs times out around 10s).

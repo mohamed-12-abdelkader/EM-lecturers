@@ -4,6 +4,7 @@ import { describeInboundImage } from './image';
 import { loadConversationHistory } from './history';
 import { TECHNICAL_SUPPORT_SYSTEM_PROMPT } from './prompts';
 import { SUPPORT_TOOL_DEFINITIONS, executeSupportTool } from './tools';
+import { sanitizeAppOnlyTeacherReply } from './appOnlyTeachers';
 import pool from '../../../../db/pool';
 
 const MAX_TOOL_ROUNDS = 6;
@@ -236,6 +237,8 @@ export async function runTechnicalSupportAgent(ctx: InboundContext): Promise<Age
     finalReply =
       'معلش، مقدرتش أرد على رسالتك دلوقتي. جرّب تاني بعد شوية، أو كلّم المدرس على طول.';
   }
+
+  finalReply = sanitizeAppOnlyTeacherReply(finalReply);
 
   // WhatsApp-friendly length
   if (finalReply.length > 3500) {

@@ -10,16 +10,16 @@ import { SeoHooks } from './seo/hooks';
 export type PublicRegisterPayload = CreateTenantInput & { remember_me?: boolean };
 
 export class PublicPlatformSignupService {
+  /** التسجيل الذاتي للمنصات متوقف — الإنشاء للأدمن فقط عبر POST /api/super/tenants */
   static isEnabled(): boolean {
-    const raw = process.env.PUBLIC_PLATFORM_SIGNUP_ENABLED;
-    if (raw === undefined || raw === '') return true;
-    return raw === '1' || raw.toLowerCase() === 'true' || raw.toLowerCase() === 'yes';
+    return false;
   }
 
   static assertEnabled(): void {
     if (!this.isEnabled()) {
-      throw new HttpError(503, 'التسجيل الذاتي للمنصات غير متاح حالياً', {
-        code: 'SIGNUP_DISABLED',
+      throw new HttpError(403, 'إنشاء المنصات متاح للأدمن فقط عبر لوحة الإدارة', {
+        code: 'PUBLIC_SIGNUP_DISABLED',
+        admin_endpoint: 'POST /api/super/tenants',
       });
     }
   }

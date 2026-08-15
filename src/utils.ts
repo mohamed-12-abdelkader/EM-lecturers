@@ -362,6 +362,8 @@ export const uploadToCloudinary = async (
     resource_type?: 'image' | 'video' | 'raw' | 'auto';
     type?: 'upload' | 'authenticated' | 'private';
     access_mode?: 'public' | 'authenticated';
+    /** عند false: لا نرجع لتخزين محلي إذا فشل Cloudinary (افتراضي true) */
+    allowLocalFallback?: boolean;
   },
 ): Promise<UploadApiResponse> => {
   const uploadOptions: Record<string, unknown> = {
@@ -395,7 +397,8 @@ export const uploadToCloudinary = async (
     await unlinkFile(filePath);
     return result;
   } catch (err) {
-    if (!isCloudinaryUnavailable(err)) {
+    const allowFallback = options?.allowLocalFallback !== false;
+    if (!allowFallback || !isCloudinaryUnavailable(err)) {
       throw err;
     }
     logger.warn(

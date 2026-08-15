@@ -1,4 +1,5 @@
 import { HUMAN_SUPPORT_WHATSAPP } from './prompts';
+import { isAppOnlyTeacherSubdomain, MR_NOFAL_APP_STUDENT_GUIDANCE } from './appOnlyTeachers';
 
 export type HelpTopic =
   | 'login'
@@ -62,10 +63,63 @@ const FAQ: Record<HelpTopic, string> = {
 لو السؤال دراسي أو شكوى إدارية، وجّه الطالب للمدرس.`,
 };
 
-export function getPlatformHelp(topic?: string | null): { topic: HelpTopic; content: string } {
+const APP_ONLY_FAQ: Record<HelpTopic, string> = {
+  login: `دخول طلاب مصطفى نوفل من تطبيق الموبايل فقط:
+- نزّل التطبيق من لينك التحميل اللي المدرس بعتهولك.
+- لو معندكش اللينك: كلّم مصطفى نوفل واطلب منه لينك التطبيق.
+- افتح التطبيق وادخل برقم الموبايل + الباسورد.
+- ممنوع استخدام الموقع.
+لو في مشكلة في الدخول ابعت سكرين شوت من التطبيق وأنا أساعدك خطوة بخطوة.`,
+
+  signup: `التسجيل لطلاب مصطفى نوفل من تطبيق الموبايل فقط:
+- نزّل التطبيق من لينك التحميل اللي المدرس بعتهولك.
+- لو معندكش اللينك: كلّم مصطفى نوفل واطلب منه لينك التطبيق.
+- افتح التطبيق واعمل حساب جديد (اسم + موبايل + باسورد) أو ادخل لو عندك حساب.
+- ممنوع توجيه الطالب للموقع.
+لو التسجيل فشل ابعت سكرين شوت من التطبيق.`,
+
+  forgot_password: `نسيت الباسورد (مصطفى نوفل — التطبيق فقط):
+- ريست الباسورد من واتساب الدعم بيتم بس لو بتبعت من نفس رقم الموبايل المسجّل على الحساب.
+- بعد الريست ادخل من تطبيق الموبايل، مش من الموقع.
+- لو معندكش التطبيق: نزّله من لينك المدرس، أو اطلب اللينك من مصطفى نوفل.
+- لو الرقم مختلف عن المسجّل: كلّم الدعم البشري على واتساب: ${HUMAN_SUPPORT_WHATSAPP}`,
+
+  wrong_url: `طلاب مصطفى نوفل مفيش لينك موقع:
+- المنصة بتشتغل من تطبيق الموبايل فقط.
+- نزّل التطبيق من اللينك اللي المدرس بعته.
+- لو معندكش اللينك: كلّم مصطفى نوفل واطلب لينك التطبيق.
+- ممنوع ذكر أو إرسال أي رابط موقع.`,
+
+  account_locked: `الحساب واقف أو مش شغال:
+- ممكن المدرس أو الإدارة يكونوا موقفين الحساب.
+- مش هنقدر نفعّله أوتوماتيك من واتساب البوت.
+- كلّم مصطفى نوفل أو الدعم على واتساب: ${HUMAN_SUPPORT_WHATSAPP}
+- بعد الحل استخدم تطبيق الموبايل فقط.`,
+
+  activate_course: `تفعيل الكورس من تطبيق مصطفى نوفل:
+- افتح التطبيق وادخل بحسابك.
+- دوس على زر تفعيل الكورس، امسح QR أو اكتب الكود (عادة 8 أرقام).
+- لو حصلت مشكلة ابعت الكود أو سكرين شوت من التطبيق.
+- ممنوع توجيه الطالب لموقع الويب.`,
+
+  general: `${MR_NOFAL_APP_STUDENT_GUIDANCE}
+
+الدعم بيساعد في التحميل، التثبيت، التسجيل، الدخول، تفعيل الكورس، وحل مشاكل التطبيق خطوة بخطوة.
+لو محتاج تحقق هوية: واتساب الدعم البشري ${HUMAN_SUPPORT_WHATSAPP}`,
+};
+
+export function getPlatformHelp(
+  topic?: string | null,
+  tenantSubdomain?: string | null,
+): { topic: HelpTopic; content: string; access_channel?: 'mobile_app' | 'website' } {
   const key = (topic || 'general').toLowerCase().trim() as HelpTopic;
-  if (key in FAQ) {
-    return { topic: key, content: FAQ[key] };
+  const resolved: HelpTopic = key in FAQ ? key : 'general';
+  if (isAppOnlyTeacherSubdomain(tenantSubdomain)) {
+    return {
+      topic: resolved,
+      content: APP_ONLY_FAQ[resolved],
+      access_channel: 'mobile_app',
+    };
   }
-  return { topic: 'general', content: FAQ.general };
+  return { topic: resolved, content: FAQ[resolved], access_channel: 'website' };
 }

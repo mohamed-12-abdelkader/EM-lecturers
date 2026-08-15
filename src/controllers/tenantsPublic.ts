@@ -1,17 +1,9 @@
 import { Router } from 'express';
 import { ipKeyGenerator, rateLimit } from 'express-rate-limit';
-import { asyncWrapper, config, HttpError } from '../utils';
+import { asyncWrapper, config } from '../utils';
 import { buildTenantPublicUrl, getProductionUrl } from '../config/appUrls';
 import { TenantService } from '../services/tenants';
 import { PublicPlatformSignupService } from '../services/publicPlatformSignup';
-import { validate } from '../middleware/validateReq';
-import {
-  PublicCreateTenantBodySchema,
-  buildCreateTenantFromMultipart,
-  isMultipartRequest,
-  uploadTenantFilesSafe,
-} from '../utils/tenantFormPayload';
-import type { CreateTenantInput } from '../services/tenants';
 import {
   getPublicCoursesBySubdomain,
   getPublicFreeLecturesBySubdomain,
@@ -82,14 +74,16 @@ router.get(
   }),
 );
 
-/** بيانات مساعدة لنموذج إنشاء المنصة (بدون تسجيل دخول) */
+/** بيانات مساعدة — التسجيل العام متوقف؛ الإنشاء للأدمن فقط */
 router.get(
   '/signup-info',
   asyncWrapper(async (_req, res) => {
     res.json({
       success: true,
       data: {
-        enabled: PublicPlatformSignupService.isEnabled(),
+        enabled: false,
+        message: 'إنشاء المنصات متاح للأدمن فقط',
+        admin_endpoint: 'POST /api/super/tenants',
         subdomain_rules: {
           min_length: 2,
           max_length: 63,
@@ -100,55 +94,22 @@ router.get(
         tenant_root_domain: config.TENANT_ROOT_DOMAIN || null,
         grades_endpoint: '/api/teacher/available-grades',
         owner_password_min_length: 6,
-        body_same_as: 'POST /api/super/tenants',
       },
     });
   }),
 );
 
-/** إنشاء منصة + حساب مدرس + تسجيل دخول تلقائي — نفس body الخاص بـ /api/super/tenants */
+/** إنشاء منصة عام — معطّل؛ استخدم POST /api/super/tenants (admin) */
 router.post(
   '/register',
   platformRegisterLimiter,
-  (req, res, next) => {
-    if (isMultipartRequest(req)) {
-      return uploadTenantFilesSafe(req, res, next);
-    }
-    next();
-  },
-  (req, res, next) => {
-    if (!isMultipartRequest(req)) {
-      return validate(PublicCreateTenantBodySchema)(req, res, next);
-    }
-    next();
-  },
-  asyncWrapper(async (req, res) => {
-    try {
-      let payload: CreateTenantInput & { remember_me?: boolean };
-      if (isMultipartRequest(req)) {
-        const built = await buildCreateTenantFromMultipart(req, { requireOwner: true });
-        if ('error' in built) {
-          return res.status(400).json({ success: false, message: built.error });
-        }
-        payload = built.data;
-      } else {
-        payload = req.body as CreateTenantInput & { remember_me?: boolean };
-      }
-
-      const data = await PublicPlatformSignupService.register(payload, req, res);
-      res.status(201).json({ success: true, data });
-    } catch (e) {
-      if (e instanceof HttpError) throw e;
-      const err = e as { code?: string };
-      if (err.code === '23505') {
-        return res.status(409).json({
-          success: false,
-          message: 'هذا النطاق أو البريد مستخدم بالفعل',
-          code: 'CONFLICT',
-        });
-      }
-      throw e;
-    }
+  asyncWrapper(async (_req, res) => {
+    return res.status(403).json({
+      success: false,
+      message: 'إنشاء المنصات متاح للأدمن فقط عبر لوحة الإدارة',
+      code: 'PUBLIC_SIGNUP_DISABLED',
+      admin_endpoint: 'POST /api/super/tenants',
+    });
   }),
 );
 

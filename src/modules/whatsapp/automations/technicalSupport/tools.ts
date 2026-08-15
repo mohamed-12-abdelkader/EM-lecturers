@@ -1,6 +1,6 @@
 import pool from '../../../../db/pool';
-import { buildTenantPublicUrl } from '../../../../config/appUrls';
 import { getActivationCodeDetails } from '../../../../services/activationCodeLookup';
+import { tenantAccessForSubdomain } from './appOnlyTeachers';
 import { getPlatformHelp } from './faq';
 import { maskPhone, phoneMatchVariants, phonesMatch } from './phoneMatch';
 import { resetStudentPasswordSecure } from './passwordReset';
@@ -16,7 +16,7 @@ export const SUPPORT_TOOL_DEFINITIONS = [
     function: {
       name: 'search_tenants',
       description:
-        'Search teacher platforms by the name the student typed (handles Arabic spelling variants like أحمد/احمد and يحيى/يحي). Pass the student wording as-is — do not “correct” Arabic spelling before calling. Also checks whether the CURRENT WhatsApp caller already has an account on each match. Returns public_url and caller_has_account_on_this_tenant.',
+        'Search teacher platforms by the name the student typed (handles Arabic spelling variants like أحمد/احمد and يحيى/يحي). Pass the student wording as-is — do not “correct” Arabic spelling before calling. Also checks whether the CURRENT WhatsApp caller already has an account on each match. Returns public_url for website platforms. For app-only teachers (e.g. mr-nofal / مصطفى نوفل) public_url is null, access_channel is mobile_app, and you MUST NOT mention any website URL.',
       parameters: {
         type: 'object',
         properties: {
@@ -64,7 +64,7 @@ export const SUPPORT_TOOL_DEFINITIONS = [
     function: {
       name: 'get_platform_help',
       description:
-        'Get curated help text for login, signup, password, wrong URL, locked account, or course activation.',
+        'Get curated help text for login, signup, password, wrong URL, locked account, or course activation. Pass tenant_subdomain when known so app-only teachers (mr-nofal) get mobile-app instructions instead of website URLs.',
       parameters: {
         type: 'object',
         properties: {
@@ -79,6 +79,10 @@ export const SUPPORT_TOOL_DEFINITIONS = [
               'activate_course',
               'general',
             ],
+          },
+          tenant_subdomain: {
+            type: 'string',
+            description: 'Teacher platform subdomain if known (e.g. mr-nofal)',
           },
         },
       },
@@ -157,6 +161,36 @@ async function lookupActivationCode(codeRaw: string, fromPhone: string) {
   if (details.is_expired) status = 'expired';
   else if (details.is_used) status = 'used';
 
+  const tenantRes = await pool.query<{ subdomain: string | null }>(
+    `SELECT t.subdomain
+     FROM users u
+     LEFT JOIN tenants t ON t.id = u.tenant_id
+     WHERE u.id = $1
+     LIMIT 1`,
+    [details.teacher.id],
+  );
+  const teacherSubdomain = tenantRes.rows[0]?.subdomain ?? null;
+  const access = tenantAccessForSubdomain(teacherSubdomain);
+  const appOnly = access.access_channel === 'mobile_app';
+
+  const websiteGuidance =
+    status === 'available'
+      ? 'Code is still available. Tell the student they can activate from the platform with QR scan or by typing this code manually.'
+      : status === 'expired'
+        ? 'Code is expired. Student should ask their teacher for a new code.'
+        : matchesCaller
+          ? 'Code already used on an account matching this WhatsApp number. Tell them to log in with that same account (mobile + password). Offer password help if needed.'
+          : 'Code already used on another account. If this code is theirs, they must log in with the account it was activated on. If not theirs / they do not have that account, they should go back to the teacher and get a new personal code.';
+
+  const appGuidance =
+    status === 'available'
+      ? 'Code is still available. Tell the student to activate from the MOBILE APP (QR or typing the code). NEVER share the website URL.'
+      : status === 'expired'
+        ? 'Code is expired. Student should ask مصطفى نوفل for a new code. Direct them to the mobile app, never the website.'
+        : matchesCaller
+          ? 'Code already used on an account matching this WhatsApp number. Tell them to log in from the MOBILE APP with that same account (mobile + password). NEVER share the website URL.'
+          : 'Code already used on another account. If this code is theirs, they must log in from the MOBILE APP with the account it was activated on. If not, they should contact مصطفى نوفل for a new code. NEVER share the website URL.';
+
   return {
     ok: true,
     code: details.code,
@@ -167,16 +201,11 @@ async function lookupActivationCode(codeRaw: string, fromPhone: string) {
     max_uses: details.max_uses,
     course_title: details.course.title,
     teacher_name: details.teacher.name,
+    tenant_subdomain: teacherSubdomain,
+    ...access,
     used_by_matches_whatsapp_caller: matchesCaller,
     used_by_phone_masked: details.used_by.map((u) => maskPhone(u.phone)),
-    guidance:
-      status === 'available'
-        ? 'Code is still available. Tell the student they can activate from the platform with QR scan or by typing this code manually.'
-        : status === 'expired'
-          ? 'Code is expired. Student should ask their teacher for a new code.'
-          : matchesCaller
-            ? 'Code already used on an account matching this WhatsApp number. Tell them to log in with that same account (mobile + password). Offer password help if needed.'
-            : 'Code already used on another account. If this code is theirs, they must log in with the account it was activated on. If not theirs / they do not have that account, they should go back to the teacher and get a new personal code.',
+    guidance: appOnly ? appGuidance : websiteGuidance,
   };
 }
 
@@ -348,9 +377,9 @@ async function searchTenants(query: string, fromPhone: string, limitRaw?: number
     query_token_variants: Object.fromEntries(tokens.map((t) => [t, arabicTokenVariants(t)])),
     checked_whatsapp_caller: true,
     account_check_note:
-      'caller_has_account_on_this_tenant is based on the current WhatsApp caller phone vs student accounts on that tenant. Prefer public_url only (do not invent separate /login or /signup links).',
+      'caller_has_account_on_this_tenant is based on the current WhatsApp caller phone vs student accounts on that tenant. For website platforms prefer public_url only (do not invent separate /login or /signup links). If access_channel is mobile_app, NEVER share a website URL — direct the student to the mobile app.',
     tenants: picked.map((row) => {
-      const publicUrl = buildTenantPublicUrl(row.subdomain);
+      const access = tenantAccessForSubdomain(row.subdomain);
       const callerStudent = byTenantId.get(row.id) || null;
       return {
         tenant_id: row.id,
@@ -358,7 +387,7 @@ async function searchTenants(query: string, fromPhone: string, limitRaw?: number
         subdomain: row.subdomain,
         specialty: row.specialty,
         teacher_name: row.owner_name,
-        public_url: publicUrl,
+        ...access,
         match_score: Number(row.match_score) || 0,
         caller_has_account_on_this_tenant: Boolean(callerStudent),
         caller_student: callerStudent
@@ -414,7 +443,7 @@ async function lookupStudentsByWhatsapp(fromPhone: string) {
       tenant_id: row.tenant_id,
       tenant_display_name: row.display_name,
       tenant_subdomain: row.subdomain,
-      public_url: row.subdomain ? buildTenantPublicUrl(row.subdomain) : null,
+      ...tenantAccessForSubdomain(row.subdomain),
     }));
 
   return { ok: true, count: students.length, students };
@@ -463,7 +492,7 @@ async function lookupStudentByCode(studentCode: string, fromPhone: string) {
         tenant_id: row.tenant_id,
         tenant_display_name: row.display_name,
         tenant_subdomain: row.subdomain,
-        public_url: row.subdomain ? buildTenantPublicUrl(row.subdomain) : null,
+        ...tenantAccessForSubdomain(row.subdomain),
       };
     }),
   };
@@ -482,7 +511,10 @@ export async function executeSupportTool(
     case 'lookup_student_by_code':
       return lookupStudentByCode(String(args.student_code || ''), ctx.fromPhone);
     case 'get_platform_help':
-      return getPlatformHelp(args.topic != null ? String(args.topic) : null);
+      return getPlatformHelp(
+        args.topic != null ? String(args.topic) : null,
+        args.tenant_subdomain != null ? String(args.tenant_subdomain) : null,
+      );
     case 'lookup_activation_code':
       return lookupActivationCode(String(args.code || ''), ctx.fromPhone);
     case 'reset_student_password': {
