@@ -217,7 +217,7 @@ router.post(
 );
 
 router.put(
-  '/:id',
+  '/:id(\\d+)',
   authMiddleware(['admin']),
   upload.single('avatar'),
   validate(UpdateTeacherSchema),

@@ -12,9 +12,64 @@
 
 ```
 مكتبة المدرّس
-  └── دروس (teacher_question_lessons)
-        ├── أسئلة مباشرة (teacher_questions)
-        └── قطع قراءة اختيارية (teacher_question_passages) → أسئلة مرتبطة بالقطعة
+  └── صفوف دراسية (teacher_question_grades)
+        └── دروس (teacher_question_lessons)
+              ├── أسئلة مباشرة (teacher_questions)
+              └── قطع قراءة اختيارية (teacher_question_passages) → أسئلة مرتبطة بالقطعة
+```
+
+---
+
+## الصفوف الدراسية (Grades)
+
+### إضافة صف
+- **POST** `/api/teacher/questions/grade`
+- **Body:**
+```json
+{ "title": "الصف الأول الثانوي", "platform_grade_id": 10 }
+```
+- `title` مطلوب إلا إذا أُرسل `platform_grade_id` — حينها يُستخدم اسم الصف من المنصة تلقائيًا.
+- `platform_grade_id` اختياري: ربط بصف من جدول `grades`.
+- **Response:**
+```json
+{
+  "grade": {
+    "id": 1,
+    "teacher_id": 5,
+    "title": "الصف الأول الثانوي",
+    "platform_grade_id": 10,
+    "platform_grade_name": "الصف الأول الثانوي",
+    "created_at": "..."
+  }
+}
+```
+
+### تعديل صف
+- **PUT** `/api/teacher/questions/grade/:id`
+- **Body:** `{ "title": "اسم جديد" }` و/أو `{ "platform_grade_id": 11 }` (أو `null` لإلغاء الربط)
+
+### حذف صف
+- **DELETE** `/api/teacher/questions/grade/:id`
+- يحذف الصف **وكل دروسه وأسئلته** (Cascade)
+
+### جلب صفوف المدرّس
+- **GET** `/api/teacher/questions/grades`
+- **Response:**
+```json
+{
+  "grades": [
+    {
+      "id": 1,
+      "teacher_id": 5,
+      "title": "الصف الأول الثانوي",
+      "platform_grade_id": 10,
+      "platform_grade_name": "الصف الأول الثانوي",
+      "lessons_count": 4,
+      "questions_count": 30,
+      "created_at": "..."
+    }
+  ]
+}
 ```
 
 ---
@@ -25,23 +80,16 @@
 - **POST** `/api/teacher/questions/lesson`
 - **Body:**
 ```json
-{ "title": "الدرس الأول" }
+{ "grade_id": 1, "title": "الدرس الأول" }
 ```
 - **Response:**
 ```json
-{ "lesson": { "id": 1, "teacher_id": 5, "title": "الدرس الأول", "created_at": "..." } }
+{ "lesson": { "id": 1, "teacher_id": 5, "grade_id": 1, "title": "الدرس الأول", "created_at": "..." } }
 ```
 
 ### تعديل درس
 - **PUT** `/api/teacher/questions/lesson/:id`
-- **Body:**
-```json
-{ "title": "اسم جديد للدرس" }
-```
-- **Response:**
-```json
-{ "lesson": { ... } }
-```
+- **Body:** `{ "title": "اسم جديد للدرس" }` و/أو `{ "grade_id": 2 }` لنقل الدرس لصف آخر
 
 ### حذف درس
 - **DELETE** `/api/teacher/questions/lesson/:id`
@@ -50,8 +98,9 @@
 { "success": true }
 ```
 
-### جلب كل دروس المدرّس
+### جلب دروس المدرّس
 - **GET** `/api/teacher/questions/lessons`
+- **Query (اختياري):** `?grade_id=1` لجلب دروس صف معيّن
 - **Response:**
 ```json
 {
@@ -59,6 +108,8 @@
     {
       "id": 1,
       "teacher_id": 5,
+      "grade_id": 1,
+      "grade_title": "الصف الأول الثانوي",
       "title": "الدرس الأول",
       "questions_count": 12,
       "created_at": "..."
@@ -155,26 +206,36 @@
 
 ---
 
-## جلب الشجرة الكاملة (دروس ← أسئلة وقطع)
+## جلب الشجرة الكاملة (صفوف ← دروس ← أسئلة وقطع)
 - **GET** `/api/teacher/questions/tree`
 - **Response:**
 ```json
 {
-  "lessons": [
+  "grades": [
     {
       "id": 1,
       "teacher_id": 5,
-      "title": "الدرس الأول",
-      "questions": [
-        { "id": 1, "question_text": "...", "passage_id": null }
-      ],
-      "passages": [
+      "title": "الصف الأول الثانوي",
+      "platform_grade_id": 10,
+      "platform_grade_name": "الصف الأول الثانوي",
+      "lessons": [
         {
           "id": 1,
-          "title": "قطعة قراءة",
-          "content": "...",
+          "teacher_id": 5,
+          "grade_id": 1,
+          "title": "الدرس الأول",
           "questions": [
-            { "id": 2, "passage_id": 1, "question_text": "..." }
+            { "id": 1, "question_text": "...", "passage_id": null }
+          ],
+          "passages": [
+            {
+              "id": 1,
+              "title": "قطعة قراءة",
+              "content": "...",
+              "questions": [
+                { "id": 2, "passage_id": 1, "question_text": "..." }
+              ]
+            }
           ]
         }
       ]
@@ -193,5 +254,6 @@
 ## ملاحظات
 - جميع الـ endpoints (ما عدا public) تتطلب مصادقة المدرس (Bearer Token)
 - كل مدرس يرى ويعدل مكتبته فقط
+- حذف الصف يحذف دروسه وأسئلته وقطعه تلقائيًا (Cascade)
 - حذف الدرس يحذف أسئله وقطعه تلقائيًا (Cascade)
-- تم إلغاء مستويات **الفصول** و**الأجزاء** — الدروس مباشرة داخل المكتبة
+- الهيكل: **صفوف دراسية → دروس → أسئلة** (مع قطع قراءة اختيارية داخل الدرس)

@@ -376,6 +376,19 @@ export class StudentsRepository {
     return result.rows[0] ?? null;
   }
 
+  static async findByQrTokenPublic(qrToken: string): Promise<TcStudentRow | null> {
+    const result = await pool.query<TcStudentRow>(
+      `SELECT st.*
+       FROM tc_qr_codes qr
+       JOIN tc_students st ON st.id = qr.student_id
+       WHERE LOWER(qr.qr_token::text) = LOWER($1)
+         AND st.deleted_at IS NULL
+         AND st.is_active = TRUE`,
+      [qrToken],
+    );
+    return result.rows[0] ?? null;
+  }
+
   static async getQr(studentId: number, teacherId: number): Promise<TcQrCodeRow | null> {
     const result = await pool.query<TcQrCodeRow>(
       `SELECT qr.*

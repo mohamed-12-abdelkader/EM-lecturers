@@ -38,6 +38,14 @@ npm run migrate up
 }
 ```
 
+أو إضافة **كل أسئلة صف دراسي**:
+
+```json
+{
+  "gradeId": 2
+}
+```
+
 أو إضافة **كل أسئلة درس**:
 
 ```json
@@ -57,6 +65,7 @@ npm run migrate up
 | الحقل | النوع | الوصف |
 |--------|------|--------|
 | `questionIds` | number[] | معرّفات من `teacher_questions` |
+| `gradeId` | number | يضيف كل أسئلة الصف |
 | `lessonId` | number | يضيف كل أسئلة الدرس |
 | `passageId` | number | يضيف كل أسئلة القطعة |
 | `type` | string | لا تُمرّر أو أي قيمة غير `course-exam` |
@@ -145,7 +154,7 @@ npm run migrate up
 
 | HTTP | السبب |
 |------|--------|
-| 400 | `questionIds` فارغ ولم يُرسَل `lessonId` أو `passageId` |
+| 400 | `questionIds` فارغ ولم يُرسَل `gradeId` أو `lessonId` أو `passageId` |
 | 400 | معرّفات غير موجودة في مكتبة المدرس (`missingQuestionIds`) |
 | 400 | سؤال مقالي في امتحان كورس |
 | 403 | الامتحان لا يخص المدرس |
@@ -177,7 +186,9 @@ npm run migrate up
 
 | Method | URL |
 |--------|-----|
+| GET | `/api/teacher/questions/grades` |
 | GET | `/api/teacher/questions/lessons` |
+| GET | `/api/teacher/questions/lessons?grade_id=` |
 | GET | `/api/teacher/questions/lesson/:lesson_id/questions` |
 | GET | `/api/teacher/questions/passage/:id` |
 

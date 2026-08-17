@@ -83,7 +83,10 @@ export class TeacherManagedStudentsService {
       ALTER TABLE users
         ADD COLUMN IF NOT EXISTS student_code VARCHAR(20),
         ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN NOT NULL DEFAULT FALSE,
-        ADD COLUMN IF NOT EXISTS managed_by_teacher_id INTEGER REFERENCES users(id) ON DELETE SET NULL
+        ADD COLUMN IF NOT EXISTS managed_by_teacher_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        ADD COLUMN IF NOT EXISTS registered_ip TEXT,
+        ADD COLUMN IF NOT EXISTS ip_registered_at TIMESTAMPTZ,
+        ADD COLUMN IF NOT EXISTS ip_reset_at TIMESTAMPTZ
     `);
     await pool.query(`
       CREATE UNIQUE INDEX IF NOT EXISTS idx_users_student_code_unique
@@ -225,6 +228,7 @@ export class TeacherManagedStudentsService {
   }
 
   private static mapStudentRow(row: Record<string, unknown>) {
+    const registeredIp = (row.registered_ip as string | null) || (row.device_ip as string | null) || null;
     return {
       id: row.id,
       student_code: row.student_code,
@@ -236,6 +240,11 @@ export class TeacherManagedStudentsService {
       account_status: row.account_status,
       must_change_password: row.must_change_password,
       created_at: row.created_at,
+      registered_ip: registeredIp,
+      device_ip: registeredIp,
+      ip_registered_at: row.ip_registered_at ?? null,
+      ip_reset_at: row.ip_reset_at ?? null,
+      device_bound: Boolean(registeredIp),
       grade: row.grade_id
         ? {
             id: row.grade_id,
@@ -419,6 +428,7 @@ export class TeacherManagedStudentsService {
       `SELECT
          u.id, u.student_code, u.name, u.phone, u.parent_phone, u.email, u.avatar,
          u.account_status, u.must_change_password, u.created_at,
+         u.device_ip, u.registered_ip, u.ip_registered_at, u.ip_reset_at,
          g.id AS grade_id, g.name AS grade_name, g.slug AS grade_slug,
          sg.id AS group_id, sg.name AS group_name
        FROM users u
@@ -457,6 +467,7 @@ export class TeacherManagedStudentsService {
       `SELECT
          u.id, u.student_code, u.name, u.phone, u.parent_phone, u.email, u.avatar,
          u.account_status, u.must_change_password, u.created_at,
+         u.device_ip, u.registered_ip, u.ip_registered_at, u.ip_reset_at,
          g.id AS grade_id, g.name AS grade_name, g.slug AS grade_slug,
          sg.id AS group_id, sg.name AS group_name
        FROM users u

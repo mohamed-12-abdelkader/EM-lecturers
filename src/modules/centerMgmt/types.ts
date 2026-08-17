@@ -59,6 +59,7 @@ export interface TcStudentListItem extends TcStudentRow {
   enrollment_status?: EnrollmentStatus;
   qr_token?: string | null;
   qr_image_base64?: string | null;
+  exams?: TcStudentExamGrade[];
 }
 
 export interface TcStudentGroupRow {
@@ -159,6 +160,73 @@ export interface TcAttendanceListItem extends TcAttendanceRow {
   student_name?: string;
   student_code?: string;
   group_name?: string;
+}
+
+export interface TcGroupExamRow {
+  id: number;
+  teacher_id: number;
+  group_id: number;
+  title: string;
+  total_grade: string;
+  exam_date: string | null;
+  notes: string | null;
+  created_at: Date;
+  updated_at: Date;
+  deleted_at: Date | null;
+}
+
+export interface TcGroupExamListItem extends TcGroupExamRow {
+  group_name?: string;
+  students_count?: number;
+  graded_count?: number;
+  absent_count?: number;
+  average_score?: number | null;
+}
+
+export interface TcGroupExamGradeRow {
+  id: number;
+  teacher_id: number;
+  exam_id: number;
+  student_id: number;
+  score: string | null;
+  is_absent: boolean;
+  notes: string | null;
+  recorded_by: number | null;
+  created_at: Date;
+  updated_at: Date;
+}
+
+export interface TcGroupExamGradeInput {
+  student_id: number;
+  score?: number | null;
+  is_absent?: boolean;
+  notes?: string | null;
+}
+
+export interface TcExamRosterStudent {
+  student_id: number;
+  full_name: string;
+  student_code: string;
+  member_no: number | null;
+  score: number | null;
+  is_absent: boolean;
+  notes: string | null;
+  percentage: number | null;
+  recorded: boolean;
+}
+
+export interface TcStudentExamGrade {
+  exam_id: number;
+  title: string;
+  group_id: number;
+  group_name: string;
+  total_grade: number;
+  exam_date: string | null;
+  score: number | null;
+  is_absent: boolean;
+  notes: string | null;
+  percentage: number | null;
+  recorded_at: Date;
 }
 
 export interface StudentAttendanceReport {

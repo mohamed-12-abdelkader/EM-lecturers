@@ -903,13 +903,30 @@ export class ExamFlowService {
   ) {
     let typeFilter = parseLectureExamTypeFilter(filters?.type);
 
+    const teacherOwnsCourseSql = `(
+      c.teacher_id = $1
+      OR EXISTS (SELECT 1 FROM course_managers cm WHERE cm.course_id = c.id AND cm.user_id = $1)
+      OR EXISTS (SELECT 1 FROM tenants t WHERE t.id = c.tenant_id AND t.owner_user_id = $1 AND t.platform_type = $academy$)
+    )`;
+
+    // امتحانات/واجبات المحاضرة + واجبات الكورس المنفصلة (assignment_mode = course_based)
+    const includeCourseBasedAssignmentsSql = `(
+      e.lecture_id IS NOT NULL
+      OR (
+        e.lecture_id IS NULL
+        AND COALESCE(c.assignment_mode, 'lecture_based') = 'course_based'
+      )
+    )`;
+
     if (typeFilter === 'assignment') {
       const assignmentCountRes = await pool.query<{ c: number }>(
         `SELECT COUNT(*)::int AS c
          FROM exams e
-         INNER JOIN lectures l ON e.lecture_id = l.id
-         INNER JOIN courses c ON l.course_id = c.id
-         WHERE (c.teacher_id = $1 OR EXISTS (SELECT 1 FROM course_managers cm WHERE cm.course_id = c.id AND cm.user_id = $1) OR EXISTS (SELECT 1 FROM tenants t WHERE t.id = c.tenant_id AND t.owner_user_id = $1 AND t.platform_type = $academy$)) AND e.type = 'assignment'`,
+         LEFT JOIN lectures l ON e.lecture_id = l.id
+         INNER JOIN courses c ON c.id = COALESCE(e.course_id, l.course_id)
+         WHERE ${teacherOwnsCourseSql}
+           AND ${includeCourseBasedAssignmentsSql}
+           AND e.type = 'assignment'`,
         [teacherId],
       );
       if ((assignmentCountRes.rows[0]?.c ?? 0) === 0) {
@@ -925,14 +942,17 @@ export class ExamFlowService {
         l.title AS lecture_title,
         c.title AS course_title,
         c.id AS course_id,
+        COALESCE(c.assignment_mode, 'lecture_based') AS assignment_mode,
+        CASE WHEN e.lecture_id IS NULL THEN 'course' ELSE 'lecture' END AS scope,
         COUNT(DISTINCT eq.id)::int AS questions_count,
         COUNT(DISTINCT es.id)::int AS submissions_count
       FROM exams e
-      INNER JOIN lectures l ON e.lecture_id = l.id
-      INNER JOIN courses c ON l.course_id = c.id
+      LEFT JOIN lectures l ON e.lecture_id = l.id
+      INNER JOIN courses c ON c.id = COALESCE(e.course_id, l.course_id)
       LEFT JOIN exam_questions eq ON eq.exam_id = e.id
       LEFT JOIN exam_submissions es ON es.exam_id = e.id
       WHERE c.teacher_id = $1
+        AND ${includeCourseBasedAssignmentsSql}
     `;
 
     if (typeFilter && typeFilter !== 'all') {
@@ -950,7 +970,7 @@ export class ExamFlowService {
     }
 
     query += `
-      GROUP BY e.id, l.title, c.title, c.id
+      GROUP BY e.id, l.title, c.title, c.id, c.assignment_mode
       ORDER BY e.created_at DESC
     `;
 
@@ -959,6 +979,8 @@ export class ExamFlowService {
     return result.rows.map((row) => ({
       ...this.mapExamRow(row),
       type: row.type,
+      scope: row.scope,
+      assignmentMode: row.assignment_mode,
       lectureTitle: row.lecture_title,
       lectureName: row.lecture_title,
       courseTitle: row.course_title,

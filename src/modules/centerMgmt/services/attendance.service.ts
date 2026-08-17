@@ -1,5 +1,6 @@
 import { HttpError } from '../../../utils';
 import { ActivityLogsRepository } from '../repositories/activityLogs.repository';
+import { extractQrToken } from '../utils/studentQr';
 import { AttendanceRepository } from '../repositories/attendance.repository';
 import { GroupsRepository } from '../repositories/groups.repository';
 import { StudentsRepository } from '../repositories/students.repository';
@@ -11,16 +12,7 @@ function todayIso(): string {
 }
 
 function parseQrToken(input: { qr_token?: string; qr_payload?: string }): string | null {
-  if (input.qr_token) return input.qr_token;
-  if (!input.qr_payload) return null;
-  try {
-    const parsed = JSON.parse(input.qr_payload) as { qr_token?: string };
-    return parsed.qr_token ?? null;
-  } catch {
-    const uuidLike =
-      /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-    return uuidLike.test(input.qr_payload) ? input.qr_payload : null;
-  }
+  return extractQrToken(input.qr_token) || extractQrToken(input.qr_payload);
 }
 
 export class AttendanceService {

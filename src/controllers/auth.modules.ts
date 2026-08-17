@@ -26,6 +26,9 @@ export const RegisterStudent = z
     student_level_id: z.number().optional(),
     course_group_id: z.coerce.number().int().positive().optional(),
     device_ip: z.string().optional(),
+    deviceIp: z.string().optional(),
+    registered_ip: z.string().optional(),
+    ip: z.string().optional(),
     course_category: z.enum(['برمجة', 'لغات', 'إدارة وتسويق', 'بيزنس', 'مهارات متنوعة']).optional(),
     /** عند استدعاء API من host افتراضي (مثل 127.0.0.1) يحدد منصة المدرّس؛ نفس الرقم على منصة أخرى = حساب جديد (tenant_id مختلف). */
     subdomain: tenantSlugField,
@@ -104,6 +107,9 @@ export const Login = z
       .optional(),
     password: z.string().optional(),
     device_ip: z.string().optional(),
+    deviceIp: z.string().optional(),
+    registered_ip: z.string().optional(),
+    ip: z.string().optional(),
     /** إبقاء الجلسة سنة كاملة (Refresh Cookie). الافتراضي: 7 أيام */
     remember_me: booleanish,
     /** للطالب عند تسجيل الدخول من host افتراضي (localhost / ngrok). المدرس لا يحتاجه — يُكتشف تلقائياً. */

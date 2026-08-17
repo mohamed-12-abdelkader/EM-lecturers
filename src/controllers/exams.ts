@@ -434,7 +434,7 @@ router.post(
   }),
 );
 
-// GET /api/exams/teacher/lecture-exams - كل امتحانات المحاضرات للمدرس
+// GET /api/exams/teacher/lecture-exams - امتحانات/واجبات المحاضرات + الواجبات المنفصلة (course_based)
 router.get(
   '/teacher/lecture-exams',
   authMiddleware(['teacher', 'admin']),
@@ -839,22 +839,26 @@ function parseTeacherLibraryBody(body: Record<string, unknown>) {
   const questionIds = Array.isArray(body.questionIds)
     ? body.questionIds.map((id) => Number(id)).filter((n) => Number.isInteger(n) && n > 0)
     : [];
+  const gradeId = body.gradeId != null ? Number(body.gradeId) : null;
   const lessonId = body.lessonId != null ? Number(body.lessonId) : null;
   const passageId = body.passageId != null ? Number(body.passageId) : null;
-  return { questionIds, lessonId, passageId };
+  return { questionIds, gradeId, lessonId, passageId };
 }
 
 async function resolveTeacherLibraryQuestionIds(
   teacherId: number,
   body: Record<string, unknown>,
 ): Promise<number[]> {
-  const { questionIds, lessonId, passageId } = parseTeacherLibraryBody(body);
+  const { questionIds, gradeId, lessonId, passageId } = parseTeacherLibraryBody(body);
 
   if (lessonId != null && Number.isInteger(lessonId) && lessonId > 0) {
     return TeacherLibraryExamQuestionsService.fetchLessonQuestionIds(teacherId, lessonId);
   }
   if (passageId != null && Number.isInteger(passageId) && passageId > 0) {
     return TeacherLibraryExamQuestionsService.fetchPassageQuestionIds(teacherId, passageId);
+  }
+  if (gradeId != null && Number.isInteger(gradeId) && gradeId > 0) {
+    return TeacherLibraryExamQuestionsService.fetchGradeQuestionIds(teacherId, gradeId);
   }
   return questionIds;
 }
@@ -873,7 +877,7 @@ router.post(
     if (!questionIds.length) {
       return res.status(400).json({
         message:
-          'Provide questionIds (non-empty array), or lessonId, or passageId from your question library',
+          'Provide questionIds (non-empty array), or gradeId, or lessonId, or passageId from your question library',
       });
     }
     const { missing } = await TeacherLibraryExamQuestionsService.validateQuestionIds(
@@ -918,7 +922,7 @@ router.post(
     if (!questionIds.length) {
       return res.status(400).json({
         message:
-          'Provide questionIds (non-empty array), or lessonId, or passageId from your question library',
+          'Provide questionIds (non-empty array), or gradeId, or lessonId, or passageId from your question library',
       });
     }
     const { missing } = await TeacherLibraryExamQuestionsService.validateQuestionIds(
@@ -961,7 +965,7 @@ router.post(
 );
 
 // POST /api/exams/:examId/questions/from-teacher-library — إضافة من مكتبة أسئلة المدرس
-// Body: { questionIds?: number[], lessonId?: number, passageId?: number, type?: "course-exam" }
+// Body: { questionIds?: number[], gradeId?: number, lessonId?: number, passageId?: number, type?: "course-exam" }
 router.post(
   '/:examId/questions/from-teacher-library',
   authMiddleware(COURSE_CONTENT_ROLES),
@@ -976,7 +980,7 @@ router.post(
     if (!questionIds.length) {
       return res.status(400).json({
         message:
-          'Provide questionIds (non-empty array), or lessonId, or passageId from your question library',
+          'Provide questionIds (non-empty array), or gradeId, or lessonId, or passageId from your question library',
       });
     }
 

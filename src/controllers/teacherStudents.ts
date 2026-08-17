@@ -7,6 +7,7 @@ import {
   TeacherManagedStudentsService,
   type ManagedStudentAccountStatus,
 } from '../services/teacherManagedStudents';
+import { StudentDeviceRestrictionService } from '../services/studentDeviceRestriction';
 
 export const router = Router();
 
@@ -219,6 +220,52 @@ router.patch(
       { group_id: groupId },
     );
     res.json({ success: true, data: student });
+  }),
+);
+
+/** إعادة تعيين جهاز الطالب (IP) — يؤثر على هذا الطالب فقط */
+router.post(
+  '/:studentId/reset-device',
+  asyncWrapper(async (req, res) => {
+    const studentId = Number(req.params.studentId);
+    if (!Number.isInteger(studentId) || studentId <= 0) {
+      return res.status(400).json({ success: false, message: 'معرف الطالب غير صالح' });
+    }
+
+    const data = await StudentDeviceRestrictionService.resetStudentIp({
+      studentId,
+      tenantId: resolveTenantId(req),
+      performedBy: req.user!.id,
+    });
+
+    res.json({
+      success: true,
+      message: 'تم إعادة تعيين جهاز الطالب. يمكنه تسجيل الدخول من الجهاز الجديد.',
+      data,
+    });
+  }),
+);
+
+/** سجل عمليات تغيير IP لهذا الطالب */
+router.get(
+  '/:studentId/device-logs',
+  asyncWrapper(async (req, res) => {
+    const studentId = Number(req.params.studentId);
+    if (!Number.isInteger(studentId) || studentId <= 0) {
+      return res.status(400).json({ success: false, message: 'معرف الطالب غير صالح' });
+    }
+
+    await StudentDeviceRestrictionService.assertTeacherCanManageStudent(
+      req.user!.id,
+      resolveTenantId(req),
+      studentId,
+    );
+
+    const logs = await StudentDeviceRestrictionService.listLogs(
+      studentId,
+      resolveTenantId(req),
+    );
+    res.json({ success: true, data: logs });
   }),
 );
 

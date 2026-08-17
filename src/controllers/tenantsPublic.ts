@@ -10,6 +10,7 @@ import {
 } from '../services/publicTeacherPlatform';
 import { TeacherManagedStudentsService } from '../services/teacherManagedStudents';
 import { TeacherVideoPlaybackService } from '../services/teacherVideoPlayback';
+import { StudentDeviceRestrictionService } from '../services/studentDeviceRestriction';
 import { CourseGroupAccessService } from '../services/courseGroupAccess';
 import { SeoMetadataService } from '../services/seo/metadata';
 import { PublicPagesService } from '../services/seo/publicPages';
@@ -366,6 +367,7 @@ router.get(
     }
 
     const data = await TeacherManagedStudentsService.getRegistrationSettings(tenant.id);
+    const deviceSettings = await StudentDeviceRestrictionService.getSettings(tenant.id);
     const teacherId = await CourseGroupAccessService.resolveTenantOwnerTeacherId(tenant.id);
     const groupSettings = teacherId
       ? await CourseGroupAccessService.getTeacherSettings(teacherId)
@@ -383,6 +385,8 @@ router.get(
         requires_course_group_selection:
           groupSettings.course_group_access_enabled &&
           data.registration_mode === 'self_registration',
+        student_device_limit: deviceSettings.student_device_limit,
+        single_device: deviceSettings.single_device,
         message:
           data.registration_mode === 'teacher_registration'
             ? 'يتم إنشاء الحسابات بواسطة المدرس. سجّل الدخول برقم الطالب و subdomain المنصة فقط.'
@@ -453,6 +457,25 @@ router.get(
     }
 
     const data = await TeacherVideoPlaybackService.getSettings(tenant.id);
+    res.json({ success: true, data });
+  }),
+);
+
+/** إعداد تقييد أجهزة الطلاب — عام بدون تسجيل دخول */
+router.get(
+  '/:subdomain/device-restriction-settings',
+  asyncWrapper(async (req, res) => {
+    const subdomain = String(req.params.subdomain || '')
+      .trim()
+      .toLowerCase();
+    if (!subdomain) return res.status(400).json({ message: 'subdomain required' });
+
+    const tenant = await TenantService.getBySubdomain(subdomain);
+    if (!tenant || !tenant.is_active) {
+      return res.status(404).json({ success: false, code: 'TENANT_NOT_FOUND' });
+    }
+
+    const data = await StudentDeviceRestrictionService.getSettings(tenant.id);
     res.json({ success: true, data });
   }),
 );

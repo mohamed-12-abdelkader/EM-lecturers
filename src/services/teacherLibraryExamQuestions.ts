@@ -79,6 +79,19 @@ export class TeacherLibraryExamQuestionsService {
     return { missing: unique.filter((id) => !found.has(id)) };
   }
 
+  static async fetchGradeQuestionIds(teacherId: number, gradeId: number): Promise<number[]> {
+    const res = await pool.query<{ id: number }>(
+      `SELECT tq.id
+       FROM teacher_questions tq
+       JOIN teacher_question_lessons l ON l.id = tq.lesson_id
+       JOIN teacher_question_grades g ON g.id = l.grade_id
+       WHERE g.teacher_id = $1 AND g.id = $2
+       ORDER BY tq.id`,
+      [teacherId, gradeId],
+    );
+    return res.rows.map((r) => r.id);
+  }
+
   static async fetchLessonQuestionIds(teacherId: number, lessonId: number): Promise<number[]> {
     const res = await pool.query<{ id: number }>(
       `SELECT tq.id

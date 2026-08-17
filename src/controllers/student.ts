@@ -8,6 +8,13 @@ import { StudentChangePassword } from './auth.modules';
 import { StudentPointsService } from '../services/studentPoints';
 import { StudentDailyReportService } from '../services/studentDailyReport';
 import { checkAnyPermission } from '../middleware/permissions';
+import {
+  clearAvatarForStudent,
+  pickUploadedAvatar,
+  publicAvatarUrl,
+  saveAvatarForUser,
+  uploadStudentAvatarMiddleware,
+} from '../services/userAvatarUpload';
 
 export const router = Router();
 
@@ -46,10 +53,50 @@ router.get(
       phone: user.phone,
       email: user.email,
       parent_phone: user.parent_phone,
-      avatar: user.avatar,
+      avatar: publicAvatarUrl(user.avatar),
       role: user.role,
       created_at: user.created_at,
       grades: gradesRes.rows,
+    });
+  }),
+);
+
+const setStudentAvatar = asyncWrapper(async (req, res) => {
+  const file = pickUploadedAvatar(req);
+  if (!file) {
+    return res.status(400).json({
+      success: false,
+      message: 'أرسل الصورة في الحقل avatar (JPG / PNG / WEBP / GIF، حد أقصى 5MB)',
+      code: 'AVATAR_REQUIRED',
+    });
+  }
+
+  const data = await saveAvatarForUser(req.user!.id, file);
+  if (!data) {
+    return res.status(404).json({ success: false, message: 'الطالب غير موجود' });
+  }
+
+  res.json({
+    success: true,
+    message: 'تم تحديث صورة البروفايل بنجاح',
+    data,
+  });
+});
+
+router.post('/me/avatar', authMiddleware(['student']), uploadStudentAvatarMiddleware, setStudentAvatar);
+router.put('/me/avatar', authMiddleware(['student']), uploadStudentAvatarMiddleware, setStudentAvatar);
+router.delete(
+  '/me/avatar',
+  authMiddleware(['student']),
+  asyncWrapper(async (req, res) => {
+    const data = await clearAvatarForStudent(req.user!.id);
+    if (!data) {
+      return res.status(404).json({ success: false, message: 'الطالب غير موجود' });
+    }
+    res.json({
+      success: true,
+      message: 'تم حذف صورة البروفايل',
+      data,
     });
   }),
 );

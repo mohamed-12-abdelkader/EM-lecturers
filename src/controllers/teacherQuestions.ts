@@ -15,12 +15,31 @@ function parseNullableNumber(value: unknown, fieldName: string): number | null {
   return n;
 }
 
+async function verifyGradeOwnership(gradeId: number, teacherId: number): Promise<boolean> {
+  const result = await pool.query(
+    `SELECT id FROM teacher_question_grades WHERE id = $1 AND teacher_id = $2`,
+    [gradeId, teacherId],
+  );
+  return Boolean(result.rowCount);
+}
+
 async function verifyLessonOwnership(lessonId: number, teacherId: number): Promise<boolean> {
   const result = await pool.query(
     `SELECT id FROM teacher_question_lessons WHERE id = $1 AND teacher_id = $2`,
     [lessonId, teacherId],
   );
   return Boolean(result.rowCount);
+}
+
+async function resolvePlatformGrade(
+  platformGradeId: number | null,
+): Promise<{ id: number; name: string } | null> {
+  if (platformGradeId == null) return null;
+  const result = await pool.query<{ id: number; name: string }>(
+    `SELECT id, name FROM grades WHERE id = $1`,
+    [platformGradeId],
+  );
+  return result.rows[0] ?? null;
 }
 
 async function verifyPassageOwnership(
@@ -37,7 +56,164 @@ async function verifyPassageOwnership(
   return result.rows[0] ?? null;
 }
 
-// ========== الدروس (Lessons) — مباشرة داخل مكتبة المدرّس ==========
+// ========== الصفوف الدراسية (Grades) — أعلى مستوى في مكتبة المدرّس ==========
+
+router.post(
+  '/grade',
+  authMiddleware(['teacher']),
+  asyncWrapper(async (req, res) => {
+    const teacher_id = req.user!.id;
+    const platformGradeId = parseNullableNumber(req.body.platform_grade_id, 'platform_grade_id');
+    const platformGrade = await resolvePlatformGrade(platformGradeId);
+    if (platformGradeId != null && !platformGrade) {
+      throw new HttpError(404, 'الصف الدراسي غير موجود');
+    }
+
+    const title = String(req.body.title ?? platformGrade?.name ?? '').trim();
+    if (!title) throw new HttpError(400, 'العنوان مطلوب');
+
+    try {
+      const result = await pool.query(
+        `INSERT INTO teacher_question_grades (teacher_id, title, platform_grade_id)
+         VALUES ($1, $2, $3)
+         RETURNING *`,
+        [teacher_id, title, platformGradeId],
+      );
+      await TeacherActivityLogService.log({
+        teacher_id,
+        action: 'add_grade',
+        entity_type: 'grade',
+        entity_id: result.rows[0].id,
+        description: `أضاف صف دراسي: ${title}`,
+      });
+      res.status(201).json({
+        grade: {
+          ...result.rows[0],
+          platform_grade_name: platformGrade?.name ?? null,
+        },
+      });
+    } catch (err: any) {
+      if (err?.code === '23505') {
+        throw new HttpError(400, 'يوجد صف بنفس الاسم أو مرتبط بنفس الصف الدراسي');
+      }
+      throw err;
+    }
+  }),
+);
+
+router.put(
+  '/grade/:id',
+  authMiddleware(['teacher']),
+  asyncWrapper(async (req, res) => {
+    const teacher_id = req.user!.id;
+    const gradeIdNum = Number(req.params.id);
+    if (!Number.isInteger(gradeIdNum) || gradeIdNum <= 0) {
+      throw new HttpError(400, 'id غير صحيح');
+    }
+
+    const existing = await pool.query(
+      `SELECT * FROM teacher_question_grades WHERE id = $1 AND teacher_id = $2`,
+      [gradeIdNum, teacher_id],
+    );
+    if (!existing.rowCount) throw new HttpError(404, 'الصف الدراسي غير موجود');
+
+    const current = existing.rows[0];
+    const hasTitle = req.body.title !== undefined;
+    const hasPlatform = req.body.platform_grade_id !== undefined;
+    if (!hasTitle && !hasPlatform) throw new HttpError(400, 'لا توجد بيانات للتعديل');
+
+    const platformGradeId = hasPlatform
+      ? parseNullableNumber(req.body.platform_grade_id, 'platform_grade_id')
+      : current.platform_grade_id;
+    const platformGrade = await resolvePlatformGrade(platformGradeId);
+    if (platformGradeId != null && !platformGrade) {
+      throw new HttpError(404, 'الصف الدراسي غير موجود');
+    }
+
+    const title = hasTitle
+      ? String(req.body.title ?? '').trim()
+      : String(current.title ?? '').trim();
+    if (!title) throw new HttpError(400, 'العنوان مطلوب');
+
+    try {
+      const result = await pool.query(
+        `UPDATE teacher_question_grades
+         SET title = $1, platform_grade_id = $2
+         WHERE id = $3 AND teacher_id = $4
+         RETURNING *`,
+        [title, platformGradeId, gradeIdNum, teacher_id],
+      );
+      await TeacherActivityLogService.log({
+        teacher_id,
+        action: 'edit_grade',
+        entity_type: 'grade',
+        entity_id: gradeIdNum,
+        description: `تعديل صف دراسي: ${title}`,
+      });
+      res.json({
+        grade: {
+          ...result.rows[0],
+          platform_grade_name: platformGrade?.name ?? null,
+        },
+      });
+    } catch (err: any) {
+      if (err?.code === '23505') {
+        throw new HttpError(400, 'يوجد صف بنفس الاسم أو مرتبط بنفس الصف الدراسي');
+      }
+      throw err;
+    }
+  }),
+);
+
+router.delete(
+  '/grade/:id',
+  authMiddleware(['teacher']),
+  asyncWrapper(async (req, res) => {
+    const teacher_id = req.user!.id;
+    const gradeIdNum = Number(req.params.id);
+    if (!Number.isInteger(gradeIdNum) || gradeIdNum <= 0) {
+      throw new HttpError(400, 'id غير صحيح');
+    }
+    const result = await pool.query(
+      'DELETE FROM teacher_question_grades WHERE id = $1 AND teacher_id = $2 RETURNING id',
+      [gradeIdNum, teacher_id],
+    );
+    if (!result.rowCount) throw new HttpError(404, 'الصف الدراسي غير موجود');
+    await TeacherActivityLogService.log({
+      teacher_id,
+      action: 'delete_grade',
+      entity_type: 'grade',
+      entity_id: gradeIdNum,
+      description: `حذف صف دراسي: ${gradeIdNum}`,
+    });
+    res.json({ success: true });
+  }),
+);
+
+router.get(
+  '/grades',
+  authMiddleware(['teacher']),
+  asyncWrapper(async (req, res) => {
+    const teacher_id = req.user!.id;
+    const result = await pool.query(
+      `SELECT g.*,
+              pg.name AS platform_grade_name,
+              COUNT(DISTINCT l.id)::int AS lessons_count,
+              COUNT(q.id)::int AS questions_count
+       FROM teacher_question_grades g
+       LEFT JOIN grades pg ON pg.id = g.platform_grade_id
+       LEFT JOIN teacher_question_lessons l ON l.grade_id = g.id
+       LEFT JOIN teacher_questions q ON q.lesson_id = l.id
+       WHERE g.teacher_id = $1
+       GROUP BY g.id, pg.name
+       ORDER BY g.id`,
+      [teacher_id],
+    );
+    res.json({ grades: result.rows });
+  }),
+);
+
+// ========== الدروس (Lessons) — داخل صف دراسي ==========
 
 router.post(
   '/lesson',
@@ -45,10 +221,17 @@ router.post(
   asyncWrapper(async (req, res) => {
     const { title } = req.body;
     const teacher_id = req.user!.id;
+    const gradeIdNum = parseNullableNumber(req.body.grade_id, 'grade_id');
+    if (!gradeIdNum) throw new HttpError(400, 'grade_id مطلوب');
     if (!title?.trim()) throw new HttpError(400, 'العنوان مطلوب');
+    if (!(await verifyGradeOwnership(gradeIdNum, teacher_id))) {
+      throw new HttpError(404, 'الصف الدراسي غير موجود');
+    }
     const result = await pool.query(
-      'INSERT INTO teacher_question_lessons (teacher_id, title) VALUES ($1, $2) RETURNING *',
-      [teacher_id, title.trim()],
+      `INSERT INTO teacher_question_lessons (teacher_id, grade_id, title)
+       VALUES ($1, $2, $3)
+       RETURNING *`,
+      [teacher_id, gradeIdNum, title.trim()],
     );
     await TeacherActivityLogService.log({
       teacher_id,
@@ -65,15 +248,37 @@ router.put(
   '/lesson/:id',
   authMiddleware(['teacher']),
   asyncWrapper(async (req, res) => {
-    const { title } = req.body;
     const teacher_id = req.user!.id;
     const lessonIdNum = Number(req.params.id);
-    if (!title?.trim()) throw new HttpError(400, 'العنوان مطلوب');
-    const result = await pool.query(
-      'UPDATE teacher_question_lessons SET title = $1 WHERE id = $2 AND teacher_id = $3 RETURNING *',
-      [title.trim(), lessonIdNum, teacher_id],
+    const existing = await pool.query(
+      `SELECT * FROM teacher_question_lessons WHERE id = $1 AND teacher_id = $2`,
+      [lessonIdNum, teacher_id],
     );
-    if (!result.rowCount) throw new HttpError(404, 'الدرس غير موجود');
+    if (!existing.rowCount) throw new HttpError(404, 'الدرس غير موجود');
+
+    const current = existing.rows[0];
+    const hasTitle = req.body.title !== undefined;
+    const hasGrade = req.body.grade_id !== undefined;
+    if (!hasTitle && !hasGrade) throw new HttpError(400, 'لا توجد بيانات للتعديل');
+
+    const title = hasTitle ? String(req.body.title ?? '').trim() : String(current.title ?? '').trim();
+    if (!title) throw new HttpError(400, 'العنوان مطلوب');
+
+    const gradeIdNum = hasGrade
+      ? parseNullableNumber(req.body.grade_id, 'grade_id')
+      : Number(current.grade_id);
+    if (!gradeIdNum) throw new HttpError(400, 'grade_id مطلوب');
+    if (hasGrade && !(await verifyGradeOwnership(gradeIdNum, teacher_id))) {
+      throw new HttpError(404, 'الصف الدراسي غير موجود');
+    }
+
+    const result = await pool.query(
+      `UPDATE teacher_question_lessons
+       SET title = $1, grade_id = $2
+       WHERE id = $3 AND teacher_id = $4
+       RETURNING *`,
+      [title, gradeIdNum, lessonIdNum, teacher_id],
+    );
     await TeacherActivityLogService.log({
       teacher_id,
       action: 'edit_lesson',
@@ -112,15 +317,24 @@ router.get(
   authMiddleware(['teacher']),
   asyncWrapper(async (req, res) => {
     const teacher_id = req.user!.id;
+    const rawGradeId = Array.isArray(req.query.grade_id) ? req.query.grade_id[0] : req.query.grade_id;
+    const gradeIdFilter = parseNullableNumber(rawGradeId, 'grade_id');
+    if (gradeIdFilter && !(await verifyGradeOwnership(gradeIdFilter, teacher_id))) {
+      throw new HttpError(404, 'الصف الدراسي غير موجود');
+    }
+
     const result = await pool.query(
       `SELECT l.*,
+              g.title AS grade_title,
               COUNT(q.id)::int AS questions_count
        FROM teacher_question_lessons l
+       JOIN teacher_question_grades g ON g.id = l.grade_id
        LEFT JOIN teacher_questions q ON q.lesson_id = l.id
        WHERE l.teacher_id = $1
-       GROUP BY l.id
+         AND ($2::int IS NULL OR l.grade_id = $2)
+       GROUP BY l.id, g.title
        ORDER BY l.id`,
-      [teacher_id],
+      [teacher_id, gradeIdFilter],
     );
     res.json({ lessons: result.rows });
   }),
@@ -529,6 +743,17 @@ router.get(
   asyncWrapper(async (req, res) => {
     const teacher_id = req.user!.id;
 
+    const grades = (
+      await pool.query(
+        `SELECT g.*, pg.name AS platform_grade_name
+         FROM teacher_question_grades g
+         LEFT JOIN grades pg ON pg.id = g.platform_grade_id
+         WHERE g.teacher_id = $1
+         ORDER BY g.id`,
+        [teacher_id],
+      )
+    ).rows;
+
     const lessons = (
       await pool.query(
         'SELECT * FROM teacher_question_lessons WHERE teacher_id = $1 ORDER BY id',
@@ -556,7 +781,10 @@ router.get(
       : [];
 
     const lessonsMap = Object.fromEntries(
-      lessons.map((l) => [l.id, { ...l, questions: [] as typeof questions, passages: [] as typeof passages }]),
+      lessons.map((l) => [
+        l.id,
+        { ...l, questions: [] as typeof questions, passages: [] as typeof passages },
+      ]),
     );
 
     for (const q of questions) {
@@ -572,6 +800,14 @@ router.get(
       }
     }
 
-    res.json({ lessons: Object.values(lessonsMap) });
+    const nestedLessons = Object.values(lessonsMap);
+    const gradesMap = Object.fromEntries(
+      grades.map((g) => [g.id, { ...g, lessons: [] as typeof nestedLessons }]),
+    );
+    for (const lesson of nestedLessons) {
+      gradesMap[lesson.grade_id]?.lessons.push(lesson);
+    }
+
+    res.json({ grades: Object.values(gradesMap) });
   }),
 );

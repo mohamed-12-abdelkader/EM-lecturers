@@ -4,27 +4,36 @@ import { asyncWrapper, HttpError } from '../../../utils';
 import { parseNumberInput } from '../../../utils/requestParsers';
 import { getTeacherId, resolveTeacherId } from '../middleware/access';
 import { AttendanceService, DashboardService } from '../services/attendance.service';
+import { ExamsService } from '../services/exams.service';
 import { GroupsService, StudentsService } from '../services/groups.service';
 import { PaymentsService, SubscriptionsService } from '../services/subscriptions.service';
 import {
   BulkAttendanceSchema,
   BulkUpdateSubscriptionsSchema,
+  CreateGroupExamSchema,
   CreateGroupSchema,
   CreatePaymentSchema,
   CreateStudentSchema,
   ManualAttendanceSchema,
   OpenBillingMonthSchema,
   ScanAttendanceSchema,
+  UpdateExamGradeSchema,
+  UpdateGroupExamSchema,
   UpdateGroupSchema,
   UpdateStudentSchema,
   UpdateSubscriptionSchema,
+  UpsertExamGradesSchema,
 } from '../validators';
 
 const CENTER_ROLES = ['teacher', 'admin'] as const;
 
 function handleServiceError(res: Response, error: unknown) {
   if (error instanceof HttpError) {
-    return res.status(error.status).json({ success: false, message: error.message });
+    return res.status(error.status).json({
+      success: false,
+      message: error.message,
+      ...(error.details ? { details: error.details } : {}),
+    });
   }
   throw error;
 }
@@ -206,6 +215,205 @@ centerRouter.post(
   }),
 );
 
+// ========== Group exams (امتحانات السنتر ورصد الدرجات) ==========
+centerRouter.get(
+  '/groups/:groupId/exams',
+  asyncWrapper(async (req: Request, res: Response) => {
+    const groupId = Number(req.params.groupId);
+    if (Number.isNaN(groupId)) {
+      return res.status(400).json({ success: false, message: 'معرّف المجموعة غير صالح' });
+    }
+    try {
+      const exams = await ExamsService.list(getTeacherId(req), groupId);
+      res.json({ success: true, data: exams });
+    } catch (error) {
+      handleServiceError(res, error);
+    }
+  }),
+);
+
+centerRouter.post(
+  '/groups/:groupId/exams',
+  asyncWrapper(async (req: Request, res: Response) => {
+    const groupId = Number(req.params.groupId);
+    if (Number.isNaN(groupId)) {
+      return res.status(400).json({ success: false, message: 'معرّف المجموعة غير صالح' });
+    }
+    const parsed = CreateGroupExamSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({
+        success: false,
+        message: 'بيانات غير صالحة',
+        errors: parsed.error.flatten(),
+      });
+    }
+    try {
+      const data = await ExamsService.create(
+        getTeacherId(req),
+        actorId(req),
+        groupId,
+        parsed.data,
+      );
+      res.status(201).json({ success: true, message: 'تم إضافة الامتحان', data });
+    } catch (error) {
+      handleServiceError(res, error);
+    }
+  }),
+);
+
+centerRouter.get(
+  '/groups/:groupId/exams/:examId',
+  asyncWrapper(async (req: Request, res: Response) => {
+    const groupId = Number(req.params.groupId);
+    const examId = Number(req.params.examId);
+    if (Number.isNaN(groupId) || Number.isNaN(examId)) {
+      return res.status(400).json({ success: false, message: 'معرّف غير صالح' });
+    }
+    try {
+      const data = await ExamsService.get(getTeacherId(req), groupId, examId);
+      res.json({ success: true, data });
+    } catch (error) {
+      handleServiceError(res, error);
+    }
+  }),
+);
+
+centerRouter.patch(
+  '/groups/:groupId/exams/:examId',
+  asyncWrapper(async (req: Request, res: Response) => {
+    const groupId = Number(req.params.groupId);
+    const examId = Number(req.params.examId);
+    if (Number.isNaN(groupId) || Number.isNaN(examId)) {
+      return res.status(400).json({ success: false, message: 'معرّف غير صالح' });
+    }
+    const parsed = UpdateGroupExamSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({
+        success: false,
+        message: 'بيانات غير صالحة',
+        errors: parsed.error.flatten(),
+      });
+    }
+    try {
+      const data = await ExamsService.update(
+        getTeacherId(req),
+        actorId(req),
+        groupId,
+        examId,
+        parsed.data,
+      );
+      res.json({ success: true, message: 'تم تحديث الامتحان', data });
+    } catch (error) {
+      handleServiceError(res, error);
+    }
+  }),
+);
+
+centerRouter.delete(
+  '/groups/:groupId/exams/:examId',
+  asyncWrapper(async (req: Request, res: Response) => {
+    const groupId = Number(req.params.groupId);
+    const examId = Number(req.params.examId);
+    if (Number.isNaN(groupId) || Number.isNaN(examId)) {
+      return res.status(400).json({ success: false, message: 'معرّف غير صالح' });
+    }
+    try {
+      await ExamsService.remove(getTeacherId(req), actorId(req), groupId, examId);
+      res.json({ success: true, message: 'تم حذف الامتحان' });
+    } catch (error) {
+      handleServiceError(res, error);
+    }
+  }),
+);
+
+centerRouter.put(
+  '/groups/:groupId/exams/:examId/grades',
+  asyncWrapper(async (req: Request, res: Response) => {
+    const groupId = Number(req.params.groupId);
+    const examId = Number(req.params.examId);
+    if (Number.isNaN(groupId) || Number.isNaN(examId)) {
+      return res.status(400).json({ success: false, message: 'معرّف غير صالح' });
+    }
+    const parsed = UpsertExamGradesSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({
+        success: false,
+        message: 'بيانات غير صالحة',
+        errors: parsed.error.flatten(),
+      });
+    }
+    try {
+      const data = await ExamsService.upsertGrades(
+        getTeacherId(req),
+        actorId(req),
+        groupId,
+        examId,
+        parsed.data.grades,
+      );
+      res.json({ success: true, message: 'تم رصد الدرجات', data });
+    } catch (error) {
+      handleServiceError(res, error);
+    }
+  }),
+);
+
+centerRouter.patch(
+  '/groups/:groupId/exams/:examId/grades/:studentId',
+  asyncWrapper(async (req: Request, res: Response) => {
+    const groupId = Number(req.params.groupId);
+    const examId = Number(req.params.examId);
+    const studentId = Number(req.params.studentId);
+    if (Number.isNaN(groupId) || Number.isNaN(examId) || Number.isNaN(studentId)) {
+      return res.status(400).json({ success: false, message: 'معرّف غير صالح' });
+    }
+    const parsed = UpdateExamGradeSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({
+        success: false,
+        message: 'بيانات غير صالحة',
+        errors: parsed.error.flatten(),
+      });
+    }
+    try {
+      const data = await ExamsService.updateStudentGrade(
+        getTeacherId(req),
+        actorId(req),
+        groupId,
+        examId,
+        studentId,
+        parsed.data,
+      );
+      res.json({ success: true, message: 'تم تحديث درجة الطالب', data });
+    } catch (error) {
+      handleServiceError(res, error);
+    }
+  }),
+);
+
+centerRouter.delete(
+  '/groups/:groupId/exams/:examId/grades/:studentId',
+  asyncWrapper(async (req: Request, res: Response) => {
+    const groupId = Number(req.params.groupId);
+    const examId = Number(req.params.examId);
+    const studentId = Number(req.params.studentId);
+    if (Number.isNaN(groupId) || Number.isNaN(examId) || Number.isNaN(studentId)) {
+      return res.status(400).json({ success: false, message: 'معرّف غير صالح' });
+    }
+    try {
+      const data = await ExamsService.deleteStudentGrade(
+        getTeacherId(req),
+        actorId(req),
+        groupId,
+        examId,
+        studentId,
+      );
+      res.json({ success: true, message: 'تم حذف درجة الطالب', data });
+    } catch (error) {
+      handleServiceError(res, error);
+    }
+  }),
+);
+
 // ========== Students ==========
 centerRouter.get(
   '/students',
@@ -241,6 +449,21 @@ centerRouter.get(
       return res.status(404).json({ success: false, message: 'الطالب غير موجود' });
     }
     res.json({ success: true, data: student });
+  }),
+);
+
+centerRouter.get(
+  '/students/:studentId/exams',
+  asyncWrapper(async (req: Request, res: Response) => {
+    const studentId = Number(req.params.studentId);
+    if (Number.isNaN(studentId)) {
+      return res.status(400).json({ success: false, message: 'معرّف الطالب غير صالح' });
+    }
+    const student = await StudentsService.get(getTeacherId(req), studentId);
+    if (!student) {
+      return res.status(404).json({ success: false, message: 'الطالب غير موجود' });
+    }
+    res.json({ success: true, data: student.exams ?? [] });
   }),
 );
 

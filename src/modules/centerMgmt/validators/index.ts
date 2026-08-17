@@ -102,7 +102,7 @@ export const BulkAttendanceSchema = z.object({
 });
 
 export const ScanAttendanceSchema = z.object({
-  qr_token: z.string().uuid().optional(),
+  qr_token: z.string().min(1).optional(),
   qr_payload: z.string().min(1).optional(),
   group_id: z.coerce.number().int().positive(),
   attendance_date: z.string().min(8).max(20).optional(),
@@ -111,3 +111,39 @@ export const ScanAttendanceSchema = z.object({
 }).refine((d) => Boolean(d.qr_token || d.qr_payload), {
   message: 'qr_token or qr_payload is required',
 });
+
+const examGradeItemSchema = z.object({
+  student_id: z.coerce.number().int().positive(),
+  score: z.coerce.number().min(0).optional().nullable(),
+  is_absent: z.boolean().optional(),
+  notes: z.string().max(1000).optional().nullable(),
+});
+
+export const CreateGroupExamSchema = z.object({
+  title: z.string().min(1).max(200),
+  total_grade: z.coerce.number().positive(),
+  exam_date: z.string().min(8).max(20).optional().nullable(),
+  notes: z.string().max(5000).optional().nullable(),
+  grades: z.array(examGradeItemSchema).max(500).optional(),
+});
+
+export const UpdateGroupExamSchema = z.object({
+  title: z.string().min(1).max(200).optional(),
+  total_grade: z.coerce.number().positive().optional(),
+  exam_date: z.string().min(8).max(20).optional().nullable(),
+  notes: z.string().max(5000).optional().nullable(),
+});
+
+export const UpsertExamGradesSchema = z.object({
+  grades: z.array(examGradeItemSchema).min(1).max(500),
+});
+
+export const UpdateExamGradeSchema = z
+  .object({
+    score: z.coerce.number().min(0).optional().nullable(),
+    is_absent: z.boolean().optional(),
+    notes: z.string().max(1000).optional().nullable(),
+  })
+  .refine((d) => d.score !== undefined || d.is_absent !== undefined || d.notes !== undefined, {
+    message: 'أرسل score أو is_absent أو notes',
+  });

@@ -2,7 +2,7 @@
 
 > **Base URL:** `/api/teacher/questions`  
 > **Controller:** `src/controllers/teacherQuestions.ts`  
-> **Migration الحالية:** `migrations/1772300000000_teacher_questions_flat_lessons.sql`
+> **Migration الحالية:** `migrations/1777000000000_teacher_question_grades.sql`
 
 ---
 
@@ -14,19 +14,19 @@
 
 ```
 مكتبة المدرّس (teacher_id)
-  └── دروس (teacher_question_lessons)
-        ├── أسئلة مستقلة (teacher_questions) — passage_id = null
-        └── قطع قراءة (teacher_question_passages) — اختياري
-              └── أسئلة مرتبطة بالقطعة (teacher_questions) — passage_id = id القطعة
+  └── صفوف دراسية (teacher_question_grades)
+        └── دروس (teacher_question_lessons)
+              ├── أسئلة مستقلة (teacher_questions) — passage_id = null
+              └── قطع قراءة (teacher_question_passages) — اختياري
+                    └── أسئلة مرتبطة بالقطعة (teacher_questions) — passage_id = id القطعة
 ```
 
 ### ما الذي تغيّر؟
 
-| النظام القديم | النظام الحالي |
+| النظام السابق | النظام الحالي |
 |---------------|---------------|
-| فصول → دروس → أجزاء → أسئلة | **دروس → أسئلة** مباشرة |
-| `chapter_id`, `part_id` | `teacher_id`, `lesson_id` |
-| جداول `teacher_question_chapters`, `teacher_question_parts` | **محذوفة** |
+| دروس مباشرة داخل المكتبة | **صفوف دراسية → دروس → أسئلة** |
+| `teacher_id` على الدرس فقط | `grade_id` على الدرس + جدول `teacher_question_grades` |
 
 > **ملاحظة:** بنك الأسئلة العام للمنصة (`/api/question-bank-v2`) نظام منفصل تمامًا (بنوك → مواد → فصول → دروس). هذا الملف يخص **مكتبة المدرّس الخاصة** فقط.
 
@@ -36,7 +36,9 @@
 
 ```mermaid
 erDiagram
-    users ||--o{ teacher_question_lessons : owns
+    users ||--o{ teacher_question_grades : owns
+    teacher_question_grades ||--o{ teacher_question_lessons : contains
+    grades |o--o{ teacher_question_grades : "optional platform_grade_id"
     teacher_question_lessons ||--o{ teacher_questions : contains
     teacher_question_lessons ||--o{ teacher_question_passages : contains
     teacher_question_passages ||--o{ teacher_questions : links
@@ -44,9 +46,17 @@ erDiagram
     users {
         int id PK
     }
+    teacher_question_grades {
+        int id PK
+        int teacher_id FK
+        text title
+        int platform_grade_id FK_nullable
+        timestamp created_at
+    }
     teacher_question_lessons {
         int id PK
         int teacher_id FK
+        int grade_id FK
         text title
         timestamp created_at
     }
@@ -77,22 +87,39 @@ erDiagram
 
 ## 3. قاعدة البيانات
 
-### 3.1 `teacher_question_lessons`
+### 3.1 `teacher_question_grades`
+
+| العمود | النوع | الوصف |
+|--------|-------|-------|
+| `id` | SERIAL PK | معرف الصف داخل مكتبة المدرّس |
+| `teacher_id` | INTEGER FK → `users(id)` | مالك المكتبة |
+| `title` | TEXT | اسم الصف (فريد لكل مدرّس) |
+| `platform_grade_id` | INTEGER FK → `grades(id)` nullable | ربط اختياري بصف المنصة |
+| `created_at` | TIMESTAMP | تاريخ الإنشاء |
+
+**Cascade:** حذف المدرّس → حذف صفوفه. حذف الصف → حذف دروسه وأسئلته وقطعه.
+
+**Indexes:** `idx_teacher_question_grades_teacher_id`، uniqueness على `(teacher_id, title)` و `(teacher_id, platform_grade_id)` عند وجود ربط.
+
+---
+
+### 3.2 `teacher_question_lessons`
 
 | العمود | النوع | الوصف |
 |--------|-------|-------|
 | `id` | SERIAL PK | معرف الدرس |
 | `teacher_id` | INTEGER FK → `users(id)` | مالك المكتبة |
+| `grade_id` | INTEGER FK → `teacher_question_grades(id)` | الصف التابع له (مطلوب) |
 | `title` | TEXT | عنوان الدرس |
 | `created_at` | TIMESTAMP | تاريخ الإنشاء |
 
 **Cascade:** حذف المدرّس → حذف دروسه. حذف الدرس → حذف أسئله وقطعه.
 
-**Index:** `idx_teacher_question_lessons_teacher_id`
+**Index:** `idx_teacher_question_lessons_teacher_id`, `idx_teacher_question_lessons_grade_id`
 
 ---
 
-### 3.2 `teacher_question_passages`
+### 3.3 `teacher_question_passages`
 
 قطع قراءة (نص + أسئلة مرتبطة). **اختيارية** — ليست كل الدروس تحتاج قطعًا.
 
@@ -110,7 +137,7 @@ erDiagram
 
 ---
 
-### 3.3 `teacher_questions`
+### 3.4 `teacher_questions`
 
 | العمود | النوع | الوصف |
 |--------|-------|-------|
@@ -141,7 +168,7 @@ erDiagram
 
 ### قواعد الملكية
 
-- كل عملية CRUD تتحقق أن `lesson.teacher_id === req.user.id`
+- كل عملية CRUD تتحقق أن `grade.teacher_id` / `lesson.teacher_id === req.user.id`
 - عند ربط سؤال بـ `passage_id`: يجب أن تكون القطعة داخل **نفس الدرس** ونفس المدرّس
 - المدرّس **لا يرى** ولا يعدّل مكتبة مدرّس آخر
 
@@ -151,11 +178,16 @@ erDiagram
 
 | Method | Path | الوظيفة |
 |--------|------|---------|
+| **الصفوف** | | |
+| POST | `/grade` | إنشاء صف دراسي |
+| PUT | `/grade/:id` | تعديل اسم/ربط الصف |
+| DELETE | `/grade/:id` | حذف صف (+ cascade للدروس) |
+| GET | `/grades` | قائمة صفوف المدرّس + `lessons_count` و `questions_count` |
 | **الدروس** | | |
-| POST | `/lesson` | إنشاء درس |
-| PUT | `/lesson/:id` | تعديل عنوان درس |
+| POST | `/lesson` | إنشاء درس داخل صف (`grade_id` مطلوب) |
+| PUT | `/lesson/:id` | تعديل عنوان درس أو نقله لصف آخر |
 | DELETE | `/lesson/:id` | حذف درس (+ cascade) |
-| GET | `/lessons` | قائمة دروس المدرّس + `questions_count` |
+| GET | `/lessons` | قائمة دروس المدرّس + `questions_count` (فلتر `?grade_id=`) |
 | **القطع** | | |
 | POST | `/passage` | إنشاء قطعة + أسئلة مرتبطة |
 | GET | `/passages/:lesson_id` | قطع درس مع أسئلتها |
@@ -182,7 +214,7 @@ POST /api/teacher/questions/lesson
 Authorization: Bearer {token}
 Content-Type: application/json
 
-{ "title": "الدرس الأول — الكهرباء" }
+{ "grade_id": 1, "title": "الدرس الأول — الكهرباء" }
 ```
 
 **Response `201`:**
@@ -191,6 +223,7 @@ Content-Type: application/json
   "lesson": {
     "id": 1,
     "teacher_id": 5,
+    "grade_id": 1,
     "title": "الدرس الأول — الكهرباء",
     "created_at": "2026-06-16T10:00:00.000Z"
   }
@@ -199,7 +232,7 @@ Content-Type: application/json
 
 #### قائمة الدروس
 ```http
-GET /api/teacher/questions/lessons
+GET /api/teacher/questions/lessons?grade_id=1
 Authorization: Bearer {token}
 ```
 
@@ -210,6 +243,8 @@ Authorization: Bearer {token}
     {
       "id": 1,
       "teacher_id": 5,
+      "grade_id": 1,
+      "grade_title": "الصف الأول الثانوي",
       "title": "الدرس الأول — الكهرباء",
       "created_at": "2026-06-16T10:00:00.000Z",
       "questions_count": 12
@@ -365,35 +400,45 @@ Authorization: Bearer {token}
 **Response `200`:**
 ```json
 {
-  "lessons": [
+  "grades": [
     {
       "id": 1,
       "teacher_id": 5,
-      "title": "الدرس الأول",
-      "created_at": "...",
-      "questions": [
+      "title": "الصف الأول الثانوي",
+      "platform_grade_id": 10,
+      "platform_grade_name": "الصف الأول الثانوي",
+      "lessons": [
         {
           "id": 1,
-          "lesson_id": 1,
-          "passage_id": null,
-          "question_text": "سؤال مستقل",
-          "question_type": "choice",
-          "choices": "[\"أ\",\"ب\",\"ج\",\"د\"]"
-        }
-      ],
-      "passages": [
-        {
-          "id": 10,
-          "lesson_id": 1,
-          "title": "قطعة قراءة",
-          "content": "...",
-          "order_index": 0,
+          "teacher_id": 5,
+          "grade_id": 1,
+          "title": "الدرس الأول",
+          "created_at": "...",
           "questions": [
             {
-              "id": 2,
+              "id": 1,
               "lesson_id": 1,
-              "passage_id": 10,
-              "question_text": "سؤال على القطعة"
+              "passage_id": null,
+              "question_text": "سؤال مستقل",
+              "question_type": "choice",
+              "choices": "[\"أ\",\"ب\",\"ج\",\"د\"]"
+            }
+          ],
+          "passages": [
+            {
+              "id": 10,
+              "lesson_id": 1,
+              "title": "قطعة قراءة",
+              "content": "...",
+              "order_index": 0,
+              "questions": [
+                {
+                  "id": 2,
+                  "lesson_id": 1,
+                  "passage_id": 10,
+                  "question_text": "سؤال على القطعة"
+                }
+              ]
             }
           ]
         }
@@ -404,9 +449,9 @@ Authorization: Bearer {token}
 ```
 
 **ملاحظة للـ Frontend:**
-- `lesson.questions` يحتوي **كل** أسئلة الدرس (بما فيها المرتبطة بقطع)
+- `grades[].lessons[].questions` يحتوي **كل** أسئلة الدرس (بما فيها المرتبطة بقطع)
 - `lesson.passages[].questions` نفس الأسئلة المفلترة حسب `passage_id`
-- لعرض UI منظم: اعرض الأسئلة ذات `passage_id === null` كـ «أسئلة مستقلة»، والباقي داخل القطعة
+- لعرض UI منظم: اعرض الصفوف أولاً، ثم دروس كل صف، ثم الأسئلة ذات `passage_id === null` كـ «أسئلة مستقلة»، والباقي داخل القطعة
 
 ---
 
@@ -426,11 +471,14 @@ GET /api/teacher/questions/public/questions/:lesson_id
 
 | HTTP | الرسالة | السبب |
 |------|---------|-------|
-| 400 | العنوان مطلوب | `title` فارغ عند إنشاء/تعديل درس |
+| 400 | العنوان مطلوب | `title` فارغ عند إنشاء/تعديل صف أو درس |
+| 400 | grade_id مطلوب | إنشاء درس بدون صف |
+| 400 | يوجد صف بنفس الاسم أو مرتبط بنفس الصف الدراسي | تكرار اسم/ربط الصف |
 | 400 | lesson_id و bulk_text مطلوبان | bulk بدون حقول إلزامية |
 | 400 | lesson_id غير صحيح | معرف غير صحيح |
 | 400 | passage_id غير صحيح | معرف قطعة غير صحيح |
 | 400 | هناك مشكلة في الأسئلة التالية: ... | تنسيق bulk خاطئ |
+| 404 | الصف الدراسي غير موجود | صف ليس للمدرّس أو غير موجود |
 | 404 | الدرس غير موجود | درس ليس للمدرّس أو غير موجود |
 | 404 | السؤال غير موجود | سؤال خارج ملكية المدرّس |
 | 404 | القطعة غير موجودة | قطعة خارج ملكية المدرّس |
@@ -445,6 +493,9 @@ GET /api/teacher/questions/public/questions/:lesson_id
 
 | Action | Entity | متى |
 |--------|--------|-----|
+| `add_grade` | grade | POST `/grade` |
+| `edit_grade` | grade | PUT `/grade/:id` |
+| `delete_grade` | grade | DELETE `/grade/:id` |
 | `add_lesson` | lesson | POST `/lesson` |
 | `edit_lesson` | lesson | PUT `/lesson/:id` |
 | `delete_lesson` | lesson | DELETE `/lesson/:id` |
@@ -528,9 +579,12 @@ for (const q of standalone) {
 ### 10.1 شاشة المكتبة الرئيسية
 
 ```
-GET /lessons
-  → عرض قائمة الدروس + questions_count
-  → زر «درس جديد» → POST /lesson
+GET /grades
+  → عرض قائمة الصفوف + lessons_count / questions_count
+  → زر «صف جديد» → POST /grade
+GET /lessons?grade_id={id}
+  → عرض دروس الصف + questions_count
+  → زر «درس جديد» → POST /lesson { grade_id, title }
 ```
 
 ### 10.2 داخل الدرس
@@ -548,7 +602,7 @@ GET /passages/:lesson_id      → قطع + أسئلتها
 
 ```
 GET /tree
-  → دروس + أسئلة + قطع في طلب واحد
+  → صفوف + دروس + أسئلة + قطع في طلب واحد
 ```
 
 ---
@@ -572,7 +626,8 @@ WHERE l.teacher_id = $teacher_id
 |-------|-------|
 | `1700000000002_teacher_questions_library.sql` | الإنشاء الأولي (النظام القديم) |
 | `1772108600000_teacher_question_passages_and_images.sql` | القطع + حقول إضافية للأسئلة |
-| `1772300000000_teacher_questions_flat_lessons.sql` | **التحويل للهيكل الحالي** (دروس مباشرة) |
+| `1772300000000_teacher_questions_flat_lessons.sql` | تحويل قديم: دروس مباشرة بدون فصول/أجزاء |
+| `1777000000000_teacher_question_grades.sql` | **الهيكل الحالي:** صفوف دراسية → دروس |
 
 لتطبيق migration الجديدة على بيئة موجودة:
 

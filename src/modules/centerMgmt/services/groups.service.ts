@@ -1,11 +1,12 @@
 import { randomUUID } from 'node:crypto';
-import QRCode from 'qrcode';
 import { HttpError } from '../../../utils';
 import { ActivityLogsRepository } from '../repositories/activityLogs.repository';
+import { ExamsRepository } from '../repositories/exams.repository';
 import { GroupsRepository } from '../repositories/groups.repository';
 import { StudentsRepository } from '../repositories/students.repository';
 import { SubscriptionsRepository } from '../repositories/subscriptions.repository';
 import type { SubscriptionStatus } from '../types';
+import { buildStudentQr, isStudentPublicProfileUrl, studentPublicProfileUrl } from '../utils/studentQr';
 
 function currentYearMonth() {
   const now = new Date();
@@ -156,22 +157,12 @@ export class StudentsService {
     const enrollment = await StudentsRepository.enrollWithMemberNo(student.id, groupId, memberNo);
 
     const qrToken = randomUUID();
-    const payload = JSON.stringify({
-      type: 'tc_student',
-      teacher_id: teacherId,
-      student_id: student.id,
-      student_code: String(memberNo),
-      group_id: groupId,
-      group_student_id: memberNo,
-      public_id: student.public_id,
-      qr_token: qrToken,
-    });
-    const qrImage = await QRCode.toDataURL(payload, { margin: 2, width: 280 });
+    const { payload, qrImageBase64 } = await buildStudentQr(qrToken);
     await StudentsRepository.upsertQr({
       studentId: student.id,
       qrToken,
       qrPayload: payload,
-      qrImageBase64: qrImage,
+      qrImageBase64,
       barcode: String(memberNo),
     });
 
@@ -277,8 +268,11 @@ export class StudentsService {
     return StudentsRepository.list(teacherId, opts);
   }
 
-  static get(teacherId: number, studentId: number) {
-    return StudentsRepository.findById(studentId, teacherId);
+  static async get(teacherId: number, studentId: number) {
+    const student = await StudentsRepository.findById(studentId, teacherId);
+    if (!student) return null;
+    const exams = await ExamsRepository.listByStudent(studentId, teacherId);
+    return { ...student, exams };
   }
 
   static listByGroup(teacherId: number, groupId: number) {
@@ -337,22 +331,15 @@ export class StudentsService {
     if (!student) throw new HttpError(404, 'الطالب غير موجود');
 
     let qr = await StudentsRepository.getQr(studentId, teacherId);
-    if (!qr) {
-      const qrToken = randomUUID();
-      const payload = JSON.stringify({
-        type: 'tc_student',
-        teacher_id: teacherId,
-        student_id: student.id,
-        student_code: student.student_code,
-        public_id: student.public_id,
-        qr_token: qrToken,
-      });
-      const qrImage = await QRCode.toDataURL(payload, { margin: 2, width: 280 });
+    const needsNewImage = !qr || !isStudentPublicProfileUrl(qr.qr_payload);
+    if (needsNewImage) {
+      const qrToken = qr?.qr_token || randomUUID();
+      const { payload, qrImageBase64 } = await buildStudentQr(qrToken);
       qr = await StudentsRepository.upsertQr({
         studentId,
         qrToken,
         qrPayload: payload,
-        qrImageBase64: qrImage,
+        qrImageBase64,
         barcode: student.student_code,
       });
     }
@@ -363,6 +350,7 @@ export class StudentsService {
       full_name: student.full_name,
       qr_token: qr.qr_token,
       qr_payload: qr.qr_payload,
+      public_url: studentPublicProfileUrl(qr.qr_token),
       qr_image_base64: qr.qr_image_base64,
       barcode: qr.barcode,
     };

@@ -344,18 +344,15 @@ npm run migrate up
 
 ### محتوى الـ QR
 
-الـ payload المخزّن داخل الصورة تقريباً:
+صورة الـ QR فيها رابط عام (يتفتح من أي قارئ باركود / كاميرا):
 
-```json
-{
-  "type": "tc_student",
-  "teacher_id": 12,
-  "student_id": 5,
-  "student_code": "TC-12-0001",
-  "public_id": "uuid...",
-  "qr_token": "uuid..."
-}
 ```
+https://YOUR_API_DOMAIN/api/public/center/students/{qr_token}
+```
+
+الصفحة تعرض حضور الطالب ودرجاته في السنتر **بدون تسجيل دخول**.
+
+تسجيل الحضور من تطبيق المدرس كما هو: `POST /attendance/scan` يقبل `qr_token` أو الرابط كامل في `qr_payload`.
 
 عند المسح يكفي إرسال `qr_token` أو `qr_payload` كاملاً إلى `/attendance/scan`.
 

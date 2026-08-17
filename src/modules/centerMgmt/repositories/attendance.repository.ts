@@ -242,4 +242,54 @@ export class AttendanceRepository {
       total_days: parseInt(r.total_days, 10),
     }));
   }
+
+  static async summaryByStudent(
+    studentId: number,
+    teacherId: number,
+  ): Promise<
+    Array<{
+      group_id: number;
+      group_name: string;
+      present: number;
+      absent: number;
+      late: number;
+      excused: number;
+    }>
+  > {
+    const result = await pool.query<{
+      group_id: number;
+      group_name: string;
+      present: string;
+      absent: string;
+      late: string;
+      excused: string;
+    }>(
+      `SELECT
+         g.id AS group_id,
+         g.name AS group_name,
+         COUNT(a.id) FILTER (WHERE a.status = 'present')::text AS present,
+         COUNT(a.id) FILTER (WHERE a.status = 'absent')::text AS absent,
+         COUNT(a.id) FILTER (WHERE a.status = 'late')::text AS late,
+         COUNT(a.id) FILTER (WHERE a.status = 'excused')::text AS excused
+       FROM tc_student_groups sg
+       JOIN tc_groups g ON g.id = sg.group_id AND g.deleted_at IS NULL
+       LEFT JOIN tc_attendance a
+         ON a.student_id = sg.student_id AND a.group_id = sg.group_id
+       WHERE sg.student_id = $1
+         AND g.teacher_id = $2
+         AND sg.deleted_at IS NULL
+         AND sg.status = 'active'
+       GROUP BY g.id, g.name
+       ORDER BY g.name ASC`,
+      [studentId, teacherId],
+    );
+    return result.rows.map((r) => ({
+      group_id: r.group_id,
+      group_name: r.group_name,
+      present: parseInt(r.present, 10),
+      absent: parseInt(r.absent, 10),
+      late: parseInt(r.late, 10),
+      excused: parseInt(r.excused, 10),
+    }));
+  }
 }

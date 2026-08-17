@@ -8,6 +8,7 @@ import { asyncWrapper, config, generateToken, sendEmail, HttpError } from '../ut
 import { validate } from '../middleware/validateReq';
 import { ForgotPassword, Login, ResetPassword, RegisterAdminOrTeacher } from './auth.modules';
 import { TeacherManagedStudentsService } from '../services/teacherManagedStudents';
+import { StudentDeviceRestrictionService } from '../services/studentDeviceRestriction';
 import {
   AuthSessionsService,
   setRefreshCookie,
@@ -60,7 +61,7 @@ router.post(
   loginLimiter,
   validate(Login),
   asyncWrapper(async (req, res) => {
-    const { email, phone, student_code, password, device_ip } = req.body;
+    const { email, phone, student_code, password } = req.body;
     let effectiveTenantId = req.tenant!.id;
 
     const staffRoles = ['teacher', 'admin', 'employee', 'academy', 'academy_teacher'];
@@ -240,34 +241,23 @@ router.post(
       }
     }
 
-    // Device IP binding logic for students only
+    // Device/IP restriction for students (skipped when platform allows multiple devices)
+    let ipRegistered = false;
     if (user.role === 'student') {
-      // Case A: Student already has a saved IP
-      if (user.device_ip) {
-        // IP is required for students with saved IP
-        if (!device_ip) {
-          return res.status(400).json({
-            success: false,
-            message: 'device_ip is required for this account',
-          });
-        }
-        // Compare saved IP with sent IP
-        if (user.device_ip !== device_ip) {
-          return res.status(403).json({
-            success: false,
-            message: 'غير مسموح لك بتسجيل الدخول من جهاز مختلف',
-          });
-        }
-      } else {
-        // Case B: Student has NO saved IP (old accounts)
-        // If device_ip is provided, save it
-        if (device_ip) {
-          await pool.query('UPDATE users SET device_ip = $1 WHERE id = $2', [device_ip, user.id]);
-          // Update user object to reflect the change
-          user.device_ip = device_ip;
-        }
-        // Allow login even without device_ip for old accounts
+      const ipCheck = await StudentDeviceRestrictionService.enforceOnLogin({
+        user,
+        tenantId: effectiveTenantId,
+        req,
+        body: req.body,
+      });
+      if (!ipCheck.allowed) {
+        return res.status(ipCheck.status || 403).json({
+          success: false,
+          code: ipCheck.code,
+          message: ipCheck.message,
+        });
       }
+      ipRegistered = ipCheck.ip_registered;
     }
 
     const token = await generateToken(user, pool, { sessionTenantId: effectiveTenantId });
@@ -312,6 +302,8 @@ router.post(
     }
 
     res.json({
+      success: true,
+      ip_registered: ipRegistered,
       user: {
         id: user.id,
         name: user.name,

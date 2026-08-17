@@ -5,15 +5,21 @@ import { validate } from '../middleware/validateReq';
 import { authMiddleware } from '../middleware/authentication';
 import { Router } from 'express';
 import { ChangePassword, RegisterStudent } from './auth.modules';
-import { asyncWrapper, generateToken, uploadToCloudinary } from '../utils';
-import { studentOnlyMiddleware } from '../middleware/authentication';
+import { asyncWrapper, generateToken } from '../utils';
 import { AuthSessionsService, setRefreshCookie } from '../services/authSessions';
 import { StudentPointsService } from '../services/studentPoints';
 import { TeacherManagedStudentsService } from '../services/teacherManagedStudents';
+import { StudentDeviceRestrictionService } from '../services/studentDeviceRestriction';
 import { CourseGroupAccessService } from '../services/courseGroupAccess';
-import multer from 'multer';
-import path from 'path';
-import fs from 'fs';
+import {
+  persistAvatarFile,
+  pickUploadedAvatar,
+  publicAvatarUrl,
+  saveAvatarForUser,
+  clearAvatarForStudent,
+  uploadMeAvatarMiddleware,
+  uploadStudentAvatarMiddleware,
+} from '../services/userAvatarUpload';
 import { checkAnyPermission } from '../middleware/permissions';
 const UpdateMe = z.object({
   email: z.string().email().optional(),
@@ -25,39 +31,6 @@ const UpdateMe = z.object({
 
 export const router = Router();
 
-// إعداد multer لرفع صور البروفايل
-const avatarStorage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    const uploadDir = 'uploads';
-    if (!fs.existsSync(uploadDir)) {
-      fs.mkdirSync(uploadDir, { recursive: true });
-    }
-    cb(null, uploadDir);
-  },
-  filename: (req, file, cb) => {
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
-    cb(null, 'avatar-' + uniqueSuffix + path.extname(file.originalname));
-  },
-});
-
-const uploadAvatar = multer({
-  storage: avatarStorage,
-  limits: {
-    fileSize: 5 * 1024 * 1024, // 5MB limit
-  },
-  fileFilter: (req, file, cb) => {
-    const allowedTypes = /jpeg|jpg|png|gif|webp/;
-    const extname = allowedTypes.test(path.extname(file.originalname).toLowerCase());
-    const mimetype = allowedTypes.test(file.mimetype);
-
-    if (mimetype && extname) {
-      return cb(null, true);
-    } else {
-      cb(new Error('فقط ملفات الصور مسموح بها!'));
-    }
-  },
-});
-
 router.post(
   '/register',
   validate(RegisterStudent),
@@ -68,7 +41,6 @@ router.post(
       name,
       parent_phone,
       grade_id,
-      device_ip,
       course_category,
       subdomain: bodySubdomain,
       tenant_subdomain: bodyTenantSubdomain,
@@ -117,12 +89,22 @@ router.post(
     const hashed = await bcrypt.hash(password, 10);
     const result = await pool.query(
       `INSERT INTO users (phone, password, name, parent_phone, role, device_ip, course_category, tenant_id)
-       VALUES ($1, $2, $3, $4, 'student', $5, $6, $7)
+       VALUES ($1, $2, $3, $4, 'student', NULL, $5, $6)
        RETURNING id, phone, name, parent_phone, role, avatar, device_ip, course_category`,
-      [phone, hashed, name, parent_phone, device_ip || null, course_category || null, tenantId],
+      [phone, hashed, name, parent_phone, course_category || null, tenantId],
     );
 
     const user = result.rows[0];
+    const ipBind = await StudentDeviceRestrictionService.bindOnRegister({
+      studentId: user.id,
+      tenantId,
+      req,
+      body: req.body,
+    });
+    if (ipBind.bound) {
+      user.device_ip = ipBind.ip;
+      user.registered_ip = ipBind.ip;
+    }
 
     // إضافة صف الطالب إذا تم إرساله
     if (grade_id && grade_id > 0) {
@@ -175,6 +157,8 @@ router.post(
     AuthSessionsService.logLogin(user.id, 'student', 'register', req);
 
     res.status(201).json({
+      success: true,
+      ip_registered: ipBind.bound,
       user: {
         ...user,
         avatar: user.avatar,
@@ -225,20 +209,73 @@ router.get('/me', authMiddleware(), async (req, res) => {
 
   const user = result.rows[0];
   res.json({
-    user,
+    user: {
+      ...user,
+      avatar: publicAvatarUrl(user.avatar),
+    },
   });
 });
+
+const setMyAvatar = asyncWrapper(async (req, res) => {
+  const file = pickUploadedAvatar(req);
+  if (!file) {
+    return res.status(400).json({
+      success: false,
+      message: 'أرسل الصورة في الحقل avatar (JPG / PNG / WEBP / GIF، حد أقصى 5MB)',
+      code: 'AVATAR_REQUIRED',
+    });
+  }
+
+  const data = await saveAvatarForUser(req.user!.id, file);
+  if (!data) {
+    return res.status(404).json({ success: false, message: 'المستخدم غير موجود' });
+  }
+
+  res.json({
+    success: true,
+    message: 'تم تحديث صورة البروفايل بنجاح',
+    data,
+  });
+});
+
+router.post(
+  '/me/avatar',
+  authMiddleware(['student']),
+  uploadStudentAvatarMiddleware,
+  setMyAvatar,
+);
+router.put(
+  '/me/avatar',
+  authMiddleware(['student']),
+  uploadStudentAvatarMiddleware,
+  setMyAvatar,
+);
+router.delete(
+  '/me/avatar',
+  authMiddleware(['student']),
+  asyncWrapper(async (req, res) => {
+    const data = await clearAvatarForStudent(req.user!.id);
+    if (!data) {
+      return res.status(404).json({ success: false, message: 'الطالب غير موجود' });
+    }
+    res.json({
+      success: true,
+      message: 'تم حذف صورة البروفايل',
+      data,
+    });
+  }),
+);
 
 // تحديث بيانات المستخدم (يدعم رفع صورة البروفايل)
 // للطلاب والمدرسين والادمن
 router.put(
   '/me',
   authMiddleware(), // السماح لأي مستخدم مسجل الدخول
-  uploadAvatar.single('avatar'),
+  uploadMeAvatarMiddleware,
   asyncWrapper(async (req, res) => {
     const userId = (req as any).user.id;
     const { email, password, name, phone, parent_phone } = req.body;
-    const file = (req as any).file;
+    const file = pickUploadedAvatar(req);
 
     // التحقق من صحة البيانات
     const parse = UpdateMe.safeParse({ email, password, name, phone, parent_phone });
@@ -281,9 +318,9 @@ router.put(
     // رفع صورة البروفايل إذا تم إرسالها
     if (file) {
       try {
-        const uploaded = await uploadToCloudinary(file.path);
+        const stored = await persistAvatarFile(file);
         updates.push(`avatar = $${paramIndex++}`);
-        values.push(uploaded.secure_url);
+        values.push(stored);
       } catch (error) {
         console.error('Error uploading avatar:', error);
         return res.status(500).json({
@@ -313,10 +350,14 @@ router.put(
       });
     }
 
+    const user = updated.rows[0];
     res.json({
       success: true,
       message: 'تم تحديث البيانات بنجاح',
-      user: updated.rows[0],
+      user: {
+        ...user,
+        avatar: publicAvatarUrl(user.avatar),
+      },
     });
   }),
 );
@@ -868,72 +909,106 @@ router.post(
   }),
 );
 
-// السماح للطالب باستخدام جهاز آخر (للأدمن) - يزيل قيد IP
+// السماح للطالب باستخدام جهاز آخر — مدرس / أكاديمية / أدمن
+// الفرونت يستدعي POST /api/users/students/allow-device
+const allowStudentNewDevice = asyncWrapper(async (req, res) => {
+  await StudentDeviceRestrictionService.ensureSchema();
+
+  const body = req.body ?? {};
+  const phoneRaw = body.phone ?? body.student_phone ?? body.studentPhone;
+  const phone = typeof phoneRaw === 'string' ? phoneRaw.trim() : '';
+  const studentIdRaw = body.student_id ?? body.studentId ?? body.id;
+  const studentId = Number(studentIdRaw);
+  const hasStudentId = Number.isInteger(studentId) && studentId > 0;
+
+  if (!phone && !hasStudentId) {
+    return res.status(400).json({
+      success: false,
+      message: 'أرسل student_id أو رقم الهاتف',
+      code: 'STUDENT_IDENTIFIER_REQUIRED',
+    });
+  }
+
+  const role = req.user!.role;
+  const tenantId = req.tenant?.id ?? req.user!.tenant_id ?? null;
+  const isPlatformStaff =
+    role === 'teacher' || role === 'academy' || role === 'academy_teacher';
+
+  if (isPlatformStaff && !tenantId) {
+    return res.status(400).json({
+      success: false,
+      message: 'تعذر تحديد المنصة',
+      code: 'TENANT_REQUIRED',
+    });
+  }
+
+  let studentQuery;
+  if (hasStudentId) {
+    studentQuery = isPlatformStaff && tenantId
+      ? await pool.query(
+          `SELECT id, name, phone, device_ip, registered_ip, tenant_id
+           FROM users WHERE id = $1 AND role = 'student' AND tenant_id = $2`,
+          [studentId, tenantId],
+        )
+      : await pool.query(
+          `SELECT id, name, phone, device_ip, registered_ip, tenant_id
+           FROM users WHERE id = $1 AND role = 'student'`,
+          [studentId],
+        );
+  } else {
+    studentQuery = isPlatformStaff && tenantId
+      ? await pool.query(
+          `SELECT id, name, phone, device_ip, registered_ip, tenant_id
+           FROM users WHERE phone = $1 AND role = 'student' AND tenant_id = $2`,
+          [phone, tenantId],
+        )
+      : await pool.query(
+          `SELECT id, name, phone, device_ip, registered_ip, tenant_id
+           FROM users WHERE phone = $1 AND role = 'student'`,
+          [phone],
+        );
+  }
+
+  if (!studentQuery.rowCount) {
+    return res.status(404).json({
+      success: false,
+      message: 'الطالب غير موجود',
+      code: 'STUDENT_NOT_FOUND',
+    });
+  }
+
+  const student = studentQuery.rows[0];
+  const data = await StudentDeviceRestrictionService.resetStudentIp({
+    studentId: student.id,
+    tenantId: student.tenant_id || tenantId || 0,
+    performedBy: req.user!.id,
+    requireTenantOwner: false,
+  });
+
+  res.json({
+    success: true,
+    message: 'تم السماح للطالب باستخدام جهاز آخر بنجاح',
+    data: {
+      student_id: data.student_id,
+      student_name: data.student_name,
+      student_phone: data.student_phone,
+      old_device_ip: data.old_ip,
+      old_ip: data.old_ip,
+      new_device_ip: null,
+      registered_ip: null,
+      note: 'يمكن للطالب الآن تسجيل الدخول من الجهاز الجديد. سيتم حفظ IP الجهاز الجديد تلقائياً عند أول تسجيل دخول.',
+      updated_at: data.ip_reset_at,
+    },
+  });
+});
+
+router.post(
+  '/students/allow-device',
+  authMiddleware(['teacher', 'academy', 'academy_teacher', 'admin', 'employee']),
+  allowStudentNewDevice,
+);
 router.patch(
   '/students/allow-device',
-  authMiddleware(['admin', 'employee']),
-  // ندعم أكثر من مفتاح صلاحيات حسب صيغة التخزين في DB/الواجهة
-  checkAnyPermission([
-    'can_manage_students',
-    'students_management',
-    'manage_students',
-    'student_management',
-  ]),
-  asyncWrapper(async (req, res) => {
-    try {
-      const { phone } = req.body;
-
-      // التحقق من وجود رقم الهاتف
-      if (!phone) {
-        return res.status(400).json({
-          success: false,
-          message: 'رقم الهاتف مطلوب',
-        });
-      }
-
-      // البحث عن الطالب برقم الهاتف
-      const studentCheck = await pool.query(
-        'SELECT id, name, phone, device_ip FROM users WHERE phone = $1 AND role = $2',
-        [phone, 'student'],
-      );
-
-      if (!studentCheck.rowCount) {
-        return res.status(404).json({
-          success: false,
-          message: 'الطالب غير موجود',
-        });
-      }
-
-      const student = studentCheck.rows[0];
-      const oldDeviceIp = student.device_ip;
-
-      // إزالة قيد IP (device_ip = null) للسماح بتسجيل الدخول من أي جهاز
-      // عند تسجيل الدخول التالي، سيتم حفظ IP الجديد تلقائياً
-      await pool.query('UPDATE users SET device_ip = NULL WHERE id = $1 AND role = $2', [
-        student.id,
-        'student',
-      ]);
-
-      res.json({
-        success: true,
-        message: 'تم السماح للطالب باستخدام جهاز آخر بنجاح',
-        data: {
-          student_id: student.id,
-          student_name: student.name,
-          student_phone: student.phone,
-          old_device_ip: oldDeviceIp,
-          new_device_ip: null,
-          note: 'يمكن للطالب الآن تسجيل الدخول من أي جهاز. سيتم حفظ IP الجهاز الجديد تلقائياً عند أول تسجيل دخول.',
-          updated_at: new Date().toISOString(),
-        },
-      });
-    } catch (error: any) {
-      console.error('Error allowing student device:', error);
-      res.status(500).json({
-        success: false,
-        message: 'فشل في السماح للطالب باستخدام جهاز آخر',
-        error: error.message,
-      });
-    }
-  }),
+  authMiddleware(['teacher', 'academy', 'academy_teacher', 'admin', 'employee']),
+  allowStudentNewDevice,
 );

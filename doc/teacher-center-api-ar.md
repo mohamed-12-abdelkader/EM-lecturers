@@ -14,6 +14,7 @@ Auth: Bearer token — أدوار `teacher` أو `admin`
 2. **الطلاب** — اسم + رقم + رقم ولي الأمر (اختياري) + كود سنتر + QR
 3. **الماليات الشهرية** — فتح شهر، تحديد من جدد، حالات: `paid` / `unpaid` / `partial` / `exempt`
 4. **الحضور** — يدوي أو بمسح QR + تقارير غياب/حضور
+5. **امتحانات السنتر** — إضافة امتحان للمجموعة ورصد درجة كل طالب (تظهر في ملف الطالب)
 
 ---
 
@@ -96,10 +97,11 @@ Auth: Bearer token — أدوار `teacher` أو `admin`
 |--------|------|--------|
 | GET | `/groups/:groupId/students` | طلاب المجموعة |
 | GET | `/students` | كل الطلاب (`group_id`, `search`, `is_active`) |
-| GET | `/students/:studentId` | تفاصيل |
+| GET | `/students/:studentId` | تفاصيل + درجات الامتحانات (`exams`) |
+| GET | `/students/:studentId/exams` | درجات الطالب فقط |
 | PATCH | `/students/:studentId` | تعديل |
 | DELETE | `/students/:studentId` | حذف ناعم |
-| GET | `/students/:studentId/qr` | QR code |
+| GET | `/students/:studentId/qr` | QR code (رابط صفحة الطالب العامة) |
 | POST | `/students/:studentId/groups/:groupId` | إضافة لمجموعة أخرى |
 | DELETE | `/students/:studentId/groups/:groupId` | إزالة من مجموعة |
 
@@ -213,7 +215,27 @@ Auth: Bearer token — أدوار `teacher` أو `admin`
 }
 ```
 
-أو أرسل `qr_payload` (نص الـ QR بالكامل).
+أو أرسل `qr_payload` (نص الـ QR بالكامل: الرابط أو JSON القديم).
+
+---
+
+## بطاقة الطالب العامة (مسح QR من أي قارئ)
+
+صورة الـ QR فيها **رابط** وليس JSON. أي تطبيق باركود أو كاميرا الموبايل هتفتح صفحة بيانات الطالب:
+
+`GET /api/public/center/students/:qrToken`  
+**بدون تسجيل دخول**
+
+الصفحة تعرض:
+
+- اسم الطالب وكوده واسم المدرس
+- عدد المحاضرات اللي حضرها والغياب لكل مجموعة
+- حالة اشتراك الشهر الحالي
+- درجات امتحانات السنتر
+
+JSON لنفس البيانات: أضف `?format=json` أو `Accept: application/json`.
+
+`GET /students/:studentId/qr` (للمدرس) بيرجع `public_url` وصورة محدّثة. لو الـ QR القديم كان JSON، استدعِ المسار ده وأعد طباعة الكود.
 
 ### استعلام
 
@@ -226,11 +248,96 @@ Auth: Bearer token — أدوار `teacher` أو `admin`
 
 ---
 
+## امتحانات السنتر ورصد الدرجات
+
+امتحان حضوري للمجموعة بالكامل (مثال: «امتحان الدرس الأول»). تُرصد درجة كل طالب وتظهر في **ملف الطالب**.
+
+### إضافة امتحان للمجموعة — `POST /groups/:groupId/exams`
+
+يمكن رصد الدرجات في نفس الطلب أو لاحقاً.
+
+```json
+{
+  "title": "امتحان الدرس الأول",
+  "total_grade": 50,
+  "exam_date": "2026-08-17",
+  "notes": "امتحان داخل السنتر",
+  "grades": [
+    { "student_id": 5, "score": 45 },
+    { "student_id": 6, "score": 30, "notes": "حلّ الجزء الثاني ناقص" },
+    { "student_id": 7, "is_absent": true, "notes": "غائب" }
+  ]
+}
+```
+
+| الحقل | مطلوب | الوصف |
+|--------|--------|--------|
+| `title` | نعم | اسم الامتحان |
+| `total_grade` | نعم | الدرجة النهائية (مثل 50 أو 100) |
+| `exam_date` | لا | تاريخ الامتحان `YYYY-MM-DD` |
+| `grades` | لا | رصد جماعي: `score` أو `is_absent: true` |
+
+### قائمة امتحانات المجموعة — `GET /groups/:groupId/exams`
+
+كل امتحان مع `students_count` و `graded_count` و `average_score`.
+
+### كشف رصد الدرجات — `GET /groups/:groupId/exams/:examId`
+
+يرجع الامتحان + كل طلاب المجموعة (حتى من لم تُرصد درجته بعد) + ملخص (`average_score`, `max_score`, `min_score`, `absent_count`).
+
+`recorded: false` يعني لسه متسجلتش درجة للطالب.
+
+### رصد / تعديل درجات المجموعة — `PUT /groups/:groupId/exams/:examId/grades`
+
+```json
+{
+  "grades": [
+    { "student_id": 5, "score": 48 },
+    { "student_id": 8, "score": 40 }
+  ]
+}
+```
+
+يعيد الكتابة على الدرجة السابقة لنفس الطالب في نفس الامتحان.
+
+### درجة طالب واحد
+
+| Method | Path | الوصف |
+|--------|------|--------|
+| PATCH | `/groups/:groupId/exams/:examId/grades/:studentId` | تعديل درجة طالب |
+| DELETE | `/groups/:groupId/exams/:examId/grades/:studentId` | حذف درجة طالب |
+| PATCH | `/groups/:groupId/exams/:examId` | تعديل اسم/درجة نهائية/تاريخ |
+| DELETE | `/groups/:groupId/exams/:examId` | حذف الامتحان (ناعم) |
+
+### ملف الطالب
+
+`GET /students/:studentId` يتضمن مصفوفة `exams`:
+
+```json
+{
+  "exam_id": 1,
+  "title": "امتحان الدرس الأول",
+  "group_id": 3,
+  "group_name": "مجموعة السبت والثلاثاء",
+  "total_grade": 50,
+  "exam_date": "2026-08-17",
+  "score": 45,
+  "is_absent": false,
+  "percentage": 90,
+  "notes": null
+}
+```
+
+أو `GET /students/:studentId/exams` لنفس القائمة فقط.
+
+---
+
 ## Migration
 
-ملف: `migrations/1774200000000_teacher_center_mgmt.sql`
+ملف: `migrations/1774200000000_teacher_center_mgmt.sql`  
+امتحانات السنتر: `migrations/1777100000000_tc_group_exams.sql`
 
-الجداول: `tc_groups`, `tc_students`, `tc_student_groups`, `tc_qr_codes`, `tc_billing_months`, `tc_monthly_subscriptions`, `tc_payments`, `tc_attendance`, `tc_activity_logs`
+الجداول: `tc_groups`, `tc_students`, `tc_student_groups`, `tc_qr_codes`, `tc_billing_months`, `tc_monthly_subscriptions`, `tc_payments`, `tc_attendance`, `tc_group_exams`, `tc_group_exam_grades`, `tc_activity_logs`
 
 تشغيل:
 
@@ -249,3 +356,4 @@ npm run migrate up
 5. تحديث حالات الدفع أو تسجيل دفعات جزئية
 6. تسجيل الحضور يدوياً أو بالسكان يوم الحصة
 7. فتح تقرير الحضور للطالب عند الحاجة
+8. بعد امتحان في السنتر: `POST /groups/:id/exams` ثم رصد درجات المجموعة — تظهر في ملف كل طالب
