@@ -800,7 +800,9 @@ router.get(
       }
     }
 
-    const nestedLessons = Object.values(lessonsMap);
+    const nestedLessons = Object.values(lessonsMap) as Array<
+      (typeof lessons)[number] & { questions: typeof questions; passages: typeof passages }
+    >;
     const gradesMap = Object.fromEntries(
       grades.map((g) => [g.id, { ...g, lessons: [] as typeof nestedLessons }]),
     );

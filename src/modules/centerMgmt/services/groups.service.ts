@@ -343,6 +343,7 @@ export class StudentsService {
         barcode: student.student_code,
       });
     }
+    if (!qr) throw new HttpError(500, 'تعذر إنشاء رمز QR');
 
     return {
       student_id: student.id,
