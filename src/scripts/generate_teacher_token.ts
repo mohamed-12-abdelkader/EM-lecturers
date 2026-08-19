@@ -141,12 +141,15 @@ async function main() {
       );
     }
 
+    const jti = crypto.randomUUID();
+    await pool.query('UPDATE users SET jti = $1 WHERE id = $2', [jti, teacher.id]);
+
     const token = jwt.sign(
       {
         id: teacher.id,
         email: teacher.email,
         role: 'teacher',
-        jti: crypto.randomUUID(),
+        jti,
         tid: Number(teacher.tenant_id),
       },
       secretKey,

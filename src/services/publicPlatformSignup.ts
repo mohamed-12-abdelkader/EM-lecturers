@@ -73,6 +73,7 @@ export class PublicPlatformSignupService {
 
     const settings = {
       registration_mode: 'self_registration',
+      student_device_limit: 'multiple_devices',
       ...(input.settings ?? {}),
     };
 
@@ -158,7 +159,6 @@ export class PublicPlatformSignupService {
     }
     const user = userRes.rows[0];
 
-    const token = await generateToken(user, pool, { sessionTenantId: tenant.id });
     const rememberMe = input.remember_me === true;
     const session = await AuthSessionsService.createDeviceSession({
       userId: user.id,
@@ -166,6 +166,7 @@ export class PublicPlatformSignupService {
       rememberMe,
       req,
     });
+    const token = await generateToken(user, pool, { sessionTenantId: tenant.id, jti: session.jti });
     setRefreshCookie(req, res, session.refreshToken, rememberMe);
     AuthSessionsService.logLogin(user.id, user.role, 'email', req);
 

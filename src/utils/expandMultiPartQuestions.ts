@@ -88,3 +88,41 @@ export function expandMultiPartQuestions(
     questions,
   };
 }
+
+/**
+ * اقتباس/جملة داخل سؤال واحد وُضعت خطأ في passages[] — ادمجها في نص السؤال.
+ * القطعة الحقيقية (قراءة) تبقى إذا تبعها أكثر من سؤال.
+ */
+export function foldSingletonPassages(
+  passages: MistralExtractedPassage[],
+  questions: MistralExtractedQuestion[],
+): {
+  passages: MistralExtractedPassage[];
+  questions: MistralExtractedQuestion[];
+} {
+  const questionsByPassage = new Map<string, MistralExtractedQuestion[]>();
+  for (const question of questions) {
+    const passageId = question.passage_id?.trim();
+    if (!passageId) continue;
+    const group = questionsByPassage.get(passageId) ?? [];
+    group.push(question);
+    questionsByPassage.set(passageId, group);
+  }
+
+  const passagesToRemove = new Set<string>();
+  const passageById = new Map(passages.map((passage) => [passage.passage_id, passage]));
+
+  for (const [passageId, group] of questionsByPassage) {
+    if (group.length !== 1) continue;
+    const passage = passageById.get(passageId);
+    if (!passage?.content.trim()) continue;
+    group[0].question_text = combineStemWithPart(passage.content, group[0].question_text);
+    group[0].passage_id = null;
+    passagesToRemove.add(passageId);
+  }
+
+  return {
+    passages: passages.filter((passage) => !passagesToRemove.has(passage.passage_id)),
+    questions,
+  };
+}

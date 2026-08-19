@@ -19,7 +19,8 @@ export interface LoginIpEnforcement {
   message?: string;
 }
 
-const DEFAULT_LIMIT: StudentDeviceLimit = 'single_device';
+/** افتراضي المنصة: الطالب يدخل من أكثر من جهاز. المدرس يغيّر من إعدادات المنصة. */
+const DEFAULT_LIMIT: StudentDeviceLimit = 'multiple_devices';
 
 const ACCOUNT_IP_MISMATCH_MESSAGE =
   'هذا الحساب مرتبط بجهاز آخر، ولا يُسمح بتسجيل الدخول من هذا الجهاز.';
@@ -182,6 +183,19 @@ export class StudentDeviceRestrictionService {
     return settings.student_device_limit === 'single_device';
   }
 
+  /**
+   * جلسة واحدة (Login جديد يلغي الجهاز القديم) للمدرس/الأدمن دائماً،
+   * وللطالب فقط إذا المدرس اختار `single_device`.
+   */
+  static async shouldReplaceOtherSessions(
+    role: string,
+    tenantId?: number | null,
+  ): Promise<boolean> {
+    if (role !== 'student') return true;
+    if (!tenantId) return false;
+    return this.isSingleDevice(tenantId);
+  }
+
   static async setSettings(
     tenantId: number,
     patch: { student_device_limit?: StudentDeviceLimit },
@@ -208,6 +222,14 @@ export class StudentDeviceRestrictionService {
        ON CONFLICT (tenant_id) DO UPDATE SET data = EXCLUDED.data, updated_at = NOW()`,
       [tenantId, JSON.stringify(merged)],
     );
+
+    // السماح بأكثر من جهاز: التوكينات القديمة تفضل شغالة (ما نربطش الجلسة بـ jti واحد)
+    if (next === 'multiple_devices') {
+      await pool.query(
+        `UPDATE users SET jti = NULL WHERE tenant_id = $1 AND role = 'student' AND jti IS NOT NULL`,
+        [tenantId],
+      );
+    }
 
     return toSettings(next);
   }

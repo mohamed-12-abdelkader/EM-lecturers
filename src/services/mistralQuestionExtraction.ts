@@ -9,7 +9,7 @@ import {
   type MistralQuestionExtractionResult,
 } from '../types/mistralQuestionExtraction';
 import { HttpError, logger, uploadBufferToCloudinary } from '../utils';
-import { expandMultiPartQuestions } from '../utils/expandMultiPartQuestions';
+import { expandMultiPartQuestions, foldSingletonPassages } from '../utils/expandMultiPartQuestions';
 import { MistralOcrService, parsePdfPageRange, type MistralOcrResult } from './mistralOcr';
 
 const ARABIC_OPTION_LABELS = ['أ', 'ب', 'ج', 'د', 'هـ', 'و', 'ز', 'ح', 'ط', 'ي'];
@@ -91,16 +91,33 @@ function resolveCorrectIndex(
   return null;
 }
 
+function sortMcqOptions<T extends { label: string }>(options: T[]): T[] {
+  return [...options].sort((a, b) => {
+    const ia = LABEL_TO_INDEX[a.label.trim()] ?? LABEL_TO_INDEX[a.label.trim().toLowerCase()] ?? 99;
+    const ib = LABEL_TO_INDEX[b.label.trim()] ?? LABEL_TO_INDEX[b.label.trim().toLowerCase()] ?? 99;
+    return ia - ib;
+  });
+}
+
+function normalizeOptionLabel(raw: string): string {
+  const ch = raw.trim();
+  if (ch === 'ا' || ch === 'إ' || ch === 'آ') return 'أ';
+  if (ch === 'ه') return 'هـ';
+  return ch;
+}
+
 function normalizeQuestion(q: MistralExtractedQuestion): MistralExtractedQuestion {
   const rawOptions = q.options ?? [];
   const fallbackLabels = defaultOptionLabels(rawOptions.length, rawOptions);
-  const options = rawOptions
-    .map((opt, i) => ({
-      label: opt.label?.trim() || fallbackLabels[i] || String(i + 1),
-      text: (opt.text ?? '').trim(),
-      image_id: opt.image_id?.trim() || undefined,
-    }))
-    .filter((opt) => opt.label || opt.text || opt.image_id);
+  const options = sortMcqOptions(
+    rawOptions
+      .map((opt, i) => ({
+        label: opt.label?.trim() || fallbackLabels[i] || String(i + 1),
+        text: (opt.text ?? '').trim(),
+        image_id: opt.image_id?.trim() || undefined,
+      }))
+      .filter((opt) => opt.label || opt.text || opt.image_id),
+  );
   const questionImages = (q.question_images ?? [])
     .map((image) => ({
       image_id: image.image_id?.trim(),
@@ -450,16 +467,32 @@ async function uploadQuestionImagesToCloudinary(
 }
 
 function extractArabicMcqOptionsFromSlice(slice: string): Array<{ label: string; text: string }> {
-  const found = new Map<string, string>();
-  const re =
-    /(?:^|[\s\n])([أابجده])\s*[)）\]\-.:：]\s*([^\nأابجده]{1,80}?)(?=(?:\s*[أابجده]\s*[)）\]\-.:：])|\n\n|$)/gu;
+  const source = slice
+    .replace(/[Ⓐⓐ🄐]/g, 'أ) ')
+    .replace(/[Ⓑⓑ🄑]/g, 'ب) ')
+    .replace(/[Ⓒⓒ🄒]/g, 'ج) ')
+    .replace(/[Ⓓⓓ🄓]/g, 'د) ');
+
+  const labelRe = /(?:^|[\s\n])(?:\(|\[)?([أابجدهـ])(?:\)|\]|[)）.\-:])\s*/gu;
+  const marks: Array<{ label: string; matchStart: number; textStart: number }> = [];
   let match: RegExpExecArray | null;
-  while ((match = re.exec(slice)) !== null) {
-    let label = match[1];
-    if (label === 'ا') label = 'أ';
-    const text = match[2].replace(/\s+/g, ' ').trim();
-    if (!text || text.length < 1) continue;
-    if (!found.has(label)) found.set(label, text);
+  while ((match = labelRe.exec(source)) !== null) {
+    marks.push({
+      label: normalizeOptionLabel(match[1]),
+      matchStart: match.index,
+      textStart: match.index + match[0].length,
+    });
+  }
+
+  const found = new Map<string, string>();
+  for (let i = 0; i < marks.length; i++) {
+    const end = i + 1 < marks.length ? marks[i + 1].matchStart : source.length;
+    let text = source.slice(marks[i].textStart, end);
+    text = text.split(/\n\s*\d{1,3}\s*[)）．.\-:]/)[0];
+    text = text.replace(/\s+/g, ' ').trim();
+    if (!text) continue;
+    if (text.length > 400) text = text.slice(0, 400).trim();
+    if (!found.has(marks[i].label)) found.set(marks[i].label, text);
   }
 
   const order = ['أ', 'ب', 'ج', 'د', 'هـ'];
@@ -468,35 +501,91 @@ function extractArabicMcqOptionsFromSlice(slice: string): Array<{ label: string;
     .map((label) => ({ label, text: found.get(label)! }));
 }
 
+function findQuestionSlice(
+  documentText: string,
+  question: MistralExtractedQuestion,
+  nextQuestion?: MistralExtractedQuestion,
+): string | null {
+  const sourceNo = (question.source_number || String(question.number)).trim();
+  const escaped = sourceNo.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const startRe = new RegExp(
+    `(?:^|\\n)\\s*(?:#{1,3}\\s*)?(?:\\*\\*)?(?<!\\d)${escaped}(?!\\d)(?:\\*\\*)?\\s*[)）．.\\-:]*`,
+    'm',
+  );
+  const startMatch = documentText.match(startRe);
+  let start = startMatch?.index ?? -1;
+
+  if (start < 0) {
+    const needle = (question.question_text || '').trim().slice(0, 32);
+    if (needle.length >= 10) start = documentText.indexOf(needle);
+  }
+  if (start < 0) return null;
+
+  let end = Math.min(documentText.length, start + 1800);
+  if (nextQuestion) {
+    const nextNo = (nextQuestion.source_number || String(nextQuestion.number)).trim();
+    const nextEscaped = nextNo.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const nextRe = new RegExp(
+      `(?:^|\\n)\\s*(?:#{1,3}\\s*)?(?:\\*\\*)?(?<!\\d)${nextEscaped}(?!\\d)(?:\\*\\*)?\\s*[)）．.\\-:]*`,
+      'm',
+    );
+    const rest = documentText.slice(start + 1);
+    const nextMatch = rest.match(nextRe);
+    if (nextMatch?.index != null) {
+      end = start + 1 + nextMatch.index;
+    }
+  }
+
+  return documentText.slice(start, end);
+}
+
+function extractQuestionStemFromSlice(slice: string): string {
+  const labelRe = /(?:^|[\s\n])(?:\(|\[)?[أابجدهـ](?:\)|\]|[)）.\-:])/;
+  const idx = slice.search(labelRe);
+  let stem = (idx >= 0 ? slice.slice(0, idx) : slice).trim();
+  stem = stem.replace(/^\s*\d{1,3}\s*[)）．.\-:]*\s*/, '').trim();
+  stem = stem.replace(/^تخير البديل الصحيح[^\n]*\n?/u, '').trim();
+  if (stem.length > 900) stem = stem.slice(0, 900).trim();
+  return stem;
+}
+
 /**
- * إذا رجّع النموذج اختيارين فقط بينما النص فيه أ/ب/ج/د — حاول استكمالها من مقطع OCR.
+ * إذا رجّع النموذج اختيارين فقط أو أسقط نص الاقتباس — أكمل من مقطع OCR.
  */
 function repairSparseTextOptions(
   questions: MistralExtractedQuestion[],
   documentText: string,
 ): MistralExtractedQuestion[] {
-  return questions.map((question) => {
+  return questions.map((question, index) => {
     if ((question.options || []).some((o) => o.image_id)) return question;
+
+    const slice = findQuestionSlice(documentText, question, questions[index + 1]);
+    if (!slice) return question;
+
+    let next = question;
     const textOpts = (question.options || []).filter((o) => (o.text || '').trim());
-    if (textOpts.length >= 4) return question;
-
-    const needle = (question.question_text || '').slice(0, 40).trim();
-    const sourceNo = question.source_number || String(question.number);
-    let start = -1;
-    if (needle) start = documentText.indexOf(needle);
-    if (start < 0) {
-      const numRe = new RegExp(`(?:^|\\n)\\s*${sourceNo}\\s*[)）.\\-:]`);
-      const m = documentText.match(numRe);
-      start = m?.index ?? -1;
+    if (textOpts.length < 4) {
+      const recovered = extractArabicMcqOptionsFromSlice(slice);
+      if (recovered.length > textOpts.length && recovered.length >= 3) {
+        next = { ...next, options: recovered };
+      }
     }
-    if (start < 0) return question;
 
-    const slice = documentText.slice(start, start + 1200);
-    const recovered = extractArabicMcqOptionsFromSlice(slice);
-    if (recovered.length > textOpts.length && recovered.length >= 3) {
-      return { ...question, options: recovered };
+    const recoveredStem = extractQuestionStemFromSlice(slice);
+    const current = (next.question_text || '').trim();
+    const currentHead = current.slice(0, 20);
+    const recoveredHead = recoveredStem.slice(0, 20);
+    if (
+      recoveredStem.length >= 24 &&
+      recoveredStem.length > current.length + 8 &&
+      (current.length < 40 ||
+        (currentHead && recoveredStem.includes(currentHead)) ||
+        (recoveredHead && current.includes(recoveredHead)))
+    ) {
+      next = { ...next, question_text: recoveredStem };
     }
-    return question;
+
+    return next;
   });
 }
 
@@ -595,9 +684,10 @@ async function parseQuestionsWithChat(
     normalizePassages(validated.passages),
     dedupeByNumber(validated.questions),
   );
-  const repairedQuestions = repairSparseTextOptions(expanded.questions, documentText);
+  const folded = foldSingletonPassages(expanded.passages, expanded.questions);
+  const repairedQuestions = repairSparseTextOptions(folded.questions, documentText);
   return {
-    passages: expanded.passages,
+    passages: folded.passages,
     questions: repairedQuestions,
     notes: validated.notes,
     chatModel,
@@ -721,10 +811,11 @@ async function parseQuestionsWithChatBatched(
     normalizePassages(allPassages),
     dedupeByNumber(allQuestions),
   );
+  const folded = foldSingletonPassages(expanded.passages, expanded.questions);
 
   return {
-    passages: expanded.passages,
-    questions: expanded.questions,
+    passages: folded.passages,
+    questions: folded.questions,
     notes: notesParts.length ? notesParts.join('\n') : undefined,
     chatModel: chatModel || getMistralConfig().chatModel,
   };

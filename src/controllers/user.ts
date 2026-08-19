@@ -144,14 +144,21 @@ router.post(
       }
     }
 
-    const token = await generateToken(user, pool, { sessionTenantId: tenantId });
-
-    // Device Session + Refresh Cookie للطالب الجديد (نفس نظام /login)
+    const exclusiveSession = await StudentDeviceRestrictionService.shouldReplaceOtherSessions(
+      'student',
+      tenantId,
+    );
     const session = await AuthSessionsService.createDeviceSession({
       userId: user.id,
       tenantId,
       rememberMe: false,
       req,
+      exclusiveSession,
+    });
+    const token = await generateToken(user, pool, {
+      sessionTenantId: tenantId,
+      jti: exclusiveSession ? session.jti : undefined,
+      persistJti: exclusiveSession,
     });
     setRefreshCookie(req, res, session.refreshToken, false);
     AuthSessionsService.logLogin(user.id, 'student', 'register', req);

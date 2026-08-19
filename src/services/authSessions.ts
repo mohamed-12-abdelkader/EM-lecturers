@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import type { Request, Response } from 'express';
 import pool from '../db/pool';
 import { config, logger, HttpError } from '../utils';
+import { disconnectUserSockets } from './notifications';
 
 /**
  * Device Sessions + Refresh Token Rotation
@@ -86,8 +87,8 @@ export function parseUserAgent(req: Request): { browser: string; platform: strin
   return { browser, platform };
 }
 
-function refreshTtlMs(rememberMe: boolean): number {
-  const days = rememberMe ? config.REFRESH_TOKEN_REMEMBER_DAYS : config.REFRESH_TOKEN_TTL_DAYS;
+function refreshTtlMs(_rememberMe: boolean): number {
+  const days = Math.max(config.REFRESH_TOKEN_TTL_DAYS, config.REFRESH_TOKEN_REMEMBER_DAYS);
   return days * 24 * 60 * 60 * 1000;
 }
 
@@ -183,40 +184,84 @@ export class AuthSessionsService {
     tenantId?: number | null;
     rememberMe: boolean;
     req: Request;
-  }): Promise<{ refreshToken: string; deviceId: string; expiresAt: Date }> {
+    /** true = Login جديد يلغي باقي الأجهزة. false = السماح بأكثر من جهاز. */
+    exclusiveSession?: boolean;
+  }): Promise<{ refreshToken: string; deviceId: string; expiresAt: Date; jti: string }> {
+    const exclusiveSession = input.exclusiveSession !== false;
     const secret = newSecret();
     const { browser, platform } = parseUserAgent(input.req);
     const ip = clientIp(input.req);
     const expiresAt = new Date(Date.now() + refreshTtlMs(input.rememberMe));
+    const jti = crypto.randomUUID();
 
-    const res = await pool.query<{ id: string }>(
-      `INSERT INTO user_devices
-         (user_id, tenant_id, refresh_token_hash, browser, platform, ip, remember_me, expires_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-       RETURNING id`,
-      [
-        input.userId,
-        input.tenantId ?? null,
-        sha256(secret),
+    const client = await pool.connect();
+    let revokedCount = 0;
+    try {
+      await client.query('BEGIN');
+      await client.query('SELECT id FROM users WHERE id = $1 FOR UPDATE', [input.userId]);
+
+      if (exclusiveSession) {
+        const revoked = await client.query(
+          `UPDATE user_devices
+           SET revoked_at = NOW(), revoked_reason = $2, updated_at = NOW()
+           WHERE user_id = $1 AND revoked_at IS NULL`,
+          [input.userId, 'login_other_device'],
+        );
+        revokedCount = revoked.rowCount ?? 0;
+      }
+
+      const res = await client.query<{ id: string }>(
+        `INSERT INTO user_devices
+           (user_id, tenant_id, refresh_token_hash, browser, platform, ip, remember_me, expires_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         RETURNING id`,
+        [
+          input.userId,
+          input.tenantId ?? null,
+          sha256(secret),
+          browser,
+          platform,
+          ip,
+          input.rememberMe,
+          expiresAt,
+        ],
+      );
+
+      if (exclusiveSession) {
+        await client.query('UPDATE users SET jti = $1 WHERE id = $2', [jti, input.userId]);
+      } else {
+        await client.query('UPDATE users SET jti = NULL WHERE id = $1 AND jti IS NOT NULL', [
+          input.userId,
+        ]);
+      }
+      await client.query('COMMIT');
+
+      const deviceId = res.rows[0].id;
+      if (revokedCount > 0) {
+        logAuthEvent('login_replaces_sessions', {
+          user_id: input.userId,
+          revoked_count: revokedCount,
+          ip,
+        });
+        disconnectUserSockets(input.userId);
+      }
+
+      logAuthEvent('device_login', {
+        user_id: input.userId,
+        device_id: deviceId,
         browser,
         platform,
         ip,
-        input.rememberMe,
-        expiresAt,
-      ],
-    );
+        remember_me: input.rememberMe,
+      });
 
-    const deviceId = res.rows[0].id;
-    logAuthEvent('device_login', {
-      user_id: input.userId,
-      device_id: deviceId,
-      browser,
-      platform,
-      ip,
-      remember_me: input.rememberMe,
-    });
-
-    return { refreshToken: `${deviceId}.${secret}`, deviceId, expiresAt };
+      return { refreshToken: `${deviceId}.${secret}`, deviceId, expiresAt, jti };
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
   }
 
   /**

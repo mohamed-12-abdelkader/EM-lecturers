@@ -20,13 +20,15 @@ const OPTIONS = [
   {
     value: 'multiple_devices',
     label_ar: 'السماح للطالب باستخدام الحساب من أكثر من جهاز',
-    description_ar: 'لا يتم ربط الحساب بعنوان IP. تسجيل الدخول مسموح من أي جهاز.',
+    description_ar: 'لا يتم ربط الحساب بعنوان IP. تسجيل الدخول مسموح من أي جهاز. (الوضع الافتراضي)',
+    is_default: true,
   },
   {
     value: 'single_device',
     label_ar: 'السماح للطالب باستخدام الحساب من جهاز واحد فقط',
     description_ar:
       'يُربط الحساب بـ IP أول جهاز يسجّل منه الطالب، ويُرفض الدخول من عنوان مختلف حتى يعيد المدرس تعيين الجهاز.',
+    is_default: false,
   },
 ];
 
@@ -41,6 +43,7 @@ router.get(
     res.json({
       success: true,
       data: settings,
+      default_value: 'multiple_devices',
       options: OPTIONS,
     });
   }),

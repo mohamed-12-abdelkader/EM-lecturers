@@ -1,6 +1,6 @@
 import { RequestHandler, Request, Response } from 'express';
 import * as jwt from 'jsonwebtoken';
-import { config, generateToken } from '../utils';
+import { config, generateToken, isAccessSessionReplaced, SESSION_REPLACED } from '../utils';
 import pool from '../db/pool';
 import { User } from '../db/types';
 
@@ -127,6 +127,7 @@ async function refreshSessionToken(
 ): Promise<string> {
   const newToken = await generateToken(user, pool, {
     sessionTenantId: (req as Request & { tenant?: { id: number } }).tenant?.id,
+    jti: user.jti,
   });
   res.setHeader('X-Access-Token', newToken);
   // Allow browsers / axios to read refreshed token across origins when CORS exposes it.
@@ -199,6 +200,10 @@ export function authMiddleware(roles: Roles[] = []): RequestHandler {
 
       if (!(await assertRequestTenantMatchesUserAndToken(req, res, decoded, user))) return;
 
+      if (isAccessSessionReplaced(decoded, user)) {
+        return res.status(401).json(SESSION_REPLACED);
+      }
+
       // Role-based access check (only if roles are specified)
       if (roles.length > 0 && !roles.includes(user.role)) {
         return res.status(403).json({
@@ -210,8 +215,6 @@ export function authMiddleware(roles: Roles[] = []): RequestHandler {
           },
         });
       }
-
-      // لا نتحقق من JTI للطلاب (يسمح بتسجيل الدخول من أجهزة متعددة)
 
       req.user = user;
       next();
@@ -266,6 +269,10 @@ export function authMiddleware(roles: Roles[] = []): RequestHandler {
           }
 
           if (!(await assertRequestTenantMatchesUserAndToken(req, res, decoded, user))) return;
+
+          if (isAccessSessionReplaced(decoded, user)) {
+            return res.status(401).json(SESSION_REPLACED);
+          }
 
           // Role-based access check (only if roles are specified)
           if (roles.length > 0 && !roles.includes(user.role)) {

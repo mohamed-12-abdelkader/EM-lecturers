@@ -4,10 +4,12 @@
 
 | العنصر | التخزين | المدة |
 |--------|---------|--------|
-| **Access Token** | JSON response (`token`) — في الذاكرة على الـ Frontend | `15m` (قابل للتعديل) |
-| **Refresh Token** | **HttpOnly Cookie** فقط (`em_refresh`) — لا يظهر في JSON | 7 أيام / سنة مع `remember_me` |
+| **Access Token** | JSON response (`token`) — في الذاكرة على الـ Frontend | `365d` (سنة) |
+| **Refresh Token** | **HttpOnly Cookie** فقط (`em_refresh`) — لا يظهر في JSON | سنة في كل الحالات |
 
 لا تعتمد على LocalStorage للـ Refresh Token.
+
+**جلسة واحدة:** للمدرس/الأدمن دائماً. للطالب فقط إذا المدرس اختار `single_device` (الافتراضي: أكثر من جهاز).
 
 ---
 
@@ -22,8 +24,8 @@
 ## إعدادات البيئة
 
 ```env
-ACCESS_TOKEN_TTL=15m
-REFRESH_TOKEN_TTL_DAYS=7
+ACCESS_TOKEN_TTL=365d
+REFRESH_TOKEN_TTL_DAYS=365
 REFRESH_TOKEN_REMEMBER_DAYS=365
 TENANT_ROOT_DOMAIN=em-online.online
 # اختياري — يفرض Domain للكوكي (افتراضي: .TENANT_ROOT_DOMAIN)
@@ -76,7 +78,7 @@ Response:
   "user": { "id": 1, "name": "...", "role": "teacher", "...": "..." },
   "token": "<access_jwt>",
   "token_type": "Bearer",
-  "expires_in": "15m",
+  "expires_in": "365d",
   "tenant": { "id": 2, "subdomain": "mr-ali", "display_name": "..." },
   "employee_permissions": null,
   "employee_data": null
@@ -117,6 +119,15 @@ Response `200`:
 | 401 | `SESSION_REVOKED` |
 | 401 | `REFRESH_EXPIRED` |
 | 401 | `REFRESH_REUSE_DETECTED` |
+
+أي طلب API بتوكين الجهاز القديم:
+
+```json
+{
+  "message": "تم تسجيل الدخول من جهاز آخر. هذه الجلسة لم تعد صالحة.",
+  "code": "SESSION_REPLACED"
+}
+```
 
 ---
 
@@ -185,7 +196,8 @@ Access Token فقط — **بدون** Refresh تلقائي داخل الـ Backen
 2. كل طلب API → Authorization: Bearer <token>
 3. لو 401 / TOKEN_EXPIRED → POST /auth/refresh (credentials: include)
 4. استبدل الـ Access Token → أعد الطلب
-5. Logout → POST /auth/logout
+5. لو 401 / SESSION_REPLACED → امسح التوكن واطلب Login من جديد (دخل من جهاز آخر)
+6. Logout → POST /auth/logout
 ```
 
 ---
@@ -201,7 +213,8 @@ Access Token فقط — **بدون** Refresh تلقائي داخل الـ Backen
 | Cookie Security | HttpOnly + Secure + SameSite + Path محدود |
 | Security Headers | nosniff, DENY frame, Referrer-Policy, ... |
 | CORS + Credentials | مفعّل للمنصات (`*.TENANT_ROOT_DOMAIN`) |
-| Logging | login, logout, refresh, refresh_failure, device_login, suspicious_activity |
+| Single active session | Login جديد يلغي كل جلسات `user_devices` + يغيّر `users.jti` |
+| Logging | login, logout, refresh, refresh_failure, device_login, login_replaces_sessions, suspicious_activity |
 
 ---
 

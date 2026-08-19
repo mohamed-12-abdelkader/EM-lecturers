@@ -4,7 +4,7 @@ import bcrypt from 'bcrypt';
 import crypto from 'node:crypto';
 import * as jwt from 'jsonwebtoken';
 import { ipKeyGenerator, rateLimit } from 'express-rate-limit';
-import { asyncWrapper, config, generateToken, sendEmail, HttpError } from '../utils';
+import { asyncWrapper, config, generateToken, sendEmail, HttpError, isAccessSessionReplaced, SESSION_REPLACED } from '../utils';
 import { validate } from '../middleware/validateReq';
 import { ForgotPassword, Login, ResetPassword, RegisterAdminOrTeacher } from './auth.modules';
 import { TeacherManagedStudentsService } from '../services/teacherManagedStudents';
@@ -260,15 +260,23 @@ router.post(
       ipRegistered = ipCheck.ip_registered;
     }
 
-    const token = await generateToken(user, pool, { sessionTenantId: effectiveTenantId });
-
     // Device Session + Refresh Cookie (HttpOnly) — الـ Refresh Token لا يُرسل في الـ JSON
     const rememberMe = req.body.remember_me === true;
+    const exclusiveSession = await StudentDeviceRestrictionService.shouldReplaceOtherSessions(
+      user.role,
+      effectiveTenantId,
+    );
     const session = await AuthSessionsService.createDeviceSession({
       userId: user.id,
       tenantId: effectiveTenantId,
       rememberMe,
       req,
+      exclusiveSession,
+    });
+    const token = await generateToken(user, pool, {
+      sessionTenantId: effectiveTenantId,
+      jti: exclusiveSession ? session.jti : undefined,
+      persistJti: exclusiveSession,
     });
     setRefreshCookie(req, res, session.refreshToken, rememberMe);
     AuthSessionsService.logLogin(
@@ -339,7 +347,7 @@ function extractBearerToken(req: import('express').Request): string | null {
   return null;
 }
 
-const PUBLIC_USER_FIELDS = `id, name, email, phone, student_code, role, avatar, tenant_id, must_change_password, account_status`;
+const PUBLIC_USER_FIELDS = `id, name, email, phone, student_code, role, avatar, tenant_id, must_change_password, account_status, jti`;
 
 /**
  * POST /auth/refresh
@@ -401,6 +409,7 @@ router.post(
     // Access Token جديد + تحديث الـ Refresh Cookie (Rotation)
     const accessToken = await generateToken(user, pool, {
       sessionTenantId: device.tenant_id ?? user.tenant_id,
+      jti: user.jti,
     });
     setRefreshCookie(req, res, refreshToken, device.remember_me);
 
@@ -473,9 +482,9 @@ router.get(
       return res.status(401).json({ message: 'Unauthorized', code: 'MISSING_TOKEN' });
     }
 
-    let decoded: { id?: unknown; tid?: unknown };
+    let decoded: { id?: unknown; tid?: unknown; jti?: unknown };
     try {
-      decoded = jwt.verify(token, config.SECRET_KEY) as { id?: unknown; tid?: unknown };
+      decoded = jwt.verify(token, config.SECRET_KEY) as { id?: unknown; tid?: unknown; jti?: unknown };
     } catch (err: unknown) {
       const name = (err as { name?: string })?.name;
       if (name === 'TokenExpiredError') {
@@ -498,6 +507,9 @@ router.get(
     }
 
     const user = userRes.rows[0];
+    if (isAccessSessionReplaced(decoded, user)) {
+      return res.status(401).json(SESSION_REPLACED);
+    }
     const tenantId = decoded.tid != null ? Number(decoded.tid) : user.tenant_id;
     let tenant = null;
     if (tenantId != null && Number.isInteger(Number(tenantId))) {
@@ -645,16 +657,14 @@ router.post(
       );
     }
 
-    // إنشاء token
-    const token = await generateToken(user, pool, { sessionTenantId: tenantId });
-
-    // Device Session + Refresh Cookie
+    // إنشاء token + جلسة جهاز واحدة (تلغي أي جلسة سابقة)
     const session = await AuthSessionsService.createDeviceSession({
       userId: user.id,
       tenantId,
       rememberMe: false,
       req,
     });
+    const token = await generateToken(user, pool, { sessionTenantId: tenantId, jti: session.jti });
     setRefreshCookie(req, res, session.refreshToken, false);
     AuthSessionsService.logLogin(user.id, user.role, 'register', req);
 

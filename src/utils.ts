@@ -90,14 +90,14 @@ export const config = cleanEnv(process.env, {
   /** e.g. next-edu.online — used to parse {sub}.root from Host. Empty = always default tenant unless X-Tenant-Subdomain. */
   TENANT_ROOT_DOMAIN: str({ default: 'em-online.online' }),
   SECRET_KEY: str({ devDefault: testOnly(crypto.randomBytes(32).toString('hex')) }),
-  ACCESS_TOKEN_EXPIRE_MINUTES: num({ default: 60 * 24 * 8 }), // 8 days
+  ACCESS_TOKEN_EXPIRE_MINUTES: num({ default: 60 * 24 * 365 }), // 365 days
   COMMON_TOKEN_EXPIRE_HOURS: num({ default: 8 }),
 
   // Auth (Access/Refresh tokens)
-  /** مدة الـ Access Token (jsonwebtoken format) */
-  ACCESS_TOKEN_TTL: str({ default: '15m' }),
-  /** مدة Refresh Token بدون Remember Me (أيام) */
-  REFRESH_TOKEN_TTL_DAYS: num({ default: 7 }),
+  /** مدة الـ Access Token (jsonwebtoken format) — سنة حتى لو المنصة ما اتفتحتش أسابيع */
+  ACCESS_TOKEN_TTL: str({ default: '365d' }),
+  /** مدة Refresh Token بدون Remember Me (أيام) — نفس السنة في كل الحالات */
+  REFRESH_TOKEN_TTL_DAYS: num({ default: 365 }),
   /** مدة Refresh Token مع Remember Me (أيام) */
   REFRESH_TOKEN_REMEMBER_DAYS: num({ default: 365 }),
   /** Domain للـ Refresh Cookie (فارغ = تلقائي: .TENANT_ROOT_DOMAIN في production) */
@@ -209,19 +209,44 @@ export const config = cleanEnv(process.env, {
 export type GenerateTokenOptions = {
   /** When set (e.g. from `req.tenant.id` at login), JWT `tid` matches the session host tenant even if `users.tenant_id` is stale. */
   sessionTenantId?: number | null;
-  /** Override access token TTL (jsonwebtoken format, e.g. '15m'). Defaults to config.ACCESS_TOKEN_TTL. */
+  /** Override access token TTL (jsonwebtoken format, e.g. '365d'). Defaults to config.ACCESS_TOKEN_TTL. */
   expiresIn?: string;
+  /**
+   * Reuse the current session jti (refresh / auto-refresh).
+   * Omit on exclusive login so a new jti is stored and every other device is invalidated.
+   */
+  jti?: string | null;
+  /** false = لا تُحدّث users.jti (دخول من أكثر من جهاز). */
+  persistJti?: boolean;
 };
+
+export const SESSION_REPLACED = {
+  message: 'تم تسجيل الدخول من جهاز آخر. هذه الجلسة لم تعد صالحة.',
+  code: 'SESSION_REPLACED' as const,
+};
+
+/** true إذا التوكين ده مش بتاع الجلسة الحالية (دخل من جهاز تاني). */
+export function isAccessSessionReplaced(
+  decoded: { jti?: unknown },
+  user: { jti?: string | null },
+): boolean {
+  const current = typeof user.jti === 'string' ? user.jti.trim() : '';
+  if (!current) return false;
+  return decoded.jti !== current;
+}
 
 export async function generateToken(
   user: User,
   pool: Pool,
   opts?: GenerateTokenOptions,
 ): Promise<string> {
-  const jti = crypto.randomUUID();
+  const reused = typeof opts?.jti === 'string' ? opts.jti.trim() : '';
+  const jti = reused || crypto.randomUUID();
 
-  // لا نحدث JTI في قاعدة البيانات للطلاب (يسمح بتسجيل الدخول من أجهزة متعددة)
-  // JTI يبقى في التوكن فقط لأغراض أخرى
+  // Exclusive login: persist jti so any previous access token dies immediately.
+  if (!reused && opts?.persistJti !== false) {
+    await pool.query('UPDATE users SET jti = $1 WHERE id = $2', [jti, user.id]);
+  }
 
   const fromUser = (user as { tenant_id?: number | null }).tenant_id;
   const explicit = opts?.sessionTenantId;

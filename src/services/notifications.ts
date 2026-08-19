@@ -15,6 +15,17 @@ function getIO(): SocketIOServer | null {
   return getIOInstance ? getIOInstance() : null;
 }
 
+/** قطع كل اتصالات الجهاز القديم بعد Login من جهاز جديد */
+export function disconnectUserSockets(userId: number): void {
+  const io = getIO();
+  if (!io) return;
+  io.to(`user:${userId}`).emit('auth:session-replaced', {
+    code: 'SESSION_REPLACED',
+    message: 'تم تسجيل الدخول من جهاز آخر. هذه الجلسة لم تعد صالحة.',
+  });
+  io.in(`user:${userId}`).disconnectSockets(true);
+}
+
 function enqueueWebPush(
   userId: number,
   title: string,

@@ -2,7 +2,7 @@ import { applyMigrations } from './db/migrate';
 import { app, server } from './app';
 import { Server as SocketIOServer } from 'socket.io';
 import * as jwt from 'jsonwebtoken';
-import { config, generateToken, logger } from './utils';
+import { config, generateToken, isAccessSessionReplaced, logger } from './utils';
 import { getServerInfo, isCorsOriginAllowed } from './config/appUrls';
 import pool from './db/pool';
 import { ChatService } from './services/chat';
@@ -172,12 +172,16 @@ const startServer = async () => {
           return next(new Error('Teacher account is not active'));
         }
 
-        // Match HTTP auth behavior: do not block student realtime on jti mismatch.
+        if (isAccessSessionReplaced(decoded, user)) {
+          return next(new Error('SESSION_REPLACED'));
+        }
+
         (socket as any).user = user;
 
         if (tokenWasExpired) {
           const newToken = await generateToken(user, pool, {
             sessionTenantId: user.tenant_id ?? undefined,
+            jti: user.jti,
           });
           socket.emit('auth:token-refreshed', { token: newToken });
         }

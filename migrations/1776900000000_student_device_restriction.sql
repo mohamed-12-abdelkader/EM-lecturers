@@ -1,5 +1,5 @@
 -- Student device/IP restriction: per-tenant setting lives in tenant_settings.data.student_device_limit
--- Values: multiple_devices | single_device (unset = single_device to keep existing IP binding)
+-- Values: multiple_devices | single_device (unset = multiple_devices; teacher can change anytime)
 
 BEGIN;
 

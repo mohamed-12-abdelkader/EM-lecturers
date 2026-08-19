@@ -11,7 +11,9 @@
 | `multiple_devices` | الدخول من أي جهاز. لا ربط IP ولا تحقق. |
 | `single_device` | الحساب يرتبط بـ IP أول جهاز، ويُرفض الدخول من عنوان مختلف حتى يعيد المدرس تعيين الجهاز. |
 
-**الافتراضي:** `single_device` (يحافظ على ربط `device_ip` الحالي إن وُجد).
+**الافتراضي:** `multiple_devices` — الطالب يدخل من أي جهاز. المدرس يغيّر الإعداد في أي وقت من `PUT /api/teacher/device-restriction-settings`.
+
+لو المنصة ما حفظتش القيمة، يتطبق الافتراضي (أكثر من جهاز).
 
 الـ Frontend يمكنه إرسال `device_ip` (أو `registered_ip` / `ip`). الـ Backend هو المسؤول عن تطبيق القاعدة، ولا يعتمد على قيمة العميل إذا وصل الطلب من IP عام مختلف.
 
@@ -28,20 +30,23 @@ Auth: `Authorization: Bearer <TEACHER_TOKEN>`
 {
   "success": true,
   "data": {
-    "student_device_limit": "single_device",
-    "single_device": true,
-    "multiple_devices": false
+    "student_device_limit": "multiple_devices",
+    "single_device": false,
+    "multiple_devices": true
   },
+  "default_value": "multiple_devices",
   "options": [
     {
       "value": "multiple_devices",
       "label_ar": "السماح للطالب باستخدام الحساب من أكثر من جهاز",
-      "description_ar": "لا يتم ربط الحساب بعنوان IP. تسجيل الدخول مسموح من أي جهاز."
+      "description_ar": "لا يتم ربط الحساب بعنوان IP. تسجيل الدخول مسموح من أي جهاز. (الوضع الافتراضي)",
+      "is_default": true
     },
     {
       "value": "single_device",
       "label_ar": "السماح للطالب باستخدام الحساب من جهاز واحد فقط",
-      "description_ar": "يُربط الحساب بـ IP أول جهاز يسجّل منه الطالب، ويُرفض الدخول من عنوان مختلف حتى يعيد المدرس تعيين الجهاز."
+      "description_ar": "يُربط الحساب بـ IP أول جهاز يسجّل منه الطالب، ويُرفض الدخول من عنوان مختلف حتى يعيد المدرس تعيين الجهاز.",
+      "is_default": false
     }
   ]
 }
@@ -65,7 +70,9 @@ Auth: `Authorization: Bearer <TEACHER_TOKEN>`
 }
 ```
 
-تغيير الإعداد **لا يمسح** IP الطلاب الحالي. يؤثر فقط على التحقق من اللحظة دي فصاعدًا.
+تغيير الإعداد **لا يمسح** IP الطلاب الحالي. يؤثر على التحقق من اللحظة دي فصاعدًا.
+
+عند التحويل إلى `multiple_devices` تُفك ربط الجلسة الواحدة (`users.jti`) حتى التوكينات القديمة تفضل شغالة على أكثر من جهاز.
 
 ---
 
@@ -79,9 +86,9 @@ Auth: `Authorization: Bearer <TEACHER_TOKEN>`
 {
   "success": true,
   "data": {
-    "student_device_limit": "single_device",
-    "single_device": true,
-    "multiple_devices": false
+    "student_device_limit": "multiple_devices",
+    "single_device": false,
+    "multiple_devices": true
   }
 }
 ```
@@ -96,8 +103,8 @@ Auth: `Authorization: Bearer <TEACHER_TOKEN>`
   "data": {
     "registration_mode": "self_registration",
     "self_registration_enabled": true,
-    "student_device_limit": "single_device",
-    "single_device": true
+    "student_device_limit": "multiple_devices",
+    "single_device": false
   }
 }
 ```
@@ -195,7 +202,7 @@ Response `201`:
   },
   "token": "...",
   "token_type": "Bearer",
-  "expires_in": 900,
+  "expires_in": "365d",
   "tenant": { "id": 5, "subdomain": "mo-adbo", "display_name": "..." }
 }
 ```
