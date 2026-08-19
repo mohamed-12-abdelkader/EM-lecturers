@@ -48,7 +48,7 @@ Authorization: Bearer <ACCESS_TOKEN>
 | المرحلة | الأداة | النموذج الافتراضي |
 |---------|--------|-------------------|
 | **OCR** — PDF/صورة → نص Markdown | Mistral OCR API | `mistral-ocr-latest` |
-| **تحليل الأسئلة** — نص → JSON منظم | Mistral Chat API | `mistral-large-latest` |
+| **تحليل الأسئلة** — تخطيط الصفحة + OCR → JSON | Mistral Chat / Vision | `mistral-large-latest` للنص، `pixtral-large-latest` مع صور الصفحات |
 | **رفع صور الأسئلة** | Cloudinary | — |
 
 ### Pipeline كامل
@@ -65,7 +65,7 @@ sequenceDiagram
   U->>API: POST /extract-questions (PDF/صورة)
   API->>OCR: استخراج نص + صور + تعليقات
   OCR-->>API: pages[] markdown + images
-  API->>Chat: prompt عربي → JSON أسئلة
+  API->>Chat: صور الصفحات (إن وُجدت) + OCR → JSON أسئلة
   Chat-->>API: passages + questions
   API->>CDN: رفع صور الأسئلة (اختياري)
   CDN-->>API: image_url
@@ -296,7 +296,8 @@ curl -X POST "http://localhost:8000/api/ocr/extract-questions" \
         ],
         "correct_answer": "ب",
         "correct_answer_index": 1,
-        "correct_answer_inferred": true
+        "correct_answer_inferred": true,
+        "confidence": 0.96
       }
     ],
     "notes": "ملاحظات اختيارية من الـ AI"
@@ -326,10 +327,16 @@ curl -X POST "http://localhost:8000/api/ocr/extract-questions" \
 |-------|--------|
 | `number` | رقم تسلسلي |
 | `source_number` | الرقم كما في الملف الأصلي |
-| `question_text` | نص السؤال فقط (بدون القطعة) |
+| `question_text` | النص الكامل المجموع (توافق خلفي). للعرض الملون استخدم `display_blocks` |
+| `intro_text` | تمهيد مثل «قال الشاعر:» — للفرونت بلون مميز (أخضر) |
+| `stimulus_text` | الجملة أو أبيات الشعر المرجعية — للفرونت بلون مميز (أحمر). أبيات بينها سطر فارغ. قد تحتوي `<u>` |
+| `prompt_text` | تعليمات السؤال فقط — للفرونت بلون مميز (أزرق) |
+| `display_blocks` | نفس الأجزاء مرتبة: `{ "role": "intro" \| "stimulus" \| "prompt", "text": "..." }` — **استخدمه للعرض** |
+| `underlined_phrases` | الكلمات التي تحتها خط فعلياً في الصورة |
 | `options` | **إما فارغة** أو **من 2 إلى 5 اختيارات** (مثلاً 3 أو 5 في امتحانات إنجليزية a–e) |
 | `correct_answer_index` | **يبدأ من 0**: أ=0، ب=1، ج=2، د=3 |
 | `correct_answer_inferred` | `true` إذا استنتجها AI وليست مكتوبة صراحة |
+| `confidence` | اختياري 0–1 لوضوح النص وحدود السؤال |
 | `question_images` | صور مرتبطة بالسؤال (رسم، جدول، معادلة) |
 
 ### الصور
@@ -343,13 +350,38 @@ curl -X POST "http://localhost:8000/api/ocr/extract-questions" \
 
 ## ما يفهمه الـ AI (قواعد الاستخراج)
 
-الـ prompt العربي في `src/prompts/mistralQuestionExtraction.prompt.ts` يوجّه النموذج لـ:
+الاستخراج **عام** — ليس قالباً لكتاب معيّن. النموذج يحلّل تخطيط الصفحة ثم حدود كل سؤال ثم النص.
 
-1. عدم اختراع أسئلة غير موجودة في الملف
-2. دعم **قطع قراءة** + أسئلة متعددة عليها
-3. دعم **سؤال رئيسي/تمهيد** يتبعه أسئلة فرعية (التمهيد = passage)
-4. ربط الأسئلة بصور من `IMAGE_CONTEXT` عبر `image_id`
-5. الحفاظ على اللغة العربية كما في المصدر
+عند رفع **صور** (وليس PDF): تُرسل صفحات الكتاب الأصلية مع نص OCR إلى نموذج رؤية (`pixtral-large-latest` افتراضياً، أو `MISTRAL_VISION_CHAT_MODEL`). الخطوط الفاصلة المرسومة بين الأسئلة تُستخدم كمرجع حدود فقط ولا تُستخرج في النص.
+
+1. فهم التخطيط البصري أولاً (كتل، مسافات، أعمدة، خطوط فاصلة، ما تحته خط)
+2. عدم اختراع أسئلة غير موجودة في الملف
+3. الحفاظ على النص الأصلي (بدون إعادة صياغة)
+4. **ما تحته خط** على الكلمة الصحيحة فقط داخل `stimulus_text` كـ `<u>…</u>` + `underlined_phrases`
+5. أبيات الشعر: سطر فارغ (`\\n\\n`) بين كل بيت
+6. فصل التمهيد / الجملة المرجعية / السؤال في `display_blocks` لألوان الفرونت
+7. دعم **قطع قراءة** + أسئلة متعددة عليها
+8. سؤال رئيسي ثم فروع باختيارات مستقلة → أسئلة منفصلة في البنك (التمهيد يُدمج في كل فرع)
+9. ربط الأسئلة بصور من `IMAGE_CONTEXT` عبر `image_id`
+10. `confidence` اختياري (0–1) لوضوح الاستخراج
+
+### عرض السؤال في الفرونت (ألوان)
+
+اعرض `display_blocks` بالترتيب. لا تعتمد على `question_text` وحدَه إذا أردت ألواناً مختلفة.
+
+| `role` | المعنى | لون مقترح |
+|--------|--------|-----------|
+| `intro` | تمهيد («قال ناجي:») | أخضر |
+| `stimulus` | الجملة أو البيت المرجعي | أحمر / عنابي |
+| `prompt` | نص السؤال والتعليمات | أزرق |
+
+ما تحته خط: `dangerouslySetInnerHTML` أو parser لـ `<u>` داخل `stimulus` فقط. الأبيات: `white-space: pre-line` لأن النص يحتوي `\n\n`.
+
+---
+
+```env
+MISTRAL_VISION_CHAT_MODEL=pixtral-large-latest
+```
 
 ---
 

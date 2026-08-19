@@ -79,6 +79,11 @@ export function expandMultiPartQuestions(
     for (const question of group) {
       question.question_text = combineStemWithPart(stem, question.question_text);
       question.passage_id = null;
+      if (!question.stimulus_text?.trim()) {
+        question.stimulus_text = stem;
+        const rest = (question.display_blocks ?? []).filter((block) => block.role !== 'stimulus');
+        question.display_blocks = [{ role: 'stimulus' as const, text: stem }, ...rest];
+      }
     }
     passagesToRemove.add(passageId);
   }
@@ -118,6 +123,14 @@ export function foldSingletonPassages(
     if (!passage?.content.trim()) continue;
     group[0].question_text = combineStemWithPart(passage.content, group[0].question_text);
     group[0].passage_id = null;
+    if (!group[0].stimulus_text?.trim()) {
+      group[0].stimulus_text = passage.content.trim();
+      const rest = (group[0].display_blocks ?? []).filter((block) => block.role !== 'stimulus');
+      group[0].display_blocks = [
+        { role: 'stimulus' as const, text: passage.content.trim() },
+        ...rest,
+      ];
+    }
     passagesToRemove.add(passageId);
   }
 

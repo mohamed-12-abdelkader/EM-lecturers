@@ -11,6 +11,7 @@ import {
 import { HttpError, logger, uploadBufferToCloudinary } from '../utils';
 import { expandMultiPartQuestions, foldSingletonPassages } from '../utils/expandMultiPartQuestions';
 import { MistralOcrService, parsePdfPageRange, type MistralOcrResult } from './mistralOcr';
+import * as fs from 'node:fs';
 
 const ARABIC_OPTION_LABELS = ['أ', 'ب', 'ج', 'د', 'هـ', 'و', 'ز', 'ح', 'ط', 'ي'];
 const ENGLISH_OPTION_LABELS = ['a', 'b', 'c', 'd', 'e'];
@@ -106,6 +107,175 @@ function normalizeOptionLabel(raw: string): string {
   return ch;
 }
 
+function clampConfidence(value: unknown): number | undefined {
+  if (typeof value !== 'number' || Number.isNaN(value)) return undefined;
+  return Math.min(1, Math.max(0, value));
+}
+
+/** يبقي وسوم التنسيق المهمة (خصوصاً <u> لما تحته خط) ويزيل الباقي. */
+function sanitizeQuestionFormatting(raw: string): string {
+  let text = (raw ?? '').trim();
+  if (!text) return '';
+
+  text = text.replace(/<ins\b[^>]*>/gi, '<u>').replace(/<\/ins>/gi, '</u>');
+  text = text.replace(/__([^_\n]{1,120})__/g, '<u>$1</u>');
+  text = text.replace(/<\/?([a-zA-Z][a-zA-Z0-9]*)\b[^>]*>/g, (full, name: string) => {
+    const tag = name.toLowerCase();
+    if (!['u', 'b', 'i', 'em', 'strong', 'sup', 'sub'].includes(tag)) return '';
+    return full.startsWith('</') ? `</${tag}>` : `<${tag}>`;
+  });
+  return text.trim();
+}
+
+function hasUnderlineMarkup(text: string): boolean {
+  return /<u[\s>]/i.test(text);
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function stripUnderlineTags(text: string): string {
+  return text.replace(/<\/?u>/gi, '');
+}
+
+function extractUnderlinedPhrases(text: string): string[] {
+  const phrases: string[] = [];
+  const re = /<u>(.*?)<\/u>/gis;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(text)) !== null) {
+    const phrase = (match[1] || '').replace(/\s+/g, ' ').trim();
+    if (phrase) phrases.push(phrase);
+  }
+  return phrases;
+}
+
+/** يعيد وضع <u> على العبارات المحددة حرفياً بعد إزالة أي تسطير خاطئ. */
+function applyExactUnderlines(text: string, phrases: string[]): string {
+  const cleanPhrases = phrases.map((p) => stripUnderlineTags(p).replace(/\s+/g, ' ').trim()).filter(Boolean);
+  if (cleanPhrases.length === 0) return text;
+
+  let out = stripUnderlineTags(text);
+  for (const phrase of cleanPhrases) {
+    const re = new RegExp(escapeRegExp(phrase).replace(/\s+/g, '\\s+'), '');
+    if (!re.test(out)) continue;
+    out = out.replace(re, (matched) => `<u>${matched}</u>`);
+  }
+  return out;
+}
+
+function looksLikePoetry(intro: string, stimulus: string): boolean {
+  const blob = `${intro}\n${stimulus}`;
+  return /شاعر|بيت|شعر|قصيد|قائل|ناجي|المتنبي|عنترة/u.test(blob);
+}
+
+/** سطر فارغ بين أبيات الشعر؛ لا يدمج الأبيات في فقرة واحدة. */
+function formatPoetrySpacing(text: string): string {
+  let t = text.replace(/\r\n/g, '\n').trim();
+  if (!t) return t;
+  const lines = t
+    .split(/\n+/)
+    .map((line) => line.replace(/[ \t]{2,}/g, '    ').trim())
+    .filter(Boolean);
+  if (lines.length >= 2) return lines.join('\n\n');
+  return t;
+}
+
+function emptyToNull(value: string | null | undefined): string | null {
+  const text = (value ?? '').trim();
+  return text || null;
+}
+
+type DisplayRole = 'intro' | 'stimulus' | 'prompt';
+
+function buildDisplayBlocks(q: {
+  display_blocks?: Array<{ role: DisplayRole; text: string }>;
+  intro_text?: string | null;
+  stimulus_text?: string | null;
+  prompt_text?: string | null;
+  question_text?: string;
+}): Array<{ role: DisplayRole; text: string }> {
+  const fromModel = (q.display_blocks ?? [])
+    .map((block) => ({
+      role: block.role,
+      text: sanitizeQuestionFormatting(block.text),
+    }))
+    .filter((block) => block.text);
+
+  if (fromModel.length > 0) return fromModel;
+
+  const blocks: Array<{ role: DisplayRole; text: string }> = [];
+  const intro = sanitizeQuestionFormatting(q.intro_text ?? '');
+  const stimulus = sanitizeQuestionFormatting(q.stimulus_text ?? '');
+  const prompt = sanitizeQuestionFormatting(q.prompt_text ?? '');
+  if (intro) blocks.push({ role: 'intro', text: intro });
+  if (stimulus) blocks.push({ role: 'stimulus', text: stimulus });
+  if (prompt) blocks.push({ role: 'prompt', text: prompt });
+  if (blocks.length > 0) return blocks;
+
+  const full = sanitizeQuestionFormatting(q.question_text ?? '');
+  return full ? [{ role: 'prompt', text: full }] : [];
+}
+
+function composeQuestionText(blocks: Array<{ text: string }>): string {
+  return blocks
+    .map((block) => block.text.trim())
+    .filter(Boolean)
+    .join('\n\n');
+}
+
+function normalizeQuestionLayout(q: MistralExtractedQuestion): {
+  intro_text: string | null;
+  stimulus_text: string | null;
+  prompt_text: string | null;
+  display_blocks: Array<{ role: DisplayRole; text: string }>;
+  underlined_phrases: string[];
+  question_text: string;
+} {
+  let blocks = buildDisplayBlocks(q);
+  const introHint = blocks.find((b) => b.role === 'intro')?.text ?? q.intro_text ?? '';
+  const poetry = looksLikePoetry(introHint, blocks.find((b) => b.role === 'stimulus')?.text ?? '');
+
+  blocks = blocks.map((block) => {
+    let text = block.text;
+    if (block.role === 'stimulus') {
+      const lineCount = text.split(/\n+/).filter((line) => line.trim()).length;
+      if (lineCount >= 2 || poetry) text = formatPoetrySpacing(text);
+    }
+    return { ...block, text };
+  });
+
+  const phrasesFromModel = (q.underlined_phrases ?? [])
+    .map((p) => stripUnderlineTags(p).replace(/\s+/g, ' ').trim())
+    .filter(Boolean);
+  const phrasesFromMarkup = blocks.flatMap((block) => extractUnderlinedPhrases(block.text));
+  const underlinedPhrases = phrasesFromModel.length > 0 ? phrasesFromModel : phrasesFromMarkup;
+
+  if (underlinedPhrases.length > 0) {
+    const hasStimulus = blocks.some((block) => block.role === 'stimulus');
+    blocks = blocks.map((block) => {
+      if (block.role === 'prompt' && hasStimulus) {
+        return { ...block, text: stripUnderlineTags(block.text) };
+      }
+      return { ...block, text: applyExactUnderlines(block.text, underlinedPhrases) };
+    });
+  }
+
+  const intro_text = emptyToNull(blocks.find((b) => b.role === 'intro')?.text);
+  const stimulus_text = emptyToNull(blocks.find((b) => b.role === 'stimulus')?.text);
+  const prompt_text = emptyToNull(blocks.find((b) => b.role === 'prompt')?.text);
+  const question_text = composeQuestionText(blocks) || sanitizeQuestionFormatting(q.question_text ?? '');
+
+  return {
+    intro_text,
+    stimulus_text,
+    prompt_text,
+    display_blocks: blocks,
+    underlined_phrases: underlinedPhrases,
+    question_text,
+  };
+}
+
 function normalizeQuestion(q: MistralExtractedQuestion): MistralExtractedQuestion {
   const rawOptions = q.options ?? [];
   const fallbackLabels = defaultOptionLabels(rawOptions.length, rawOptions);
@@ -113,7 +283,7 @@ function normalizeQuestion(q: MistralExtractedQuestion): MistralExtractedQuestio
     rawOptions
       .map((opt, i) => ({
         label: opt.label?.trim() || fallbackLabels[i] || String(i + 1),
-        text: (opt.text ?? '').trim(),
+        text: sanitizeQuestionFormatting(opt.text ?? ''),
         image_id: opt.image_id?.trim() || undefined,
       }))
       .filter((opt) => opt.label || opt.text || opt.image_id),
@@ -145,31 +315,45 @@ function normalizeQuestion(q: MistralExtractedQuestion): MistralExtractedQuestio
     correctAnswerIndex = resolveCorrectIndex(correctAnswer, options);
   }
 
+  const layout = normalizeQuestionLayout(q);
+
   if (correctAnswerIndex != null && !correctAnswer) {
     const label = options[correctAnswerIndex]?.label ?? null;
     return {
       number: q.number,
       source_number: q.source_number?.trim() || String(q.number),
-      question_text: (q.question_text ?? '').trim(),
+      question_text: layout.question_text,
+      intro_text: layout.intro_text,
+      stimulus_text: layout.stimulus_text,
+      prompt_text: layout.prompt_text,
+      display_blocks: layout.display_blocks,
+      underlined_phrases: layout.underlined_phrases,
       passage_id: q.passage_id?.trim() || null,
       options,
       question_images: questionImages,
       correct_answer: label,
       correct_answer_index: correctAnswerIndex,
       correct_answer_inferred: q.correct_answer_inferred ?? false,
+      confidence: clampConfidence(q.confidence),
     };
   }
 
   return {
     number: q.number,
     source_number: q.source_number?.trim() || String(q.number),
-    question_text: (q.question_text ?? '').trim(),
+    question_text: layout.question_text,
+    intro_text: layout.intro_text,
+    stimulus_text: layout.stimulus_text,
+    prompt_text: layout.prompt_text,
+    display_blocks: layout.display_blocks,
+    underlined_phrases: layout.underlined_phrases,
     passage_id: q.passage_id?.trim() || null,
     options,
     question_images: questionImages,
     correct_answer: correctAnswer ?? null,
     correct_answer_index: correctAnswerIndex,
     correct_answer_inferred: q.correct_answer_inferred ?? false,
+    confidence: clampConfidence(q.confidence),
   };
 }
 
@@ -208,6 +392,15 @@ function mergeExtractedQuestion(
 ) {
   if (normalized.question_text.length > existing.question_text.length) {
     existing.question_text = normalized.question_text;
+  }
+  if (normalized.display_blocks.length > existing.display_blocks.length) {
+    existing.display_blocks = normalized.display_blocks;
+    existing.intro_text = normalized.intro_text;
+    existing.stimulus_text = normalized.stimulus_text;
+    existing.prompt_text = normalized.prompt_text;
+  }
+  if (normalized.underlined_phrases.length > existing.underlined_phrases.length) {
+    existing.underlined_phrases = normalized.underlined_phrases;
   }
   if (normalized.source_number && !existing.source_number) {
     existing.source_number = normalized.source_number;
@@ -573,6 +766,9 @@ function repairSparseTextOptions(
 
     const recoveredStem = extractQuestionStemFromSlice(slice);
     const current = (next.question_text || '').trim();
+    if (hasUnderlineMarkup(current) || (next.underlined_phrases?.length ?? 0) > 0 || (next.display_blocks?.length ?? 0) > 1) {
+      return next;
+    }
     const currentHead = current.slice(0, 20);
     const recoveredHead = recoveredStem.slice(0, 20);
     if (
@@ -606,40 +802,75 @@ async function parseQuestionsWithChat(
   filename: string,
   inferCorrectAnswer: boolean,
   chatModelOverride?: string,
+  pageImages: VisionPageImage[] = [],
 ): Promise<{
   passages: MistralExtractedPassage[];
   questions: MistralExtractedQuestion[];
   notes?: string;
   chatModel: string;
 }> {
-  const { apiKey, apiBaseUrl, chatModel: defaultChatModel } = getMistralConfig();
-  const chatModel = chatModelOverride?.trim() || defaultChatModel;
+  const { apiKey, apiBaseUrl, chatModel: defaultChatModel, visionChatModel } = getMistralConfig();
+  const hasPageImages = pageImages.length > 0;
+  const chatModel =
+    chatModelOverride?.trim() || (hasPageImages ? visionChatModel : defaultChatModel) || defaultChatModel;
 
-  const response = await fetch(`${apiBaseUrl}/chat/completions`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      model: chatModel,
-      temperature: inferCorrectAnswer ? 0.2 : 0.1,
-      response_format: { type: 'json_object' },
-      messages: [
-        {
-          role: 'system',
-          content:
-            'أنت محلل امتحانات. أخرج JSON صالح فقط وفق المخطط المطلوب. لا تضف markdown أو شرح.',
-        },
-        {
-          role: 'user',
-          content: buildQuestionExtractionPrompt(documentText, filename, {
-            inferCorrectAnswer,
-          }),
-        },
-      ],
-    }),
+  const prompt = buildQuestionExtractionPrompt(documentText, filename, {
+    inferCorrectAnswer,
+    hasPageImages,
   });
+
+  const userContent: unknown = hasPageImages
+    ? [
+        { type: 'text', text: prompt },
+        ...pageImages.slice(0, 6).map((image) => ({
+          type: 'image_url' as const,
+          image_url: `data:${image.mime};base64,${image.base64}`,
+        })),
+      ]
+    : prompt;
+
+  const runChat = async (model: string, content: unknown) => {
+    const response = await fetch(`${apiBaseUrl}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model,
+        temperature: inferCorrectAnswer ? 0.2 : 0.1,
+        response_format: { type: 'json_object' },
+        messages: [
+          {
+            role: 'system',
+            content:
+              'أنت محلل بصري لصفحات الامتحانات والكتب. افهم تخطيط الصفحة وحدود كل سؤال ثم أخرج JSON صالح فقط وفق المخطط. لا تضف markdown أو شرح خارج JSON.',
+          },
+          { role: 'user', content },
+        ],
+      }),
+    });
+    return response;
+  };
+
+  let response = await runChat(chatModel, userContent);
+  let usedModel = chatModel;
+
+  if (!response.ok && hasPageImages && response.status >= 400 && response.status < 500) {
+    const errBody = await response.text();
+    logger.warn(
+      { status: response.status, body: errBody.slice(0, 300) },
+      'vision question extraction failed — retrying text-only OCR',
+    );
+    usedModel = chatModelOverride?.trim() || defaultChatModel;
+    response = await runChat(
+      usedModel,
+      buildQuestionExtractionPrompt(documentText, filename, {
+        inferCorrectAnswer,
+        hasPageImages: false,
+      }),
+    );
+  }
 
   if (!response.ok) {
     const errBody = await response.text();
@@ -690,16 +921,41 @@ async function parseQuestionsWithChat(
     passages: folded.passages,
     questions: repairedQuestions,
     notes: validated.notes,
-    chatModel,
+    chatModel: usedModel,
   };
+}
+
+type VisionPageImage = { pageIndex: number; mime: string; base64: string };
+
+const MAX_VISION_FILE_BYTES = 5 * 1024 * 1024;
+
+function collectVisionPagesFromFiles(files: Express.Multer.File[]): VisionPageImage[] {
+  const out: VisionPageImage[] = [];
+  let pageIndex = 0;
+  for (const file of files) {
+    const mime = MistralOcrService.resolveSupportedMime(file);
+    if (mime.includes('pdf')) return [];
+
+    let buffer = file.buffer;
+    if (!buffer?.length && file.path && fs.existsSync(file.path)) {
+      buffer = fs.readFileSync(file.path);
+    }
+    if (buffer?.length && buffer.length <= MAX_VISION_FILE_BYTES) {
+      out.push({ pageIndex, mime, base64: buffer.toString('base64') });
+    }
+    pageIndex += 1;
+  }
+  return out;
 }
 
 /** Soft limits so huge PDFs don't blow the chat context window. */
 const CHAT_BATCH_MAX_PAGES = 15;
+const CHAT_BATCH_MAX_PAGES_WITH_VISION = 6;
 const CHAT_BATCH_MAX_CHARS = 90_000;
 
-function chunkOcrPagesForChat(ocr: MistralOcrResult): MistralOcrResult[] {
-  if (ocr.pages.length <= CHAT_BATCH_MAX_PAGES) {
+function chunkOcrPagesForChat(ocr: MistralOcrResult, hasPageImages = false): MistralOcrResult[] {
+  const maxPages = hasPageImages ? CHAT_BATCH_MAX_PAGES_WITH_VISION : CHAT_BATCH_MAX_PAGES;
+  if (ocr.pages.length <= maxPages) {
     const chars = buildDocumentContext(ocr).length;
     if (chars <= CHAT_BATCH_MAX_CHARS) return [ocr];
   }
@@ -729,7 +985,7 @@ function chunkOcrPagesForChat(ocr: MistralOcrResult): MistralOcrResult[] {
     const pageChars = (page.markdown?.length ?? 0) + 64;
     if (
       currentPages.length > 0 &&
-      (currentPages.length >= CHAT_BATCH_MAX_PAGES ||
+      (currentPages.length >= maxPages ||
         currentChars + pageChars > CHAT_BATCH_MAX_CHARS)
     ) {
       flush();
@@ -764,19 +1020,26 @@ async function parseQuestionsWithChatBatched(
   ocr: MistralOcrResult,
   inferCorrectAnswer: boolean,
   chatModelOverride?: string,
+  pageImages: VisionPageImage[] = [],
 ): Promise<{
   passages: MistralExtractedPassage[];
   questions: MistralExtractedQuestion[];
   notes?: string;
   chatModel: string;
 }> {
-  const batches = chunkOcrPagesForChat(ocr);
+  const batches = chunkOcrPagesForChat(ocr, pageImages.length > 0);
+  const imagesForBatch = (batch: MistralOcrResult) => {
+    const indexes = new Set(batch.pages.map((page) => page.index));
+    return pageImages.filter((image) => indexes.has(image.pageIndex)).slice(0, 6);
+  };
+
   if (batches.length === 1) {
     return parseQuestionsWithChat(
       buildDocumentContext(batches[0]),
       ocr.filename,
       inferCorrectAnswer,
       chatModelOverride,
+      imagesForBatch(batches[0]),
     );
   }
 
@@ -795,6 +1058,7 @@ async function parseQuestionsWithChatBatched(
       `${ocr.filename} [pages-batch ${i + 1}/${batches.length}]`,
       inferCorrectAnswer,
       chatModelOverride,
+      imagesForBatch(batch),
     );
     chatModel = result.chatModel;
     const remapped = prefixPassageIds(result.passages, result.questions, `b${i + 1}_`);
@@ -823,7 +1087,7 @@ async function parseQuestionsWithChatBatched(
 
 export class MistralQuestionExtractionService {
   /**
-   * Pipeline: Mistral OCR (PDF/صورة → markdown) → Mistral Chat (markdown → أسئلة JSON)
+   * Pipeline: OCR → فهم تخطيط الصفحة (صور إن وُجدت + markdown) → أسئلة JSON
    */
   static async extractQuestionsFromFile(
     file: Express.Multer.File,
@@ -892,6 +1156,7 @@ export class MistralQuestionExtractionService {
         filename: f.originalname || f.filename,
         mime_type: MistralOcrService.resolveSupportedMime(f),
       })),
+      pageImages: collectVisionPagesFromFiles(files),
       pageRange:
         pages && pages.length > 0
           ? {
@@ -910,6 +1175,7 @@ export class MistralQuestionExtractionService {
       includeQuestionImages: boolean;
       requestedChatModel?: string;
       sourceFiles?: Array<{ filename: string; mime_type: string }>;
+      pageImages?: VisionPageImage[];
       pageRange?: MistralQuestionExtractionResult['page_range'];
     },
   ): Promise<MistralQuestionExtractionResult> {
@@ -923,6 +1189,7 @@ export class MistralQuestionExtractionService {
       ocr,
       opts.inferCorrectAnswer,
       opts.requestedChatModel,
+      opts.pageImages ?? [],
     );
     const questionsWithPassages = fillMissingPassageIds(questions, passages);
     const attachedQuestions = opts.includeQuestionImages

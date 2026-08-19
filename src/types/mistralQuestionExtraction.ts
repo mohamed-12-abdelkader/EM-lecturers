@@ -31,17 +31,41 @@ export const MistralExtractedPassageSchema = z.object({
   content: z.string().min(1),
 });
 
+export const QuestionDisplayBlockSchema = z.object({
+  /** intro = تمهيد (قال الشاعر…) — stimulus = الجملة/البيت المرجعي — prompt = نص السؤال */
+  role: z.enum(['intro', 'stimulus', 'prompt']),
+  text: z.string().min(1),
+});
+
 export const MistralExtractedQuestionSchema = z
   .object({
     number: z.number().int().positive(),
     source_number: z.string().optional(),
     question_text: z.string().default(''),
+    /** تمهيد قصير مثل «قال ناجي:» */
+    intro_text: z.string().nullable().optional(),
+    /** الجملة أو أبيات الشعر المرجعية (قد تحتوي <u>) */
+    stimulus_text: z.string().nullable().optional(),
+    /** تعليمات السؤال فقط مثل «بين المفضل في البيت السابق.» */
+    prompt_text: z.string().nullable().optional(),
+    /** نفس الأجزاء للفرونت: intro أخضر، stimulus أحمر، prompt أزرق */
+    display_blocks: z
+      .array(QuestionDisplayBlockSchema)
+      .nullish()
+      .transform((value) => value ?? []),
+    /** الكلمات التي تحتها خط فعلياً في الصورة — لتصحيح الـ underline */
+    underlined_phrases: z
+      .array(z.string())
+      .nullish()
+      .transform((value) => value ?? []),
     passage_id: z.string().nullable().optional(),
     options: z.array(MistralExtractedOptionSchema).default([]),
     question_images: z.array(MistralQuestionImageSchema).optional().default([]),
     correct_answer: z.string().nullable().optional(),
     correct_answer_index: z.number().int().min(0).nullable().optional(),
     correct_answer_inferred: z.boolean().optional().default(false),
+    /** 0–1 وضوح الاستخراج وحدود السؤال */
+    confidence: z.number().min(0).max(1).optional(),
   })
   .superRefine((question, ctx) => {
     if (!isValidMistralOptionCount(question.options.length)) {
@@ -141,6 +165,7 @@ export function parseQuestionExtractionImportPayload(body: unknown): {
 export type MistralExtractedOption = z.infer<typeof MistralExtractedOptionSchema>;
 export type MistralQuestionImage = z.infer<typeof MistralQuestionImageSchema>;
 export type MistralExtractedPassage = z.infer<typeof MistralExtractedPassageSchema>;
+export type QuestionDisplayBlock = z.infer<typeof QuestionDisplayBlockSchema>;
 export type MistralExtractedQuestion = z.infer<typeof MistralExtractedQuestionSchema>;
 export type MistralQuestionExtractionPayload = z.infer<typeof MistralQuestionExtractionSchema>;
 
