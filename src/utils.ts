@@ -15,16 +15,26 @@ import * as fs from 'node:fs';
 import * as util from 'node:util';
 import * as path from 'node:path';
 
-const envFile =
+const projectRoot = path.resolve(__dirname, '..');
+
+const envFileName =
   process.env.NODE_ENV === 'production'
     ? '.env'
     : process.env.NODE_ENV === 'test'
       ? '.env'
       : '.env.development';
 
-dotenv.config({ path: envFile });
+const envFilePath = path.join(projectRoot, envFileName);
+const envLoaded = dotenv.config({ path: envFilePath });
+
 if (process.env.NODE_ENV === 'development') {
-  dotenv.config({ path: '.env.ngrok.local', override: true });
+  dotenv.config({ path: path.join(projectRoot, '.env.ngrok.local'), override: true });
+}
+
+if (process.env.NODE_ENV === 'development' && envLoaded.error) {
+  console.error(`\n❌ Missing ${envFileName} in project root.`);
+  console.error(`   Copy .env.example to ${envFileName} and fill required values:\n`);
+  console.error(`   copy .env.example ${envFileName}\n`);
 }
 
 // Utils functions
@@ -89,7 +99,10 @@ export const config = cleanEnv(process.env, {
   NGROK_RELAX_CORS: bool({ default: true }),
   /** e.g. next-edu.online — used to parse {sub}.root from Host. Empty = always default tenant unless X-Tenant-Subdomain. */
   TENANT_ROOT_DOMAIN: str({ default: 'em-online.online' }),
-  SECRET_KEY: str({ devDefault: testOnly(crypto.randomBytes(32).toString('hex')) }),
+  SECRET_KEY: str({
+    desc: 'SECRET_KEY (JWT signing secret)',
+    devDefault: testOnly(crypto.randomBytes(32).toString('hex')),
+  }),
   ACCESS_TOKEN_EXPIRE_MINUTES: num({ default: 60 * 24 * 365 }), // 365 days
   COMMON_TOKEN_EXPIRE_HOURS: num({ default: 8 }),
 
@@ -389,10 +402,12 @@ export const uploadToCloudinary = async (
     access_mode?: 'public' | 'authenticated';
     /** عند false: لا نرجع لتخزين محلي إذا فشل Cloudinary (افتراضي true) */
     allowLocalFallback?: boolean;
+    folder?: string;
+    public_id?: string;
   },
 ): Promise<UploadApiResponse> => {
   const uploadOptions: Record<string, unknown> = {
-    folder: 'media',
+    folder: options?.folder || 'media',
   };
 
   if (options?.resource_type) {
@@ -403,6 +418,9 @@ export const uploadToCloudinary = async (
   }
   if (options?.access_mode) {
     uploadOptions.access_mode = options.access_mode;
+  }
+  if (options?.public_id) {
+    uploadOptions.public_id = options.public_id;
   }
 
   // Large files: chunked upload (Cloudinary) so platform hero/avatar aren't capped by single PUT size

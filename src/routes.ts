@@ -8,6 +8,11 @@ import { router as teacherRouter } from './controllers/teacher';
 import { router as studentRouter } from './controllers/student';
 import { router as utilsRouter } from './controllers/utils';
 import { router as coursesRouter } from './controllers/courses';
+import {
+  courseFilesByCourseRouter,
+  courseFilesRouter,
+  courseFileViewHandlers,
+} from './controllers/courseFiles';
 import { router as availableCourseRouter } from './controllers/availableCourse';
 import { router as teacherQuestionsRouter } from './controllers/teacherQuestions';
 import {
@@ -92,6 +97,11 @@ import { whatsappTeacherRouter } from './modules/whatsapp/controllers/whatsappTe
 
 export const router = Router();
 
+// عرض PDF: GET و POST على الراوتر الرئيسي حتى لا يضيع الطلب في راوترات أخرى
+router.get('/course-files/:fileId/view', ...courseFileViewHandlers);
+router.post('/course-files/:fileId/view', ...courseFileViewHandlers);
+router.head('/course-files/:fileId/view', ...courseFileViewHandlers);
+
 router.use('/tenants/public', tenantsPublicRouter);
 router.use('/seo', seoPublicRouter);
 router.use('/super/tenants', tenantsSuperRouter);
@@ -105,6 +115,9 @@ router.use('/teacher', teacherRouter);
 router.use('/student', studentRouter);
 router.use('/utils', utilsRouter);
 router.use('/course', availableCourseRouter);
+router.use('/course', courseFilesByCourseRouter);
+router.use('/courses', courseFilesByCourseRouter);
+router.use('/course-files', courseFilesRouter);
 router.use('/course', coursesRouter);
 router.use('/chat', chatRouter);
 router.use('/social', socialRouter);

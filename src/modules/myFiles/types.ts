@@ -51,4 +51,13 @@ export interface FileStatistics {
 export interface StorageUploadResult {
   fileUrl: string;
   fileKey: string;
+  deliveryType?: 'upload' | 'authenticated' | 'private';
+  resourceType?: 'image' | 'raw';
 }
+
+export type StorageAccessMode = 'public' | 'authenticated';
+
+export type StorageUploadOptions = {
+  access?: StorageAccessMode;
+  folder?: string;
+};
