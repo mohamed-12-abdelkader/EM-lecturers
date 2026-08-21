@@ -8,27 +8,69 @@ function escapeHtml(value: string | number | null | undefined): string {
     .replace(/"/g, '&quot;');
 }
 
-function formatExamDate(value: string | null): string {
+function formatDate(value: string | null | undefined): string {
   if (!value) return '';
   return String(value).slice(0, 10);
 }
 
+function money(value: number | null | undefined): string {
+  if (value == null || !Number.isFinite(value)) return '—';
+  const rounded = Number.isInteger(value) ? String(value) : value.toFixed(2);
+  return `${rounded} ج.م.`;
+}
+
 export function renderPublicStudentCardHtml(card: PublicStudentCard): string {
-  const attended = card.attendance_totals.present + card.attendance_totals.late;
+  const totals = card.attendance_totals;
   const groupsHtml = card.groups.length
     ? card.groups
+        .map((g) => {
+          const meta = [g.subject_name, g.grade_name].filter(Boolean).join(' · ');
+          const payClass = g.payment_status ? `pill ${g.payment_status}` : 'pill muted-pill';
+          const payText = g.payment_status_ar ?? 'لم يُسجَّل اشتراك هذا الشهر';
+          const payAmounts =
+            g.payment_status == null
+              ? g.monthly_fee
+                ? `<div class="muted">اشتراك المجموعة: ${escapeHtml(money(g.monthly_fee))}</div>`
+                : ''
+              : `<div class="muted">المطلوب ${escapeHtml(money(g.amount_due))} · المدفوع ${escapeHtml(money(g.amount_paid))} · المتبقي ${escapeHtml(money(g.remaining))}</div>`;
+
+          return `
+        <div class="group">
+          <div class="group-head">
+            <div>
+              <strong>${escapeHtml(g.group_name)}</strong>
+              ${meta ? `<div class="muted">${escapeHtml(meta)}</div>` : ''}
+              ${g.schedule_label ? `<div class="muted">${escapeHtml(g.schedule_label)}</div>` : ''}
+            </div>
+            <span class="${payClass}">${escapeHtml(payText)}</span>
+          </div>
+          <div class="mini-stats">
+            <span>حضر ${g.lectures_attended}</span>
+            <span>غاب ${g.absent}</span>
+            <span>تأخر ${g.late}</span>
+            ${g.excused ? `<span>بعذر ${g.excused}</span>` : ''}
+          </div>
+          ${payAmounts}
+          ${g.last_attendance_date ? `<div class="muted">آخر حضور: ${escapeHtml(formatDate(g.last_attendance_date))}</div>` : ''}
+        </div>`;
+        })
+        .join('')
+    : '<p class="muted">لا توجد مجموعات مسجّل فيها الطالب</p>';
+
+  const recentHtml = card.recent_attendance.length
+    ? card.recent_attendance
         .map(
-          (g) => `
+          (row) => `
         <div class="row">
           <div>
-            <strong>${escapeHtml(g.group_name)}</strong>
-            ${g.payment_status_ar ? `<span class="pill">${escapeHtml(g.payment_status_ar)}</span>` : ''}
+            <strong>${escapeHtml(row.status_ar)}</strong>
+            <div class="muted">${escapeHtml(row.group_name)}${row.day_name ? ` · ${escapeHtml(row.day_name)}` : ''}</div>
           </div>
-          <div class="muted">حضر ${g.lectures_attended} · غاب ${g.absent}</div>
+          <div class="score status-${escapeHtml(row.status)}">${escapeHtml(row.attendance_date)}</div>
         </div>`,
         )
         .join('')
-    : '<p class="muted">لا توجد مجموعات</p>';
+    : '<p class="muted">لا يوجد سجل حضور بعد</p>';
 
   const examsHtml = card.exams.length
     ? card.exams
@@ -42,7 +84,7 @@ export function renderPublicStudentCardHtml(card: PublicStudentCard): string {
         <div class="row">
           <div>
             <strong>${escapeHtml(e.title)}</strong>
-            <div class="muted">${escapeHtml(e.group_name)}${e.exam_date ? ` · ${escapeHtml(formatExamDate(e.exam_date))}` : ''}</div>
+            <div class="muted">${escapeHtml(e.group_name)}${e.exam_date ? ` · ${escapeHtml(formatDate(e.exam_date))}` : ''}</div>
           </div>
           <div class="score">${escapeHtml(scoreText)}</div>
         </div>`;
@@ -55,7 +97,7 @@ export function renderPublicStudentCardHtml(card: PublicStudentCard): string {
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>${escapeHtml(card.student.full_name)} — بطاقة السنتر</title>
+  <title>${escapeHtml(card.student.full_name)} — بطاقة ولي الأمر</title>
   <style>
     :root { color-scheme: light; }
     * { box-sizing: border-box; }
@@ -65,7 +107,7 @@ export function renderPublicStudentCardHtml(card: PublicStudentCard): string {
       background: #eef2f7;
       color: #122033;
     }
-    .wrap { max-width: 520px; margin: 0 auto; padding: 16px; }
+    .wrap { max-width: 560px; margin: 0 auto; padding: 16px; }
     .hero {
       background: linear-gradient(135deg, #123a63, #1d5a93);
       color: #fff;
@@ -97,6 +139,30 @@ export function renderPublicStudentCardHtml(card: PublicStudentCard): string {
       box-shadow: 0 6px 18px rgba(18, 58, 99, .08);
     }
     .card h2 { margin: 0 0 10px; font-size: 16px; color: #123a63; }
+    .group {
+      padding: 12px 0;
+      border-bottom: 1px solid #eef2f7;
+    }
+    .group:last-child { border-bottom: 0; }
+    .group-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      align-items: flex-start;
+    }
+    .mini-stats {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin: 8px 0 4px;
+      font-size: 13px;
+      color: #345;
+    }
+    .mini-stats span {
+      background: #f4f7fb;
+      padding: 3px 8px;
+      border-radius: 999px;
+    }
     .row {
       display: flex;
       justify-content: space-between;
@@ -105,40 +171,52 @@ export function renderPublicStudentCardHtml(card: PublicStudentCard): string {
       border-bottom: 1px solid #eef2f7;
     }
     .row:last-child { border-bottom: 0; }
-    .muted { color: #6b7c8d; font-size: 13px; margin: 0; }
+    .muted { color: #6b7c8d; font-size: 13px; margin: 4px 0 0; }
     .pill {
       display: inline-block;
-      margin-right: 6px;
-      background: #e8f3ee;
-      color: #1b6b45;
       font-size: 11px;
-      padding: 2px 8px;
+      padding: 3px 8px;
       border-radius: 999px;
+      white-space: nowrap;
     }
+    .pill.paid { background: #e8f3ee; color: #1b6b45; }
+    .pill.unpaid { background: #fdecec; color: #a12a2a; }
+    .pill.partial { background: #fff4e5; color: #9a5b00; }
+    .pill.exempt { background: #eef2f7; color: #445566; }
+    .pill.muted-pill { background: #eef2f7; color: #5b6b7c; }
     .score { font-weight: 700; color: #123a63; white-space: nowrap; }
+    .status-absent { color: #a12a2a; }
+    .status-present { color: #1b6b45; }
+    .status-late { color: #9a5b00; }
     .foot { text-align: center; color: #7b8a99; font-size: 12px; margin-top: 8px; }
   </style>
 </head>
 <body>
   <div class="wrap">
     <div class="hero">
-      <div class="label">${escapeHtml(card.teacher_name)}</div>
+      <div class="label">بطاقة ولي الأمر · ${escapeHtml(card.teacher_name)}</div>
       <h1>${escapeHtml(card.student.full_name)}</h1>
       <div class="code">كود الطالب: ${escapeHtml(card.student.student_code)}</div>
     </div>
     <div class="stats">
-      <div class="stat"><b>${attended}</b><span>محاضرة حضرها</span></div>
-      <div class="stat"><b>${card.attendance_totals.absent}</b><span>غياب</span></div>
+      <div class="stat"><b>${totals.lectures_attended}</b><span>محاضرة حضرها</span></div>
+      <div class="stat"><b>${totals.absent}</b><span>غياب</span></div>
+      <div class="stat"><b>${totals.late}</b><span>تأخير</span></div>
+      <div class="stat"><b>${totals.excused}</b><span>غياب بعذر</span></div>
     </div>
     <div class="card">
-      <h2>المجموعات والحضور</h2>
+      <h2>المجموعات والحضور · ${escapeHtml(card.billing_month.label)}</h2>
       ${groupsHtml}
+    </div>
+    <div class="card">
+      <h2>آخر الحصص</h2>
+      ${recentHtml}
     </div>
     <div class="card">
       <h2>درجات السنتر</h2>
       ${examsHtml}
     </div>
-    <p class="foot">بطاقة طالب — نظام إدارة السنتر</p>
+    <p class="foot">مسح الكود من تطبيق المدرس يسجّل الحضور — ومن أي قارئ يعرض هذه البطاقة لولي الأمر</p>
   </div>
 </body>
 </html>`;

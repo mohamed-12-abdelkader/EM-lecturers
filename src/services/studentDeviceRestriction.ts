@@ -184,16 +184,75 @@ export class StudentDeviceRestrictionService {
   }
 
   /**
-   * جلسة واحدة (Login جديد يلغي الجهاز القديم) للمدرس/الأدمن دائماً،
-   * وللطالب فقط إذا المدرس اختار `single_device`.
+   * الطالب: جلسة نشطة واحدة دائماً. دخول جهاز جديد يلغي التوكين القديم.
+   * المدرس/الأدمن: أكثر من جهاز. إعداد `student_device_limit` للربط بـ IP فقط.
    */
   static async shouldReplaceOtherSessions(
     role: string,
-    tenantId?: number | null,
+    _tenantId?: number | null,
   ): Promise<boolean> {
-    if (role !== 'student') return true;
-    if (!tenantId) return false;
-    return this.isSingleDevice(tenantId);
+    return role === 'student';
+  }
+
+  static async applyStudentSessionPolicy(
+    tenantId: number,
+    limit: StudentDeviceLimit,
+  ): Promise<void> {
+    if (limit === 'multiple_devices') {
+      await pool.query(
+        `UPDATE users SET jti = NULL WHERE tenant_id = $1 AND role = 'student' AND jti IS NOT NULL`,
+        [tenantId],
+      );
+      await pool.query(
+        `UPDATE user_devices d
+         SET exclusive = FALSE, updated_at = NOW()
+         FROM users u
+         WHERE u.id = d.user_id AND u.tenant_id = $1 AND u.role = 'student'`,
+        [tenantId],
+      );
+      return;
+    }
+
+    await pool.query(
+      `WITH ranked AS (
+         SELECT d.id,
+                ROW_NUMBER() OVER (
+                  PARTITION BY d.user_id
+                  ORDER BY d.last_used_at DESC, d.created_at DESC
+                ) AS rn
+         FROM user_devices d
+         JOIN users u ON u.id = d.user_id
+         WHERE u.tenant_id = $1 AND u.role = 'student' AND d.revoked_at IS NULL
+       )
+       UPDATE user_devices d
+       SET revoked_at = NOW(),
+           revoked_reason = 'login_other_device',
+           updated_at = NOW()
+       FROM ranked r
+       WHERE d.id = r.id AND r.rn > 1`,
+      [tenantId],
+    );
+    await pool.query(
+      `UPDATE user_devices d
+       SET exclusive = TRUE, updated_at = NOW()
+       FROM users u
+       WHERE u.id = d.user_id
+         AND u.tenant_id = $1
+         AND u.role = 'student'
+         AND d.revoked_at IS NULL`,
+      [tenantId],
+    );
+    await pool.query(
+      `UPDATE users u
+       SET jti = d.jti::text
+       FROM user_devices d
+       WHERE d.user_id = u.id
+         AND u.tenant_id = $1
+         AND u.role = 'student'
+         AND d.revoked_at IS NULL
+         AND d.expires_at > NOW()`,
+      [tenantId],
+    );
   }
 
   static async setSettings(
@@ -222,14 +281,6 @@ export class StudentDeviceRestrictionService {
        ON CONFLICT (tenant_id) DO UPDATE SET data = EXCLUDED.data, updated_at = NOW()`,
       [tenantId, JSON.stringify(merged)],
     );
-
-    // السماح بأكثر من جهاز: التوكينات القديمة تفضل شغالة (ما نربطش الجلسة بـ jti واحد)
-    if (next === 'multiple_devices') {
-      await pool.query(
-        `UPDATE users SET jti = NULL WHERE tenant_id = $1 AND role = 'student' AND jti IS NOT NULL`,
-        [tenantId],
-      );
-    }
 
     return toSettings(next);
   }

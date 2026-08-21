@@ -4,7 +4,7 @@ import bcrypt from 'bcrypt';
 import crypto from 'node:crypto';
 import * as jwt from 'jsonwebtoken';
 import { ipKeyGenerator, rateLimit } from 'express-rate-limit';
-import { asyncWrapper, config, generateToken, sendEmail, HttpError, isAccessSessionReplaced, SESSION_REPLACED } from '../utils';
+import { asyncWrapper, config, sendEmail, HttpError } from '../utils';
 import { validate } from '../middleware/validateReq';
 import { ForgotPassword, Login, ResetPassword, RegisterAdminOrTeacher } from './auth.modules';
 import { TeacherManagedStudentsService } from '../services/teacherManagedStudents';
@@ -268,16 +268,13 @@ router.post(
     );
     const session = await AuthSessionsService.createDeviceSession({
       userId: user.id,
+      role: user.role,
       tenantId: effectiveTenantId,
       rememberMe,
       req,
       exclusiveSession,
     });
-    const token = await generateToken(user, pool, {
-      sessionTenantId: effectiveTenantId,
-      jti: exclusiveSession ? session.jti : undefined,
-      persistJti: exclusiveSession,
-    });
+    const token = await AuthSessionsService.signAccessToken(user, session.session);
     setRefreshCookie(req, res, session.refreshToken, rememberMe);
     AuthSessionsService.logLogin(
       user.id,
@@ -322,7 +319,7 @@ router.post(
         avatar: user.avatar,
         must_change_password: user.must_change_password === true,
       },
-      /** Access Token (قصير العمر) — احفظه في الذاكرة فقط، ليس LocalStorage */
+      /** Access Token — صالح 365 يوم. احفظه في الذاكرة فقط، ليس LocalStorage */
       token,
       token_type: 'Bearer',
       expires_in: config.ACCESS_TOKEN_TTL,
@@ -407,10 +404,7 @@ router.post(
     }
 
     // Access Token جديد + تحديث الـ Refresh Cookie (Rotation)
-    const accessToken = await generateToken(user, pool, {
-      sessionTenantId: device.tenant_id ?? user.tenant_id,
-      jti: user.jti,
-    });
+    const accessToken = await AuthSessionsService.signAccessToken(user, device);
     setRefreshCookie(req, res, refreshToken, device.remember_me);
 
     res.json({
@@ -437,6 +431,7 @@ router.post(
   '/auth/logout',
   asyncWrapper(async (req, res) => {
     const rawToken = readRefreshCookie(req);
+    const accessToken = extractBearerToken(req);
     let deviceId: string | null = null;
     let userId: number | null = null;
 
@@ -445,6 +440,23 @@ router.post(
       if (revoked) {
         deviceId = revoked.id;
         userId = revoked.user_id;
+      }
+    }
+
+    if (!deviceId && accessToken) {
+      try {
+        const decoded = jwt.verify(accessToken, config.SECRET_KEY, {
+          ignoreExpiration: true,
+        }) as { jti?: string };
+        if (decoded?.jti) {
+          const revoked = await AuthSessionsService.revokeByJti(decoded.jti, 'logout');
+          if (revoked) {
+            deviceId = revoked.id;
+            userId = revoked.user_id;
+          }
+        }
+      } catch {
+        // ignore invalid access token on logout
       }
     }
 
@@ -507,8 +519,9 @@ router.get(
     }
 
     const user = userRes.rows[0];
-    if (isAccessSessionReplaced(decoded, user)) {
-      return res.status(401).json(SESSION_REPLACED);
+    const sessionCheck = await AuthSessionsService.assertAccessSession(decoded, user);
+    if (!sessionCheck.ok) {
+      return res.status(sessionCheck.status).json(sessionCheck.body);
     }
     const tenantId = decoded.tid != null ? Number(decoded.tid) : user.tenant_id;
     let tenant = null;
@@ -657,14 +670,16 @@ router.post(
       );
     }
 
-    // إنشاء token + جلسة جهاز واحدة (تلغي أي جلسة سابقة)
+    // إنشاء token + جلسة جهاز (المدرس/الأدمن يقدروا يدخلوا من أكثر من جهاز)
     const session = await AuthSessionsService.createDeviceSession({
       userId: user.id,
+      role: user.role,
       tenantId,
       rememberMe: false,
       req,
+      exclusiveSession: false,
     });
-    const token = await generateToken(user, pool, { sessionTenantId: tenantId, jti: session.jti });
+    const token = await AuthSessionsService.signAccessToken(user, session.session);
     setRefreshCookie(req, res, session.refreshToken, false);
     AuthSessionsService.logLogin(user.id, user.role, 'register', req);
 

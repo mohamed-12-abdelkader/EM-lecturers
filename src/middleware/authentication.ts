@@ -1,8 +1,9 @@
 import { RequestHandler, Request, Response } from 'express';
 import * as jwt from 'jsonwebtoken';
-import { config, generateToken, isAccessSessionReplaced, SESSION_REPLACED } from '../utils';
+import { config, generateToken } from '../utils';
 import pool from '../db/pool';
 import { User } from '../db/types';
+import { AuthSessionsService } from '../services/authSessions';
 
 type Roles = 'student' | 'teacher' | 'admin' | 'employee' | 'academy' | 'academy_teacher';
 
@@ -124,10 +125,15 @@ async function refreshSessionToken(
   res: Response,
   req: Request,
   user: UserRow,
+  decoded: { jti?: unknown; tid?: unknown },
+  session?: { id: string; jti: string | null; expires_at: string } | null,
 ): Promise<string> {
   const newToken = await generateToken(user, pool, {
     sessionTenantId: (req as Request & { tenant?: { id: number } }).tenant?.id,
-    jti: user.jti,
+    jti: session?.jti || (typeof decoded.jti === 'string' ? decoded.jti : user.jti),
+    sid: session?.id,
+    expiresAt: session?.expires_at,
+    persistJti: false,
   });
   res.setHeader('X-Access-Token', newToken);
   // Allow browsers / axios to read refreshed token across origins when CORS exposes it.
@@ -200,8 +206,9 @@ export function authMiddleware(roles: Roles[] = []): RequestHandler {
 
       if (!(await assertRequestTenantMatchesUserAndToken(req, res, decoded, user))) return;
 
-      if (isAccessSessionReplaced(decoded, user)) {
-        return res.status(401).json(SESSION_REPLACED);
+      const sessionCheck = await AuthSessionsService.assertAccessSession(decoded, user);
+      if (!sessionCheck.ok) {
+        return res.status(sessionCheck.status).json(sessionCheck.body);
       }
 
       // Role-based access check (only if roles are specified)
@@ -270,8 +277,17 @@ export function authMiddleware(roles: Roles[] = []): RequestHandler {
 
           if (!(await assertRequestTenantMatchesUserAndToken(req, res, decoded, user))) return;
 
-          if (isAccessSessionReplaced(decoded, user)) {
-            return res.status(401).json(SESSION_REPLACED);
+          const sessionCheck = await AuthSessionsService.assertAccessSession(decoded, user);
+          if (!sessionCheck.ok) {
+            return res.status(sessionCheck.status).json(sessionCheck.body);
+          }
+          if (!sessionCheck.session) {
+            return res.status(401).json({
+              success: false,
+              message: 'Access token expired',
+              code: 'TOKEN_EXPIRED',
+              hint: 'Call POST /api/auth/refresh',
+            });
           }
 
           // Role-based access check (only if roles are specified)
@@ -286,7 +302,7 @@ export function authMiddleware(roles: Roles[] = []): RequestHandler {
             });
           }
 
-          await refreshSessionToken(res, req, user);
+          await refreshSessionToken(res, req, user, decoded, sessionCheck.session);
           req.user = user;
           return next();
         } catch (innerErr) {

@@ -6,7 +6,8 @@ import { GroupsRepository } from '../repositories/groups.repository';
 import { StudentsRepository } from '../repositories/students.repository';
 import { SubscriptionsRepository } from '../repositories/subscriptions.repository';
 import type { SubscriptionStatus } from '../types';
-import { buildStudentQr, isStudentPublicProfileUrl, studentPublicProfileUrl } from '../utils/studentQr';
+import { PublicStudentCardService } from './publicStudentCard.service';
+import { buildStudentQr } from '../utils/studentQr';
 
 function currentYearMonth() {
   const now = new Date();
@@ -157,7 +158,8 @@ export class StudentsService {
     const enrollment = await StudentsRepository.enrollWithMemberNo(student.id, groupId, memberNo);
 
     const qrToken = randomUUID();
-    const { payload, qrImageBase64 } = await buildStudentQr(qrToken);
+    const card = await PublicStudentCardService.getByStudentId(student.id, teacherId);
+    const { payload, qrImageBase64 } = await buildStudentQr(qrToken, card);
     await StudentsRepository.upsertQr({
       studentId: student.id,
       qrToken,
@@ -330,19 +332,17 @@ export class StudentsService {
     const student = await StudentsRepository.findById(studentId, teacherId);
     if (!student) throw new HttpError(404, 'الطالب غير موجود');
 
-    let qr = await StudentsRepository.getQr(studentId, teacherId);
-    const needsNewImage = !qr || !isStudentPublicProfileUrl(qr.qr_payload);
-    if (needsNewImage) {
-      const qrToken = qr?.qr_token || randomUUID();
-      const { payload, qrImageBase64 } = await buildStudentQr(qrToken);
-      qr = await StudentsRepository.upsertQr({
-        studentId,
-        qrToken,
-        qrPayload: payload,
-        qrImageBase64,
-        barcode: student.student_code,
-      });
-    }
+    const existing = await StudentsRepository.getQr(studentId, teacherId);
+    const qrToken = existing?.qr_token || randomUUID();
+    const card = await PublicStudentCardService.getByStudentId(studentId, teacherId);
+    const { payload, qrImageBase64 } = await buildStudentQr(qrToken, card);
+    const qr = await StudentsRepository.upsertQr({
+      studentId,
+      qrToken,
+      qrPayload: payload,
+      qrImageBase64,
+      barcode: student.student_code,
+    });
     if (!qr) throw new HttpError(500, 'تعذر إنشاء رمز QR');
 
     return {
@@ -351,7 +351,6 @@ export class StudentsService {
       full_name: student.full_name,
       qr_token: qr.qr_token,
       qr_payload: qr.qr_payload,
-      public_url: studentPublicProfileUrl(qr.qr_token),
       qr_image_base64: qr.qr_image_base64,
       barcode: qr.barcode,
     };

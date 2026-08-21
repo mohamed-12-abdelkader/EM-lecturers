@@ -250,46 +250,106 @@ export class AttendanceRepository {
     Array<{
       group_id: number;
       group_name: string;
+      grade_name: string | null;
+      subject_name: string | null;
+      days: string[];
+      start_time: string | null;
+      end_time: string | null;
+      monthly_fee: string;
       present: number;
       absent: number;
       late: number;
       excused: number;
+      last_attendance_date: string | null;
     }>
   > {
     const result = await pool.query<{
       group_id: number;
       group_name: string;
+      grade_name: string | null;
+      subject_name: string | null;
+      days: string[] | null;
+      start_time: string | null;
+      end_time: string | null;
+      monthly_fee: string;
       present: string;
       absent: string;
       late: string;
       excused: string;
+      last_attendance_date: string | null;
     }>(
       `SELECT
          g.id AS group_id,
          g.name AS group_name,
+         gr.name AS grade_name,
+         s.name AS subject_name,
+         g.days,
+         g.start_time::text AS start_time,
+         g.end_time::text AS end_time,
+         g.monthly_fee::text AS monthly_fee,
          COUNT(a.id) FILTER (WHERE a.status = 'present')::text AS present,
          COUNT(a.id) FILTER (WHERE a.status = 'absent')::text AS absent,
          COUNT(a.id) FILTER (WHERE a.status = 'late')::text AS late,
-         COUNT(a.id) FILTER (WHERE a.status = 'excused')::text AS excused
+         COUNT(a.id) FILTER (WHERE a.status = 'excused')::text AS excused,
+         MAX(a.attendance_date)::text AS last_attendance_date
        FROM tc_student_groups sg
        JOIN tc_groups g ON g.id = sg.group_id AND g.deleted_at IS NULL
+       LEFT JOIN grades gr ON gr.id = g.grade_id
+       LEFT JOIN subjects s ON s.id = g.subject_id
        LEFT JOIN tc_attendance a
          ON a.student_id = sg.student_id AND a.group_id = sg.group_id
        WHERE sg.student_id = $1
          AND g.teacher_id = $2
          AND sg.deleted_at IS NULL
          AND sg.status = 'active'
-       GROUP BY g.id, g.name
+       GROUP BY g.id, g.name, gr.name, s.name, g.days, g.start_time, g.end_time, g.monthly_fee
        ORDER BY g.name ASC`,
       [studentId, teacherId],
     );
     return result.rows.map((r) => ({
       group_id: r.group_id,
       group_name: r.group_name,
+      grade_name: r.grade_name,
+      subject_name: r.subject_name,
+      days: Array.isArray(r.days) ? r.days : [],
+      start_time: r.start_time,
+      end_time: r.end_time,
+      monthly_fee: r.monthly_fee,
       present: parseInt(r.present, 10),
       absent: parseInt(r.absent, 10),
       late: parseInt(r.late, 10),
       excused: parseInt(r.excused, 10),
+      last_attendance_date: r.last_attendance_date,
     }));
+  }
+
+  static async listRecentByStudent(
+    teacherId: number,
+    studentId: number,
+    limit = 20,
+  ): Promise<
+    Array<{
+      attendance_date: string;
+      day_name: string | null;
+      status: AttendanceStatus;
+      group_name: string;
+    }>
+  > {
+    const safeLimit = Math.min(Math.max(limit, 1), 50);
+    const result = await pool.query<{
+      attendance_date: string;
+      day_name: string | null;
+      status: AttendanceStatus;
+      group_name: string;
+    }>(
+      `SELECT a.attendance_date::text AS attendance_date, a.day_name, a.status, g.name AS group_name
+       FROM tc_attendance a
+       JOIN tc_groups g ON g.id = a.group_id
+       WHERE a.teacher_id = $1 AND a.student_id = $2
+       ORDER BY a.attendance_date DESC, a.id DESC
+       LIMIT $3`,
+      [teacherId, studentId, safeLimit],
+    );
+    return result.rows;
   }
 }

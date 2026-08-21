@@ -2,9 +2,10 @@ import { applyMigrations } from './db/migrate';
 import { app, server } from './app';
 import { Server as SocketIOServer } from 'socket.io';
 import * as jwt from 'jsonwebtoken';
-import { config, generateToken, isAccessSessionReplaced, logger } from './utils';
+import { config, logger } from './utils';
 import { getServerInfo, isCorsOriginAllowed } from './config/appUrls';
 import pool from './db/pool';
+import { AuthSessionsService } from './services/authSessions';
 import { ChatService } from './services/chat';
 import { GameService } from './services/GameService';
 // Support assistant: REST /api/support — intent-aware replies
@@ -172,17 +173,16 @@ const startServer = async () => {
           return next(new Error('Teacher account is not active'));
         }
 
-        if (isAccessSessionReplaced(decoded, user)) {
-          return next(new Error('SESSION_REPLACED'));
+        const sessionCheck = await AuthSessionsService.assertAccessSession(decoded, user);
+        if (!sessionCheck.ok) {
+          return next(new Error(sessionCheck.body.code));
         }
 
         (socket as any).user = user;
 
         if (tokenWasExpired) {
-          const newToken = await generateToken(user, pool, {
-            sessionTenantId: user.tenant_id ?? undefined,
-            jti: user.jti,
-          });
+          if (!sessionCheck.session) return next(new Error('TOKEN_EXPIRED'));
+          const newToken = await AuthSessionsService.signAccessToken(user, sessionCheck.session);
           socket.emit('auth:token-refreshed', { token: newToken });
         }
 

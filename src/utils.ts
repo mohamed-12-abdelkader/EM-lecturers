@@ -90,6 +90,8 @@ export const config = cleanEnv(process.env, {
   /** Public API base (HTTPS). Set automatically by npm run dev:expo */
   BASE_URL: str({ default: '' }),
   API_URL: str({ default: '' }),
+  /** Public HTTPS API base encoded in student QR (parent phone scanners). Empty = API_URL / getApiUrl(). */
+  CENTER_PUBLIC_API_URL: str({ default: '' }),
   LOCAL_URL: str({ default: '' }),
   NGROK_URL: str({ default: '' }),
   PRODUCTION_URL: str({ default: '' }),
@@ -222,20 +224,28 @@ export const config = cleanEnv(process.env, {
 export type GenerateTokenOptions = {
   /** When set (e.g. from `req.tenant.id` at login), JWT `tid` matches the session host tenant even if `users.tenant_id` is stale. */
   sessionTenantId?: number | null;
-  /** Override access token TTL (jsonwebtoken format, e.g. '365d'). Defaults to config.ACCESS_TOKEN_TTL. */
+  /** Override access token TTL (jsonwebtoken format, e.g. '365d'). Ignored when expiresAt is set. */
   expiresIn?: string;
-  /**
-   * Reuse the current session jti (refresh / auto-refresh).
-   * Omit on exclusive login so a new jti is stored and every other device is invalidated.
-   */
+  /** Absolute expiry (unix) — must match session.expires_at. No sliding. */
+  expiresAt?: Date | string;
+  /** Session id stored in user_devices.id */
+  sid?: string | null;
+  /** Session jti stored in user_devices.jti — always pass this after login. */
   jti?: string | null;
-  /** false = لا تُحدّث users.jti (دخول من أكثر من جهاز). */
+  /** true = exclusive session: store users.jti so legacy tokens die. Default false. */
   persistJti?: boolean;
 };
 
 export const SESSION_REPLACED = {
+  success: false as const,
   message: 'تم تسجيل الدخول من جهاز آخر. هذه الجلسة لم تعد صالحة.',
   code: 'SESSION_REPLACED' as const,
+};
+
+export const SESSION_REVOKED = {
+  success: false as const,
+  message: 'تم إلغاء هذه الجلسة. سجّل الدخول مرة أخرى.',
+  code: 'SESSION_REVOKED' as const,
 };
 
 /** true إذا التوكين ده مش بتاع الجلسة الحالية (دخل من جهاز تاني). */
@@ -256,8 +266,7 @@ export async function generateToken(
   const reused = typeof opts?.jti === 'string' ? opts.jti.trim() : '';
   const jti = reused || crypto.randomUUID();
 
-  // Exclusive login: persist jti so any previous access token dies immediately.
-  if (!reused && opts?.persistJti !== false) {
+  if (opts?.persistJti === true && !reused) {
     await pool.query('UPDATE users SET jti = $1 WHERE id = $2', [jti, user.id]);
   }
 
@@ -271,8 +280,15 @@ export async function generateToken(
     role: user.role,
     jti,
   };
+  if (opts?.sid) payload.sid = opts.sid;
   if (tenantId != null && !Number.isNaN(Number(tenantId))) {
     payload.tid = Number(tenantId);
+  }
+
+  const expiresAt = opts?.expiresAt ? new Date(opts.expiresAt) : null;
+  if (expiresAt && !Number.isNaN(expiresAt.getTime())) {
+    payload.exp = Math.floor(expiresAt.getTime() / 1000);
+    return jwt.sign(payload, config.SECRET_KEY);
   }
 
   return jwt.sign(payload, config.SECRET_KEY, {

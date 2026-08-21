@@ -5,7 +5,7 @@ import { validate } from '../middleware/validateReq';
 import { authMiddleware } from '../middleware/authentication';
 import { Router } from 'express';
 import { ChangePassword, RegisterStudent } from './auth.modules';
-import { asyncWrapper, generateToken } from '../utils';
+import { asyncWrapper } from '../utils';
 import { AuthSessionsService, setRefreshCookie } from '../services/authSessions';
 import { StudentPointsService } from '../services/studentPoints';
 import { TeacherManagedStudentsService } from '../services/teacherManagedStudents';
@@ -150,16 +150,13 @@ router.post(
     );
     const session = await AuthSessionsService.createDeviceSession({
       userId: user.id,
+      role: 'student',
       tenantId,
       rememberMe: false,
       req,
       exclusiveSession,
     });
-    const token = await generateToken(user, pool, {
-      sessionTenantId: tenantId,
-      jti: exclusiveSession ? session.jti : undefined,
-      persistJti: exclusiveSession,
-    });
+    const token = await AuthSessionsService.signAccessToken(user, session.session);
     setRefreshCookie(req, res, session.refreshToken, false);
     AuthSessionsService.logLogin(user.id, 'student', 'register', req);
 

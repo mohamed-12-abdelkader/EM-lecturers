@@ -1,6 +1,6 @@
 import type { Request, Response } from 'express';
 import pool from '../db/pool';
-import { HttpError, generateToken, config } from '../utils';
+import { HttpError, config } from '../utils';
 import { validateSubdomain } from '../utils/subdomain';
 import { TenantService, type CreateTenantInput } from './tenants';
 import { AuthSessionsService, setRefreshCookie } from './authSessions';
@@ -162,11 +162,13 @@ export class PublicPlatformSignupService {
     const rememberMe = input.remember_me === true;
     const session = await AuthSessionsService.createDeviceSession({
       userId: user.id,
+      role: user.role,
       tenantId: tenant.id,
       rememberMe,
       req,
+      exclusiveSession: false,
     });
-    const token = await generateToken(user, pool, { sessionTenantId: tenant.id, jti: session.jti });
+    const token = await AuthSessionsService.signAccessToken(user, session.session);
     setRefreshCookie(req, res, session.refreshToken, rememberMe);
     AuthSessionsService.logLogin(user.id, user.role, 'email', req);
 
