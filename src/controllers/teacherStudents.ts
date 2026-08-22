@@ -27,6 +27,7 @@ const uploadCsv = multer({
 const RegistrationSettingsSchema = z.object({
   registration_mode: z.enum(['self_registration', 'teacher_registration']).optional(),
   default_password_from_phone: z.boolean().optional(),
+  students_can_choose_study_group: z.boolean().optional(),
 });
 
 const CreateStudentSchema = z.object({

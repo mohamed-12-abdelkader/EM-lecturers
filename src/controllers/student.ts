@@ -1,6 +1,7 @@
 import { Router } from 'express';
+import { z } from 'zod';
 import { authMiddleware } from '../middleware/authentication';
-import { asyncWrapper } from '../utils';
+import { asyncWrapper, HttpError } from '../utils';
 import pool from '../db/pool';
 import bcrypt from 'bcrypt';
 import { validate } from '../middleware/validateReq';
@@ -15,48 +16,263 @@ import {
   saveAvatarForUser,
   uploadStudentAvatarMiddleware,
 } from '../services/userAvatarUpload';
+import { TeacherManagedStudentsService } from '../services/teacherManagedStudents';
+import { CourseGroupAccessService } from '../services/courseGroupAccess';
 
 export const router = Router();
+
+const UpdateStudentMeSchema = z
+  .object({
+    name: z.string().min(2).max(120).optional(),
+    phone: z.string().min(8).max(20).optional(),
+    parent_phone: z.string().min(8).max(20).nullable().optional(),
+    email: z.string().email().nullable().optional(),
+    password: z.string().min(6).optional(),
+    group_id: z.coerce.number().int().positive().optional(),
+    course_group_id: z.coerce.number().int().positive().optional(),
+  })
+  .refine(
+    (d) =>
+      d.name !== undefined ||
+      d.phone !== undefined ||
+      d.parent_phone !== undefined ||
+      d.email !== undefined ||
+      d.password !== undefined ||
+      d.group_id !== undefined ||
+      d.course_group_id !== undefined,
+    { message: 'أرسل حقلاً واحداً على الأقل للتعديل' },
+  );
+
+async function buildStudentProfile(studentId: number, tenantId?: number | null) {
+  const userRes = await pool.query(
+    `SELECT id, name, phone, email, parent_phone, avatar, role, created_at,
+            student_code, account_status, must_change_password, managed_by_teacher_id, tenant_id
+     FROM users
+     WHERE id = $1 AND role = 'student'`,
+    [studentId],
+  );
+
+  if (userRes.rowCount === 0) {
+    throw new HttpError(404, 'الطالب غير موجود');
+  }
+
+  const user = userRes.rows[0];
+  const effectiveTenantId = tenantId ?? user.tenant_id ?? null;
+
+  const gradesRes = await pool.query(
+    `SELECT g.id, g.name
+     FROM user_grades ug
+     JOIN grades g ON ug.grade_id = g.id
+     WHERE ug.user_id = $1
+     ORDER BY g.id`,
+    [studentId],
+  );
+
+  const teacherId = await TeacherManagedStudentsService.resolveTeacherIdForStudent(
+    studentId,
+    effectiveTenantId,
+  );
+
+  let canChooseStudyGroup = false;
+  let availableStudyGroups: Awaited<
+    ReturnType<typeof TeacherManagedStudentsService.listAvailableStudyGroupsForStudent>
+  > = [];
+
+  if (teacherId) {
+    let chooseAllowed = true;
+    if (effectiveTenantId) {
+      const settings =
+        await TeacherManagedStudentsService.getRegistrationSettings(effectiveTenantId);
+      chooseAllowed = settings.students_can_choose_study_group;
+    } else {
+      // لو مفيش tenant على الطلب: ابحث إعدادات تينانت المدرس
+      const teacherTenant = await pool.query<{ id: number }>(
+        `SELECT id FROM tenants WHERE owner_user_id = $1 AND is_active = TRUE ORDER BY id LIMIT 1`,
+        [teacherId],
+      );
+      if (teacherTenant.rowCount) {
+        const settings = await TeacherManagedStudentsService.getRegistrationSettings(
+          teacherTenant.rows[0].id,
+        );
+        chooseAllowed = settings.students_can_choose_study_group;
+      }
+    }
+    canChooseStudyGroup = chooseAllowed;
+    if (canChooseStudyGroup) {
+      availableStudyGroups =
+        await TeacherManagedStudentsService.listAvailableStudyGroupsForStudent(
+          teacherId,
+          studentId,
+        );
+    }
+  }
+
+  const studyGroup = await TeacherManagedStudentsService.getStudentStudyGroup(studentId);
+
+  let canChooseCourseGroup = false;
+  let courseGroup: Record<string, unknown> | null = null;
+  let availableCourseGroups: Awaited<
+    ReturnType<typeof CourseGroupAccessService.listGroups>
+  > = [];
+
+  const courseTeacherId =
+    teacherId ??
+    (effectiveTenantId
+      ? await CourseGroupAccessService.resolveTenantOwnerTeacherId(effectiveTenantId)
+      : null);
+
+  if (courseTeacherId) {
+    const courseSettings =
+      await CourseGroupAccessService.getTeacherSettings(courseTeacherId);
+    canChooseCourseGroup = courseSettings.course_group_access_enabled === true;
+    const membership = await CourseGroupAccessService.getStudentMembershipForTeacher(
+      studentId,
+      courseTeacherId,
+    );
+    if (membership) {
+      courseGroup = {
+        id: membership.group_id,
+        name: membership.group_name,
+        grade_id: membership.grade_id,
+        grade_name: membership.grade_name,
+        status: membership.group_status,
+        joined_at: membership.created_at ?? membership.updated_at ?? null,
+      };
+    }
+    if (canChooseCourseGroup) {
+      const studentGradeIds = gradesRes.rows.map((g: { id: number }) => Number(g.id));
+      const gradeFilter = studentGradeIds.length === 1 ? studentGradeIds[0] : undefined;
+      availableCourseGroups = await CourseGroupAccessService.listGroups(courseTeacherId, {
+        grade_id: gradeFilter,
+      });
+    }
+  }
+
+  return {
+    id: user.id,
+    name: user.name,
+    phone: user.phone,
+    email: user.email,
+    parent_phone: user.parent_phone,
+    avatar: publicAvatarUrl(user.avatar),
+    role: user.role,
+    student_code: user.student_code,
+    account_status: user.account_status,
+    must_change_password: user.must_change_password,
+    created_at: user.created_at,
+    grades: gradesRes.rows,
+    study_group: studyGroup,
+    can_choose_study_group: canChooseStudyGroup,
+    available_study_groups: canChooseStudyGroup ? availableStudyGroups : [],
+    course_group: courseGroup,
+    can_choose_course_group: canChooseCourseGroup,
+    available_course_groups: canChooseCourseGroup ? availableCourseGroups : [],
+  };
+}
 
 router.get(
   '/me',
   authMiddleware(['student']),
   asyncWrapper(async (req, res) => {
-    const studentId = req.user!.id;
+    const tenantId = (req as any).tenant?.id ?? null;
+    const profile = await buildStudentProfile(req.user!.id, tenantId);
+    return res.status(200).json({
+      success: true,
+      ...profile,
+    });
+  }),
+);
 
-    // Fetch basic student info
-    const userRes = await pool.query(
-      `SELECT id, name, phone, email, parent_phone, avatar, role, created_at
-       FROM users
-       WHERE id = $1 AND role = 'student'`,
-      [studentId],
-    );
-
-    if (userRes.rowCount === 0) {
-      return res.status(404).json({ message: 'Student not found' });
+router.put(
+  '/me',
+  authMiddleware(['student']),
+  asyncWrapper(async (req, res) => {
+    const parsed = UpdateStudentMeSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({
+        success: false,
+        message: 'بيانات غير صالحة',
+        errors: parsed.error.errors,
+      });
     }
 
-    // Fetch student's grades
-    const gradesRes = await pool.query(
-      `SELECT g.id, g.name
-       FROM user_grades ug
-       JOIN grades g ON ug.grade_id = g.id
-       WHERE ug.user_id = $1
-       ORDER BY g.id`,
-      [studentId],
-    );
+    const studentId = req.user!.id;
+    const tenantId = (req as any).tenant?.id ?? null;
+    const data = parsed.data;
 
-    const user = userRes.rows[0];
-    return res.status(200).json({
-      id: user.id,
-      name: user.name,
-      phone: user.phone,
-      email: user.email,
-      parent_phone: user.parent_phone,
-      avatar: publicAvatarUrl(user.avatar),
-      role: user.role,
-      created_at: user.created_at,
-      grades: gradesRes.rows,
+    const updates: string[] = [];
+    const values: unknown[] = [];
+    let i = 1;
+
+    if (data.name !== undefined) {
+      updates.push(`name = $${i++}`);
+      values.push(data.name);
+    }
+    if (data.phone !== undefined) {
+      updates.push(`phone = $${i++}`);
+      values.push(data.phone);
+    }
+    if (data.parent_phone !== undefined) {
+      updates.push(`parent_phone = $${i++}`);
+      values.push(data.parent_phone);
+    }
+    if (data.email !== undefined) {
+      updates.push(`email = $${i++}`);
+      values.push(data.email);
+    }
+    if (data.password !== undefined) {
+      const hashed = await bcrypt.hash(data.password, 10);
+      updates.push(`password = $${i++}`);
+      values.push(hashed);
+      updates.push(`must_change_password = FALSE`);
+    }
+
+    if (updates.length > 0) {
+      values.push(studentId);
+      const result = await pool.query(
+        `UPDATE users SET ${updates.join(', ')}
+         WHERE id = $${i} AND role = 'student'
+         RETURNING id`,
+        values,
+      );
+      if (!result.rowCount) {
+        return res.status(404).json({ success: false, message: 'الطالب غير موجود' });
+      }
+    }
+
+    if (data.group_id !== undefined) {
+      await TeacherManagedStudentsService.studentChooseStudyGroup(
+        studentId,
+        data.group_id,
+        tenantId,
+      );
+    }
+
+    if (data.course_group_id !== undefined) {
+      const teacherId =
+        (await TeacherManagedStudentsService.resolveTeacherIdForStudent(studentId, tenantId)) ??
+        (tenantId
+          ? await CourseGroupAccessService.resolveTenantOwnerTeacherId(tenantId)
+          : null);
+      if (!teacherId) {
+        throw new HttpError(400, 'تعذر تحديد المدرس لهذه المنصة');
+      }
+      const settings = await CourseGroupAccessService.getTeacherSettings(teacherId);
+      if (!settings.course_group_access_enabled) {
+        throw new HttpError(403, 'نظام مجموعات الكورسات غير مفعّل على هذه المنصة');
+      }
+      await CourseGroupAccessService.assignStudentToGroup(
+        studentId,
+        data.course_group_id,
+        teacherId,
+      );
+    }
+
+    const profile = await buildStudentProfile(studentId, tenantId);
+    return res.json({
+      success: true,
+      message: 'تم تحديث البيانات بنجاح',
+      ...profile,
     });
   }),
 );

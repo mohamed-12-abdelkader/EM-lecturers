@@ -12,6 +12,8 @@ export interface RegistrationSettings {
   registration_mode: RegistrationMode;
   /** عند إنشاء الطالب بواسطة المدرس: استخدام رقم الهاتف ككلمة مرور افتراضية */
   default_password_from_phone: boolean;
+  /** يسمح للطالب باختيار/تغيير مجموعته الدراسية بنفسه */
+  students_can_choose_study_group: boolean;
 }
 
 export interface CreateManagedStudentInput {
@@ -56,6 +58,7 @@ export interface ImportRowResult {
 const DEFAULT_SETTINGS: RegistrationSettings = {
   registration_mode: 'self_registration',
   default_password_from_phone: true,
+  students_can_choose_study_group: true,
 };
 
 function normalizeStudentCode(code: string): string {
@@ -106,8 +109,9 @@ export class TeacherManagedStudentsService {
     return {
       registration_mode:
         mode === 'teacher_registration' ? 'teacher_registration' : 'self_registration',
-      default_password_from_phone:
-        data.default_password_from_phone !== false,
+      default_password_from_phone: data.default_password_from_phone !== false,
+      // افتراضيًا مسموح — يُقفل فقط إذا المدرس ضبطها صراحةً على false
+      students_can_choose_study_group: data.students_can_choose_study_group !== false,
     };
   }
 
@@ -121,6 +125,8 @@ export class TeacherManagedStudentsService {
       registration_mode: patch.registration_mode ?? current.registration_mode,
       default_password_from_phone:
         patch.default_password_from_phone ?? current.default_password_from_phone,
+      students_can_choose_study_group:
+        patch.students_can_choose_study_group ?? current.students_can_choose_study_group,
     };
 
     if (
@@ -135,6 +141,7 @@ export class TeacherManagedStudentsService {
       ...data,
       registration_mode: next.registration_mode,
       default_password_from_phone: next.default_password_from_phone,
+      students_can_choose_study_group: next.students_can_choose_study_group,
     };
 
     await pool.query(
@@ -835,5 +842,196 @@ export class TeacherManagedStudentsService {
       failed_count: failed,
       results,
     };
+  }
+
+  /** يحدد مدرس المنصة المرتبط بالطالب (إدارة / ملكية التينانت / المجموعة الحالية) */
+  static async resolveTeacherIdForStudent(
+    studentId: number,
+    tenantId?: number | null,
+  ): Promise<number | null> {
+    await this.ensureSchema();
+    const userRes = await pool.query<{
+      managed_by_teacher_id: number | null;
+      tenant_id: number | null;
+    }>(
+      `SELECT managed_by_teacher_id, tenant_id FROM users WHERE id = $1 AND role = 'student'`,
+      [studentId],
+    );
+    if (!userRes.rowCount) return null;
+
+    if (userRes.rows[0].managed_by_teacher_id) {
+      return Number(userRes.rows[0].managed_by_teacher_id);
+    }
+
+    const effectiveTenantId = tenantId ?? userRes.rows[0].tenant_id;
+    if (effectiveTenantId) {
+      const owner = await pool.query<{ owner_user_id: number | null }>(
+        `SELECT owner_user_id FROM tenants WHERE id = $1 AND is_active = TRUE`,
+        [effectiveTenantId],
+      );
+      if (owner.rows[0]?.owner_user_id) return Number(owner.rows[0].owner_user_id);
+    }
+
+    const fromGroup = await pool.query<{ teacher_id: number }>(
+      `SELECT sg.teacher_id
+       FROM group_students gs
+       JOIN study_groups sg ON sg.id = gs.group_id
+       WHERE gs.student_id = $1
+       LIMIT 1`,
+      [studentId],
+    );
+    return fromGroup.rows[0]?.teacher_id ? Number(fromGroup.rows[0].teacher_id) : null;
+  }
+
+  static async getStudentStudyGroup(studentId: number) {
+    const r = await pool.query<{
+      id: number;
+      name: string;
+      teacher_id: number;
+      start_time: string | null;
+      end_time: string | null;
+      days: string | null;
+      grade_id: number | null;
+      grade_name: string | null;
+      number_in_group: number | null;
+      joined_at: Date | null;
+    }>(
+      `SELECT sg.id, sg.name, sg.teacher_id, sg.start_time, sg.end_time, sg.days,
+              sg.grade_id, g.name AS grade_name,
+              gs.number_in_group, gs.joined_at
+       FROM group_students gs
+       JOIN study_groups sg ON sg.id = gs.group_id
+       LEFT JOIN grades g ON g.id = sg.grade_id
+       WHERE gs.student_id = $1
+       ORDER BY gs.joined_at DESC NULLS LAST
+       LIMIT 1`,
+      [studentId],
+    );
+    if (!r.rowCount) return null;
+    const row = r.rows[0];
+    return {
+      id: row.id,
+      name: row.name,
+      teacher_id: row.teacher_id,
+      start_time: row.start_time,
+      end_time: row.end_time,
+      days: row.days,
+      grade_id: row.grade_id,
+      grade_name: row.grade_name,
+      number_in_group: row.number_in_group,
+      joined_at: row.joined_at,
+    };
+  }
+
+  static async listAvailableStudyGroupsForStudent(teacherId: number, studentId: number) {
+    const grades = await pool.query<{ grade_id: number }>(
+      `SELECT grade_id FROM user_grades WHERE user_id = $1`,
+      [studentId],
+    );
+    const gradeIds = grades.rows.map((g) => Number(g.grade_id));
+
+    const r = await pool.query<{
+      id: number;
+      name: string;
+      start_time: string | null;
+      end_time: string | null;
+      days: string | null;
+      grade_id: number | null;
+      grade_name: string | null;
+      students_count: number;
+    }>(
+      `SELECT sg.id, sg.name, sg.start_time, sg.end_time, sg.days, sg.grade_id,
+              g.name AS grade_name,
+              (SELECT COUNT(*)::int FROM group_students gs WHERE gs.group_id = sg.id) AS students_count
+       FROM study_groups sg
+       LEFT JOIN grades g ON g.id = sg.grade_id
+       WHERE sg.teacher_id = $1
+         AND (
+           sg.grade_id IS NULL
+           OR cardinality($2::int[]) = 0
+           OR sg.grade_id = ANY($2::int[])
+         )
+       ORDER BY sg.name`,
+      [teacherId, gradeIds],
+    );
+
+    return r.rows.map((row) => ({
+      id: row.id,
+      name: row.name,
+      start_time: row.start_time,
+      end_time: row.end_time,
+      days: row.days,
+      grade_id: row.grade_id,
+      grade_name: row.grade_name,
+      students_count: row.students_count,
+    }));
+  }
+
+  static async studentChooseStudyGroup(
+    studentId: number,
+    groupId: number,
+    tenantId?: number | null,
+  ) {
+    await this.ensureSchema();
+
+    const teacherId = await this.resolveTeacherIdForStudent(studentId, tenantId);
+    if (!teacherId) {
+      throw new HttpError(400, 'تعذر تحديد المدرس المرتبط بالطالب');
+    }
+
+    let effectiveTenantId =
+      tenantId ??
+      (
+        await pool.query<{ tenant_id: number | null }>(
+          `SELECT tenant_id FROM users WHERE id = $1`,
+          [studentId],
+        )
+      ).rows[0]?.tenant_id;
+
+    if (!effectiveTenantId) {
+      const teacherTenant = await pool.query<{ id: number }>(
+        `SELECT id FROM tenants WHERE owner_user_id = $1 AND is_active = TRUE ORDER BY id LIMIT 1`,
+        [teacherId],
+      );
+      effectiveTenantId = teacherTenant.rows[0]?.id ?? null;
+    }
+
+    if (effectiveTenantId) {
+      const settings = await this.getRegistrationSettings(effectiveTenantId);
+      if (!settings.students_can_choose_study_group) {
+        throw new HttpError(403, 'غير مسموح للطالب باختيار المجموعة الدراسية على هذه المنصة');
+      }
+    }
+
+    await this.assertGroupForTeacher(groupId, teacherId);
+
+    const groupGrade = await pool.query<{ grade_id: number | null }>(
+      `SELECT grade_id FROM study_groups WHERE id = $1`,
+      [groupId],
+    );
+    const groupGradeId = groupGrade.rows[0]?.grade_id;
+    if (groupGradeId) {
+      const match = await pool.query(
+        `SELECT 1 FROM user_grades WHERE user_id = $1 AND grade_id = $2 LIMIT 1`,
+        [studentId, groupGradeId],
+      );
+      if (!match.rowCount) {
+        throw new HttpError(400, 'المجموعة لا تناسب صفك الدراسي');
+      }
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await this.assignStudentToGroup(client, groupId, studentId);
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+
+    return this.getStudentStudyGroup(studentId);
   }
 }
