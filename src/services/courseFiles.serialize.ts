@@ -1,6 +1,7 @@
 export type CourseFileRowLike = {
   id: number;
   course_id: number;
+  lecture_id?: number | null;
   teacher_id: number | null;
   uploaded_by: number | null;
   name: string;
@@ -17,6 +18,7 @@ export type CourseFileRowLike = {
 export type CourseFilePublic = {
   id: number;
   courseId: number;
+  lectureId: number | null;
   teacherId: number | null;
   title: string;
   description: string | null;
@@ -43,6 +45,7 @@ export function serializeCourseFile(file: CourseFileRowLike): CourseFilePublic {
   return {
     id: file.id,
     courseId: file.course_id,
+    lectureId: file.lecture_id ?? null,
     teacherId: file.teacher_id ?? file.uploaded_by,
     title: file.title || file.name,
     description: file.description,

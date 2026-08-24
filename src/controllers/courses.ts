@@ -34,6 +34,7 @@ import {
 import { ExamFlowService } from '../services/examFlow';
 import { LectureAccessService } from '../services/lectureAccess';
 import { CourseGroupAccessService } from '../services/courseGroupAccess';
+import { serializeCourseFile } from '../services/courseFiles.serialize';
 
 export const router = Router();
 
@@ -1816,52 +1817,8 @@ router.delete(
   }),
 );
 
-// إضافة ملف PDF لمحاضرة (للأستاذ فقط)
-const LectureFileSchema = z.object({
-  file_url: z.string().url(),
-  filename: z.string(),
-});
-
-router.post(
-  '/lecture/:lectureId/files',
-  authMiddleware(COURSE_CONTENT_ROLES),
-  asyncWrapper(async (req, res) => {
-    const lectureId = Number(req.params.lectureId);
-    const teacherId = req.user!.id;
-    const parse = LectureFileSchema.safeParse(req.body);
-    if (!parse.success) {
-      return res.status(400).json({ message: 'Validation failed', errors: parse.error.errors });
-    }
-    // تحقق أن المحاضرة تخص كورس يملكه المدرس
-    const lectureCheck = await pool.query(
-      `SELECT l.id, l.title as lecture_title, c.id as course_id, c.title as course_title 
-       FROM lectures l JOIN courses c ON l.course_id = c.id WHERE l.id = $1 AND (c.teacher_id = $2 OR EXISTS (SELECT 1 FROM course_managers cm WHERE cm.course_id = c.id AND cm.user_id = $2) OR EXISTS (SELECT 1 FROM tenants t WHERE t.id = c.tenant_id AND t.owner_user_id = $2 AND t.platform_type = $$academy$$))`,
-      [lectureId, teacherId],
-    );
-    if (!lectureCheck.rowCount) {
-      return res.status(404).json({ message: 'Lecture not found or not yours' });
-    }
-    const { file_url, filename } = parse.data;
-    const result = await pool.query(
-      `INSERT INTO lecture_files (lecture_id, file_url, filename) VALUES ($1, $2, $3) RETURNING *`,
-      [lectureId, file_url, filename],
-    );
-
-    // إرسال إشعار للطلاب المشتركين في الكورس
-    const lectureData = lectureCheck.rows[0];
-    await NotificationService.notifyFileAdded(
-      lectureData.course_id,
-      lectureId,
-      filename,
-      lectureData.lecture_title,
-      lectureData.course_title,
-    );
-
-    res.status(201).json({ file: result.rows[0] });
-  }),
-);
-
-// ملفات PDF على مستوى الكورس: انظر src/controllers/courseFiles.ts
+// ملفات PDF للمحاضرة: انظر src/controllers/courseFiles.ts
+// POST/GET /api/course/lecture/:lectureId/files (رفع multipart + عرض آمن)
 // POST/GET /api/course/:courseId/files و /api/courses/:courseId/files
 // GET/PATCH/DELETE /api/course-files/:fileId و GET /api/course-files/:fileId/view
 
@@ -2020,11 +1977,23 @@ router.get(
         [lectureIds],
       );
       videos = videosRes.rows;
-      const filesRes = await pool.query(
-        `SELECT * FROM lecture_files WHERE lecture_id = ANY($1::int[]) ORDER BY uploaded_at, id`,
-        [lectureIds],
-      );
-      files = filesRes.rows;
+      try {
+        const filesRes = await pool.query(
+          `SELECT id, course_id, lecture_id, teacher_id, uploaded_by, name, title, description,
+                  original_name, file_size, file_type, mime_type, created_at, updated_at
+           FROM course_files
+           WHERE lecture_id = ANY($1::int[]) AND deleted_at IS NULL
+           ORDER BY created_at DESC, id DESC`,
+          [lectureIds],
+        );
+        files = filesRes.rows.map((row) => serializeCourseFile(row));
+      } catch {
+        const filesRes = await pool.query(
+          `SELECT * FROM lecture_files WHERE lecture_id = ANY($1::int[]) ORDER BY uploaded_at, id`,
+          [lectureIds],
+        );
+        files = filesRes.rows;
+      }
     }
     // جلب الامتحانات والواجبات لكل محاضرة (يُسمح بأكثر من واحد لنفس المحاضرة)
     let assessments: any[] = [];
@@ -2064,7 +2033,9 @@ router.get(
         const lec = lectures[i];
         const { exam, exams: examsList, assignments } = attachAssessments(lec, 'student');
         const lecVideos = videos.filter((v) => v.lecture_id === lec.id);
-        const lecFiles = files.filter((f) => f.lecture_id === lec.id);
+        const lecFiles = files.filter(
+          (f) => (f.lectureId ?? f.lecture_id) === lec.id,
+        );
 
         // أوضاع الوصول (activation_code / time_limited) تُطبَّق على كل المحاضرات بما فيها الأولى
         try {
@@ -2178,7 +2149,7 @@ router.get(
         return {
           ...lec,
           videos: videos.filter((v) => v.lecture_id === lec.id),
-          files: files.filter((f) => f.lecture_id === lec.id),
+          files: files.filter((f) => (f.lectureId ?? f.lecture_id) === lec.id),
           exam,
           exams: examsList,
           assignments,

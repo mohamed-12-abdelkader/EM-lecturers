@@ -576,6 +576,8 @@ router.post('/webhook', async (req, res) => {
       // Only the first idle→started transition should start egress.
       // Reopen / room_started after ended|started would overwrite /recordings/{id}.mp4.
       let shouldStartEgress = Boolean(updateResult.rowCount && updateResult.rowCount > 0);
+      let startedMeeting: { title: string; created_by: number } | null =
+        shouldStartEgress && updateResult.rows[0] ? updateResult.rows[0] : null;
 
       if (!shouldStartEgress) {
         const groupUpdate = await pool.query(
@@ -586,6 +588,7 @@ router.post('/webhook', async (req, res) => {
         );
         if (groupUpdate.rowCount && groupUpdate.rowCount > 0) {
           shouldStartEgress = true;
+          startedMeeting = groupUpdate.rows[0];
           try {
                   // eslint-disable-next-line @typescript-eslint/ban-ts-comment
       // @ts-ignore
@@ -648,8 +651,23 @@ router.post('/webhook', async (req, res) => {
           filepath: `/recordings/${name}.mp4`,
         });
 
+        const { teacherName } = startedMeeting
+          ? await resolveMeetingTeacherDisplay(startedMeeting.created_by)
+          : { teacherName: null };
+
+        const egressParams = new URLSearchParams({
+          token: egressToken,
+          url: LIVEKIT_SERVER_URL,
+        });
+        if (startedMeeting?.title) {
+          egressParams.set('meetingTitle', startedMeeting.title);
+        }
+        if (teacherName) {
+          egressParams.set('teacherName', teacherName);
+        }
+
         const egressOpt: RoomCompositeOptions = {
-          customBaseUrl: `https://lk-recording.next-edu.online?token=${egressToken}&url=${LIVEKIT_SERVER_URL}`,
+          customBaseUrl: `https://lk-recording.next-edu.online?${egressParams.toString()}`,
           layout: 'grid',
         };
         await egressClient.startRoomCompositeEgress(name, outputFile, egressOpt);

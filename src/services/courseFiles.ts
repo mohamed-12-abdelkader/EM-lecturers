@@ -23,6 +23,7 @@ const PDF_MAGIC = Buffer.from('%PDF-');
 export type CourseFileRow = {
   id: number;
   course_id: number;
+  lecture_id: number | null;
   teacher_id: number | null;
   uploaded_by: number | null;
   name: string;
@@ -50,7 +51,7 @@ export type RequestUser = {
 };
 
 const FILE_SELECT = `
-  id, course_id, teacher_id, uploaded_by, name, title, description, original_name,
+  id, course_id, lecture_id, teacher_id, uploaded_by, name, title, description, original_name,
   file_url, file_key, file_size, file_type, mime_type, storage_provider,
   upload_status, delivery_type, created_at, updated_at, deleted_at, storage_deleted_at
 `;
@@ -144,7 +145,7 @@ export class CourseFilesService {
       const result = await pool.query<CourseFileRow>(
         `SELECT ${FILE_SELECT}
          FROM course_files
-         WHERE course_id = $1 AND deleted_at IS NULL
+         WHERE course_id = $1 AND deleted_at IS NULL AND lecture_id IS NULL
          ORDER BY created_at DESC, id DESC`,
         [courseId],
       );
@@ -152,7 +153,7 @@ export class CourseFilesService {
     } catch (error) {
       if (!isMissingColumnError(error)) throw error;
       const result = await pool.query<CourseFileRow>(
-        `SELECT id, course_id, uploaded_by AS teacher_id, uploaded_by, name, name AS title,
+        `SELECT id, course_id, NULL::integer AS lecture_id, uploaded_by AS teacher_id, uploaded_by, name, name AS title,
                 NULL::text AS description, name AS original_name, file_url, NULL::text AS file_key,
                 file_size, file_type, file_type AS mime_type, 'legacy'::varchar AS storage_provider,
                 'uploaded'::varchar AS upload_status, 'upload'::varchar AS delivery_type,
@@ -164,6 +165,36 @@ export class CourseFilesService {
       );
       return result.rows;
     }
+  }
+
+  static async listByLecture(lectureId: number): Promise<CourseFileRow[]> {
+    try {
+      const result = await pool.query<CourseFileRow>(
+        `SELECT ${FILE_SELECT}
+         FROM course_files
+         WHERE lecture_id = $1 AND deleted_at IS NULL
+         ORDER BY created_at DESC, id DESC`,
+        [lectureId],
+      );
+      return result.rows;
+    } catch (error) {
+      if (!isMissingColumnError(error)) throw error;
+      return [];
+    }
+  }
+
+  static async resolveLectureCourse(lectureId: number): Promise<{ courseId: number; lectureTitle: string }> {
+    const result = await pool.query<{ course_id: number; title: string }>(
+      `SELECT course_id, title FROM lectures WHERE id = $1 LIMIT 1`,
+      [lectureId],
+    );
+    if (!result.rowCount) {
+      throw new HttpError(404, 'المحاضرة غير موجودة');
+    }
+    return {
+      courseId: result.rows[0].course_id,
+      lectureTitle: result.rows[0].title,
+    };
   }
 
   static async getById(fileId: number): Promise<CourseFileRow | null> {
@@ -178,7 +209,7 @@ export class CourseFilesService {
     } catch (error) {
       if (!isMissingColumnError(error)) throw error;
       const result = await pool.query<CourseFileRow>(
-        `SELECT id, course_id, uploaded_by AS teacher_id, uploaded_by, name, name AS title,
+        `SELECT id, course_id, NULL::integer AS lecture_id, uploaded_by AS teacher_id, uploaded_by, name, name AS title,
                 NULL::text AS description, name AS original_name, file_url, NULL::text AS file_key,
                 file_size, file_type, file_type AS mime_type, 'legacy'::varchar AS storage_provider,
                 'uploaded'::varchar AS upload_status, 'upload'::varchar AS delivery_type,
@@ -200,11 +231,19 @@ export class CourseFilesService {
   static async createFromUpload(input: {
     user: RequestUser;
     courseId: number;
+    lectureId?: number | null;
     file: Express.Multer.File;
     title: string;
     description?: string | null;
   }): Promise<CourseFileRow> {
     await this.assertCanManage(input.user, input.courseId);
+
+    if (input.lectureId) {
+      const lecture = await this.resolveLectureCourse(input.lectureId);
+      if (lecture.courseId !== input.courseId) {
+        throw new HttpError(400, 'المحاضرة لا تنتمي لهذا الكورس');
+      }
+    }
 
     const title = input.title.trim();
     if (!title) throw new HttpError(400, 'عنوان الملف مطلوب');
@@ -231,14 +270,15 @@ export class CourseFilesService {
     try {
       const result = await pool.query<CourseFileRow>(
         `INSERT INTO course_files (
-           course_id, teacher_id, uploaded_by, name, title, description, original_name,
+           course_id, lecture_id, teacher_id, uploaded_by, name, title, description, original_name,
            file_url, file_key, file_size, file_type, mime_type,
            storage_provider, upload_status, delivery_type
          )
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'uploaded',$14)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'uploaded',$15)
          RETURNING ${FILE_SELECT}`,
         [
           input.courseId,
+          input.lectureId ?? null,
           input.user.id,
           input.user.id,
           title,
@@ -261,6 +301,12 @@ export class CourseFilesService {
         deliveryType: stored.deliveryType,
       });
       if (isMissingColumnError(error)) {
+        if (input.lectureId) {
+          throw new HttpError(
+            500,
+            'جدول course_files يحتاج تحديث — شغّل الـ migration: 1778200000000_course_files_lecture_id.sql',
+          );
+        }
         throw new HttpError(
           500,
           'جدول course_files يحتاج تحديث — شغّل الـ migration: 1777000000000_enhance_course_files_pdf.sql',
@@ -337,7 +383,7 @@ export class CourseFilesService {
       if (isMissingColumnError(error)) {
         const hard = await pool.query<CourseFileRow>(
           `DELETE FROM course_files WHERE id = $1 RETURNING
-             id, course_id, uploaded_by AS teacher_id, uploaded_by, name, name AS title,
+             id, course_id, NULL::integer AS lecture_id, uploaded_by AS teacher_id, uploaded_by, name, name AS title,
              NULL::text AS description, name AS original_name, file_url, NULL::text AS file_key,
              file_size, file_type, file_type AS mime_type, 'legacy'::varchar AS storage_provider,
              'uploaded'::varchar AS upload_status, 'upload'::varchar AS delivery_type,

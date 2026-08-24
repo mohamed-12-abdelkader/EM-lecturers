@@ -119,6 +119,70 @@ const UpdateFileSchema = z.object({
   description: z.string().max(5000).optional().nullable(),
 });
 
+async function listLectureFiles(req: Request, res: Response) {
+  const lectureId = parseId(req.params.lectureId, 'معرف المحاضرة');
+  const { courseId } = await CourseFilesService.resolveLectureCourse(lectureId);
+  await CourseFilesService.assertCanView(requestUser(req), courseId);
+  const files = await CourseFilesService.listByLecture(lectureId);
+  const data = files.map((file) => CourseFilesService.serialize(file));
+  return res.json({
+    success: true,
+    data,
+    files: data,
+  });
+}
+
+async function uploadLectureFile(req: Request, res: Response) {
+  const lectureId = parseId(req.params.lectureId, 'معرف المحاضرة');
+  const uploaded = req.file;
+  if (!uploaded) {
+    return res.status(400).json({ success: false, message: 'يجب إرفاق ملف PDF في الحقل file' });
+  }
+
+  const { courseId, lectureTitle } = await CourseFilesService.resolveLectureCourse(lectureId);
+  const title = String(req.body?.title ?? req.body?.name ?? '').trim();
+  const description =
+    req.body?.description === undefined || req.body?.description === ''
+      ? null
+      : String(req.body.description);
+
+  try {
+    const created = await CourseFilesService.createFromUpload({
+      user: requestUser(req),
+      courseId,
+      lectureId,
+      file: uploaded,
+      title,
+      description,
+    });
+
+    try {
+      const courseRes = await pool.query(`SELECT title FROM courses WHERE id = $1`, [courseId]);
+      await NotificationService.notifyFileAdded(
+        courseId,
+        lectureId,
+        created.title,
+        lectureTitle,
+        courseRes.rows[0]?.title || '',
+      );
+    } catch (notifErr) {
+      console.warn('Lecture file notification failed:', notifErr);
+    }
+
+    return res.status(201).json({
+      success: true,
+      message: 'تم رفع الملف بنجاح',
+      data: CourseFilesService.serialize(created),
+      file: CourseFilesService.serialize(created),
+    });
+  } catch (error) {
+    cleanupUpload(uploaded);
+    const handled = handleServiceError(res, error);
+    if (handled) return handled;
+    throw error;
+  }
+}
+
 async function listCourseFiles(req: Request, res: Response) {
   const courseId = parseId(req.params.courseId, 'معرف الكورس');
   await CourseFilesService.assertCanView(requestUser(req), courseId);
@@ -349,6 +413,20 @@ export const courseFileViewHandlers = [
   courseFilesViewRateLimit,
   wrap(viewCourseFile),
 ];
+
+courseFilesByCourseRouter.get(
+  '/lecture/:lectureId/files',
+  authMiddleware([...VIEW_ROLES]),
+  wrap(listLectureFiles),
+);
+
+courseFilesByCourseRouter.post(
+  '/lecture/:lectureId/files',
+  authMiddleware([...COURSE_CONTENT_ROLES]),
+  courseFilesUploadRateLimit,
+  multerPdfUpload,
+  wrap(uploadLectureFile),
+);
 
 courseFilesByCourseRouter.get(
   '/:courseId/files',
