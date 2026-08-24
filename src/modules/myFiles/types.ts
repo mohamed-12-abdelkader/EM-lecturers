@@ -61,4 +61,8 @@ export type StorageUploadOptions = {
   access?: StorageAccessMode;
   folder?: string;
   tenantId?: number;
+  /** Absolute or cwd-relative directory for non-tenant local uploads (e.g. course PDFs). */
+  localDir?: string;
+  /** Public URL prefix matching localDir (e.g. /uploads/course-pdfs). */
+  localUrlPrefix?: string;
 };

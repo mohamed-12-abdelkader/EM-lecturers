@@ -161,8 +161,14 @@ export class FileStorageService {
     const key = withFolder(storageKey, options?.folder);
     switch (myFilesConfig.storageProvider) {
       case 'local':
+        if (options?.localDir && options?.localUrlPrefix) {
+          return this.uploadScopedLocal(filePath, storageKey, options.localDir, options.localUrlPrefix);
+        }
         if (options?.tenantId == null) {
-          throw new HttpError(500, 'tenantId is required for local storage uploads');
+          throw new HttpError(
+            500,
+            'tenantId is required for local teacher-library uploads, or pass localDir/localUrlPrefix',
+          );
         }
         return this.uploadLocal(filePath, key, options.tenantId);
       case 's3':
@@ -182,7 +188,9 @@ export class FileStorageService {
     try {
       switch (provider) {
         case 'local': {
-          const fullPath = resolveLocalFilePath(fileKey);
+          const fullPath = fileUrl.startsWith('/uploads/')
+            ? path.resolve(process.cwd(), fileUrl.replace(/^\/+/, ''))
+            : resolveLocalFilePath(fileKey);
           await fs.unlink(fullPath).catch(() => undefined);
           break;
         }
@@ -396,6 +404,23 @@ export class FileStorageService {
       default:
         return null;
     }
+  }
+
+  private static async uploadScopedLocal(
+    filePath: string,
+    storageKey: string,
+    localDir: string,
+    localUrlPrefix: string,
+  ): Promise<StorageUploadResult> {
+    const base = path.isAbsolute(localDir) ? localDir : path.join(process.cwd(), localDir);
+    await fs.mkdir(base, { recursive: true });
+    const filename = storageKey.includes('/') ? storageKey.split('/').pop()! : storageKey;
+    const dest = path.join(base, filename);
+    await fs.copyFile(filePath, dest);
+    await fs.unlink(filePath).catch(() => undefined);
+    const prefix = localUrlPrefix.replace(/\/+$/g, '');
+    const fileUrl = `${prefix}/${filename}`;
+    return { fileUrl, fileKey: filename, deliveryType: 'upload', resourceType: 'raw' };
   }
 
   private static async uploadLocal(

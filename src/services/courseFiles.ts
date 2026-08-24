@@ -3,7 +3,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { fileTypeFromFile } from 'file-type';
 import pool from '../db/pool';
-import { courseFilesConfig } from '../config/courseFiles';
+import { courseFilesConfig, resolveCoursePdfLocalDir } from '../config/courseFiles';
 import { FileStorageService } from '../modules/myFiles/services/fileStorage.service';
 import { CourseAccessControl } from './courseAccessControl';
 import { CourseAccessService } from './courseAccess';
@@ -253,13 +253,21 @@ export class CourseFilesService {
 
     let stored;
     try {
-      stored = await FileStorageService.upload(input.file.path, storageKey, mimeType, {
+      const uploadOptions: Parameters<typeof FileStorageService.upload>[3] = {
         access: 'authenticated',
         folder: courseFilesConfig.storageFolder,
-      });
+      };
+
+      if (FileStorageService.getProvider() === 'local') {
+        uploadOptions.localDir = resolveCoursePdfLocalDir();
+        uploadOptions.localUrlPrefix = courseFilesConfig.localPublicPrefix;
+      }
+
+      stored = await FileStorageService.upload(input.file.path, storageKey, mimeType, uploadOptions);
     } catch (error) {
       await fs.unlink(input.file.path).catch(() => undefined);
       logger.error({ err: error }, 'Course PDF storage upload failed');
+      if (error instanceof HttpError) throw error;
       throw new HttpError(502, 'فشل رفع الملف إلى التخزين');
     }
 
