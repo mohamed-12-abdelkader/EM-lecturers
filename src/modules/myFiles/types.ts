@@ -60,4 +60,5 @@ export type StorageAccessMode = 'public' | 'authenticated';
 export type StorageUploadOptions = {
   access?: StorageAccessMode;
   folder?: string;
+  tenantId?: number;
 };

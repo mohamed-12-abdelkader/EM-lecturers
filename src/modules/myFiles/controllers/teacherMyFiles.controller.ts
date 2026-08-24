@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { Router, Request, Response } from 'express';
+import { Router, Request, Response, NextFunction } from 'express';
 import multer from 'multer';
 import { z } from 'zod';
 import { authMiddleware } from '../../../middleware/authentication';
@@ -53,6 +53,20 @@ function cleanupFiles(files?: Express.Multer.File | Express.Multer.File[]) {
   for (const file of list) {
     if (file?.path) fs.promises.unlink(file.path).catch(() => undefined);
   }
+}
+
+function resolveTenantId(req: Request): number {
+  const tenantId = req.tenant?.id;
+  if (!tenantId) throw new HttpError(400, 'Tenant context is required');
+  return tenantId;
+}
+
+function maybeUploadSingle(req: Request, res: Response, next: NextFunction) {
+  const contentType = String(req.headers['content-type'] || '');
+  if (contentType.includes('multipart/form-data')) {
+    return upload.single('file')(req, res, next);
+  }
+  next();
 }
 
 function handleServiceError(res: Response, error: unknown) {
@@ -127,8 +141,40 @@ teacherFilesRouter.post(
   '/',
   authMiddleware([...MY_FILES_ROLES]),
   teacherFilesUploadRateLimit,
+  maybeUploadSingle,
   asyncWrapper(async (req: Request, res: Response) => {
     const teacherId = resolveTeacherId(req);
+    const tenantId = resolveTenantId(req);
+
+    if (req.file) {
+      const name = (req.body.name as string | undefined)?.trim() || req.file.originalname || 'file';
+      const description = req.body.description as string | undefined;
+      const categoryId =
+        parseNumberInput(req.body.categoryId) ?? parseNumberInput(req.body.category_id) ?? null;
+
+      try {
+        const saved = await TeacherFilesService.uploadFile({
+          teacherId,
+          tenantId,
+          file: req.file,
+          name,
+          description,
+          categoryId,
+        });
+
+        return res.status(201).json({
+          success: true,
+          message: 'تم رفع الملف بنجاح',
+          data: TeacherFilesService.serializeFile(saved),
+        });
+      } catch (error) {
+        cleanupFiles(req.file);
+        const handled = handleServiceError(res, error);
+        if (handled) return handled;
+        throw error;
+      }
+    }
+
     const parsed = CreateDriveFileSchema.safeParse(req.body);
     if (!parsed.success) {
       return res.status(400).json({
@@ -217,6 +263,7 @@ teacherFilesRouter.post(
   upload.array('files', myFilesConfig.maxBulkFiles),
   asyncWrapper(async (req: Request, res: Response) => {
     const teacherId = resolveTeacherId(req);
+    const tenantId = resolveTenantId(req);
     const files = req.files as Express.Multer.File[] | undefined;
     if (!files?.length) {
       return res.status(400).json({ success: false, message: 'يجب رفع ملف واحد على الأقل' });
@@ -232,6 +279,7 @@ teacherFilesRouter.post(
       try {
         const saved = await TeacherFilesService.uploadFile({
           teacherId,
+          tenantId,
           file,
           name: (req.body.namePrefix ? `${req.body.namePrefix} - ` : '') + (file.originalname || 'file'),
           description: baseDescription,

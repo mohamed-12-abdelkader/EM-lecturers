@@ -1,12 +1,11 @@
 import path from 'node:path';
-import { randomUUID } from 'node:crypto';
 import { fileTypeFromFile } from 'file-type';
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const pdfParse = require('pdf-parse') as (
   buffer: Buffer,
 ) => Promise<{ text?: string; numpages?: number }>;
 import { getApiUrl } from '../../../config/appUrls';
-import { myFilesConfig } from '../config';
+import { buildPublicFileUrl, buildTenantStorageKey, myFilesConfig } from '../config';
 import { FileCategoriesRepository } from '../repositories/fileCategories.repository';
 import { TeacherFilesRepository } from '../repositories/teacherFiles.repository';
 import { FileStorageService } from './fileStorage.service';
@@ -452,8 +451,8 @@ export class TeacherFilesService {
     return { extension: ext, mimeType };
   }
 
-  static buildStorageKey(extension: string): string {
-    return `${randomUUID()}.${extension}`;
+  static buildStorageKey(tenantId: number, extension: string): string {
+    return buildTenantStorageKey(tenantId, extension);
   }
 
   static async ensureCategoryOwnership(teacherId: number, categoryId?: number | null) {
@@ -502,6 +501,7 @@ export class TeacherFilesService {
 
   static async uploadFile(input: {
     teacherId: number;
+    tenantId: number;
     file: Express.Multer.File;
     name: string;
     description?: string;
@@ -510,8 +510,13 @@ export class TeacherFilesService {
     const { extension, mimeType } = await this.validateUploadedFile(input.file);
     await this.ensureCategoryOwnership(input.teacherId, input.categoryId);
 
-    const storageKey = this.buildStorageKey(extension);
-    const stored = await FileStorageService.upload(input.file.path, storageKey, mimeType);
+    const storageKey = this.buildStorageKey(input.tenantId, extension);
+    const stored = await FileStorageService.upload(
+      input.file.path,
+      storageKey,
+      mimeType,
+      { tenantId: input.tenantId },
+    );
 
     const created = await TeacherFilesRepository.create({
       teacherId: input.teacherId,
@@ -644,6 +649,11 @@ export class TeacherFilesService {
     const urls = TeacherFilesService.buildFileUrls(file.id);
     const storageProvider = isDrive ? 'google_drive' : FileStorageService.getProvider();
     const driveUrl = file.drive_url || (isDrive ? file.file_url : null);
+    const isLocalUpload = !isDrive && storageProvider === 'local';
+    const staticFileUrl = isLocalUpload ? buildPublicFileUrl(file.file_key) : file.file_url;
+    const staticAbsoluteUrl = isLocalUpload
+      ? `${getApiUrl()}${staticFileUrl}`
+      : null;
 
     return {
       id: file.id,
@@ -654,7 +664,7 @@ export class TeacherFilesService {
       driveUrl,
       drivePreviewUrl: drive?.previewUrl ?? null,
       driveViewUrl: drive?.viewUrl ?? null,
-      fileUrl: isDrive ? driveUrl : file.file_url,
+      fileUrl: isDrive ? driveUrl : staticFileUrl,
       fileKey: file.file_key,
       storageProvider,
       fileSize: Number(file.file_size),
@@ -668,13 +678,33 @@ export class TeacherFilesService {
       icon: isDrive ? 'document' : TeacherFilesService.getFileIconType(file.file_extension, file.mime_type),
       viewerComponent: isDrive ? 'drive-embed' : TeacherFilesService.getViewerComponent(previewType),
       canPreviewInline: isDrive || previewType !== 'none',
-      viewUrl: isDrive ? drive?.previewUrl ?? driveUrl : urls.viewPath,
+      viewUrl: isDrive
+        ? drive?.previewUrl ?? driveUrl
+        : isLocalUpload && (previewType === 'pdf' || previewType === 'image')
+          ? staticFileUrl
+          : urls.viewPath,
       contentUrl: isDrive ? null : urls.contentPath,
-      downloadUrl: isDrive ? drive?.viewUrl ?? driveUrl : urls.downloadPath,
-      openUrl: isDrive ? drive?.previewUrl ?? driveUrl : urls.viewPath,
-      absoluteViewUrl: isDrive ? drive?.previewUrl ?? driveUrl : urls.view,
+      downloadUrl: isDrive
+        ? drive?.viewUrl ?? driveUrl
+        : isLocalUpload
+          ? staticFileUrl
+          : urls.downloadPath,
+      openUrl: isDrive
+        ? drive?.previewUrl ?? driveUrl
+        : isLocalUpload && (previewType === 'pdf' || previewType === 'image')
+          ? staticFileUrl
+          : urls.viewPath,
+      absoluteViewUrl: isDrive
+        ? drive?.previewUrl ?? driveUrl
+        : isLocalUpload && (previewType === 'pdf' || previewType === 'image')
+          ? staticAbsoluteUrl
+          : urls.view,
       absoluteContentUrl: isDrive ? null : urls.content,
-      absoluteDownloadUrl: isDrive ? drive?.viewUrl ?? driveUrl : urls.download,
+      absoluteDownloadUrl: isDrive
+        ? drive?.viewUrl ?? driveUrl
+        : isLocalUpload
+          ? staticAbsoluteUrl
+          : urls.download,
       createdAt: file.created_at,
       updatedAt: file.updated_at,
     };

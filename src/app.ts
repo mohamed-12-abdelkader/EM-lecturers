@@ -9,6 +9,7 @@ import cors from 'cors';
 import { getCorsOriginDelegate, getServerInfo } from './config/appUrls';
 import { router } from './routes';
 import { tenantContextMiddleware } from './middleware/tenantContext';
+import { teacherLibraryStaticMiddleware } from './modules/myFiles/middleware/teacherLibraryStatic';
 import { whatsappWebhookRouter } from './modules/whatsapp/controllers/whatsappWebhook.controller';
 // Register WhatsApp chatbot handlers (side-effect)
 import './modules/whatsapp/automations/technicalSupport';
@@ -72,6 +73,7 @@ app.use('/api/webhooks/whatsapp', whatsappWebhookRouter);
 // Routes
 app.use('/api', tenantContextMiddleware);
 app.use('/api', router);
+app.use('/uploads/teacher-library', teacherLibraryStaticMiddleware);
 app.use('/uploads', express.static('uploads'));
 
 app.use(errorHandlerMiddleware);

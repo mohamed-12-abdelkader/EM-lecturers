@@ -260,10 +260,13 @@ export class TeacherWhatsAppService {
           gw = await getSession(loc.slug);
           await pool.query(
             `UPDATE wa_sessions SET
-               phone_number = COALESCE($2, phone_number),
-               status = $3,
-               last_ready_at = CASE WHEN $3 = 'ready' THEN COALESCE(last_ready_at, NOW()) ELSE last_ready_at END,
-               last_error = CASE WHEN $3 = 'ready' THEN NULL ELSE last_error END,
+               phone_number = COALESCE($2::varchar, phone_number),
+               status = $3::varchar,
+               last_ready_at = CASE
+                 WHEN $3::varchar = 'ready' THEN COALESCE(last_ready_at, NOW())
+                 ELSE last_ready_at
+               END,
+               last_error = CASE WHEN $3::varchar = 'ready' THEN NULL ELSE last_error END,
                updated_at = NOW()
              WHERE slug = $1`,
             [loc.slug, gw.phone_number ?? null, gw.status || loc.status],
@@ -340,9 +343,12 @@ export class TeacherWhatsAppService {
     const gw = await getSession(slug);
     await pool.query(
       `UPDATE wa_sessions SET
-         phone_number = COALESCE($2, phone_number),
-         status = $3,
-         last_ready_at = CASE WHEN $3 = 'ready' THEN COALESCE(last_ready_at, NOW()) ELSE last_ready_at END,
+         phone_number = COALESCE($2::varchar, phone_number),
+         status = $3::varchar,
+         last_ready_at = CASE
+           WHEN $3::varchar = 'ready' THEN COALESCE(last_ready_at, NOW())
+           ELSE last_ready_at
+         END,
          updated_at = NOW()
        WHERE slug = $1 AND teacher_id = $4`,
       [slug, gw.phone_number ?? null, gw.status || 'pending', teacherId],

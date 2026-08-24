@@ -6,7 +6,12 @@ import axios from 'axios';
 import { GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { v2 as cloudinary } from 'cloudinary';
-import { myFilesConfig, resolveLocalStorageDir } from '../config';
+import {
+  buildPublicFileUrl,
+  myFilesConfig,
+  resolveLocalFilePath,
+  resolveTenantStorageDir,
+} from '../config';
 import type { FileStorageProvider } from '../config';
 import type { StorageUploadOptions, StorageUploadResult } from '../types';
 import { HttpError, logger, uploadToCloudinary } from '../../../utils';
@@ -156,7 +161,10 @@ export class FileStorageService {
     const key = withFolder(storageKey, options?.folder);
     switch (myFilesConfig.storageProvider) {
       case 'local':
-        return this.uploadLocal(filePath, key);
+        if (options?.tenantId == null) {
+          throw new HttpError(500, 'tenantId is required for local storage uploads');
+        }
+        return this.uploadLocal(filePath, key, options.tenantId);
       case 's3':
         return this.uploadS3(filePath, key, mimeType);
       case 'cloudinary':
@@ -174,7 +182,7 @@ export class FileStorageService {
     try {
       switch (provider) {
         case 'local': {
-          const fullPath = path.join(resolveLocalStorageDir(), fileKey);
+          const fullPath = resolveLocalFilePath(fileKey);
           await fs.unlink(fullPath).catch(() => undefined);
           break;
         }
@@ -212,7 +220,7 @@ export class FileStorageService {
   static async readBuffer(fileKey: string, fileUrl: string): Promise<Buffer> {
     switch (myFilesConfig.storageProvider) {
       case 'local': {
-        const fullPath = path.join(resolveLocalStorageDir(), fileKey);
+        const fullPath = resolveLocalFilePath(fileKey);
         return fs.readFile(fullPath);
       }
       case 's3': {
@@ -256,7 +264,7 @@ export class FileStorageService {
     }
 
     if (provider === 'local') {
-      const fullPath = path.join(resolveLocalStorageDir(), fileKey);
+      const fullPath = resolveLocalFilePath(fileKey);
       const stat = await fs.stat(fullPath);
       return { stream: createReadStream(fullPath), contentLength: stat.size };
     }
@@ -328,6 +336,8 @@ export class FileStorageService {
 
   static async getDownloadUrl(fileKey: string, fileUrl: string): Promise<string> {
     switch (myFilesConfig.storageProvider) {
+      case 'local':
+        return buildPublicFileUrl(fileKey);
       case 's3': {
         const command = new GetObjectCommand({
           Bucket: myFilesConfig.aws.bucket,
@@ -375,25 +385,31 @@ export class FileStorageService {
   /** رابط مباشر للعرض في iframe (أسرع من البروكسي عبر الـ API) */
   static async getDirectAccessUrl(fileKey: string, fileUrl: string): Promise<string | null> {
     switch (myFilesConfig.storageProvider) {
+      case 'local':
+        return buildPublicFileUrl(fileKey);
       case 'cloudinary': {
         const signedUrls = buildCloudinaryAccessUrls(fileKey, fileUrl);
         return signedUrls[0] || null;
       }
       case 's3':
         return this.getDownloadUrl(fileKey, fileUrl);
-      case 'local':
       default:
         return null;
     }
   }
 
-  private static async uploadLocal(filePath: string, storageKey: string): Promise<StorageUploadResult> {
-    const dir = resolveLocalStorageDir();
-    const dest = path.join(dir, storageKey);
-    await fs.mkdir(path.dirname(dest), { recursive: true });
+  private static async uploadLocal(
+    filePath: string,
+    storageKey: string,
+    tenantId: number,
+  ): Promise<StorageUploadResult> {
+    const dir = resolveTenantStorageDir(tenantId);
+    await fs.mkdir(dir, { recursive: true });
+    const filename = storageKey.includes('/') ? storageKey.split('/').pop()! : storageKey;
+    const dest = path.join(dir, filename);
     await fs.copyFile(filePath, dest);
     await fs.unlink(filePath).catch(() => undefined);
-    const fileUrl = `/uploads/teacher-library/${storageKey}`;
+    const fileUrl = buildPublicFileUrl(storageKey);
     return { fileUrl, fileKey: storageKey, deliveryType: 'upload', resourceType: 'raw' };
   }
 
