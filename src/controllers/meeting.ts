@@ -42,6 +42,49 @@ const { LIVEKIT_API_KEY, LIVEKIT_API_SECRET, LIVEKIT_URL: LIVEKIT_SERVER_URL } =
 const roomService = new RoomServiceClient(LIVEKIT_SERVER_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET);
 const egressClient = new EgressClient(LIVEKIT_SERVER_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET);
 
+const RECORDING_COMPOSITE_BASE_URL =
+  process.env.LK_RECORDING_BASE_URL || 'https://lk-recording.next-edu.online';
+
+type MeetingEgressRow = { title: string; created_by: number };
+
+async function startMeetingRecordingEgress(
+  roomName: string,
+  meeting: MeetingEgressRow,
+): Promise<void> {
+  const egressToken = await generateParticipantToken({
+    roomName,
+    identity: `recorder_${Date.now()}`,
+    name: 'egress',
+    role: 'egress',
+    ttl: '8760h',
+  });
+
+  const outputFile = new EncodedFileOutput({
+    filepath: `/recordings/${roomName}.mp4`,
+  });
+
+  const { teacherName } = await resolveMeetingTeacherDisplay(meeting.created_by);
+
+  const egressParams = new URLSearchParams({
+    token: egressToken,
+    url: LIVEKIT_SERVER_URL,
+  });
+  if (meeting.title) {
+    egressParams.set('meetingTitle', meeting.title);
+  }
+  if (teacherName) {
+    egressParams.set('teacherName', teacherName);
+  }
+
+  const egressOpt: RoomCompositeOptions = {
+    customBaseUrl: `${RECORDING_COMPOSITE_BASE_URL}?${egressParams.toString()}`,
+    layout: 'grid',
+  };
+
+  await egressClient.startRoomCompositeEgress(roomName, outputFile, egressOpt);
+  console.log('[Meeting] Started recording egress for room:', roomName);
+}
+
 /**
  * -------------------------
  * MEETING MANAGEMENT
@@ -327,37 +370,43 @@ router.get(
         req.tenant as any,
       );
 
-      // عند دخول المحاضر (صاحب الجلسة) نحدّث الحالة إلى started فوراً حتى يظهر للطلاب أن الجلسة نشطة (بدون الاعتماد على webhook LiveKit)
+      // Mark live for students immediately. Do NOT start egress here — LiveKit room
+      // usually does not exist until the host joins; room_started webhook starts recording.
       if (isOwner && (meeting as any).status === 'idle') {
         if (meetingSource === 'general_course_group') {
           await pool.query(
-            `UPDATE general_course_group_meeting SET status = 'started', updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+            `UPDATE general_course_group_meeting SET status = 'started', updated_at = CURRENT_TIMESTAMP
+             WHERE id = $1 AND status = 'idle'`,
             [meetingId],
           );
         } else {
-          await pool.query(
-            `UPDATE meeting SET status = 'started', updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+          const courseStart = await pool.query<{ title: string; course_id: number }>(
+            `UPDATE meeting SET status = 'started', updated_at = CURRENT_TIMESTAMP
+             WHERE id = $1 AND status = 'idle'
+             RETURNING title, course_id`,
             [meetingId],
           );
-          // إشعار لحظي ودقيق عند البدء الفعلي للبث (للطلاب المشتركين في نفس الكورس فقط).
-          try {
-            // eslint-disable-next-line @typescript-eslint/ban-ts-comment
-            // @ts-ignore
-            const { NotificationService } = await import('../services/notifications');
-            const courseInfo = await pool.query(`SELECT id, title FROM courses WHERE id = $1 LIMIT 1`, [
-              (meeting as any).course_id,
-            ]);
-            if (courseInfo.rowCount && courseInfo.rowCount > 0) {
-              await NotificationService.notifyLiveStreamStarted(
-                (meeting as any).course_id,
-                (meeting as any).title,
-                courseInfo.rows[0].title,
-                true,
-                meetingId,
-              );
+          if (courseStart.rowCount && courseStart.rowCount > 0) {
+            const startedRow = courseStart.rows[0];
+            try {
+              // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+              // @ts-ignore
+              const { NotificationService } = await import('../services/notifications');
+              const courseInfo = await pool.query(`SELECT id, title FROM courses WHERE id = $1 LIMIT 1`, [
+                startedRow.course_id,
+              ]);
+              if (courseInfo.rowCount && courseInfo.rowCount > 0) {
+                await NotificationService.notifyLiveStreamStarted(
+                  startedRow.course_id,
+                  startedRow.title,
+                  courseInfo.rows[0].title,
+                  true,
+                  meetingId,
+                );
+              }
+            } catch (notifError) {
+              console.error('❌ [Notification] Error sending live-start notification:', notifError);
             }
-          } catch (notifError) {
-            console.error('❌ [Notification] Error sending live-start notification:', notifError);
           }
         }
       }
@@ -569,34 +618,70 @@ router.post('/webhook', async (req, res) => {
     const event = await receiver.receive(req.body, req.get('Authorization'));
     if (event.event === 'room_started') {
       const { name, sid } = event.room!;
-      const updateResult = await pool.query(
+      // Claim recording when:
+      // - idle → started (normal), OR
+      // - already started by /connection but room_sid still null (host got token before room existed)
+      // Do NOT restart after ended or when room_sid is already set (avoids overwriting MP4).
+      const idleStart = await pool.query(
         `UPDATE meeting SET status = 'started', room_sid = $1, updated_at = CURRENT_TIMESTAMP
          WHERE id = $2 AND status = 'idle'
          RETURNING *`,
         [sid, name],
       );
 
-      // Only the first idle→started transition should start egress.
-      // Reopen / room_started after ended|started would overwrite /recordings/{id}.mp4.
-      let shouldStartEgress = Boolean(updateResult.rowCount && updateResult.rowCount > 0);
+      let shouldStartEgress = Boolean(idleStart.rowCount && idleStart.rowCount > 0);
       let startedMeeting: { title: string; created_by: number } | null =
-        shouldStartEgress && updateResult.rows[0] ? updateResult.rows[0] : null;
+        shouldStartEgress && idleStart.rows[0] ? idleStart.rows[0] : null;
+
+      if (shouldStartEgress) {
+        try {
+          const meeting = idleStart.rows[0];
+          const courseInfo = await pool.query(`SELECT id, title FROM courses WHERE id = $1`, [
+            meeting.course_id,
+          ]);
+          if (courseInfo.rowCount && courseInfo.rowCount > 0) {
+            // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+            // @ts-ignore
+            const { NotificationService } = await import('../services/notifications');
+            await NotificationService.notifyLiveStreamStarted(
+              meeting.course_id,
+              meeting.title,
+              courseInfo.rows[0].title,
+              true,
+              meeting.id,
+            );
+          }
+        } catch (notifError) {
+          console.error('Error sending live stream notification:', notifError);
+        }
+      } else {
+        const lateClaim = await pool.query(
+          `UPDATE meeting SET room_sid = $1, updated_at = CURRENT_TIMESTAMP
+           WHERE id = $2 AND status = 'started' AND room_sid IS NULL
+           RETURNING title, created_by`,
+          [sid, name],
+        );
+        if (lateClaim.rowCount && lateClaim.rowCount > 0) {
+          shouldStartEgress = true;
+          startedMeeting = lateClaim.rows[0];
+        }
+      }
 
       if (!shouldStartEgress) {
-        const groupUpdate = await pool.query(
+        const groupIdle = await pool.query(
           `UPDATE general_course_group_meeting SET status = 'started', room_sid = $1, updated_at = CURRENT_TIMESTAMP
            WHERE id = $2 AND status = 'idle'
            RETURNING *`,
           [sid, name],
         );
-        if (groupUpdate.rowCount && groupUpdate.rowCount > 0) {
+        if (groupIdle.rowCount && groupIdle.rowCount > 0) {
           shouldStartEgress = true;
-          startedMeeting = groupUpdate.rows[0];
+          startedMeeting = groupIdle.rows[0];
           try {
-                  // eslint-disable-next-line @typescript-eslint/ban-ts-comment
-      // @ts-ignore
+            // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+            // @ts-ignore
             const { NotificationService } = await import('../services/notifications');
-            const meeting = groupUpdate.rows[0];
+            const meeting = groupIdle.rows[0];
             const groupRow = await pool.query(
               `SELECT g.general_course_id, c.title FROM general_course_groups g
                JOIN general_courses c ON c.id = g.general_course_id WHERE g.id = $1`,
@@ -614,68 +699,25 @@ router.post('/webhook', async (req, res) => {
           } catch (notifError) {
             console.error('Error sending group live stream notification:', notifError);
           }
-        }
-      } else {
-        // إرسال إشعار للطلاب المشتركين في الكورس عند بدء البث المباشر
-        try {
-          const meeting = updateResult.rows[0];
-          const courseInfo = await pool.query(
-            `SELECT id, title FROM courses WHERE id = $1`,
-            [meeting.course_id],
+        } else {
+          const groupLate = await pool.query(
+            `UPDATE general_course_group_meeting SET room_sid = $1, updated_at = CURRENT_TIMESTAMP
+             WHERE id = $2 AND status = 'started' AND room_sid IS NULL
+             RETURNING title, created_by`,
+            [sid, name],
           );
-          if (courseInfo.rowCount && courseInfo.rowCount > 0) {
-                  // eslint-disable-next-line @typescript-eslint/ban-ts-comment
-      // @ts-ignore
-            const { NotificationService } = await import('../services/notifications');
-            await NotificationService.notifyLiveStreamStarted(
-              meeting.course_id,
-              meeting.title,
-              courseInfo.rows[0].title,
-              true,
-              meeting.id,
-            );
+          if (groupLate.rowCount && groupLate.rowCount > 0) {
+            shouldStartEgress = true;
+            startedMeeting = groupLate.rows[0];
           }
-        } catch (notifError) {
-          console.error('Error sending live stream notification:', notifError);
         }
       }
 
-      if (shouldStartEgress) {
-        // تسجيل البث (egress) للكورس العادي ومجموعات الكورس العام — once per meeting
-        const egressToken = await generateParticipantToken({
-          roomName: name,
-          identity: `recorder_${Date.now()}`,
-          name: 'egress',
-          role: 'egress',
-          ttl: '8760h',
-        });
-
-        const outputFile = new EncodedFileOutput({
-          filepath: `/recordings/${name}.mp4`,
-        });
-
-        const { teacherName } = startedMeeting
-          ? await resolveMeetingTeacherDisplay(startedMeeting.created_by)
-          : { teacherName: null };
-
-        const egressParams = new URLSearchParams({
-          token: egressToken,
-          url: LIVEKIT_SERVER_URL,
-        });
-        if (startedMeeting?.title) {
-          egressParams.set('meetingTitle', startedMeeting.title);
-        }
-        if (teacherName) {
-          egressParams.set('teacherName', teacherName);
-        }
-
-        const egressOpt: RoomCompositeOptions = {
-          customBaseUrl: `https://lk-recording.next-edu.online?${egressParams.toString()}`,
-          layout: 'grid',
-        };
-        await egressClient.startRoomCompositeEgress(name, outputFile, egressOpt);
+      if (shouldStartEgress && startedMeeting) {
+        console.log('[Meeting webhook] room_started → starting egress for', name);
+        await startMeetingRecordingEgress(name, startedMeeting);
       } else {
-        console.warn('Skipping egress restart for room (meeting not idle):', name);
+        console.warn('Skipping egress restart for room (already claimed or ended):', name);
       }
     } else if (event.event === 'room_finished') {
       const sid = event.room!.sid;
@@ -710,6 +752,7 @@ router.post('/webhook', async (req, res) => {
       }
     } else if (event.event === 'egress_ended') {
       const roomName = event.egressInfo?.roomName;
+      console.log('[Meeting webhook] egress_ended for room:', roomName);
 
       if (!roomName) {
         console.warn('Room name not available in egress_ended event', event);

@@ -36,12 +36,27 @@ async function saveRecordingUrl(
   );
 }
 
+async function waitForRecordingFile(
+  filePath: string,
+  maxAttempts = 30,
+  delayMs = 2000,
+): Promise<boolean> {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    if (fs.existsSync(filePath)) {
+      return true;
+    }
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+  }
+  return false;
+}
+
 export async function processMeetingRecordingAfterEgress(
   input: ProcessMeetingRecordingInput,
 ): Promise<string | null> {
   const { roomName, recordingFilePath, meetingTitle, table } = input;
 
-  if (!fs.existsSync(recordingFilePath)) {
+  const fileReady = await waitForRecordingFile(recordingFilePath);
+  if (!fileReady) {
     logger.warn({ roomName, recordingFilePath }, 'Meeting recording file not found after egress');
     return null;
   }
