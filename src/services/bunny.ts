@@ -101,11 +101,23 @@ export async function uploadToBunnyStorage(
 
 export async function uploadToBunnyStream(
   file: UploadFile,
-  maxAttempts = 3,
-  retryDelay = 0,
+  options?: {
+    maxAttempts?: number;
+    retryDelay?: number;
+    deleteSource?: boolean;
+    uploadTimeoutMs?: number;
+  },
 ): Promise<string> {
+  const maxAttempts = options?.maxAttempts ?? 3;
+  const retryDelay = options?.retryDelay ?? 0;
+  const deleteSource = options?.deleteSource ?? true;
+  const uploadTimeoutMs = options?.uploadTimeoutMs ?? 600_000;
+
+  if (!STREAM_API_KEY || !STREAM_LIBRARY_ID) {
+    throw new Error('Bunny Stream is not configured (BUNNY_STREAM_API_KEY / BUNNY_STREAM_LIBRARY_ID)');
+  }
+
   try {
-    const fileStream = fs.createReadStream(file.path);
     const createResponse = await axios.post(
       STREAM_BASE,
       {
@@ -117,19 +129,21 @@ export async function uploadToBunnyStream(
           'Content-Type': 'application/json',
           AccessKey: STREAM_API_KEY,
         },
-        timeout: 10000,
+        timeout: 30_000,
       },
     );
     const videoId = createResponse.data.guid;
     const videoUploadUrl = `${STREAM_BASE}/${videoId}`;
+
     await retryRequest(
       async () => {
+        const fileStream = fs.createReadStream(file.path);
         return axios.put(videoUploadUrl, fileStream, {
           headers: {
             'Content-Type': 'application/octet-stream',
             AccessKey: STREAM_API_KEY,
           },
-          timeout: 10000,
+          timeout: uploadTimeoutMs,
           maxContentLength: Infinity,
           maxBodyLength: Infinity,
         });
@@ -137,11 +151,13 @@ export async function uploadToBunnyStream(
       maxAttempts,
       retryDelay,
     );
+
     return `${STREAM_EMBED_BASE}/${STREAM_LIBRARY_ID}/${videoId}`;
-  } catch (error: any) {
-    throw new Error(`Failed to upload to Bunny Stream: ${error.message}`);
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : 'unknown error';
+    throw new Error(`Failed to upload to Bunny Stream: ${message}`);
   } finally {
-    if (file && file.path) {
+    if (deleteSource && file?.path && fs.existsSync(file.path)) {
       fs.unlinkSync(file.path);
     }
   }

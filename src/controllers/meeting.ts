@@ -29,7 +29,10 @@ import {
   singleActiveMeetingLimit,
 } from '../middleware/meetings';
 import { generateParticipantToken, getParticipantsCount, resolveMeetingTeacherDisplay } from '../services/meetings-room-services';
-import { uploadToYouTube } from '../services/uploadToYoutube';
+import {
+  processMeetingRecordingAfterEgress,
+  type MeetingRecordingTable,
+} from '../services/meetingRecordingUpload';
 import { enforceTeacherLiveCreationLimit } from '../services/teacherLivePackagePolicy';
 
 const router = Router();
@@ -736,17 +739,15 @@ router.post('/webhook', async (req, res) => {
         return res.status(404).send('Meeting not found');
       }
 
-      const ytResponse = await uploadToYouTube({
-        filePath: recordingFilePath,
-        title: meetingTitle,
-        privacyStatus: 'unlisted',
+      const recordingTable: MeetingRecordingTable = table;
+      void processMeetingRecordingAfterEgress({
+        roomName,
+        recordingFilePath,
+        meetingTitle,
+        table: recordingTable,
+      }).catch((uploadError) => {
+        console.error('Async meeting recording upload failed:', uploadError);
       });
-      const youtubeLink = `https://www.youtube.com/watch?v=${ytResponse.id}`;
-      if (table === 'meeting') {
-        await pool.query(`UPDATE meeting SET egress_url = $1 WHERE id = $2`, [youtubeLink, roomName]);
-      } else {
-        await pool.query(`UPDATE general_course_group_meeting SET egress_url = $1 WHERE id = $2`, [youtubeLink, roomName]);
-      }
     }
     res.status(200).send('OK');
   } catch (err) {
