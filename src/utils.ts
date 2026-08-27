@@ -185,6 +185,16 @@ export const config = cleanEnv(process.env, {
   /** Max tenant platform image (avatar/favicon/og/hero) in MB. 0 = unlimited. Default 0. */
   TENANT_IMAGE_MAX_FILE_SIZE_MB: num({ default: 0 }),
 
+  /** المنطقة الزمنية لحساب يوم العمل والحضور */
+  PLATFORM_TIMEZONE: str({ default: 'Africa/Cairo' }),
+
+  /** Admin ↔ Employee staff chat */
+  STAFF_CHAT_MAX_IMAGE_SIZE_MB: num({ default: 5 }),
+  STAFF_CHAT_MAX_MESSAGE_LENGTH: num({ default: 4000 }),
+  STAFF_CHAT_MESSAGE_EDIT_WINDOW_MINUTES: num({ default: 15 }),
+  STAFF_CHAT_RATE_LIMIT_MESSAGES_PER_MINUTE: num({ default: 30 }),
+  STAFF_CHAT_GROUP_NAME: str({ default: 'فريق العمل' }),
+
   // Teacher creative chatbot
   OPENAI_API_KEY: str({ default: '' }),
   OPENAI_IMAGE_MODEL: str({ default: 'gpt-image-2' }),

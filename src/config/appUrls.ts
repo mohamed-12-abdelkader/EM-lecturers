@@ -123,6 +123,20 @@ function isExpoOrigin(origin: string): boolean {
   );
 }
 
+function isLocalDevOrigin(origin: string): boolean {
+  try {
+    const { hostname } = new URL(origin);
+    return (
+      hostname === 'localhost' ||
+      hostname === '127.0.0.1' ||
+      hostname === '0.0.0.0' ||
+      hostname === '::1'
+    );
+  } catch {
+    return false;
+  }
+}
+
 function isNgrokOrigin(origin: string): boolean {
   return /\.ngrok(-free)?\.(app|io)$/i.test(origin) || origin.includes('ngrok');
 }
@@ -159,6 +173,11 @@ export function isCorsOriginAllowed(origin: string | undefined): boolean {
     return true;
   }
 
+  // Expo web / local admin app (any port: 8081, 8083, 3000, …)
+  if (origin && isLocalDevOrigin(origin)) {
+    return true;
+  }
+
   // Any *.next-edu.online
   if (isAllowedSubdomain(origin)) {
     return true;
@@ -180,6 +199,15 @@ export function getCorsOriginDelegate(): CorsOptionsDelegate<Request> {
     callback(null, {
       origin: allowed ? origin || true : false,
       credentials: true,
+      methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+      allowedHeaders: [
+        'Content-Type',
+        'Authorization',
+        'X-Tenant-Subdomain',
+        'X-Access-Token',
+        'ngrok-skip-browser-warning',
+      ],
+      exposedHeaders: ['X-Access-Token'],
     });
   };
 }

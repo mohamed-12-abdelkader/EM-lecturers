@@ -390,13 +390,10 @@ export class TeacherManagedStudentsService {
     const sortColumn =
       sort === 'name' ? 'u.name' : sort === 'student_code' ? 'u.student_code' : 'u.created_at';
 
-    const conditions = [
-      `u.role = 'student'`,
-      `u.tenant_id = $1`,
-      `u.managed_by_teacher_id = $2`,
-    ];
-    const values: unknown[] = [tenantId, teacherId];
-    let i = 3;
+    // كل طلاب المنصة (تسجيل ذاتي + إنشاء المدرس)
+    const conditions = [`u.role = 'student'`, `u.tenant_id = $1`];
+    const values: unknown[] = [tenantId];
+    let i = 2;
 
     if (filters.search?.trim()) {
       conditions.push(
@@ -486,12 +483,101 @@ export class TeacherManagedStudentsService {
          SELECT gs.group_id FROM group_students gs WHERE gs.student_id = u.id LIMIT 1
        ) gs_ref ON TRUE
        LEFT JOIN study_groups sg ON sg.id = gs_ref.group_id
-       WHERE u.id = $1 AND u.role = 'student' AND u.tenant_id = $2 AND u.managed_by_teacher_id = $3
+       WHERE u.id = $1 AND u.role = 'student' AND u.tenant_id = $2
        LIMIT 1`,
-      [studentId, tenantId, teacherId],
+      [studentId, tenantId],
     );
     if (!r.rowCount) throw new HttpError(404, 'الطالب غير موجود');
     return this.mapStudentRow(r.rows[0]);
+  }
+
+  /** حذف اختياري داخل معاملة — لا يُلغي الـ transaction إن فشل الجدول/العمود */
+  private static async tryPurgeQuery(
+    client: PoolClient,
+    sql: string,
+    params: unknown[],
+  ) {
+    await client.query('SAVEPOINT student_purge_sp');
+    try {
+      await client.query(sql, params);
+      await client.query('RELEASE SAVEPOINT student_purge_sp');
+    } catch {
+      await client.query('ROLLBACK TO SAVEPOINT student_purge_sp');
+    }
+  }
+
+  /**
+   * يحذف السجلات المرتبطة بالطالب قبل حذف صف users
+   * (خاصة الجداول بدون ON DELETE CASCADE).
+   */
+  private static async purgeStudentRelatedRows(
+    client: PoolClient,
+    studentIds: number[],
+  ) {
+    if (!studentIds.length) return;
+
+    const ids = studentIds;
+
+    // امتحانات المحاضرات (بدون CASCADE على student_id)
+    await this.tryPurgeQuery(
+      client,
+      `DELETE FROM exam_answers
+       WHERE submission_id IN (SELECT id FROM exam_submissions WHERE student_id = ANY($1::int[]))`,
+      [ids],
+    );
+    await this.tryPurgeQuery(
+      client,
+      `DELETE FROM exam_submissions WHERE student_id = ANY($1::int[])`,
+      [ids],
+    );
+
+    await this.tryPurgeQuery(
+      client,
+      `DELETE FROM course_exam_answers
+       WHERE submission_id IN (
+         SELECT id FROM course_exam_submissions WHERE student_id = ANY($1::int[])
+       )`,
+      [ids],
+    );
+    await this.tryPurgeQuery(
+      client,
+      `DELETE FROM course_exam_submissions WHERE student_id = ANY($1::int[])`,
+      [ids],
+    );
+
+    await this.tryPurgeQuery(
+      client,
+      `DELETE FROM general_course_exam_answers
+       WHERE submission_id IN (
+         SELECT id FROM general_course_exam_submissions WHERE student_id = ANY($1::int[])
+       )`,
+      [ids],
+    );
+    await this.tryPurgeQuery(
+      client,
+      `DELETE FROM general_course_exam_submissions WHERE student_id = ANY($1::int[])`,
+      [ids],
+    );
+
+    await this.tryPurgeQuery(
+      client,
+      `DELETE FROM competition_results WHERE student_id = ANY($1::int[])`,
+      [ids],
+    );
+    await this.tryPurgeQuery(
+      client,
+      `DELETE FROM competition_students WHERE student_id = ANY($1::int[])`,
+      [ids],
+    );
+    await this.tryPurgeQuery(
+      client,
+      `DELETE FROM password_resets WHERE user_id = ANY($1::int[])`,
+      [ids],
+    );
+
+    await client.query(`DELETE FROM group_students WHERE student_id = ANY($1::int[])`, [ids]);
+    await client.query(`DELETE FROM user_grades WHERE user_id = ANY($1::int[])`, [ids]);
+    await client.query(`DELETE FROM enrollments WHERE user_id = ANY($1::int[])`, [ids]);
   }
 
   static async updateStudent(
@@ -583,6 +669,7 @@ export class TeacherManagedStudentsService {
   ) {
     const student = await this.getStudentById(teacherId, tenantId, studentId);
     let plain = options.new_password?.trim() || null;
+    const teacherSetPassword = !!plain;
     let mustChange = false;
 
     if (!plain) {
@@ -604,8 +691,11 @@ export class TeacherManagedStudentsService {
     return {
       student_id: studentId,
       student_code: student.student_code,
+      /** كلمة السر اللي عيّنها المدرس (أو المؤقتة عند التوليد التلقائي) */
+      password: plain,
       temporary_password: mustChange ? plain : undefined,
       must_change_password: mustChange,
+      set_by_teacher: teacherSetPassword,
     };
   }
 
@@ -629,14 +719,12 @@ export class TeacherManagedStudentsService {
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
-      await client.query(`DELETE FROM group_students WHERE student_id = $1`, [studentId]);
-      await client.query(`DELETE FROM user_grades WHERE user_id = $1`, [studentId]);
-      await client.query(`DELETE FROM enrollments WHERE user_id = $1`, [studentId]);
+      await this.purgeStudentRelatedRows(client, [studentId]);
       const del = await client.query(
         `DELETE FROM users
-         WHERE id = $1 AND role = 'student' AND tenant_id = $2 AND managed_by_teacher_id = $3
+         WHERE id = $1 AND role = 'student' AND tenant_id = $2
          RETURNING id`,
-        [studentId, tenantId, teacherId],
+        [studentId, tenantId],
       );
       if (!del.rowCount) {
         throw new HttpError(409, 'تعذر حذف الطالب — قد يكون مرتبطاً ببيانات أخرى');
@@ -649,6 +737,70 @@ export class TeacherManagedStudentsService {
         throw new HttpError(
           409,
           'لا يمكن حذف الطالب لوجود سجلات مرتبطة. يمكنك إيقاف الحساب بدلاً من ذلك.',
+        );
+      }
+      throw e;
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * حذف كل حسابات الطلاب على منصة المدرس.
+   * يتطلب confirm = "DELETE_ALL_STUDENTS".
+   */
+  static async deleteAllStudents(
+    teacherId: number,
+    tenantId: number,
+    confirm: string,
+  ) {
+    await this.ensureSchema();
+    await this.assertTeacherOwnsTenant(teacherId, tenantId);
+
+    if (confirm !== 'DELETE_ALL_STUDENTS') {
+      throw new HttpError(
+        400,
+        'للتأكيد أرسل confirm: "DELETE_ALL_STUDENTS"',
+      );
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      const idsRes = await client.query<{ id: number }>(
+        `SELECT id FROM users
+         WHERE role = 'student' AND tenant_id = $1
+         ORDER BY id
+         FOR UPDATE`,
+        [tenantId],
+      );
+      const ids = idsRes.rows.map((r) => Number(r.id));
+
+      if (!ids.length) {
+        await client.query('COMMIT');
+        return { deleted: true, deleted_count: 0 };
+      }
+
+      await this.purgeStudentRelatedRows(client, ids);
+
+      const del = await client.query(
+        `DELETE FROM users
+         WHERE role = 'student' AND tenant_id = $1`,
+        [tenantId],
+      );
+
+      await client.query('COMMIT');
+      return {
+        deleted: true,
+        deleted_count: del.rowCount ?? 0,
+      };
+    } catch (e: unknown) {
+      await client.query('ROLLBACK');
+      if ((e as { code?: string }).code === '23503') {
+        throw new HttpError(
+          409,
+          'تعذر حذف بعض الحسابات لوجود سجلات مرتبطة. جرّب حذف الطلاب فردياً أو أوقف الحسابات.',
         );
       }
       throw e;

@@ -35,6 +35,7 @@ import { ExamFlowService } from '../services/examFlow';
 import { LectureAccessService } from '../services/lectureAccess';
 import { CourseGroupAccessService } from '../services/courseGroupAccess';
 import { serializeCourseFile } from '../services/courseFiles.serialize';
+import { LectureActivationService } from '../services/lectureActivation';
 
 export const router = Router();
 
@@ -1584,14 +1585,54 @@ router.get(
 );
 
 // إضافة محاضرة جديدة لكورس (للأستاذ فقط)
-const LectureSchema = z.object({
-  title: z.string().min(2),
-  description: z.string().optional(),
-  position: z.number().optional(),
-  expires_at: z.string().optional().nullable(),
-  access_type: z.enum(['all', 'groups']).optional().default('all'),
-  group_ids: z.array(z.coerce.number().int().positive()).optional(),
+// access_mode: open | activation_code | groups
+// groups و activation_code يدعمان أكواد تفعيل (إلزامي إنشاء كود واحد على الأقل)
+const LectureActivationCodeInputSchema = z.object({
+  code: z.string().min(3).max(64).optional().nullable(),
+  duration_hours: z.coerce.number().positive(),
+  max_uses: z.coerce.number().int().min(0).optional().default(0),
 });
+
+const LectureSchema = z
+  .object({
+    title: z.string().min(2),
+    description: z.string().optional(),
+    position: z.number().optional(),
+    expires_at: z.string().optional().nullable(),
+    access_mode: z.enum(['open', 'activation_code', 'groups']).default('open'),
+    /** توافق قديم — يُفضّل access_mode */
+    access_type: z.enum(['all', 'groups']).optional(),
+    group_ids: z.array(z.coerce.number().int().positive()).optional(),
+    /** أكواد تفعيل — مطلوبة مع activation_code و groups */
+    activation_codes: z.array(LectureActivationCodeInputSchema).optional(),
+    /** بديل سريع: ينشئ كودًا واحدًا تلقائيًا بهذه المدة */
+    duration_hours: z.coerce.number().positive().optional(),
+    max_uses: z.coerce.number().int().min(0).optional(),
+  })
+  .superRefine((data, ctx) => {
+    const mode =
+      data.access_mode ||
+      (data.access_type === 'groups' ? 'groups' : 'open');
+    if (mode === 'groups' && (!data.group_ids || data.group_ids.length === 0)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'group_ids مطلوب عندما تكون المحاضرة لمجموعات محددة (access_mode=groups)',
+        path: ['group_ids'],
+      });
+    }
+    if (mode === 'activation_code' || mode === 'groups') {
+      const hasCodes = (data.activation_codes?.length ?? 0) > 0;
+      const hasDuration = data.duration_hours != null && data.duration_hours > 0;
+      if (!hasCodes && !hasDuration) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message:
+            'يجب إنشاء كود تفعيل واحد على الأقل: أرسل activation_codes أو duration_hours (ينشئ كودًا تلقائيًا)',
+          path: ['activation_codes'],
+        });
+      }
+    }
+  });
 
 router.post(
   '/:courseId/lectures',
@@ -1605,8 +1646,7 @@ router.post(
     }
     // تحقق أن الكورس يخص المدرس
     const courseCheck = await pool.query(
-      `SELECT id, title,
-              COALESCE(lecture_access_mode, 'always_open') AS lecture_access_mode
+      `SELECT id, title
        FROM courses WHERE id = $1 AND (teacher_id = $2 OR EXISTS (SELECT 1 FROM course_managers cm WHERE cm.course_id = id AND cm.user_id = $2) OR EXISTS (SELECT 1 FROM tenants t WHERE t.id = tenant_id AND t.owner_user_id = $2 AND t.platform_type = $$academy$$))`,
       [courseId, teacherId],
     );
@@ -1614,24 +1654,18 @@ router.post(
       return res.status(404).json({ message: 'Course not found or not yours' });
     }
 
-    const mode = courseCheck.rows[0].lecture_access_mode as string;
     let expiresAt: Date | null = null;
-    if (mode === 'time_limited') {
-      if (!parse.data.expires_at) {
-        return res.status(400).json({
-          message: 'expires_at مطلوب عندما يكون lecture_access_mode = time_limited',
-        });
-      }
-      expiresAt = new Date(parse.data.expires_at);
-      if (Number.isNaN(expiresAt.getTime())) {
-        return res.status(400).json({ message: 'expires_at غير صالح' });
-      }
-    } else if (parse.data.expires_at) {
+    if (parse.data.expires_at) {
       expiresAt = new Date(parse.data.expires_at);
       if (Number.isNaN(expiresAt.getTime())) {
         return res.status(400).json({ message: 'expires_at غير صالح' });
       }
     }
+
+    const accessMode =
+      parse.data.access_mode ||
+      (parse.data.access_type === 'groups' ? 'groups' : 'open');
+    const accessType = accessMode === 'groups' ? 'groups' : 'all';
 
     const { title, description, position } = parse.data;
     // احسب position تلقائياً إذا لم يُرسل
@@ -1644,14 +1678,14 @@ router.post(
       pos = posRes.rows[0].next_pos;
     }
     const result = await pool.query(
-      `INSERT INTO lectures (course_id, title, description, position, is_visible, expires_at, access_type)
-       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
-      [courseId, title, description, pos, true, expiresAt, parse.data.access_type ?? 'all'],
+      `INSERT INTO lectures (course_id, title, description, position, is_visible, expires_at, access_type, access_mode)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
+      [courseId, title, description, pos, true, expiresAt, accessType, accessMode],
     );
 
     const lecture = result.rows[0];
 
-    if (parse.data.access_type === 'groups' && parse.data.group_ids?.length) {
+    if (accessMode === 'groups' && parse.data.group_ids?.length) {
       const teacherRow = await pool.query(`SELECT teacher_id FROM courses WHERE id = $1`, [courseId]);
       const courseTeacherId = teacherRow.rows[0]?.teacher_id ?? teacherId;
       await CourseGroupAccessService.attachGroupsToNewLecture(
@@ -1667,13 +1701,45 @@ router.post(
       }
     }
 
+    lecture.access_mode = accessMode;
+    lecture.supports_activation_codes =
+      accessMode === 'activation_code' || accessMode === 'groups';
+
+    // إنشاء أكواد التفعيل (مطلوبة لـ activation_code و groups)
+    let createdCodes: any[] = [];
+    if (accessMode === 'activation_code' || accessMode === 'groups') {
+      const codeInputs =
+        parse.data.activation_codes && parse.data.activation_codes.length > 0
+          ? parse.data.activation_codes
+          : [
+              {
+                duration_hours: parse.data.duration_hours!,
+                max_uses: parse.data.max_uses ?? 0,
+                code: null as string | null,
+              },
+            ];
+      for (const input of codeInputs) {
+        const code = await LectureActivationService.createCode(lecture.id, teacherId, input);
+        createdCodes.push(code);
+      }
+    }
+
     // إرسال إشعار للطلاب المشتركين في الكورس فقط إذا كانت المحاضرة ظاهرة
     const courseTitle = courseCheck.rows[0].title;
     if (lecture.is_visible !== false) {
       await NotificationService.notifyLectureAdded(courseId, lecture.id, title, courseTitle);
     }
 
-    res.status(201).json({ lecture });
+    res.status(201).json({
+      lecture,
+      activation_codes: createdCodes,
+      note:
+        accessMode === 'groups'
+          ? 'المجموعات المحددة تدخل بدون كود — باقي الطلاب يستخدمون أكواد التفعيل المُنشأة'
+          : accessMode === 'activation_code'
+            ? 'جميع الطلاب يحتاجون كود تفعيل لفتح المحاضرة'
+            : undefined,
+    });
   }),
 );
 
@@ -2052,6 +2118,7 @@ router.get(
               locked: true,
               access_status: modeAccess.status,
               lecture_access_mode: modeAccess.lecture_access_mode,
+              access_mode: modeAccess.access_mode,
               expires_at: modeAccess.expires_at ?? lec.expires_at ?? null,
               activation: modeAccess.activation ?? null,
               access_message: modeAccess.message,
@@ -2072,6 +2139,7 @@ router.get(
               locked: false,
               access_status: modeAccess.status,
               lecture_access_mode: modeAccess.lecture_access_mode,
+              access_mode: modeAccess.access_mode,
               expires_at: modeAccess.expires_at ?? lec.expires_at ?? null,
               activation: modeAccess.activation ?? null,
               is_visible: lec.is_visible,
@@ -2090,6 +2158,7 @@ router.get(
               locked: true,
               access_status: 'locked',
               lecture_access_mode: modeAccess.lecture_access_mode,
+              access_mode: modeAccess.access_mode,
               is_visible: lec.is_visible,
             };
             continue;
@@ -2108,6 +2177,7 @@ router.get(
               locked: true,
               access_status: 'locked',
               lecture_access_mode: modeAccess.lecture_access_mode,
+              access_mode: modeAccess.access_mode,
               is_visible: lec.is_visible,
             };
             continue;

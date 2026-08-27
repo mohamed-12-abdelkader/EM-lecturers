@@ -39,6 +39,10 @@ import { router as financeRouter } from './controllers/finance';
 import { router as teacherSubscriptionRouter } from './controllers/teacherSubscription';
 import { router as employeesRouter } from './controllers/employees';
 import { router as tasksRouter } from './controllers/tasks';
+import {
+  adminEmployeeWorkRouter,
+  employeePortalRouter,
+} from './modules/employeeWork';
 import { router as studentGradesRouter } from './controllers/studentGrades';
 import { router as meetingRouter } from './controllers/meeting';
 import { router as competitionsRouter } from './controllers/competitions';
@@ -55,6 +59,7 @@ import { router as booksAdminRouter } from './controllers/booksAdmin';
 import { router as lessonsAdminRouter } from './controllers/lessonsAdmin';
 import { router as lectureCommentsRouter } from './controllers/lectureComments';
 import { router as chatRouter } from './controllers/chat';
+import { staffChatRouter } from './modules/staffChat';
 import { router as socialRouter } from './controllers/social';
 import { router as teacherPermissionsAdminRouter } from './controllers/teacherPermissionsAdmin';
 import { router as leaguesRouter } from './controllers/leagues';
@@ -119,6 +124,7 @@ router.use('/course', courseFilesByCourseRouter);
 router.use('/courses', courseFilesByCourseRouter);
 router.use('/course-files', courseFilesRouter);
 router.use('/course', coursesRouter);
+router.use('/chat', staffChatRouter);
 router.use('/chat', chatRouter);
 router.use('/social', socialRouter);
 // دعم المسار /api/v1/social المستخدم من التطبيق (نفس راوتر السوشيال)
@@ -168,6 +174,8 @@ router.use('/group-exams', groupExamsRouter);
 router.use('/accounting', accountingRouter);
 router.use('/teacher/subscription', teacherSubscriptionRouter);
 router.use('/finance', financeRouter);
+router.use('/employee', employeePortalRouter);
+router.use('/admin/employees', adminEmployeeWorkRouter);
 router.use('/employees', employeesRouter);
 router.use('/admin/employees', employeesRouter);
 router.use('/tasks', tasksRouter);

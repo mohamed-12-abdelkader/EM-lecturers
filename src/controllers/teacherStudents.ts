@@ -51,8 +51,21 @@ const UpdateStudentSchema = z.object({
 
 const ResetPasswordSchema = z.object({
   new_password: z.string().min(6).optional(),
+  /** alias لـ new_password */
+  password: z.string().min(6).optional(),
   use_phone_as_password: z.boolean().optional(),
 });
+
+/** تغيير كلمة المرور — المدرس يكتب الباسورد الجديد إلزامياً */
+const ChangePasswordSchema = z
+  .object({
+    new_password: z.string().min(6).optional(),
+    password: z.string().min(6).optional(),
+  })
+  .refine((d) => !!(d.new_password?.trim() || d.password?.trim()), {
+    message: 'أرسل new_password أو password (6 أحرف على الأقل)',
+    path: ['new_password'],
+  });
 
 const StatusSchema = z.object({
   account_status: z.enum(['active', 'inactive', 'suspended']),
@@ -166,6 +179,37 @@ router.post(
   }),
 );
 
+const DeleteAllStudentsSchema = z.object({
+  confirm: z.literal('DELETE_ALL_STUDENTS'),
+});
+
+/** حذف كل حسابات الطلاب على منصة المدرس */
+router.delete(
+  '/all',
+  asyncWrapper(async (req, res) => {
+    const parsed = DeleteAllStudentsSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      return res.status(400).json({
+        success: false,
+        message: 'للتأكيد أرسل { "confirm": "DELETE_ALL_STUDENTS" }',
+        errors: parsed.error.errors,
+      });
+    }
+
+    const result = await TeacherManagedStudentsService.deleteAllStudents(
+      req.user!.id,
+      resolveTenantId(req),
+      parsed.data.confirm,
+    );
+
+    res.json({
+      success: true,
+      message: `تم حذف ${result.deleted_count} حساب طالب من المنصة`,
+      data: result,
+    });
+  }),
+);
+
 /** عرض بيانات طالب */
 router.get(
   '/:studentId',
@@ -270,7 +314,7 @@ router.get(
   }),
 );
 
-/** إعادة تعيين كلمة المرور */
+/** إعادة تعيين كلمة مرور طالب (يدعم باسورد مكتوب أو هاتف أو عشوائي) */
 router.post(
   '/:studentId/reset-password',
   asyncWrapper(async (req, res) => {
@@ -284,9 +328,48 @@ router.post(
       req.user!.id,
       resolveTenantId(req),
       studentId,
-      parsed.data,
+      {
+        new_password: parsed.data.new_password ?? parsed.data.password,
+        use_phone_as_password: parsed.data.use_phone_as_password,
+      },
     );
     res.json({ success: true, data: result });
+  }),
+);
+
+/**
+ * تغيير كلمة مرور طالب — المدرس يكتب الباسورد الجديد بنفسه (إلزامي).
+ * Body: { "new_password": "..." } أو { "password": "..." }
+ */
+router.post(
+  '/:studentId/change-password',
+  asyncWrapper(async (req, res) => {
+    const studentId = Number(req.params.studentId);
+    if (!Number.isInteger(studentId) || studentId <= 0) {
+      return res.status(400).json({ success: false, message: 'معرف الطالب غير صالح' });
+    }
+
+    const parsed = ChangePasswordSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      return res.status(400).json({
+        success: false,
+        message: 'يجب إرسال كلمة السر الجديدة في new_password أو password (6 أحرف على الأقل)',
+        errors: parsed.error.errors,
+      });
+    }
+
+    const newPassword = (parsed.data.new_password ?? parsed.data.password)!.trim();
+    const result = await TeacherManagedStudentsService.resetPassword(
+      req.user!.id,
+      resolveTenantId(req),
+      studentId,
+      { new_password: newPassword },
+    );
+    res.json({
+      success: true,
+      message: 'تم تحديث كلمة مرور الطالب',
+      data: result,
+    });
   }),
 );
 

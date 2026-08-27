@@ -155,9 +155,14 @@ Content-Type: multipart/form-data
 
 | Field | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
-| `file` | File | Yes | - | PDF or image file. |
+| `file` | File | Yes* | - | PDF or single image (`files` for multiple images). |
+| `files` | File[] | Yes* | - | Multiple images as one document. |
+| `subject` | string | Recommended | - | اسم المادة. يفعّل `ARABIC_HIGH_ACCURACY_MODE` للغة العربية، و`STANDARD_EXTRACTION_MODE` لباقي المواد. عند وجود قطعة قراءة تُملأ `passages[]` و`content_type=reading_passage`. |
 | `infer_correct_answer` | boolean | No | `false` | If true, AI may infer the correct answer if it is not explicit. |
 | `include_question_images` | boolean | No | `true` | If true, OCR extracts image annotations and uploads linked question images when possible. |
+| `start_page` / `end_page` | number | No | - | PDF page range (1-based). |
+
+\* ارفع `file` أو `files`.
 
 ### Example
 
@@ -165,6 +170,7 @@ Content-Type: multipart/form-data
 curl -X POST "http://localhost:8000/api/ocr/extract-questions" \
   -H "Authorization: Bearer $TOKEN" \
   -F "file=@/home/user/Downloads/questions.pdf" \
+  -F "subject=اللغة العربية" \
   -F "infer_correct_answer=true" \
   -F "include_question_images=true"
 ```
@@ -183,6 +189,8 @@ curl -X POST "http://localhost:8000/api/ocr/extract-questions" \
     "ocr_model": "mistral-ocr-latest",
     "chat_model": "mistral-large-latest",
     "infer_correct_answer": true,
+    "subject": "اللغة العربية",
+    "extraction_mode": "ARABIC_HIGH_ACCURACY_MODE",
     "passages": [
       {
         "passage_id": "passage_1",

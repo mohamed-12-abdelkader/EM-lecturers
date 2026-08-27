@@ -37,6 +37,11 @@ export const QuestionDisplayBlockSchema = z.object({
   text: z.string().min(1),
 });
 
+export const PoetryVerseSchema = z.object({
+  firstHemistich: z.string().min(1),
+  secondHemistich: z.string().min(1),
+});
+
 export const MistralExtractedQuestionSchema = z
   .object({
     number: z.number().int().positive(),
@@ -58,6 +63,15 @@ export const MistralExtractedQuestionSchema = z
       .array(z.string())
       .nullish()
       .transform((value) => value ?? []),
+    /** هل يحتوي السؤال على بيت شعر */
+    poetry: z.boolean().optional().default(false),
+    /** أبيات الشعر: صدر / عجز */
+    verses: z
+      .array(PoetryVerseSchema)
+      .nullish()
+      .transform((value) => value ?? []),
+    /** الدرجة إن وُجدت في المصدر (marks/score) */
+    score: z.number().nullable().optional(),
     passage_id: z.string().nullable().optional(),
     options: z.array(MistralExtractedOptionSchema).default([]),
     question_images: z.array(MistralQuestionImageSchema).optional().default([]),
@@ -89,6 +103,12 @@ export const MistralExtractedQuestionSchema = z
   });
 
 export const MistralQuestionExtractionSchema = z.object({
+  subject: z.string().optional(),
+  extraction_mode: z
+    .enum(['ARABIC_HIGH_ACCURACY_MODE', 'STANDARD_EXTRACTION_MODE'])
+    .optional(),
+  /** إن وُجدت قطعة قراءة: reading_passage — وإلا general */
+  content_type: z.enum(['reading_passage', 'general']).optional(),
   passages: z.array(MistralExtractedPassageSchema).optional().default([]),
   questions: z.array(MistralExtractedQuestionSchema),
   notes: z.string().optional(),
@@ -166,6 +186,7 @@ export type MistralExtractedOption = z.infer<typeof MistralExtractedOptionSchema
 export type MistralQuestionImage = z.infer<typeof MistralQuestionImageSchema>;
 export type MistralExtractedPassage = z.infer<typeof MistralExtractedPassageSchema>;
 export type QuestionDisplayBlock = z.infer<typeof QuestionDisplayBlockSchema>;
+export type PoetryVerse = z.infer<typeof PoetryVerseSchema>;
 export type MistralExtractedQuestion = z.infer<typeof MistralExtractedQuestionSchema>;
 export type MistralQuestionExtractionPayload = z.infer<typeof MistralQuestionExtractionSchema>;
 
@@ -177,7 +198,10 @@ export type MistralQuestionExtractionResult = {
   question_count: number;
   ocr_model: string;
   chat_model: string;
-  infer_correct_answer: boolean;
+    infer_correct_answer: boolean;
+  subject?: string;
+  extraction_mode?: 'ARABIC_HIGH_ACCURACY_MODE' | 'STANDARD_EXTRACTION_MODE';
+  content_type?: 'reading_passage' | 'general';
   passages: MistralExtractedPassage[];
   extracted_images: MistralQuestionImage[];
   questions: MistralExtractedQuestion[];
@@ -199,4 +223,6 @@ export type MistralQuestionExtractionOptions = {
   /** 1-based inclusive PDF page range (converted to Mistral 0-based indices). */
   startPage?: number;
   endPage?: number;
+  /** اسم المادة — يفعّل ARABIC_HIGH_ACCURACY_MODE للغة العربية */
+  subject?: string | null;
 };

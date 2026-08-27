@@ -3,7 +3,11 @@ import { HttpError } from '../utils';
 import { CourseAccessService } from './courseAccess';
 import { CourseGroupAccessService } from './courseGroupAccess';
 
-export type LectureAccessMode = 'always_open' | 'time_limited' | 'activation_code';
+/** وضع وصول المحاضرة نفسها (يحدده المدرس عند الإضافة) */
+export type LectureAccessMode = 'open' | 'activation_code' | 'groups';
+
+/** @deprecated وضع الكورس القديم — يُتجاهل لصالح lectures.access_mode */
+export type CourseLectureAccessMode = 'always_open' | 'time_limited' | 'activation_code';
 export type AssignmentMode = 'lecture_based' | 'course_based';
 
 export type LectureAccessStatus =
@@ -21,13 +25,19 @@ export type LectureAccessResult = {
   can_access: boolean;
   status: LectureAccessStatus;
   message: string;
-  lecture_access_mode: LectureAccessMode;
+  /** وضع وصول هذه المحاضرة */
+  access_mode: LectureAccessMode;
+  /** للتوافق مع الواجهات القديمة */
+  lecture_access_mode: LectureAccessMode | CourseLectureAccessMode;
   expires_at?: string | null;
   activation?: {
     activated_at: string;
     expires_at: string;
     remaining_seconds: number;
   } | null;
+  group_ids?: number[];
+  /** في وضع groups: هل فُتحت لأن الطالب ضمن المجموعة المحددة؟ */
+  open_via_group?: boolean;
 };
 
 type LectureRow = {
@@ -35,7 +45,7 @@ type LectureRow = {
   course_id: number;
   title: string;
   expires_at: Date | string | null;
-  lecture_access_mode: LectureAccessMode;
+  access_mode: LectureAccessMode;
   assignment_mode: AssignmentMode;
 };
 
@@ -45,64 +55,74 @@ function asDate(value: Date | string | null | undefined): Date | null {
   return Number.isNaN(d.getTime()) ? null : d;
 }
 
+function normalizeAccessMode(raw: unknown): LectureAccessMode {
+  const v = String(raw || 'open');
+  if (v === 'activation_code') return 'activation_code';
+  if (v === 'groups') return 'groups';
+  // legacy course modes mapped when reading old data
+  if (v === 'always_open' || v === 'time_limited' || v === 'open') return 'open';
+  return 'open';
+}
+
 export class LectureAccessService {
+  /** إعدادات الكورس المتبقية (واجبات فقط) — lecture_access_mode لم يعد يُستخدم */
   static async getCourseModes(courseId: number): Promise<{
-    lecture_access_mode: LectureAccessMode;
+    lecture_access_mode: 'per_lecture';
     assignment_mode: AssignmentMode;
+    note: string;
   }> {
     const r = await pool.query(
-      `SELECT
-         COALESCE(lecture_access_mode, 'always_open') AS lecture_access_mode,
-         COALESCE(assignment_mode, 'lecture_based') AS assignment_mode
+      `SELECT COALESCE(assignment_mode, 'lecture_based') AS assignment_mode
        FROM courses WHERE id = $1`,
       [courseId],
     );
     if (!r.rowCount) throw new HttpError(404, 'الكورس غير موجود');
     return {
-      lecture_access_mode: r.rows[0].lecture_access_mode,
+      lecture_access_mode: 'per_lecture',
       assignment_mode: r.rows[0].assignment_mode,
+      note: 'يتم تحديد وصول كل محاضرة عند إضافتها: open | activation_code | groups',
     };
   }
 
   static async updateCourseModes(
     courseId: number,
-    patch: { lecture_access_mode?: LectureAccessMode; assignment_mode?: AssignmentMode },
+    patch: { lecture_access_mode?: string; assignment_mode?: AssignmentMode },
   ) {
-    const fields: string[] = [];
-    const vals: unknown[] = [];
-    let i = 1;
     if (patch.lecture_access_mode) {
-      fields.push(`lecture_access_mode = $${i++}`);
-      vals.push(patch.lecture_access_mode);
+      throw new HttpError(
+        400,
+        'تم إلغاء إعداد lecture_access_mode على مستوى الكورس. حدّد access_mode عند إضافة/تعديل كل محاضرة (open | activation_code | groups)',
+        { code: 'LECTURE_ACCESS_MOVED_TO_LECTURE' },
+      );
     }
     if (patch.assignment_mode) {
-      fields.push(`assignment_mode = $${i++}`);
-      vals.push(patch.assignment_mode);
+      await pool.query(`UPDATE courses SET assignment_mode = $1 WHERE id = $2`, [
+        patch.assignment_mode,
+        courseId,
+      ]);
     }
-    if (!fields.length) return this.getCourseModes(courseId);
-    vals.push(courseId);
-    await pool.query(
-      `UPDATE courses SET ${fields.join(', ')} WHERE id = $${i}`,
-      vals,
-    );
     return this.getCourseModes(courseId);
   }
 
   static async getLectureContext(lectureId: number): Promise<LectureRow | null> {
-    const r = await pool.query<LectureRow>(
+    const r = await pool.query(
       `SELECT l.id, l.course_id, l.title, l.expires_at,
-              COALESCE(c.lecture_access_mode, 'always_open') AS lecture_access_mode,
+              COALESCE(l.access_mode, 'open') AS access_mode,
               COALESCE(c.assignment_mode, 'lecture_based') AS assignment_mode
        FROM lectures l
        JOIN courses c ON c.id = l.course_id
        WHERE l.id = $1`,
       [lectureId],
     );
-    return r.rowCount ? r.rows[0] : null;
+    if (!r.rowCount) return null;
+    return {
+      ...r.rows[0],
+      access_mode: normalizeAccessMode(r.rows[0].access_mode),
+    };
   }
 
   /**
-   * صلاحية دخول الطالب للمحاضرة حسب وضع الكورس.
+   * صلاحية دخول الطالب للمحاضرة حسب access_mode الخاص بالمحاضرة.
    * لا يغطي قفل الواجبات المتسلسل — يُدمج معه من الخارج إن لزم.
    */
   static async checkStudentLectureAccess(
@@ -116,9 +136,12 @@ export class LectureAccessService {
         can_access: false,
         status: 'forbidden',
         message: 'المحاضرة غير موجودة',
-        lecture_access_mode: 'always_open',
+        access_mode: 'open',
+        lecture_access_mode: 'open',
       };
     }
+
+    const mode = lecture.access_mode;
 
     const courseAccess = await CourseAccessService.checkStudentAccess(studentId, lecture.course_id);
     if (!courseAccess.hasAccess) {
@@ -126,71 +149,69 @@ export class LectureAccessService {
         can_access: false,
         status: 'not_enrolled',
         message: courseAccess.message || 'غير مشترك في هذا الكورس',
-        lecture_access_mode: lecture.lecture_access_mode,
+        access_mode: mode,
+        lecture_access_mode: mode,
       };
     }
 
-    // Course group targeting (independent from centerMgmt)
-    const groupAccess = await CourseGroupAccessService.checkStudentLectureGroupAccess(
-      lectureId,
-      studentId,
-    );
-    if (!groupAccess.allowed) {
-      return {
-        can_access: false,
-        status: 'group_restricted',
-        message: groupAccess.message,
-        lecture_access_mode: lecture.lecture_access_mode,
-      };
-    }
-
-    const mode = lecture.lecture_access_mode;
-
-    if (mode === 'always_open') {
+    if (mode === 'open') {
       return {
         can_access: true,
         status: 'open',
-        message: 'المحاضرة متاحة',
+        message: 'المحاضرة متاحة للجميع',
+        access_mode: mode,
         lecture_access_mode: mode,
         expires_at: null,
         activation: null,
       };
     }
 
-    if (mode === 'time_limited') {
-      const expiresAt = asDate(lecture.expires_at);
-      if (!expiresAt) {
-        // محاضرة بلا expires_at في وضع time_limited = مفتوحة حتى يُحدَّد الموعد
+    if (mode === 'groups') {
+      const groupAccess = await CourseGroupAccessService.checkStudentLectureGroupAccess(
+        lectureId,
+        studentId,
+        { enforce: true },
+      );
+      const groupIds = (await CourseGroupAccessService.getLectureGroupIds(lectureId)) ?? [];
+
+      // أعضاء المجموعات المحددة: مفتوحة بدون كود
+      if (groupAccess.allowed) {
         return {
           can_access: true,
           status: 'open',
-          message: 'المحاضرة متاحة (لم يُحدد موعد إغلاق)',
+          message: 'المحاضرة متاحة لمجموعتك بدون كود',
+          access_mode: mode,
           lecture_access_mode: mode,
-          expires_at: null,
+          group_ids: groupIds,
+          open_via_group: true,
           activation: null,
         };
       }
-      if (now.getTime() > expiresAt.getTime()) {
-        return {
-          can_access: false,
-          status: 'expired',
-          message: 'انتهت مدة الوصول لهذه المحاضرة',
-          lecture_access_mode: mode,
-          expires_at: expiresAt.toISOString(),
-          activation: null,
-        };
-      }
+
+      // باقي الطلاب: ظاهرة لكن تحتاج كود تفعيل مثل المحاضرات المغلقة
+      const byCode = await this.checkActivationWindow(lectureId, studentId, now, mode);
       return {
-        can_access: true,
-        status: 'open',
-        message: 'المحاضرة متاحة حتى موعد الإغلاق',
-        lecture_access_mode: mode,
-        expires_at: expiresAt.toISOString(),
-        activation: null,
+        ...byCode,
+        group_ids: groupIds,
+        open_via_group: false,
+        message:
+          byCode.status === 'requires_activation_code'
+            ? 'المحاضرة ظاهرة لك ومقفولة — أدخل كود التفعيل (مفتوحة بدون كود لمجموعات محددة فقط)'
+            : byCode.message,
       };
     }
 
-    // activation_code
+    // activation_code — مقفولة للكل حتى التفعيل
+    return this.checkActivationWindow(lectureId, studentId, now, mode);
+  }
+
+  /** نافذة تفعيل بالكود (مستخدمة في activation_code وفي groups لغير أعضاء المجموعة) */
+  private static async checkActivationWindow(
+    lectureId: number,
+    studentId: number,
+    now: Date,
+    mode: LectureAccessMode,
+  ): Promise<LectureAccessResult> {
     const act = await pool.query(
       `SELECT activated_at, expires_at
        FROM lecture_activations
@@ -203,7 +224,8 @@ export class LectureAccessService {
       return {
         can_access: false,
         status: 'requires_activation_code',
-        message: 'يجب إدخال كود تفعيل لفتح هذه المحاضرة',
+        message: 'المحاضرة مقفولة — يجب إدخال كود تفعيل',
+        access_mode: mode,
         lecture_access_mode: mode,
         activation: null,
       };
@@ -218,6 +240,7 @@ export class LectureAccessService {
         can_access: false,
         status: 'activation_expired',
         message: 'انتهت مدة تفعيل المحاضرة الخاصة بك',
+        access_mode: mode,
         lecture_access_mode: mode,
         activation: {
           activated_at: activatedAt.toISOString(),
@@ -231,6 +254,7 @@ export class LectureAccessService {
       can_access: true,
       status: 'activated',
       message: 'المحاضرة مفعّلة لديك',
+      access_mode: mode,
       lecture_access_mode: mode,
       activation: {
         activated_at: activatedAt.toISOString(),
@@ -246,6 +270,7 @@ export class LectureAccessService {
       throw new HttpError(403, result.message, {
         code: 'LECTURE_ACCESS_DENIED',
         status: result.status,
+        access_mode: result.access_mode,
         lecture_access_mode: result.lecture_access_mode,
         expires_at: result.expires_at ?? null,
         activation: result.activation ?? null,

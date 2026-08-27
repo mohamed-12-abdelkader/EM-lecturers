@@ -17,7 +17,10 @@ import { CourseGroupAccessService } from '../services/courseGroupAccess';
 export const router = Router();
 
 const AccessSettingsSchema = z.object({
-  lecture_access_mode: z.enum(['always_open', 'time_limited', 'activation_code']).optional(),
+  /** أُلغي — الوصول يُحدد لكل محاضرة عبر access_mode */
+  lecture_access_mode: z
+    .enum(['always_open', 'time_limited', 'activation_code', 'per_lecture'])
+    .optional(),
   assignment_mode: z.enum(['lecture_based', 'course_based']).optional(),
 });
 
@@ -31,15 +34,29 @@ const ActivateLectureSchema = z.object({
   code: z.union([z.string(), z.number()]).transform((v) => String(v).trim()),
 });
 
-const UpdateLectureSchema = z.object({
-  title: z.string().min(2).optional(),
-  description: z.string().optional().nullable(),
-  position: z.coerce.number().optional(),
-  expires_at: z.union([z.string(), z.null()]).optional(),
-  is_visible: z.boolean().optional(),
-  access_type: z.enum(['all', 'groups']).optional(),
-  group_ids: z.array(z.coerce.number().int().positive()).optional(),
-});
+const UpdateLectureSchema = z
+  .object({
+    title: z.string().min(2).optional(),
+    description: z.string().optional().nullable(),
+    position: z.coerce.number().optional(),
+    expires_at: z.union([z.string(), z.null()]).optional(),
+    is_visible: z.boolean().optional(),
+    access_mode: z.enum(['open', 'activation_code', 'groups']).optional(),
+    access_type: z.enum(['all', 'groups']).optional(),
+    group_ids: z.array(z.coerce.number().int().positive()).optional(),
+  })
+  .superRefine((data, ctx) => {
+    const mode =
+      data.access_mode ||
+      (data.access_type === 'groups' ? 'groups' : undefined);
+    if (mode === 'groups' && data.group_ids !== undefined && data.group_ids.length === 0) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'group_ids لا يمكن أن تكون فارغة مع access_mode=groups',
+        path: ['group_ids'],
+      });
+    }
+  });
 
 const CourseAssignmentSchema = z.object({
   title: z.string().min(1).optional(),
@@ -103,7 +120,10 @@ router.patch(
       return res.status(400).json({ message: 'بيانات غير صالحة', errors: parsed.error.errors });
     }
     if (!parsed.data.lecture_access_mode && !parsed.data.assignment_mode) {
-      return res.status(400).json({ message: 'أرسل lecture_access_mode أو assignment_mode' });
+      return res.status(400).json({
+        message:
+          'أرسل assignment_mode فقط. وصول المحاضرات أصبح لكل محاضرة عبر access_mode عند الإضافة/التعديل',
+      });
     }
 
     await assertManagesCourse(req.user, courseId);
@@ -173,9 +193,28 @@ router.patch(
     if (data.expires_at !== undefined) {
       add('expires_at', data.expires_at === null ? null : new Date(data.expires_at));
     }
-    if (data.access_type !== undefined) add('access_type', data.access_type);
 
-    if (!fields.length && data.group_ids === undefined && data.access_type === undefined) {
+    const nextMode =
+      data.access_mode ||
+      (data.access_type === 'groups'
+        ? 'groups'
+        : data.access_type === 'all'
+          ? 'open'
+          : undefined);
+
+    if (nextMode) {
+      add('access_mode', nextMode);
+      add('access_type', nextMode === 'groups' ? 'groups' : 'all');
+    } else if (data.access_type !== undefined) {
+      add('access_type', data.access_type);
+    }
+
+    if (
+      !fields.length &&
+      data.group_ids === undefined &&
+      data.access_type === undefined &&
+      data.access_mode === undefined
+    ) {
       const cur = await pool.query(`SELECT * FROM lectures WHERE id = $1`, [lectureId]);
       return res.json({ success: true, lecture: cur.rows[0] });
     }
@@ -188,19 +227,20 @@ router.patch(
       );
     }
 
-    if (data.access_type !== undefined || data.group_ids !== undefined) {
+    const effectiveMode =
+      nextMode ||
+      (await LectureAccessService.getLectureContext(lectureId))?.access_mode ||
+      'open';
+
+    if (effectiveMode === 'groups' || data.group_ids !== undefined || data.access_type === 'groups') {
       const teacherId = (await CourseGroupAccessService.resolveCourseTeacherId(lecture.course_id))!;
-      const accessType =
-        data.access_type ??
-        ((await CourseGroupAccessService.getLectureAccessMeta(lectureId))?.access_type || 'all');
       const groupIds =
         data.group_ids ?? (await CourseGroupAccessService.getLectureGroupIds(lectureId));
-      await CourseGroupAccessService.setLectureAccess(
-        lectureId,
-        teacherId,
-        accessType,
-        groupIds,
-      );
+      if (effectiveMode === 'groups') {
+        await CourseGroupAccessService.setLectureAccess(lectureId, teacherId, 'groups', groupIds);
+      } else if (data.access_type === 'all' || nextMode === 'open' || nextMode === 'activation_code') {
+        await CourseGroupAccessService.setLectureAccess(lectureId, teacherId, 'all', []);
+      }
     }
 
     const cur = await pool.query(`SELECT * FROM lectures WHERE id = $1`, [lectureId]);
@@ -222,7 +262,7 @@ router.post(
   authMiddleware(COURSE_CONTENT_ROLES),
   asyncWrapper(async (req, res) => {
     const lectureId = Number(req.params.lectureId);
-    await assertManagesLecture(req.user, lectureId);
+    const lecture = await assertManagesLecture(req.user, lectureId);
 
     const parsed = CreateCodeSchema.safeParse(req.body);
     if (!parsed.success) {
@@ -230,7 +270,15 @@ router.post(
     }
 
     const created = await LectureActivationService.createCode(lectureId, req.user!.id, parsed.data);
-    res.status(201).json({ success: true, code: created });
+    res.status(201).json({
+      success: true,
+      code: created,
+      access_mode: lecture.access_mode,
+      note:
+        lecture.access_mode === 'groups'
+          ? 'هذا الكود لطلاب خارج المجموعات المحددة — أعضاء المجموعة يدخلون بدون كود'
+          : 'هذا الكود مطلوب لكل الطلاب لفتح المحاضرة',
+    });
   }),
 );
 

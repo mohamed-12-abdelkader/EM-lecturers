@@ -391,16 +391,11 @@ export class CourseGroupAccessService {
     }
 
     if (accessType === 'groups') {
-      const enabled = await this.isGroupAccessEnabledForTeacher(teacherId);
-      if (!enabled) {
-        throw new HttpError(
-          400,
-          'نظام مجموعات الكورسات غير مفعّل — فعّله من إعدادات المدرس أولاً',
-        );
-      }
+      // تفعيل نظام المجموعات تلقائيًا عند اختيار مجموعات للمحاضرة
+      await this.updateTeacherSettings(teacherId, { course_group_access_enabled: true });
       const validIds = await this.validateGroupIdsForTeacher(groupIds, teacherId);
       if (!validIds.length) {
-        throw new HttpError(400, 'يجب اختيار مجموعة واحدة على الأقل عند access_type = groups');
+        throw new HttpError(400, 'يجب اختيار مجموعة واحدة على الأقل عندما تكون المحاضرة لمجموعات محددة');
       }
       groupIds = validIds;
     } else {
@@ -409,7 +404,17 @@ export class CourseGroupAccessService {
 
     await pool.query('BEGIN');
     try {
-      await pool.query(`UPDATE lectures SET access_type = $1 WHERE id = $2`, [accessType, lectureId]);
+      await pool.query(
+        `UPDATE lectures
+         SET access_type = $1,
+             access_mode = CASE
+               WHEN $1 = 'groups' THEN 'groups'
+               WHEN COALESCE(access_mode, 'open') = 'groups' THEN 'open'
+               ELSE COALESCE(access_mode, 'open')
+             END
+         WHERE id = $2`,
+        [accessType, lectureId],
+      );
       await pool.query(`DELETE FROM lecture_course_groups WHERE lecture_id = $1`, [lectureId]);
       if (accessType === 'groups' && groupIds.length) {
         for (const gid of groupIds) {
@@ -439,28 +444,48 @@ export class CourseGroupAccessService {
     await this.setLectureAccess(lectureId, teacherId, accessType, groupIds);
   }
 
-  /** Core authorization: can this student see this lecture based on group rules? */
+  /** Core authorization: can this student see this lecture based on group rules?
+   *  opts.enforce = true → تجاهل إعداد المدرس وطبّق قيد المجموعات دائمًا (وضع access_mode=groups)
+   */
   static async checkStudentLectureGroupAccess(
     lectureId: number,
     studentId: number,
+    opts?: { enforce?: boolean },
   ): Promise<GroupAccessCheck> {
     const meta = await this.getLectureAccessMeta(lectureId);
     if (!meta) {
       return { allowed: false, message: 'المحاضرة غير موجودة', status: 'group_restricted' };
     }
 
-    const enabled = await this.isGroupAccessEnabledForTeacher(meta.teacher_id);
-    if (!enabled) {
-      return {
-        allowed: true,
-        message: 'نظام المجموعات غير مفعّل',
-        status: 'not_applicable',
-        access_type: meta.access_type,
-        teacher_group_access_enabled: false,
-      };
-    }
+    const enforce = !!opts?.enforce;
+    const modeRes = await pool.query<{ access_mode: string }>(
+      `SELECT COALESCE(access_mode, 'open') AS access_mode FROM lectures WHERE id = $1`,
+      [lectureId],
+    );
+    const accessMode = modeRes.rows[0]?.access_mode || 'open';
+    const isGroupsMode = accessMode === 'groups' || meta.access_type === 'groups';
 
-    if (meta.access_type !== 'groups') {
+    if (!enforce) {
+      const enabled = await this.isGroupAccessEnabledForTeacher(meta.teacher_id);
+      if (!enabled) {
+        return {
+          allowed: true,
+          message: 'نظام المجموعات غير مفعّل',
+          status: 'not_applicable',
+          access_type: meta.access_type,
+          teacher_group_access_enabled: false,
+        };
+      }
+      if (!isGroupsMode) {
+        return {
+          allowed: true,
+          message: 'المحاضرة متاحة للكل',
+          status: 'open',
+          access_type: 'all',
+          teacher_group_access_enabled: true,
+        };
+      }
+    } else if (!isGroupsMode) {
       return {
         allowed: true,
         message: 'المحاضرة متاحة للكل',
@@ -510,64 +535,26 @@ export class CourseGroupAccessService {
     };
   }
 
-  /** SQL fragment + params for filtering lectures in a course for a student (param indices start at startIndex) */
+  /** SQL fragment — محاضرات المجموعات تظهر للكل (غير الأعضاء يفتحونها بالكود) */
   static buildStudentLectureFilterClause(
-    studentId: number,
-    teacherId: number,
-    lectureAlias = 'l',
-    startIndex = 1,
+    _studentId: number,
+    _teacherId: number,
+    _lectureAlias = 'l',
+    _startIndex = 1,
   ): { sql: string; params: unknown[] } {
-    const pStudent = startIndex;
-    const pTeacher = startIndex + 1;
     return {
-      sql: `(
-        NOT EXISTS (
-          SELECT 1 FROM teacher_course_settings tcs
-          WHERE tcs.teacher_id = $${pTeacher} AND tcs.course_group_access_enabled = TRUE
-        )
-        OR COALESCE(${lectureAlias}.access_type, 'all') = 'all'
-        OR EXISTS (
-          SELECT 1
-          FROM lecture_course_groups lcg
-          JOIN student_course_group_memberships scgm ON scgm.group_id = lcg.group_id
-          WHERE lcg.lecture_id = ${lectureAlias}.id
-            AND scgm.student_id = $${pStudent}
-        )
-      )`,
-      params: [studentId, teacherId],
+      sql: `TRUE`,
+      params: [],
     };
   }
 
   static async filterLectureRowsForStudent<T extends { id: number }>(
     lectures: T[],
-    courseId: number,
-    studentId: number,
+    _courseId: number,
+    _studentId: number,
   ): Promise<T[]> {
-    if (!lectures.length) return lectures;
-    const teacherId = await this.resolveCourseTeacherId(courseId);
-    if (!teacherId) return lectures;
-
-    const enabled = await this.isGroupAccessEnabledForTeacher(teacherId);
-    if (!enabled) return lectures;
-
-    const ids = lectures.map((l) => l.id);
-    const r = await pool.query<{ id: number }>(
-      `SELECT l.id
-       FROM lectures l
-       WHERE l.id = ANY($1::int[])
-         AND (
-           COALESCE(l.access_type, 'all') = 'all'
-           OR EXISTS (
-             SELECT 1
-             FROM lecture_course_groups lcg
-             JOIN student_course_group_memberships scgm ON scgm.group_id = lcg.group_id
-             WHERE lcg.lecture_id = l.id AND scgm.student_id = $2
-           )
-         )`,
-      [ids, studentId],
-    );
-    const allowed = new Set(r.rows.map((row) => row.id));
-    return lectures.filter((l) => allowed.has(l.id));
+    // كل المحاضرات الظاهرة تُعرض؛ القفل بالكود يُحسب في LectureAccessService
+    return lectures;
   }
 
   static async listPublicGroupsByGrade(tenantId: number, gradeId: number) {

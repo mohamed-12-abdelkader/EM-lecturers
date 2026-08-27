@@ -46,6 +46,7 @@ app.use(
 app.use(express.urlencoded({ extended: true }));
 app.use(cookieParserMiddleware);
 app.use(cors(getCorsOriginDelegate()));
+app.options('*', cors(getCorsOriginDelegate()));
 // Expose refreshed token header to the browser
 app.use((req, res, next) => {
   const existing = res.getHeader('Access-Control-Expose-Headers');

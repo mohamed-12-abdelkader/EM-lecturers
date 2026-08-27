@@ -173,6 +173,16 @@ const startServer = async () => {
           return next(new Error('Teacher account is not active'));
         }
 
+        if (user.role === 'employee') {
+          const empRes = await pool.query(
+            'SELECT is_active FROM employees WHERE user_id = $1',
+            [id],
+          );
+          if (!empRes.rowCount || !empRes.rows[0].is_active) {
+            return next(new Error('Employee account is not active'));
+          }
+        }
+
         const sessionCheck = await AuthSessionsService.assertAccessSession(decoded, user);
         if (!sessionCheck.ok) {
           return next(new Error(sessionCheck.body.code));
@@ -191,6 +201,12 @@ const startServer = async () => {
         next(new Error('Invalid token'));
       }
     });
+
+    const { registerStaffChatSocket, attachStaffChatAppHelpers } = await import(
+      './modules/staffChat/socket/registerStaffChatSocket.js'
+    );
+    registerStaffChatSocket(io);
+    attachStaffChatAppHelpers(app, io);
 
     io.on('connection', async (socket) => {
       const user = (socket as any).user as { id: number; role: string };
@@ -426,12 +442,6 @@ const startServer = async () => {
           }
         },
       );
-
-
-      // Event جديد: message:send (للتوافق مع المطلوب)
-      socket.on('message:send', async (payload: { chat_id?: number; text: string }) => {
-        socket.emit('chat:send-message', payload);
-      });
     });
 
     // Game System Socket Handlers

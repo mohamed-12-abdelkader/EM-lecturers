@@ -331,13 +331,87 @@ PATCH /api/teacher/students/:studentId/group
 DELETE /api/teacher/students/:studentId
 ```
 
-يحذف: `group_students`, `user_grades`, `enrollments`, ثم `users`.
+يحذف السجلات المرتبطة (مجموعات، صفوف، تسجيلات، تسليمات امتحانات…) ثم حساب `users`.
+
+يعمل على **أي طالب على منصة المدرس** (تسجيل ذاتي أو مُنشأ بواسطة المدرس).
 
 إذا وُجدت سجلات مرتبطة أخرى → `409` مع اقتراح إيقاف الحساب بدلاً من الحذف.
 
+### 4.5 حذف كل طلاب المنصة
+
+```http
+DELETE /api/teacher/students/all
+Content-Type: application/json
+```
+
+```json
+{
+  "confirm": "DELETE_ALL_STUDENTS"
+}
+```
+
+> إلزامي إرسال `confirm` بالقيمة الحرفية `DELETE_ALL_STUDENTS` لمنع الحذف بالخطأ.
+
+**Response:**
+
+```json
+{
+  "success": true,
+  "message": "تم حذف 120 حساب طالب من المنصة",
+  "data": {
+    "deleted": true,
+    "deleted_count": 120
+  }
+}
+```
+
+يحذف **كل** حسابات `role=student` على `tenant` المنصة فقط (لا يمس المدرس أو الأدمن).
+
 ---
 
-## 5. إعادة تعيين كلمة المرور
+## 5. تغيير / إعادة تعيين كلمة المرور
+
+### 5.1 تغيير كلمة المرور (المدرس يكتب الباسورد) — الموصى به
+
+```http
+POST /api/teacher/students/:studentId/change-password
+```
+
+```json
+{
+  "new_password": "MyNewPass123"
+}
+```
+
+أو:
+
+```json
+{
+  "password": "MyNewPass123"
+}
+```
+
+| الحقل | مطلوب؟ | الوصف |
+|--------|---------|--------|
+| `new_password` أو `password` | **نعم** | كلمة السر الجديدة (6 أحرف على الأقل) — يكتبها المدرس |
+
+**Response:**
+
+```json
+{
+  "success": true,
+  "message": "تم تحديث كلمة مرور الطالب",
+  "data": {
+    "student_id": 42,
+    "student_code": "10001",
+    "password": "MyNewPass123",
+    "must_change_password": false,
+    "set_by_teacher": true
+  }
+}
+```
+
+### 5.2 إعادة تعيين مرنة (اختياري — هاتف / عشوائي)
 
 ```http
 POST /api/teacher/students/:studentId/reset-password
@@ -345,27 +419,11 @@ POST /api/teacher/students/:studentId/reset-password
 
 ```json
 {
-  "new_password": "MyNewPass123",
-  "use_phone_as_password": true
+  "new_password": "MyNewPass123"
 }
 ```
 
-- إن لم يُرسل `new_password` و`use_phone_as_password` مفعّل والطالب له هاتف → تُستخدم كلمة المرور = رقم الهاتف.
-- وإلا يُولَّد رمز عشوائي.
-
-**Response:**
-
-```json
-{
-  "success": true,
-  "data": {
-    "student_id": 42,
-    "student_code": "10001",
-    "temporary_password": "01012345678",
-    "must_change_password": true
-  }
-}
-```
+بدون `new_password`: يستخدم رقم الهاتف إن وُجد، وإلا يولّد رمزاً عشوائياً مؤقتاً.
 
 ---
 

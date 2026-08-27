@@ -1,5 +1,5 @@
 import { assertMistralConfigured, getMistralConfig } from '../config/mistral';
-import { buildQuestionExtractionPrompt } from '../prompts/mistralQuestionExtraction.prompt';
+import { buildQuestionExtractionPrompt, resolveExtractionMode } from '../prompts/mistralQuestionExtraction.prompt';
 import {
   MistralQuestionExtractionSchema,
   type MistralExtractedPassage,
@@ -231,10 +231,39 @@ function normalizeQuestionLayout(q: MistralExtractedQuestion): {
   display_blocks: Array<{ role: DisplayRole; text: string }>;
   underlined_phrases: string[];
   question_text: string;
+  poetry: boolean;
+  verses: Array<{ firstHemistich: string; secondHemistich: string }>;
 } {
   let blocks = buildDisplayBlocks(q);
   const introHint = blocks.find((b) => b.role === 'intro')?.text ?? q.intro_text ?? '';
-  const poetry = looksLikePoetry(introHint, blocks.find((b) => b.role === 'stimulus')?.text ?? '');
+  const versesFromModel = (q.verses ?? [])
+    .map((v) => ({
+      firstHemistich: String(v.firstHemistich ?? '').trim(),
+      secondHemistich: String(v.secondHemistich ?? '').trim(),
+    }))
+    .filter((v) => v.firstHemistich && v.secondHemistich);
+  const poetry =
+    q.poetry === true ||
+    versesFromModel.length > 0 ||
+    looksLikePoetry(introHint, blocks.find((b) => b.role === 'stimulus')?.text ?? '');
+
+  // إن وُجدت verses بلا stimulus كافٍ — ابنِ stimulus من الأبيات
+  if (versesFromModel.length > 0) {
+    const fromVerses = versesFromModel
+      .map((v) => `${v.firstHemistich}    ${v.secondHemistich}`)
+      .join('\n\n');
+    const stimulusIdx = blocks.findIndex((b) => b.role === 'stimulus');
+    if (stimulusIdx >= 0) {
+      const current = blocks[stimulusIdx].text.trim();
+      if (!current || current.length < fromVerses.length * 0.5) {
+        blocks[stimulusIdx] = { role: 'stimulus', text: fromVerses };
+      }
+    } else {
+      const promptIdx = blocks.findIndex((b) => b.role === 'prompt');
+      const insertAt = promptIdx >= 0 ? promptIdx : blocks.length;
+      blocks.splice(insertAt, 0, { role: 'stimulus', text: fromVerses });
+    }
+  }
 
   blocks = blocks.map((block) => {
     let text = block.text;
@@ -273,6 +302,8 @@ function normalizeQuestionLayout(q: MistralExtractedQuestion): {
     display_blocks: blocks,
     underlined_phrases: underlinedPhrases,
     question_text,
+    poetry,
+    verses: versesFromModel,
   };
 }
 
@@ -328,6 +359,10 @@ function normalizeQuestion(q: MistralExtractedQuestion): MistralExtractedQuestio
       prompt_text: layout.prompt_text,
       display_blocks: layout.display_blocks,
       underlined_phrases: layout.underlined_phrases,
+      poetry: layout.poetry,
+      verses: layout.verses,
+      score:
+        q.score == null || Number.isNaN(Number(q.score)) ? null : Number(q.score),
       passage_id: q.passage_id?.trim() || null,
       options,
       question_images: questionImages,
@@ -347,6 +382,9 @@ function normalizeQuestion(q: MistralExtractedQuestion): MistralExtractedQuestio
     prompt_text: layout.prompt_text,
     display_blocks: layout.display_blocks,
     underlined_phrases: layout.underlined_phrases,
+    poetry: layout.poetry,
+    verses: layout.verses,
+    score: q.score == null || Number.isNaN(Number(q.score)) ? null : Number(q.score),
     passage_id: q.passage_id?.trim() || null,
     options,
     question_images: questionImages,
@@ -797,12 +835,149 @@ function collectQuestionImages(questions: MistralExtractedQuestion[]): MistralQu
   return [...byId.values()];
 }
 
+const LATIN_TO_AR_OPTION: Record<string, string> = {
+  a: 'أ',
+  b: 'ب',
+  c: 'ج',
+  d: 'د',
+  e: 'هـ',
+  A: 'أ',
+  B: 'ب',
+  C: 'ج',
+  D: 'د',
+  E: 'هـ',
+};
+
+/**
+ * يحوّل مخطط قطعة القراءة البديل إلى مخطط النظام الداخلي.
+ * يقبل أيضًا: type/reading_passage + passage_text + question_number + options[].id
+ */
+function normalizeExtractionPayload(raw: unknown): unknown {
+  if (!raw || typeof raw !== 'object') return raw;
+  const data = raw as Record<string, unknown>;
+
+  // مخطط reading_passage المبسّط (قبل الشكل العام)
+  const isReadingAlt =
+    data.type === 'reading_passage' ||
+    typeof data.passage_text === 'string' ||
+    typeof data.passageText === 'string';
+
+  if (isReadingAlt && !Array.isArray(data.passages)) {
+    const passageText = String(data.passage_text ?? data.passageText ?? '').trim();
+    const passageTitleRaw = data.passage_title ?? data.passageTitle ?? null;
+    const passageTitle =
+      typeof passageTitleRaw === 'string' && passageTitleRaw.trim()
+        ? passageTitleRaw.trim()
+        : null;
+    const passageId = 'p1';
+    const passages = passageText
+      ? [{ passage_id: passageId, title: passageTitle, content: passageText }]
+      : [];
+
+    const rawQuestions = Array.isArray(data.questions) ? data.questions : [];
+    const questions = rawQuestions.map((q, index) =>
+      normalizeLooseQuestion(q, index, passages.length ? passageId : null),
+    );
+
+    return {
+      subject: data.subject,
+      extraction_mode: data.extraction_mode,
+      content_type: 'reading_passage',
+      passages,
+      questions,
+      notes: typeof data.notes === 'string' ? data.notes : undefined,
+    };
+  }
+
+  if (Array.isArray(data.questions)) {
+    const questions = (data.questions as unknown[]).map((q, index) =>
+      normalizeLooseQuestion(q, index, null),
+    );
+    return {
+      ...data,
+      content_type:
+        data.content_type ??
+        data.document_type ??
+        (Array.isArray(data.passages) && (data.passages as unknown[]).length > 0
+          ? 'reading_passage'
+          : 'general'),
+      passages: Array.isArray(data.passages) ? data.passages : [],
+      questions,
+    };
+  }
+
+  return data;
+}
+
+function normalizeLooseQuestion(
+  raw: unknown,
+  index: number,
+  defaultPassageId: string | null,
+): Record<string, unknown> {
+  if (!raw || typeof raw !== 'object') {
+    return {
+      number: index + 1,
+      question_text: '',
+      options: [],
+      passage_id: defaultPassageId,
+    };
+  }
+  const q = raw as Record<string, unknown>;
+  const number =
+    Number(q.number ?? q.question_number ?? q.questionNumber ?? index + 1) || index + 1;
+  const questionText = String(
+    q.question_text ?? q.questionText ?? q.prompt_text ?? q.promptText ?? '',
+  ).trim();
+  const scoreRaw = q.score ?? q.marks ?? q.mark;
+  const score =
+    scoreRaw == null || scoreRaw === ''
+      ? null
+      : Number.isFinite(Number(scoreRaw))
+        ? Number(scoreRaw)
+        : null;
+
+  const rawOptions = Array.isArray(q.options) ? q.options : [];
+  const options = rawOptions.map((opt, i) => {
+    if (!opt || typeof opt !== 'object') {
+      return { label: String(i + 1), text: String(opt ?? '') };
+    }
+    const o = opt as Record<string, unknown>;
+    const rawLabel = String(o.label ?? o.id ?? '').trim();
+    const label =
+      LATIN_TO_AR_OPTION[rawLabel] ||
+      LATIN_TO_AR_OPTION[rawLabel.toLowerCase()] ||
+      rawLabel ||
+      ARABIC_OPTION_LABELS[i] ||
+      String(i + 1);
+    return {
+      label,
+      text: String(o.text ?? '').trim(),
+      ...(typeof o.image_id === 'string' ? { image_id: o.image_id } : {}),
+    };
+  });
+
+    const promptCandidate = q.prompt_text ?? q.promptText ?? questionText;
+    return {
+    ...q,
+    number,
+    source_number: String(q.source_number ?? q.question_number ?? q.questionNumber ?? number),
+    question_text: questionText,
+    prompt_text: String(promptCandidate ?? '').trim() || null,
+    passage_id: q.passage_id ?? q.passageId ?? defaultPassageId,
+    score,
+    options,
+    poetry: q.poetry ?? false,
+    verses: Array.isArray(q.verses) ? q.verses : [],
+  };
+}
+
 async function parseQuestionsWithChat(
   documentText: string,
   filename: string,
   inferCorrectAnswer: boolean,
   chatModelOverride?: string,
   pageImages: VisionPageImage[] = [],
+  subject?: string | null,
 ): Promise<{
   passages: MistralExtractedPassage[];
   questions: MistralExtractedQuestion[];
@@ -813,10 +988,12 @@ async function parseQuestionsWithChat(
   const hasPageImages = pageImages.length > 0;
   const chatModel =
     chatModelOverride?.trim() || (hasPageImages ? visionChatModel : defaultChatModel) || defaultChatModel;
+  const mode = resolveExtractionMode(subject);
 
   const prompt = buildQuestionExtractionPrompt(documentText, filename, {
     inferCorrectAnswer,
     hasPageImages,
+    subject,
   });
 
   const userContent: unknown = hasPageImages
@@ -829,6 +1006,11 @@ async function parseQuestionsWithChat(
       ]
     : prompt;
 
+  const systemContent =
+    mode === 'ARABIC_HIGH_ACCURACY_MODE'
+      ? 'أنت AI متخصص في تحليل واقتطاع أسئلة الامتحانات من الصور. للغة العربية: دقة قصوى في التشكيل والهمزات وبيوت الشعر. اكتشف قطعة القراءة إن وُجدت وضعها في passages[] مرة واحدة مع passage_id. أخرج JSON صالح فقط بلا markdown.'
+      : 'أنت AI متخصص في تحليل واقتطاع أسئلة الامتحانات من الصور وتحويلها إلى JSON. اكتشف قطعة القراءة إن وُجدت وضعها في passages[] مرة واحدة مع passage_id. افهم حدود كل سؤال ثم أخرج JSON صالح فقط بلا markdown.';
+
   const runChat = async (model: string, content: unknown) => {
     const response = await fetch(`${apiBaseUrl}/chat/completions`, {
       method: 'POST',
@@ -838,13 +1020,12 @@ async function parseQuestionsWithChat(
       },
       body: JSON.stringify({
         model,
-        temperature: inferCorrectAnswer ? 0.2 : 0.1,
+        temperature: inferCorrectAnswer ? 0.2 : mode === 'ARABIC_HIGH_ACCURACY_MODE' ? 0.05 : 0.1,
         response_format: { type: 'json_object' },
         messages: [
           {
             role: 'system',
-            content:
-              'أنت محلل بصري لصفحات الامتحانات والكتب. افهم تخطيط الصفحة وحدود كل سؤال ثم أخرج JSON صالح فقط وفق المخطط. لا تضف markdown أو شرح خارج JSON.',
+            content: systemContent,
           },
           { role: 'user', content },
         ],
@@ -868,6 +1049,7 @@ async function parseQuestionsWithChat(
       buildQuestionExtractionPrompt(documentText, filename, {
         inferCorrectAnswer,
         hasPageImages: false,
+        subject,
       }),
     );
   }
@@ -900,6 +1082,8 @@ async function parseQuestionsWithChat(
   } catch {
     throw new HttpError(502, 'Mistral Chat returned invalid JSON');
   }
+
+  parsed = normalizeExtractionPayload(parsed);
 
   const validatedResult = MistralQuestionExtractionSchema.safeParse(parsed);
   if (!validatedResult.success) {
@@ -1021,6 +1205,7 @@ async function parseQuestionsWithChatBatched(
   inferCorrectAnswer: boolean,
   chatModelOverride?: string,
   pageImages: VisionPageImage[] = [],
+  subject?: string | null,
 ): Promise<{
   passages: MistralExtractedPassage[];
   questions: MistralExtractedQuestion[];
@@ -1040,6 +1225,7 @@ async function parseQuestionsWithChatBatched(
       inferCorrectAnswer,
       chatModelOverride,
       imagesForBatch(batches[0]),
+      subject,
     );
   }
 
@@ -1059,6 +1245,7 @@ async function parseQuestionsWithChatBatched(
       inferCorrectAnswer,
       chatModelOverride,
       imagesForBatch(batch),
+      subject,
     );
     chatModel = result.chatModel;
     const remapped = prefixPassageIds(result.passages, result.questions, `b${i + 1}_`);
@@ -1110,6 +1297,7 @@ export class MistralQuestionExtractionService {
     const includeQuestionImages = options.includeQuestionImages ?? true;
     const requestedChatModel = options.chatModel?.trim();
     const ocrModel = options.ocrModel?.trim();
+    const subject = options.subject?.trim() || null;
 
     const pdfFiles = files.filter((f) => {
       const mime = MistralOcrService.resolveSupportedMime(f);
@@ -1152,6 +1340,7 @@ export class MistralQuestionExtractionService {
       inferCorrectAnswer,
       includeQuestionImages,
       requestedChatModel,
+      subject,
       sourceFiles: files.map((f) => ({
         filename: f.originalname || f.filename,
         mime_type: MistralOcrService.resolveSupportedMime(f),
@@ -1174,6 +1363,7 @@ export class MistralQuestionExtractionService {
       inferCorrectAnswer: boolean;
       includeQuestionImages: boolean;
       requestedChatModel?: string;
+      subject?: string | null;
       sourceFiles?: Array<{ filename: string; mime_type: string }>;
       pageImages?: VisionPageImage[];
       pageRange?: MistralQuestionExtractionResult['page_range'];
@@ -1190,6 +1380,7 @@ export class MistralQuestionExtractionService {
       opts.inferCorrectAnswer,
       opts.requestedChatModel,
       opts.pageImages ?? [],
+      opts.subject,
     );
     const questionsWithPassages = fillMissingPassageIds(questions, passages);
     const attachedQuestions = opts.includeQuestionImages
@@ -1213,6 +1404,9 @@ export class MistralQuestionExtractionService {
       ocr_model: ocr.model,
       chat_model: chatModel,
       infer_correct_answer: opts.inferCorrectAnswer,
+      subject: opts.subject?.trim() || undefined,
+      extraction_mode: resolveExtractionMode(opts.subject),
+      content_type: passages.length > 0 ? 'reading_passage' : 'general',
       passages,
       extracted_images: opts.includeQuestionImages ? collectQuestionImages(questionsWithImages) : [],
       questions: questionsWithImages,

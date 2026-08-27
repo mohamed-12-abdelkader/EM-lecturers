@@ -19,22 +19,22 @@ function generateCode(length = 8): string {
 }
 
 export class LectureActivationService {
-  static async assertActivationMode(courseId: number) {
-    const modes = await LectureAccessService.getCourseModes(courseId);
-    if (modes.lecture_access_mode !== 'activation_code') {
+  static async assertActivationMode(lectureId: number) {
+    const lecture = await LectureAccessService.getLectureContext(lectureId);
+    if (!lecture) throw new HttpError(404, 'المحاضرة غير موجودة');
+    // كود التفعيل مطلوب لـ activation_code، ولـ groups (لطلاب خارج المجموعات المحددة)
+    if (lecture.access_mode !== 'activation_code' && lecture.access_mode !== 'groups') {
       throw new HttpError(
         400,
-        'وضع الوصول للكورس ليس activation_code — غيّر lecture_access_mode أولاً',
+        'أكواد التفعيل متاحة فقط للمحاضرات ذات access_mode = activation_code أو groups',
         { code: 'WRONG_ACCESS_MODE' },
       );
     }
+    return lecture;
   }
 
   static async createCode(lectureId: number, teacherId: number, input: CreateLectureCodeInput) {
-    const lecture = await LectureAccessService.getLectureContext(lectureId);
-    if (!lecture) throw new HttpError(404, 'المحاضرة غير موجودة');
-
-    await this.assertActivationMode(lecture.course_id);
+    const lecture = await this.assertActivationMode(lectureId);
 
     const duration = Number(input.duration_hours);
     if (!duration || duration <= 0) {
@@ -123,10 +123,10 @@ export class LectureActivationService {
       await client.query('BEGIN');
 
       const codeRes = await client.query(
-        `SELECT lac.*, l.title AS lecture_title, c.lecture_access_mode
+        `SELECT lac.*, l.title AS lecture_title,
+                COALESCE(l.access_mode, 'open') AS lecture_access_mode
          FROM lecture_activation_codes lac
          JOIN lectures l ON l.id = lac.lecture_id
-         JOIN courses c ON c.id = lac.course_id
          WHERE lac.code = $1
          FOR UPDATE OF lac`,
         [code],
@@ -137,8 +137,8 @@ export class LectureActivationService {
       }
 
       const row = codeRes.rows[0];
-      if (row.lecture_access_mode !== 'activation_code') {
-        throw new HttpError(400, 'هذا الكورس لا يستخدم نظام أكواد تفعيل المحاضرات');
+      if (row.lecture_access_mode !== 'activation_code' && row.lecture_access_mode !== 'groups') {
+        throw new HttpError(400, 'هذه المحاضرة لا تستخدم نظام أكواد التفعيل');
       }
       if (!row.is_active) {
         throw new HttpError(400, 'هذا الكود غير مفعّل');

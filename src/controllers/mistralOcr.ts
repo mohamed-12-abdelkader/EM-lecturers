@@ -162,11 +162,16 @@ function parseExtractionOptions(req: Request) {
       ? true
       : parseBooleanField(req.body.include_question_images ?? req.query.include_question_images);
 
+  const subjectRaw = req.body.subject ?? req.query.subject;
+  const subject =
+    typeof subjectRaw === 'string' && subjectRaw.trim() ? subjectRaw.trim() : undefined;
+
   return {
     inferCorrectAnswer,
     includeQuestionImages,
     startPage: parseOptionalInt(req.body.start_page ?? req.query.start_page),
     endPage: parseOptionalInt(req.body.end_page ?? req.query.end_page),
+    subject,
   };
 }
 
@@ -245,6 +250,7 @@ router.post(
         includeQuestionImages: options.includeQuestionImages,
         startPage: options.startPage,
         endPage: options.endPage,
+        subject: options.subject,
       });
       return res.json({ success: true, data });
     } catch (error) {
