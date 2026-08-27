@@ -5,15 +5,13 @@ import { StaffConversationService } from '../services/conversation.service';
 import { StaffMessageService } from '../services/message.service';
 import { StaffChatPresence } from '../services/presence.service';
 
-type StaffSocket = Socket & { user: StaffUser };
-
 function emitChatError(socket: Socket, code: string, message: string) {
   socket.emit('chat:error', { event: 'chat:error', code, message });
 }
 
 export function registerStaffChatSocket(io: SocketIOServer) {
-  io.on('connection', (socket: StaffSocket) => {
-    const user = (socket as any).user as StaffUser | undefined;
+  io.on('connection', (socket: Socket) => {
+    const user = (socket as Socket & { user?: StaffUser }).user;
     if (!user || (user.role !== 'admin' && user.role !== 'employee')) return;
 
     void (async () => {
