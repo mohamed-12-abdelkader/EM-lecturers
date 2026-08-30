@@ -6,7 +6,7 @@ import { z } from 'zod';
 import { authMiddleware } from '../middleware/authentication';
 import { asyncWrapper, HttpError } from '../utils';
 import { parseNumberInput } from '../utils/requestParsers';
-import { courseFilesConfig } from '../config/courseFiles';
+import { courseFilesConfig, resolveCoursePdfLocalPath } from '../config/courseFiles';
 import { CourseFilesService, type RequestUser } from '../services/courseFiles';
 import { FileStorageService } from '../modules/myFiles/services/fileStorage.service';
 import { COURSE_CONTENT_ROLES } from '../services/courseAccessControl';
@@ -355,6 +355,33 @@ async function viewCourseFile(req: Request, res: Response) {
     }
   }
 
+  res.setHeader('Cache-Control', 'private, no-store');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+  res.setHeader('Accept-Ranges', 'bytes');
+  res.removeHeader('X-Frame-Options');
+
+  if (isInAppPdfClient(req)) {
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', 'inline');
+  } else {
+    res.setHeader('Content-Type', mimeType);
+    res.setHeader('Content-Disposition', `inline; filename*=UTF-8''${encodeURIComponent(inlineName)}`);
+  }
+
+  const localPath = resolveLocalCoursePdfPath(file);
+  if (localPath && fs.existsSync(localPath)) {
+    return res.sendFile(localPath, {
+      acceptRanges: true,
+      cacheControl: false,
+      lastModified: true,
+      etag: false,
+      headers: {
+        'Cache-Control': 'private, no-store',
+      },
+    });
+  }
+
   const { stream, contentLength } = await FileStorageService.openReadStream(
     file.file_key || '',
     file.file_url,
@@ -365,17 +392,6 @@ async function viewCourseFile(req: Request, res: Response) {
     },
   );
 
-  if (isInAppPdfClient(req)) {
-    // octet-stream بدون اسم .pdf حتى لا يحوّل IDM/المتصفح الطلب إلى تحميل
-    res.setHeader('Content-Type', 'application/octet-stream');
-    res.setHeader('Content-Disposition', 'inline');
-  } else {
-    res.setHeader('Content-Type', mimeType);
-    res.setHeader('Content-Disposition', `inline; filename*=UTF-8''${encodeURIComponent(inlineName)}`);
-  }
-  res.setHeader('Cache-Control', 'private, no-store');
-  res.setHeader('X-Content-Type-Options', 'nosniff');
-  res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
   if (contentLength) res.setHeader('Content-Length', String(contentLength));
 
   stream.on('error', (error) => {
@@ -387,6 +403,21 @@ async function viewCourseFile(req: Request, res: Response) {
     }
   });
   stream.pipe(res);
+}
+
+function resolveLocalCoursePdfPath(file: {
+  file_key?: string | null;
+  file_url?: string | null;
+  storage_provider?: string | null;
+}): string | null {
+  const url = String(file.file_url || '');
+  const isLocal = url.startsWith('/uploads/') || file.storage_provider === 'local' || !file.storage_provider;
+  if (!isLocal && !url.startsWith('/uploads/')) return null;
+  try {
+    return resolveCoursePdfLocalPath(file.file_key || '', file.file_url);
+  } catch {
+    return null;
+  }
 }
 
 function sanitizeContentDisposition(name: string): string {

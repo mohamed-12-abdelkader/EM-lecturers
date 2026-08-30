@@ -203,11 +203,20 @@ export function getCorsOriginDelegate(): CorsOptionsDelegate<Request> {
       allowedHeaders: [
         'Content-Type',
         'Authorization',
+        'Accept',
+        'Range',
+        'X-Requested-With',
         'X-Tenant-Subdomain',
         'X-Access-Token',
         'ngrok-skip-browser-warning',
       ],
-      exposedHeaders: ['X-Access-Token'],
+      exposedHeaders: [
+        'X-Access-Token',
+        'Accept-Ranges',
+        'Content-Range',
+        'Content-Length',
+        'Content-Type',
+      ],
     });
   };
 }
