@@ -75,6 +75,22 @@ app.use('/api/webhooks/whatsapp', whatsappWebhookRouter);
 app.use('/api', tenantContextMiddleware);
 app.use('/api', router);
 app.use('/uploads/teacher-library', teacherLibraryStaticMiddleware);
-app.use('/uploads', express.static('uploads'));
+app.use(
+  '/uploads',
+  express.static('uploads', {
+    // Weak ETags (W/"...") + Accept-Ranges break Chrome's built-in PDF viewer.
+    etag: false,
+    lastModified: true,
+    acceptRanges: true,
+    setHeaders(res, filePath) {
+      if (filePath.toLowerCase().endsWith('.pdf')) {
+        res.setHeader('Content-Type', 'application/pdf');
+        res.setHeader('Content-Disposition', 'inline');
+        res.setHeader('Cache-Control', 'public, max-age=300');
+        res.removeHeader('X-Frame-Options');
+      }
+    },
+  }),
+);
 
 app.use(errorHandlerMiddleware);

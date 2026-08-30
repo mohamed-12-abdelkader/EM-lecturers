@@ -4,9 +4,13 @@ import type { RequestHandler } from 'express';
  * Security headers أساسية لـ REST API (بديل مبسّط لـ helmet بدون dependency).
  * لا نضبط CSP صارم لأن الـ API يقدّم ملفات وصور عبر CORS للمنصات.
  */
-export const securityHeadersMiddleware: RequestHandler = (_req, res, next) => {
+export const securityHeadersMiddleware: RequestHandler = (req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
-  res.setHeader('X-Frame-Options', 'DENY');
+  // PDFs/images under /uploads are opened in viewers/iframes on tenant sites.
+  // DENY makes Chrome's PDF plugin hang on Range requests then fail with a network error.
+  if (!req.path.startsWith('/uploads/')) {
+    res.setHeader('X-Frame-Options', 'DENY');
+  }
   res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
   res.setHeader('X-DNS-Prefetch-Control', 'off');
   res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
