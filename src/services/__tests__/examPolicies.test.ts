@@ -31,6 +31,45 @@ describe('determineAnswerRelease', () => {
     );
     expect(afterDecision).toEqual({ release: true, reason: 'scheduled_release' });
   });
+
+  it('releases after the exam expire date when mode is after_end', () => {
+    const policy = {
+      answersReleaseMode: 'after_end' as const,
+      examExpireAt: '2025-01-10T18:00:00Z',
+    };
+    expect(
+      determineAnswerRelease(policy, null, new Date('2025-01-10T17:59:59Z')).release,
+    ).toBe(false);
+    expect(determineAnswerRelease(policy, null, new Date('2025-01-10T18:00:00Z'))).toEqual({
+      release: true,
+      reason: 'after_end',
+    });
+  });
+
+  it('releases after delayed hours from submit', () => {
+    const attempt = {
+      status: 'submitted' as const,
+      submittedAt: '2025-01-10T08:00:00Z',
+    };
+    const policy = { answersReleaseMode: 'after_hours' as const, showAnswersAfterHours: 2 };
+    expect(
+      determineAnswerRelease(policy, attempt, new Date('2025-01-10T09:59:59Z')).release,
+    ).toBe(false);
+    expect(determineAnswerRelease(policy, attempt, new Date('2025-01-10T10:00:00Z'))).toEqual({
+      release: true,
+      reason: 'delayed_hours',
+    });
+  });
+
+  it('still prefers immediate when the mode is immediate', () => {
+    expect(
+      determineAnswerRelease(
+        { answersReleaseMode: 'immediate', examExpireAt: '2099-01-01T00:00:00Z' },
+        null,
+        new Date('2025-01-10T10:00:00Z'),
+      ),
+    ).toEqual({ release: true, reason: 'immediate' });
+  });
 });
 
 describe('attempt orchestration', () => {

@@ -72,6 +72,13 @@ const CourseAssignmentSchema = z.object({
   show_answers_after_hours: z.coerce.number().optional(),
   type: z.string().optional(),
   exam_type: z.string().optional(),
+  questions_count: z.coerce.number().positive().optional(),
+  questionsCount: z.coerce.number().positive().optional(),
+  question_display_mode: z.string().optional(),
+  questionDisplayMode: z.string().optional(),
+  answers_release_mode: z.string().optional(),
+  answersReleaseMode: z.string().optional(),
+  answers_release_date: z.string().optional().nullable(),
 });
 
 async function assertManagesCourse(user: any, courseId: number) {
@@ -362,16 +369,27 @@ async function createCourseLevelExam(params: {
     : 0;
   const examTitle =
     body.title || (examType === 'assignment' ? 'واجب الكورس' : 'امتحان الكورس');
+  const questionsCount = body.questions_count ?? body.questionsCount ?? null;
+  const questionDisplayMode =
+    String(body.question_display_mode ?? body.questionDisplayMode ?? 'ordered').toLowerCase() ===
+    'random'
+      ? 'random'
+      : 'ordered';
+  const answersReleaseMode = String(
+    body.answers_release_mode ?? body.answersReleaseMode ?? (showAnswersImmediately ? 'immediate' : 'after_hours'),
+  ).toLowerCase();
 
   const result = await pool.query(
     `INSERT INTO exams (
        lecture_id, course_id, type, total_grade, created_by, title, duration, is_visible,
        show_at, hide_at, lock_next_lectures,
-       show_answers_immediately, show_answers_after_hours
+       show_answers_immediately, show_answers_after_hours,
+       questions_count, question_display_mode, answers_release_mode
      ) VALUES (
        NULL, $1, $2, $3, $4, $5, $6, $7,
        $8, $9, $10,
-       $11, $12
+       $11, $12,
+       $13, $14, $15
      ) RETURNING *`,
     [
       courseId,
@@ -386,6 +404,9 @@ async function createCourseLevelExam(params: {
       lockNextLectures,
       showAnswersImmediately,
       showAnswersAfterHours,
+      questionsCount,
+      questionDisplayMode,
+      answersReleaseMode,
     ],
   );
 
@@ -415,7 +436,10 @@ async function listCourseLevelExams(params: {
          isStudent
            ? `AND e.is_visible = TRUE
               AND (e.show_at IS NULL OR e.show_at <= NOW())
-              AND (e.hide_at IS NULL OR e.hide_at >= NOW())`
+              AND (
+                e.questions_count IS NULL OR e.questions_count <= 0
+                OR (SELECT COUNT(*) FROM exam_questions eq WHERE eq.exam_id = e.id) >= e.questions_count
+              )`
            : ''
        }
      ORDER BY e.created_at DESC`,

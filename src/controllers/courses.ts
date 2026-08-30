@@ -36,6 +36,11 @@ import { LectureAccessService } from '../services/lectureAccess';
 import { CourseGroupAccessService } from '../services/courseGroupAccess';
 import { serializeCourseFile } from '../services/courseFiles.serialize';
 import { LectureActivationService } from '../services/lectureActivation';
+import {
+  getStudentExamAvailability,
+  lectureExamAvailabilityInput,
+  shouldListExamForStudent,
+} from '../services/examAccessPolicy';
 
 export const router = Router();
 
@@ -2065,20 +2070,31 @@ router.get(
     let assessments: any[] = [];
     if (lectureIds.length) {
       const examsRes = await pool.query(
-        `SELECT * FROM exams
-         WHERE lecture_id = ANY($1::int[])
-         ORDER BY id ASC`,
+        `SELECT e.*,
+                (SELECT COUNT(*)::int FROM exam_questions eq WHERE eq.exam_id = e.id) AS actual_questions_count
+         FROM exams e
+         WHERE e.lecture_id = ANY($1::int[])
+         ORDER BY e.id ASC`,
         [lectureIds],
       );
       assessments = examsRes.rows;
     }
 
     const attachAssessments = (lec: any, role: string) => {
-      const forLec = assessments.filter(
-        (e) =>
-          e.lecture_id === lec.id &&
-          (role === 'teacher' || role === 'admin' || e.is_visible === true),
-      );
+      const forLec = assessments
+        .filter((e) => e.lecture_id === lec.id)
+        .filter((e) => {
+          if (role === 'teacher' || role === 'admin') return true;
+          return shouldListExamForStudent(lectureExamAvailabilityInput(e));
+        })
+        .map((e) => {
+          const availability_status = getStudentExamAvailability(lectureExamAvailabilityInput(e));
+          return {
+            ...e,
+            availability_status,
+            can_start: availability_status === 'open',
+          };
+        });
       const examsList = forLec.filter((e) => e.type === 'exam');
       const assignmentsList = forLec.filter((e) => e.type === 'assignment');
       return {
@@ -2344,7 +2360,12 @@ router.get(
              isStudent
                ? `AND e.is_visible = TRUE
                   AND (e.show_at IS NULL OR e.show_at <= NOW())
-                  AND (e.hide_at IS NULL OR e.hide_at >= NOW())`
+                  AND (
+                    e.questions_count IS NULL OR e.questions_count <= 0
+                    OR (
+                      SELECT COUNT(*) FROM exam_questions eq WHERE eq.exam_id = e.id
+                    ) >= e.questions_count
+                  )`
                : ''
            }
          ORDER BY e.created_at DESC`,
@@ -3195,6 +3216,9 @@ router.post(
       show_answers_after_hours,
       type,
       exam_type,
+      questions_count,
+      question_display_mode,
+      answers_release_mode,
     } = req.body;
 
     if (isNaN(lectureId)) {
@@ -3261,14 +3285,21 @@ router.post(
     const examTitle =
       title || (examType === 'assignment' ? 'Lecture Assignment' : 'Lecture Exam');
     const courseIdForExam = Number(lectureCheck.rows[0].course_id);
+    const questionsCount = questions_count != null ? Number(questions_count) : null;
+    const questionDisplayMode =
+      String(question_display_mode || 'ordered').toLowerCase() === 'random' ? 'random' : 'ordered';
+    const answersReleaseMode = String(
+      answers_release_mode || (showAnswersImmediately ? 'immediate' : 'after_hours'),
+    ).toLowerCase();
 
     const exam = await pool.query(
       `INSERT INTO exams (
         lecture_id, course_id, type, total_grade, created_by, title, duration, is_visible,
         show_at, hide_at, lock_next_lectures,
-        show_answers_immediately, show_answers_after_hours
+        show_answers_immediately, show_answers_after_hours,
+        questions_count, question_display_mode, answers_release_mode
       )
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING *`,
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) RETURNING *`,
       [
         lectureId,
         courseIdForExam,
@@ -3283,6 +3314,9 @@ router.post(
         lockNextLectures,
         showAnswersImmediately,
         showAnswersAfterHours,
+        questionsCount,
+        questionDisplayMode,
+        answersReleaseMode,
       ],
     );
 
@@ -3480,11 +3514,16 @@ router.get(
       examParams = [lectureId];
     } else {
       const now = new Date();
-      examQuery = `SELECT * FROM exams
-                   WHERE lecture_id = $1 ${typeFilterSql} AND is_visible = true
-                   AND (show_at IS NULL OR show_at <= $2)
-                   AND (hide_at IS NULL OR hide_at >= $2)
-                   ORDER BY id ASC`;
+      examQuery = `SELECT e.*,
+                     (SELECT COUNT(*)::int FROM exam_questions eq WHERE eq.exam_id = e.id) AS actual_questions_count
+                   FROM exams e
+                   WHERE e.lecture_id = $1 ${typeFilterSql} AND e.is_visible = true
+                   AND (e.show_at IS NULL OR e.show_at <= $2)
+                   AND (
+                     e.questions_count IS NULL OR e.questions_count <= 0
+                     OR (SELECT COUNT(*) FROM exam_questions eq WHERE eq.exam_id = e.id) >= e.questions_count
+                   )
+                   ORDER BY e.id ASC`;
       examParams = [lectureId, now];
     }
 
@@ -3518,7 +3557,22 @@ router.patch(
   authMiddleware(COURSE_CONTENT_ROLES),
   asyncWrapper(async (req, res) => {
     const examId = Number(req.params.examId);
-    const { title, total_grade, duration, is_visible } = req.body;
+    const {
+      title,
+      total_grade,
+      duration,
+      is_visible,
+      show_at,
+      hide_at,
+      lock_next_lectures,
+      show_answers_immediately,
+      show_answers_after_hours,
+      questions_count,
+      question_display_mode,
+      answers_release_mode,
+      answers_release_date,
+      show_answers_later,
+    } = req.body;
 
     if (isNaN(examId)) {
       return res.status(400).json({ message: 'Invalid exam ID' });
@@ -3558,6 +3612,66 @@ router.patch(
     if (is_visible !== undefined) {
       updateFields.push(`is_visible = $${i++}`);
       values.push(is_visible);
+    }
+    if (show_at !== undefined) {
+      updateFields.push(`show_at = $${i++}`);
+      values.push(show_at ? new Date(show_at) : null);
+    }
+    if (hide_at !== undefined) {
+      updateFields.push(`hide_at = $${i++}`);
+      values.push(hide_at ? new Date(hide_at) : null);
+    }
+    if (lock_next_lectures !== undefined) {
+      updateFields.push(`lock_next_lectures = $${i++}`);
+      values.push(lock_next_lectures === true || lock_next_lectures === 'true');
+    }
+    if (questions_count !== undefined) {
+      const count = Number(questions_count);
+      if (!Number.isFinite(count) || count <= 0) {
+        return res.status(400).json({ message: 'questions_count must be a positive number' });
+      }
+      updateFields.push(`questions_count = $${i++}`);
+      values.push(count);
+    }
+    if (question_display_mode !== undefined) {
+      updateFields.push(`question_display_mode = $${i++}`);
+      values.push(String(question_display_mode).toLowerCase() === 'random' ? 'random' : 'ordered');
+    }
+    if (answers_release_mode !== undefined) {
+      const mode = String(answers_release_mode).toLowerCase();
+      const allowed = ['immediate', 'after_end', 'after_hours', 'scheduled'];
+      if (!allowed.includes(mode)) {
+        return res.status(400).json({ message: 'Invalid answers_release_mode' });
+      }
+      updateFields.push(`answers_release_mode = $${i++}`);
+      values.push(mode);
+      if (mode === 'immediate') {
+        updateFields.push(`show_answers_immediately = $${i++}`);
+        values.push(true);
+        updateFields.push(`show_answers_later = $${i++}`);
+        values.push(false);
+      } else {
+        updateFields.push(`show_answers_immediately = $${i++}`);
+        values.push(false);
+        updateFields.push(`show_answers_later = $${i++}`);
+        values.push(mode === 'scheduled');
+      }
+    }
+    if (show_answers_immediately !== undefined && answers_release_mode === undefined) {
+      updateFields.push(`show_answers_immediately = $${i++}`);
+      values.push(show_answers_immediately !== false && show_answers_immediately !== 'false');
+    }
+    if (show_answers_after_hours !== undefined) {
+      updateFields.push(`show_answers_after_hours = $${i++}`);
+      values.push(Number(show_answers_after_hours) || 0);
+    }
+    if (answers_release_date !== undefined) {
+      updateFields.push(`answers_release_date = $${i++}`);
+      values.push(answers_release_date ? new Date(answers_release_date) : null);
+    }
+    if (show_answers_later !== undefined && answers_release_mode === undefined) {
+      updateFields.push(`show_answers_later = $${i++}`);
+      values.push(show_answers_later === true || show_answers_later === 'true');
     }
 
     if (updateFields.length === 0) {

@@ -17,14 +17,20 @@ export type AttemptSnapshot = {
 };
 
 export type ReleaseDecision =
-  | { release: true; reason: 'immediate' | 'scheduled_release' | 'delayed_hours' }
+  | {
+      release: true;
+      reason: 'immediate' | 'scheduled_release' | 'delayed_hours' | 'after_end';
+    }
   | { release: false };
 
 type AnswerPolicy = {
+  answersReleaseMode?: 'immediate' | 'after_end' | 'after_hours' | 'scheduled' | string | null;
   showAnswersImmediately?: boolean;
   showAnswersLater?: boolean;
   answersReleaseDate?: NullableDate;
+  answersVisibleAt?: NullableDate;
   showAnswersAfterHours?: number | null;
+  examExpireAt?: NullableDate;
 };
 
 type ShouldPreventParams = {
@@ -49,26 +55,52 @@ export const isPastExpiry = (expireAt: NullableDate, referenceDate: Date = new D
   return referenceDate.getTime() > expireDate.getTime();
 };
 
+const resolveReleaseMode = (policy: AnswerPolicy): string => {
+  const mode = String(policy?.answersReleaseMode ?? '')
+    .trim()
+    .toLowerCase();
+  if (mode === 'immediate' || mode === 'after_end' || mode === 'after_hours' || mode === 'scheduled') {
+    return mode;
+  }
+  if (policy?.showAnswersImmediately) return 'immediate';
+  if (policy?.showAnswersLater && (policy.answersReleaseDate || policy.answersVisibleAt)) {
+    return 'scheduled';
+  }
+  if ((policy?.showAnswersAfterHours ?? 0) > 0) return 'after_hours';
+  if (policy?.answersVisibleAt) return 'scheduled';
+  return 'immediate';
+};
+
 export const determineAnswerRelease = (
   policy: AnswerPolicy,
   attempt: AttemptSnapshot | null,
   referenceDate: Date = new Date(),
 ): ReleaseDecision => {
-  if (policy?.showAnswersImmediately) {
+  const mode = resolveReleaseMode(policy);
+
+  if (mode === 'immediate') {
     return { release: true, reason: 'immediate' };
   }
 
-  if (policy?.showAnswersLater && policy.answersReleaseDate) {
-    const releaseDate = toDate(policy.answersReleaseDate);
+  if (mode === 'after_end') {
+    const expireAt = toDate(policy.examExpireAt);
+    if (expireAt && referenceDate.getTime() >= expireAt.getTime()) {
+      return { release: true, reason: 'after_end' };
+    }
+    return { release: false };
+  }
+
+  if (mode === 'scheduled' || policy?.showAnswersLater) {
+    const releaseDate = toDate(policy.answersReleaseDate ?? policy.answersVisibleAt);
     if (releaseDate && referenceDate.getTime() >= releaseDate.getTime()) {
       return { release: true, reason: 'scheduled_release' };
     }
   }
 
   const delayHours = policy?.showAnswersAfterHours ?? 0;
-  if (delayHours > 0 && attempt?.submittedAt) {
+  if ((mode === 'after_hours' || delayHours > 0) && attempt?.submittedAt) {
     const submittedAtDate = toDate(attempt.submittedAt);
-    if (submittedAtDate) {
+    if (submittedAtDate && delayHours > 0) {
       const releaseAfter = new Date(submittedAtDate.getTime() + delayHours * 60 * 60 * 1000);
       if (referenceDate.getTime() >= releaseAfter.getTime()) {
         return { release: true, reason: 'delayed_hours' };

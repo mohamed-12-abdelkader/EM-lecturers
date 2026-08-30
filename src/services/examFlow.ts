@@ -8,6 +8,19 @@ import {
   type AttemptSnapshot,
   type ReleaseDecision,
 } from './examPolicies';
+import {
+  attemptQuestionSeed,
+  canStudentStartExam,
+  flagsFromAnswersReleaseMode,
+  getStudentExamAvailability,
+  inferAnswersReleaseMode,
+  lectureExamAvailabilityInput,
+  normalizeAnswersReleaseMode,
+  normalizeQuestionDisplayMode,
+  orderItemsByIds,
+  parseSelectedQuestionIds,
+  selectAttemptQuestions,
+} from './examAccessPolicy';
 import { CourseAccessControl } from './courseAccessControl';
 
 type UserRole = 'student' | 'teacher' | 'admin' | 'employee' | 'academy' | 'academy_teacher';
@@ -40,6 +53,9 @@ interface CreateExamPayload {
   allowMultipleAttempts?: boolean;
   showAnswersLater?: boolean;
   answersReleaseDate?: string | null;
+  answersReleaseMode?: string | null;
+  questionsCount?: number | null;
+  questionDisplayMode?: string | null;
   timeLimitEnabled?: boolean;
   timeLimitMinutes?: number | null;
   startWindow?: string | null;
@@ -303,6 +319,9 @@ export class ExamFlowService {
       allowMultipleAttempts,
       showAnswersLater,
       answersReleaseDate,
+      answersReleaseMode,
+      questionsCount,
+      questionDisplayMode,
       timeLimitEnabled,
       timeLimitMinutes,
       startWindow,
@@ -394,19 +413,48 @@ export class ExamFlowService {
     const normalizedHideAt = hideAt ? new Date(hideAt) : null;
     const examType = normalizeLectureExamType(type, 'exam');
 
+    const normalizedQuestionsCount =
+      questionsCount === undefined || questionsCount === null
+        ? null
+        : Number(questionsCount);
+    if (
+      normalizedQuestionsCount !== null &&
+      (!Number.isFinite(normalizedQuestionsCount) || normalizedQuestionsCount <= 0)
+    ) {
+      const error: any = new Error('questionsCount must be a positive number');
+      error.status = 400;
+      throw error;
+    }
+
+    const resolvedDisplayMode = normalizeQuestionDisplayMode(questionDisplayMode);
+    const resolvedReleaseMode = answersReleaseMode
+      ? normalizeAnswersReleaseMode(answersReleaseMode)
+      : inferAnswersReleaseMode({
+          showAnswersImmediately,
+          showAnswersLater,
+          answersReleaseDate: normalizedAnswersReleaseDate,
+          showAnswersAfterHours,
+        });
+    const releaseFlags = flagsFromAnswersReleaseMode(resolvedReleaseMode, {
+      afterHours: showAnswersAfterHours,
+      scheduledDate: normalizedAnswersReleaseDate,
+    });
+
     const result = await pool.query(
       `INSERT INTO exams (
         lecture_id, type, total_grade, created_by, title, duration, is_visible,
         show_at, hide_at, lock_next_lectures,
         show_answers_immediately, show_answers_after_hours,
         allow_multiple_attempts, show_answers_later, answers_release_date,
-        time_limit_enabled, time_limit_minutes, start_window, end_window
+        time_limit_enabled, time_limit_minutes, start_window, end_window,
+        questions_count, question_display_mode, answers_release_mode
       ) VALUES (
         $1, $2, $3, $4, $5, $6, $7,
         $8, $9, $10,
         $11, $12,
         $13, $14, $15,
-        $16, $17, $18, $19
+        $16, $17, $18, $19,
+        $20, $21, $22
       ) RETURNING *`,
       [
         lectureId,
@@ -419,15 +467,18 @@ export class ExamFlowService {
         normalizedShowAt,
         normalizedHideAt,
         lockNextLectures ?? examType === 'assignment',
-        showAnswersImmediately ?? true,
-        showAnswersAfterHours ?? 0,
+        releaseFlags.showAnswersImmediately,
+        releaseFlags.showAnswersAfterHours,
         allowMultipleAttempts ?? false,
-        showAnswersLater ?? false,
-        normalizedAnswersReleaseDate,
+        releaseFlags.showAnswersLater,
+        releaseFlags.answersReleaseDate,
         timeLimitEnabled ?? false,
         normalizedTimeLimitMinutes,
         normalizedStartWindow,
         normalizedEndWindow,
+        normalizedQuestionsCount,
+        resolvedDisplayMode,
+        resolvedReleaseMode,
       ],
     );
 
@@ -1021,27 +1072,48 @@ export class ExamFlowService {
         activeAttemptIndex >= 0 ? normalizedAttempts[activeAttemptIndex] : null;
       const attemptHistory = this.summarizeAttempts(attempts);
       const feedback = await this.buildFeedbackIfAllowed(exam, attempts);
+      const availabilityStatus = getStudentExamAvailability(
+        lectureExamAvailabilityInput(exam),
+      );
       const baseResponse = {
-        exam: this.mapExamRow(exam),
+        exam: this.mapExamRow(exam, availabilityStatus),
         attemptHistory,
         attempt: activeAttempt ? this.mapAttemptForStudent(activeAttempt) : null,
         feedback,
       };
 
-      if (!exam.is_visible || !this.isWithinVisibilityWindow(exam)) {
+      if (
+        availabilityStatus === 'hidden' ||
+        availabilityStatus === 'incomplete' ||
+        availabilityStatus === 'upcoming'
+      ) {
         return {
           ...baseResponse,
-          status: 'hidden',
-          message: 'This exam is not visible right now.',
+          status: availabilityStatus === 'upcoming' ? 'not_open_yet' : 'hidden',
+          message:
+            availabilityStatus === 'upcoming'
+              ? 'This exam is not visible yet.'
+              : availabilityStatus === 'incomplete'
+                ? 'This exam is not ready yet.'
+                : 'This exam is not visible right now.',
         };
       }
 
-      const availability = this.getWindowStatus(exam);
-      if (availability.status !== 'ready') {
+      const windowAvailability = this.getWindowStatus(exam);
+      if (windowAvailability.status !== 'ready' && !activeAttempt) {
         return {
           ...baseResponse,
-          status: availability.status,
-          message: availability.message,
+          status: windowAvailability.status,
+          message: windowAvailability.message,
+        };
+      }
+
+      if (activeAttempt) {
+        const questions = await this.loadStudentAttemptQuestions(exam, activeAttempt, user.id);
+        return {
+          ...baseResponse,
+          status: 'ready',
+          questions: this.sanitizeQuestions(questions, false),
         };
       }
 
@@ -1059,11 +1131,18 @@ export class ExamFlowService {
         };
       }
 
-      const questions = await this.loadExamQuestions(exam.id, true);
+      if (availabilityStatus === 'expired') {
+        return {
+          ...baseResponse,
+          status: 'closed',
+          message: 'This exam has ended. You can view it but cannot start a new attempt.',
+        };
+      }
+
       return {
         ...baseResponse,
         status: 'ready',
-        questions: this.sanitizeQuestions(questions, false),
+        questions: [],
       };
     }
 
@@ -1090,8 +1169,29 @@ export class ExamFlowService {
       studentId,
     );
 
-    if (!exam.is_visible || !this.isWithinVisibilityWindow(exam)) {
-      const error: any = new Error('This exam is not available right now');
+    await this.expireOverdueAttempts(exam.id, studentId);
+    const attempts = await this.getStudentAttempts(exam.id, studentId);
+    const activeAttempt = attempts.find((a) => a.status === 'in_progress');
+
+    if (activeAttempt) {
+      return this.mapAttemptForStudent(activeAttempt);
+    }
+
+    if (
+      !canStudentStartExam(lectureExamAvailabilityInput(exam), new Date(), {
+        hasInProgressAttempt: false,
+      })
+    ) {
+      const status = getStudentExamAvailability(lectureExamAvailabilityInput(exam));
+      const message =
+        status === 'expired'
+          ? 'This exam has ended. You can view it but cannot start a new attempt.'
+          : status === 'upcoming'
+            ? 'This exam is not open yet.'
+            : status === 'incomplete'
+              ? 'This exam is not ready yet.'
+              : 'This exam is not available right now';
+      const error: any = new Error(message);
       error.status = 403;
       throw error;
     }
@@ -1103,14 +1203,6 @@ export class ExamFlowService {
       const error: any = new Error(availability.message);
       error.status = 403;
       throw error;
-    }
-
-    await this.expireOverdueAttempts(exam.id, studentId);
-    const attempts = await this.getStudentAttempts(exam.id, studentId);
-    const activeAttempt = attempts.find((a) => a.status === 'in_progress');
-
-    if (activeAttempt) {
-      return this.mapAttemptForStudent(activeAttempt);
     }
 
     const preventNewAttempt = shouldPreventNewAttempt({
@@ -1130,17 +1222,33 @@ export class ExamFlowService {
         ? new Date(startTime.getTime() + exam.time_limit_minutes * 60 * 1000)
         : null;
 
+    const questionBank = await this.loadExamQuestions(exam.id, true);
+    const selectedQuestionIds = selectAttemptQuestions(
+      questionBank.map((q) => q.id),
+      exam.questions_count,
+      exam.question_display_mode,
+      attemptQuestionSeed(exam.id, studentId, attemptNumber),
+    );
+
     const insertResult = await pool.query(
       `INSERT INTO exam_submissions (
         exam_id, student_id, total_grade, passed, submitted_at,
         attempt_start_time, attempt_end_time, status, attempt_number,
-        time_limit_minutes, attempt_expire_at, is_late
+        time_limit_minutes, attempt_expire_at, is_late, selected_question_ids
       ) VALUES (
         $1, $2, NULL, NULL, NULL,
         $3, NULL, 'in_progress', $4,
-        $5, $6, FALSE
+        $5, $6, FALSE, $7
       ) RETURNING *`,
-      [exam.id, studentId, startTime, attemptNumber, exam.time_limit_minutes ?? null, expireAt],
+      [
+        exam.id,
+        studentId,
+        startTime,
+        attemptNumber,
+        exam.time_limit_minutes ?? null,
+        expireAt,
+        selectedQuestionIds,
+      ],
     );
 
     return this.mapAttemptForStudent(insertResult.rows[0]);
@@ -1193,7 +1301,7 @@ export class ExamFlowService {
       throw error;
     }
 
-    const questionBank = await this.loadExamQuestions(exam.id, true);
+    const questionBank = await this.loadStudentAttemptQuestions(exam, attempt, studentId);
     if (!questionBank.length) {
       const error: any = new Error('This exam has no questions yet.');
       error.status = 400;
@@ -1630,7 +1738,12 @@ export class ExamFlowService {
       `SELECT e.*,
               COALESCE(e.course_id, l.course_id) AS course_id,
               c.teacher_id,
-              l.title AS lecture_title
+              l.title AS lecture_title,
+              (
+                SELECT COUNT(*)::int
+                FROM exam_questions eq
+                WHERE eq.exam_id = e.id
+              ) AS actual_questions_count
        FROM exams e
        LEFT JOIN lectures l ON e.lecture_id = l.id
        JOIN courses c ON c.id = COALESCE(e.course_id, l.course_id)
@@ -1668,14 +1781,8 @@ export class ExamFlowService {
   }
 
   private static isWithinVisibilityWindow(exam: any) {
-    const now = new Date();
-    if (exam.show_at && new Date(exam.show_at) > now) {
-      return false;
-    }
-    if (exam.hide_at && new Date(exam.hide_at) < now) {
-      return false;
-    }
-    return true;
+    const status = getStudentExamAvailability(lectureExamAvailabilityInput(exam));
+    return status === 'open';
   }
 
   private static getWindowStatus(exam: any) {
@@ -1781,6 +1888,29 @@ export class ExamFlowService {
       [examId],
     );
     return res.rows[0];
+  }
+
+  private static async loadStudentAttemptQuestions(
+    exam: any,
+    attempt: any,
+    studentId: number,
+  ): Promise<ExamQuestion[]> {
+    const allQuestions = await this.loadExamQuestions(exam.id, true);
+    const storedIds = parseSelectedQuestionIds(attempt?.selected_question_ids);
+    const selectedIds =
+      storedIds && storedIds.length
+        ? storedIds
+        : selectAttemptQuestions(
+            allQuestions.map((q) => q.id),
+            exam.questions_count,
+            exam.question_display_mode,
+            attemptQuestionSeed(
+              Number(exam.id),
+              studentId,
+              Number(attempt?.attempt_number || 1),
+            ),
+          );
+    return orderItemsByIds(allQuestions, selectedIds);
   }
 
   private static async loadExamQuestions(examId: number, forStudent?: boolean): Promise<ExamQuestion[]> {
@@ -2219,10 +2349,12 @@ export class ExamFlowService {
   ): ReleaseDecision {
     return determineAnswerRelease(
       {
+        answersReleaseMode: exam.answers_release_mode,
         showAnswersImmediately: !!exam.show_answers_immediately,
         showAnswersLater: !!exam.show_answers_later,
         answersReleaseDate: exam.answers_release_date,
         showAnswersAfterHours: exam.show_answers_after_hours ?? 0,
+        examExpireAt: exam.hide_at,
       },
       attempt
         ? {
@@ -2429,17 +2561,28 @@ export class ExamFlowService {
     }
   }
 
-  private static mapExamRow(row: any) {
+  private static mapExamRow(row: any, availabilityStatus?: string) {
     return {
       id: row.id,
       lectureId: row.lecture_id,
       title: row.title,
+      type: row.type,
       totalGrade: row.total_grade,
       duration: row.duration,
       isVisible: row.is_visible,
       showAt: row.show_at,
       hideAt: row.hide_at,
+      expireAt: row.hide_at,
       lockNextLectures: row.lock_next_lectures,
+      questionsCount: row.questions_count,
+      actualQuestionsCount: row.actual_questions_count ?? null,
+      questionDisplayMode: row.question_display_mode || 'ordered',
+      answersReleaseMode: row.answers_release_mode || inferAnswersReleaseMode({
+        showAnswersImmediately: row.show_answers_immediately,
+        showAnswersLater: row.show_answers_later,
+        answersReleaseDate: row.answers_release_date,
+        showAnswersAfterHours: row.show_answers_after_hours,
+      }),
       showAnswersImmediately: row.show_answers_immediately,
       showAnswersAfterHours: row.show_answers_after_hours,
       allowMultipleAttempts: row.allow_multiple_attempts,
@@ -2449,6 +2592,8 @@ export class ExamFlowService {
       timeLimitMinutes: row.time_limit_minutes,
       startWindow: row.start_window,
       endWindow: row.end_window,
+      availabilityStatus: availabilityStatus || null,
+      canStart: availabilityStatus ? availabilityStatus === 'open' : null,
       createdAt: row.created_at,
     };
   }

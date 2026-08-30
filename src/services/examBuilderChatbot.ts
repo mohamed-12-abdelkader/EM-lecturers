@@ -140,6 +140,14 @@ export interface ApproveExamPayload {
   duration_minutes?: number | null;
   total_grade?: number;
   questions_count?: number;
+  question_display_mode?: string;
+  answers_release_mode?: string;
+  show_at?: string | null;
+  hide_at?: string | null;
+  available_from?: string | null;
+  visibility_end_date?: string | null;
+  show_answers_after_hours?: number | null;
+  answers_visible_at?: string | null;
   create_exam?: boolean;
 }
 
@@ -1745,6 +1753,14 @@ export class ExamBuilderChatbotService {
         type: payload.type ?? 'exam',
         duration: payload.duration ?? null,
         totalGrade: payload.total_grade,
+        questionsCount: payload.questions_count ?? questionIds.length,
+        questionDisplayMode: payload.question_display_mode,
+        answersReleaseMode: payload.answers_release_mode,
+        showAt: payload.show_at,
+        hideAt: payload.hide_at,
+        showAnswersAfterHours: payload.show_answers_after_hours ?? undefined,
+        answersReleaseDate: payload.answers_visible_at,
+        isVisible: true,
       });
       const createdExamId = Number(exam.id);
       examId = createdExamId;
@@ -1758,11 +1774,21 @@ export class ExamBuilderChatbotService {
           title: payload.title ?? session.parsed_filters.exam_title ?? 'امتحان من بنك الأسئلة',
           courseId: payload.course_id,
           durationMinutes: Number(durationMinutes),
-          questionsCount: questionIds.length,
+          questionsCount: payload.questions_count ?? questionIds.length,
           isVisibleToStudents: true,
-          visibilityEndDate: null,
-          showAnswersImmediately: true,
-          answersVisibleAt: null,
+          visibilityEndDate: payload.visibility_end_date
+            ? new Date(payload.visibility_end_date)
+            : null,
+          availableFrom: payload.available_from || payload.show_at
+            ? new Date(payload.available_from || payload.show_at || '')
+            : null,
+          showAnswersImmediately: (payload.answers_release_mode || 'immediate') === 'immediate',
+          answersVisibleAt: payload.answers_visible_at
+            ? new Date(payload.answers_visible_at)
+            : null,
+          answersReleaseMode: payload.answers_release_mode,
+          showAnswersAfterHours: payload.show_answers_after_hours,
+          questionDisplayMode: payload.question_display_mode,
           isActive: true,
         },
       );

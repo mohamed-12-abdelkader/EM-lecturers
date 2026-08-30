@@ -129,6 +129,10 @@ export class LectureExamService {
       lockNextLectures?: boolean;
       showAnswersImmediately?: boolean;
       showAnswersAfterHours?: number;
+      questionsCount?: number | null;
+      questionDisplayMode?: string | null;
+      answersReleaseMode?: string | null;
+      answersReleaseDate?: Date | null;
     },
     updatedBy: number,
   ): Promise<LectureExam | null> {
@@ -171,6 +175,22 @@ export class LectureExamService {
     if (updates.showAnswersAfterHours !== undefined) {
       setClause.push(`show_answers_after_hours = $${paramIndex++}`);
       values.push(updates.showAnswersAfterHours);
+    }
+    if (updates.questionsCount !== undefined) {
+      setClause.push(`questions_count = $${paramIndex++}`);
+      values.push(updates.questionsCount);
+    }
+    if (updates.questionDisplayMode !== undefined) {
+      setClause.push(`question_display_mode = $${paramIndex++}`);
+      values.push(updates.questionDisplayMode);
+    }
+    if (updates.answersReleaseMode !== undefined) {
+      setClause.push(`answers_release_mode = $${paramIndex++}`);
+      values.push(updates.answersReleaseMode);
+    }
+    if (updates.answersReleaseDate !== undefined) {
+      setClause.push(`answers_release_date = $${paramIndex++}`);
+      values.push(updates.answersReleaseDate);
     }
 
     if (setClause.length === 0) {
@@ -298,9 +318,13 @@ export class LectureExamService {
        JOIN lectures l ON l.id = e.lecture_id
        JOIN courses c ON c.id = l.course_id
        WHERE e.id = $1 AND ${studentCourseAccessSql('$2')}
+       AND e.is_visible = true
        AND (e.show_at IS NULL OR e.show_at <= $3)
        AND (e.hide_at IS NULL OR e.hide_at >= $3)
-       AND e.is_visible = true`,
+       AND (
+         e.questions_count IS NULL OR e.questions_count <= 0
+         OR (SELECT COUNT(*) FROM exam_questions eq WHERE eq.exam_id = e.id) >= e.questions_count
+       )`,
       [examId, studentId, now],
     );
 
@@ -330,6 +354,10 @@ export class LectureExamService {
        AND e.is_visible = true
        AND (e.show_at IS NULL OR e.show_at <= $3)
        AND (e.hide_at IS NULL OR e.hide_at >= $3)
+       AND (
+         e.questions_count IS NULL OR e.questions_count <= 0
+         OR (SELECT COUNT(*) FROM exam_questions eq WHERE eq.exam_id = e.id) >= e.questions_count
+       )
        AND (
          e.type = 'assignment'
          OR e.lock_next_lectures = true
@@ -405,6 +433,10 @@ export class LectureExamService {
        AND (e.show_at IS NULL OR e.show_at <= $3)
        AND (e.hide_at IS NULL OR e.hide_at >= $3)
        AND (
+         e.questions_count IS NULL OR e.questions_count <= 0
+         OR (SELECT COUNT(*) FROM exam_questions eq WHERE eq.exam_id = e.id) >= e.questions_count
+       )
+       AND (
          e.type = 'assignment'
          OR e.lock_next_lectures = true
        )
@@ -450,6 +482,10 @@ export class LectureExamService {
        AND e.is_visible = true
        AND (e.show_at IS NULL OR e.show_at <= $3)
        AND (e.hide_at IS NULL OR e.hide_at >= $3)
+       AND (
+         e.questions_count IS NULL OR e.questions_count <= 0
+         OR (SELECT COUNT(*) FROM exam_questions eq WHERE eq.exam_id = e.id) >= e.questions_count
+       )
        AND (
          e.type = 'assignment'
          OR e.lock_next_lectures = true
@@ -509,6 +545,10 @@ export class LectureExamService {
        AND (e.show_at IS NULL OR e.show_at <= $3)
        AND (e.hide_at IS NULL OR e.hide_at >= $3)
        AND (
+         e.questions_count IS NULL OR e.questions_count <= 0
+         OR (SELECT COUNT(*) FROM exam_questions eq WHERE eq.exam_id = e.id) >= e.questions_count
+       )
+       AND (
          e.type = 'assignment'
          OR e.lock_next_lectures = true
        )
@@ -533,7 +573,10 @@ export class LectureExamService {
        AND ${studentCourseAccessSql('$2')}
        AND e.is_visible = true
        AND (e.show_at IS NULL OR e.show_at <= $3)
-       AND (e.hide_at IS NULL OR e.hide_at >= $3)`,
+       AND (
+         e.questions_count IS NULL OR e.questions_count <= 0
+         OR (SELECT COUNT(*) FROM exam_questions eq WHERE eq.exam_id = e.id) >= e.questions_count
+       )`,
       [examId, studentId, now],
     );
 

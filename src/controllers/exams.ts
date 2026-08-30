@@ -135,23 +135,56 @@ router.post(
         pickBodyValue(req.body, 'visibilityEndDate', 'visibility_end_date'),
         'visibilityEndDate',
       );
-      if (!isVisibleToStudents && !visibilityEndDate) {
-        throw new HttpError(400, 'visibilityEndDate is required when isVisibleToStudents is false');
-      }
+      const availableFrom = parseTimestampOrNull(
+        pickBodyValue(req.body, 'availableFrom', 'available_from', 'showAt', 'show_at'),
+        'availableFrom',
+      );
 
+      const answersReleaseModeRaw = pickBodyValue(
+        req.body,
+        'answersReleaseMode',
+        'answers_release_mode',
+      );
       const showAnswersInput = parseBooleanInput(
         pickBodyValue(req.body, 'showAnswersImmediately', 'show_answers_immediately'),
       );
-      const showAnswersImmediately = showAnswersInput ?? true;
       const answersVisibleAt = parseTimestampOrNull(
         pickBodyValue(req.body, 'answersVisibleAt', 'answers_visible_at'),
         'answersVisibleAt',
       );
-      if (!showAnswersImmediately && !answersVisibleAt) {
-        throw new HttpError(
-          400,
-          'answersVisibleAt is required when showAnswersImmediately is false',
-        );
+      const showAnswersAfterHoursRaw = pickBodyValue(
+        req.body,
+        'showAnswersAfterHours',
+        'show_answers_after_hours',
+      );
+      const showAnswersAfterHours =
+        showAnswersAfterHoursRaw === undefined || showAnswersAfterHoursRaw === null
+          ? null
+          : Number(showAnswersAfterHoursRaw);
+      const questionDisplayMode = pickBodyValue(
+        req.body,
+        'questionDisplayMode',
+        'question_display_mode',
+      );
+      const showAnswersImmediately =
+        showAnswersInput ??
+        (answersReleaseModeRaw
+          ? String(answersReleaseModeRaw).toLowerCase() === 'immediate'
+          : true);
+
+      if (
+        (answersReleaseModeRaw === 'scheduled' ||
+          (!answersReleaseModeRaw && showAnswersImmediately === false)) &&
+        !answersVisibleAt &&
+        String(answersReleaseModeRaw || '').toLowerCase() !== 'after_end' &&
+        String(answersReleaseModeRaw || '').toLowerCase() !== 'after_hours'
+      ) {
+        if (!answersReleaseModeRaw) {
+          throw new HttpError(
+            400,
+            'answersVisibleAt is required when showAnswersImmediately is false',
+          );
+        }
       }
 
       const isActiveInput = parseBooleanInput(pickBodyValue(req.body, 'isActive', 'is_active'));
@@ -182,8 +215,12 @@ router.post(
         questionsCount,
         isVisibleToStudents,
         visibilityEndDate,
+        availableFrom,
         showAnswersImmediately,
         answersVisibleAt,
+        answersReleaseMode: answersReleaseModeRaw,
+        showAnswersAfterHours,
+        questionDisplayMode,
         isActive,
         attemptLimit,
       });
@@ -234,6 +271,9 @@ router.post(
         allowMultipleAttempts: req.body.allowMultipleAttempts,
         showAnswersLater: req.body.showAnswersLater,
         answersReleaseDate: req.body.answersReleaseDate,
+        answersReleaseMode: pickBodyValue(req.body, 'answersReleaseMode', 'answers_release_mode'),
+        questionsCount: pickBodyValue(req.body, 'questionsCount', 'questions_count'),
+        questionDisplayMode: pickBodyValue(req.body, 'questionDisplayMode', 'question_display_mode'),
         timeLimitEnabled: req.body.timeLimitEnabled,
         timeLimitMinutes: req.body.timeLimitMinutes,
         startWindow: req.body.startWindow,
@@ -624,6 +664,50 @@ router.patch(
         'answersVisibleAt',
       );
       updateData.answersVisibleAt = answersVisibleAt;
+    }
+
+    if (
+      req.body.availableFrom !== undefined ||
+      req.body.available_from !== undefined ||
+      req.body.showAt !== undefined ||
+      req.body.show_at !== undefined
+    ) {
+      updateData.availableFrom = parseTimestampOrNull(
+        pickBodyValue(req.body, 'availableFrom', 'available_from', 'showAt', 'show_at'),
+        'availableFrom',
+      );
+    }
+
+    if (
+      req.body.questionDisplayMode !== undefined ||
+      req.body.question_display_mode !== undefined
+    ) {
+      updateData.questionDisplayMode = pickBodyValue(
+        req.body,
+        'questionDisplayMode',
+        'question_display_mode',
+      );
+    }
+
+    if (
+      req.body.answersReleaseMode !== undefined ||
+      req.body.answers_release_mode !== undefined
+    ) {
+      updateData.answersReleaseMode = pickBodyValue(
+        req.body,
+        'answersReleaseMode',
+        'answers_release_mode',
+      );
+    }
+
+    if (
+      req.body.showAnswersAfterHours !== undefined ||
+      req.body.show_answers_after_hours !== undefined
+    ) {
+      const hours = parseNumberInput(
+        pickBodyValue(req.body, 'showAnswersAfterHours', 'show_answers_after_hours'),
+      );
+      updateData.showAnswersAfterHours = hours ?? 0;
     }
 
     if (req.body.isActive !== undefined || req.body.is_active !== undefined) {

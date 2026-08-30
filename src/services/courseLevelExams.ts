@@ -1,6 +1,21 @@
 import pool from '../db/pool';
 import { HttpError } from '../utils';
 import { CourseAccessControl } from './courseAccessControl';
+import { determineAnswerRelease } from './examPolicies';
+import {
+  attemptQuestionSeed,
+  canStudentStartExam,
+  courseLevelExamAvailabilityInput,
+  flagsFromAnswersReleaseMode,
+  getStudentExamAvailability,
+  inferAnswersReleaseMode,
+  normalizeAnswersReleaseMode,
+  normalizeQuestionDisplayMode,
+  orderItemsByIds,
+  parseSelectedQuestionIds,
+  selectAttemptQuestions,
+  shouldListExamForStudent,
+} from './examAccessPolicy';
 
 interface RequestUser {
   id: number;
@@ -14,8 +29,12 @@ interface CreateCourseLevelExamInput {
   questionsCount: number;
   isVisibleToStudents: boolean;
   visibilityEndDate: Date | null;
+  availableFrom?: Date | null;
   showAnswersImmediately: boolean;
   answersVisibleAt: Date | null;
+  answersReleaseMode?: string | null;
+  showAnswersAfterHours?: number | null;
+  questionDisplayMode?: string | null;
   isActive: boolean;
   attemptLimit?: number | null;
 }
@@ -26,8 +45,12 @@ interface UpdateCourseLevelExamInput {
   questionsCount?: number;
   isVisibleToStudents?: boolean;
   visibilityEndDate?: Date | null;
+  availableFrom?: Date | null;
   showAnswersImmediately?: boolean;
   answersVisibleAt?: Date | null;
+  answersReleaseMode?: string | null;
+  showAnswersAfterHours?: number | null;
+  questionDisplayMode?: string | null;
   isActive?: boolean;
   attemptLimit?: number | null;
 }
@@ -56,6 +79,19 @@ export class CourseLevelExamsService {
       throw new HttpError(400, 'attemptLimit must be greater than 0 if provided');
     }
 
+    const resolvedDisplayMode = normalizeQuestionDisplayMode(input.questionDisplayMode);
+    const resolvedReleaseMode = input.answersReleaseMode
+      ? normalizeAnswersReleaseMode(input.answersReleaseMode)
+      : inferAnswersReleaseMode({
+          showAnswersImmediately: input.showAnswersImmediately,
+          answersVisibleAt: input.answersVisibleAt,
+          showAnswersAfterHours: input.showAnswersAfterHours,
+        });
+    const releaseFlags = flagsFromAnswersReleaseMode(resolvedReleaseMode, {
+      afterHours: input.showAnswersAfterHours,
+      scheduledDate: input.answersVisibleAt,
+    });
+
     const result = await pool.query(
       `INSERT INTO course_level_exams (
         course_id,
@@ -64,12 +100,16 @@ export class CourseLevelExamsService {
         questions_count,
         is_visible_to_students,
         visibility_end_date,
+        available_from,
         show_answers_immediately,
         answers_visible_at,
         is_active,
-        attempt_limit
+        attempt_limit,
+        question_display_mode,
+        answers_release_mode,
+        show_answers_after_hours
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
       RETURNING *`,
       [
         input.courseId,
@@ -78,10 +118,14 @@ export class CourseLevelExamsService {
         input.questionsCount,
         input.isVisibleToStudents,
         input.visibilityEndDate,
-        input.showAnswersImmediately,
-        input.answersVisibleAt,
+        input.availableFrom ?? null,
+        releaseFlags.showAnswersImmediately,
+        resolvedReleaseMode === 'scheduled' ? input.answersVisibleAt : null,
         input.isActive,
         input.attemptLimit ?? null,
+        resolvedDisplayMode,
+        resolvedReleaseMode,
+        releaseFlags.showAnswersAfterHours,
       ],
     );
 
@@ -104,13 +148,20 @@ export class CourseLevelExamsService {
     }
 
     const result = await pool.query(
-      `SELECT * FROM course_level_exams 
-       WHERE course_id = $1 
-       ORDER BY created_at DESC`,
+      `SELECT e.*,
+              (SELECT COUNT(*)::int FROM course_level_exam_questions q WHERE q.exam_id = e.id) AS actual_questions_count
+       FROM course_level_exams e
+       WHERE e.course_id = $1
+       ORDER BY e.created_at DESC`,
       [courseId],
     );
 
-    return result.rows;
+    return result.rows.map((row) => ({
+      ...row,
+      configuredQuestionsCount: row.questions_count,
+      actualQuestionsCount: row.actual_questions_count,
+      availability_status: getStudentExamAvailability(courseLevelExamAvailabilityInput(row)),
+    }));
   }
 
   static async getExamsByTeacher(
@@ -154,8 +205,13 @@ export class CourseLevelExamsService {
       courseTitle: row.course_title,
       courseName: row.course_title,
       durationMinutes: row.duration_minutes,
-      questionsCount: row.actual_questions_count ?? row.questions_count,
+      questionsCount: row.questions_count,
       configuredQuestionsCount: row.questions_count,
+      actualQuestionsCount: row.actual_questions_count,
+      questionDisplayMode: row.question_display_mode || 'ordered',
+      answersReleaseMode: row.answers_release_mode,
+      availableFrom: row.available_from,
+      showAnswersAfterHours: row.show_answers_after_hours,
       isVisibleToStudents: row.is_visible_to_students,
       visibilityEndDate: row.visibility_end_date,
       showAnswersImmediately: row.show_answers_immediately,
@@ -218,12 +274,6 @@ export class CourseLevelExamsService {
       input.isVisibleToStudents !== undefined
         ? input.isVisibleToStudents
         : exam.is_visible_to_students;
-    const visibilityEndDate =
-      input.visibilityEndDate !== undefined ? input.visibilityEndDate : exam.visibility_end_date;
-
-    if (!isVisibleToStudents && !visibilityEndDate) {
-      throw new HttpError(400, 'visibilityEndDate is required when isVisibleToStudents is false');
-    }
 
     const showAnswersImmediately =
       input.showAnswersImmediately !== undefined
@@ -231,9 +281,17 @@ export class CourseLevelExamsService {
         : exam.show_answers_immediately;
     const answersVisibleAt =
       input.answersVisibleAt !== undefined ? input.answersVisibleAt : exam.answers_visible_at;
+    const answersReleaseMode = normalizeAnswersReleaseMode(
+      input.answersReleaseMode ?? exam.answers_release_mode,
+      inferAnswersReleaseMode({
+        showAnswersImmediately,
+        answersVisibleAt,
+        showAnswersAfterHours: input.showAnswersAfterHours ?? exam.show_answers_after_hours,
+      }),
+    );
 
-    if (!showAnswersImmediately && !answersVisibleAt) {
-      throw new HttpError(400, 'answersVisibleAt is required when showAnswersImmediately is false');
+    if (answersReleaseMode === 'scheduled' && !answersVisibleAt) {
+      throw new HttpError(400, 'answersVisibleAt is required when answers are scheduled');
     }
 
     // Validate positive numbers if provided
@@ -276,6 +334,10 @@ export class CourseLevelExamsService {
       updates.push(`visibility_end_date = $${paramIndex++}`);
       values.push(input.visibilityEndDate);
     }
+    if (input.availableFrom !== undefined) {
+      updates.push(`available_from = $${paramIndex++}`);
+      values.push(input.availableFrom);
+    }
     if (input.showAnswersImmediately !== undefined) {
       updates.push(`show_answers_immediately = $${paramIndex++}`);
       values.push(input.showAnswersImmediately);
@@ -283,6 +345,18 @@ export class CourseLevelExamsService {
     if (input.answersVisibleAt !== undefined) {
       updates.push(`answers_visible_at = $${paramIndex++}`);
       values.push(input.answersVisibleAt);
+    }
+    if (input.answersReleaseMode !== undefined) {
+      updates.push(`answers_release_mode = $${paramIndex++}`);
+      values.push(normalizeAnswersReleaseMode(input.answersReleaseMode));
+    }
+    if (input.showAnswersAfterHours !== undefined) {
+      updates.push(`show_answers_after_hours = $${paramIndex++}`);
+      values.push(input.showAnswersAfterHours ?? 0);
+    }
+    if (input.questionDisplayMode !== undefined) {
+      updates.push(`question_display_mode = $${paramIndex++}`);
+      values.push(normalizeQuestionDisplayMode(input.questionDisplayMode));
     }
     if (input.isActive !== undefined) {
       updates.push(`is_active = $${paramIndex++}`);
@@ -353,20 +427,24 @@ export class CourseLevelExamsService {
     // Get visible exams
     const now = new Date();
     const result = await pool.query(
-      `SELECT e.*, c.title as course_title
+      `SELECT e.*, c.title as course_title,
+              (SELECT COUNT(*)::int FROM course_level_exam_questions q WHERE q.exam_id = e.id) AS actual_questions_count
        FROM course_level_exams e
        JOIN courses c ON e.course_id = c.id
        WHERE e.course_id = $1
          AND e.is_active = TRUE
          AND e.is_visible_to_students = TRUE
-         AND (e.visibility_end_date IS NULL OR e.visibility_end_date > $2)
        ORDER BY e.created_at DESC`,
-      [courseId, now],
+      [courseId],
+    );
+
+    const listed = result.rows.filter((exam) =>
+      shouldListExamForStudent(courseLevelExamAvailabilityInput(exam), now),
     );
 
     // Get attempt counts for each exam
     const examsWithAttempts = await Promise.all(
-      result.rows.map(async (exam) => {
+      listed.map(async (exam) => {
         const attemptsRes = await pool.query(
           `SELECT COUNT(*) as attempts_count, 
                   MAX(attempt_number) as last_attempt_number
@@ -379,11 +457,20 @@ export class CourseLevelExamsService {
         const lastAttemptNumber = attemptsRes.rows[0]?.last_attempt_number || 0;
         const canAttempt = exam.attempt_limit === null || attemptsCount < exam.attempt_limit;
 
+        const availability_status = getStudentExamAvailability(
+          courseLevelExamAvailabilityInput(exam),
+          now,
+        );
+        const canStart = canStudentStartExam(courseLevelExamAvailabilityInput(exam), now);
+
         return {
           ...exam,
+          configuredQuestionsCount: exam.questions_count,
+          actualQuestionsCount: exam.actual_questions_count,
+          availability_status,
           attempts_count: Number(attemptsCount),
           last_attempt_number: Number(lastAttemptNumber),
-          can_attempt: canAttempt,
+          can_attempt: canAttempt && canStart,
           attempts_remaining:
             exam.attempt_limit === null
               ? null
@@ -433,13 +520,37 @@ export class CourseLevelExamsService {
       throw new HttpError(403, 'This exam is not visible to students');
     }
 
-    // Check visibility end date
-    if (exam.visibility_end_date) {
-      const now = new Date();
-      const endDate = new Date(exam.visibility_end_date);
-      if (now > endDate) {
-        throw new HttpError(403, 'This exam is no longer available');
+    const actualCountRes = await pool.query(
+      `SELECT COUNT(*)::int AS count FROM course_level_exam_questions WHERE exam_id = $1`,
+      [examId],
+    );
+    exam.actual_questions_count = actualCountRes.rows[0]?.count || 0;
+
+    const activeAttemptRes = await pool.query(
+      `SELECT * FROM course_level_exam_attempts
+       WHERE exam_id = $1 AND student_id = $2 AND status = 'in_progress'
+       ORDER BY started_at DESC
+       LIMIT 1`,
+      [examId, studentId],
+    );
+    const hasInProgressAttempt = !!(activeAttemptRes.rowCount && activeAttemptRes.rowCount > 0);
+
+    if (
+      !canStudentStartExam(courseLevelExamAvailabilityInput(exam), new Date(), {
+        hasInProgressAttempt,
+      })
+    ) {
+      const status = getStudentExamAvailability(courseLevelExamAvailabilityInput(exam));
+      if (status === 'expired') {
+        throw new HttpError(403, 'This exam has ended. You can view it but cannot start a new attempt.');
       }
+      if (status === 'upcoming') {
+        throw new HttpError(403, 'This exam is not open yet');
+      }
+      if (status === 'incomplete') {
+        throw new HttpError(403, 'This exam is not ready yet');
+      }
+      throw new HttpError(403, 'This exam is no longer available');
     }
 
     // Check attempt limit and get previous attempts
@@ -536,63 +647,50 @@ export class CourseLevelExamsService {
       throw new HttpError(403, 'You have used all allowed attempts for this exam');
     }
 
-    // Check if there's an active attempt
-    const activeAttemptRes = await pool.query(
-      `SELECT * FROM course_level_exam_attempts
-       WHERE exam_id = $1 AND student_id = $2 AND status = 'in_progress'
-       ORDER BY started_at DESC
-       LIMIT 1`,
-      [examId, studentId],
-    );
-
-    if (activeAttemptRes.rowCount && activeAttemptRes.rowCount > 0) {
-      // Return existing active attempt
+    if (hasInProgressAttempt) {
       const attempt = activeAttemptRes.rows[0];
-      const questionsRes = await pool.query(
-        `SELECT * FROM course_level_exam_questions
-         WHERE exam_id = $1
-         ORDER BY created_at ASC`,
-        [examId],
+      const questions = await CourseLevelExamsService.loadSlicedCourseQuestions(
+        exam,
+        attempt,
+        studentId,
       );
-
       return {
         attemptId: attempt.id,
         examId: exam.id,
         examTitle: exam.title,
         durationMinutes: exam.duration_minutes,
-        questionsCount: exam.questions_count,
+        questionsCount: questions.length,
         startedAt: attempt.started_at,
-        questions: questionsRes.rows.map((q) => ({
-          id: q.id,
-          type: q.type,
-          questionText: q.question_text,
-          questionImage: q.question_image,
-          optionA: q.option_a,
-          optionB: q.option_b,
-          optionC: q.option_c,
-          optionD: q.option_d,
-        })),
+        questions,
       };
     }
 
     // Create new attempt
     const nextAttemptNumber = Number(attemptsRes.rows[0]?.last_attempt_number || 0) + 1;
+    const allQuestionsRes = await pool.query(
+      `SELECT * FROM course_level_exam_questions
+       WHERE exam_id = $1
+       ORDER BY created_at ASC, id ASC`,
+      [examId],
+    );
+    const selectedQuestionIds = selectAttemptQuestions(
+      allQuestionsRes.rows.map((q) => q.id),
+      exam.questions_count,
+      exam.question_display_mode,
+      attemptQuestionSeed(exam.id, studentId, nextAttemptNumber),
+    );
+
     const attemptResult = await pool.query(
       `INSERT INTO course_level_exam_attempts (
-        exam_id, student_id, attempt_number, status, started_at
-      ) VALUES ($1, $2, $3, 'in_progress', NOW())
+        exam_id, student_id, attempt_number, status, started_at, selected_question_ids
+      ) VALUES ($1, $2, $3, 'in_progress', NOW(), $4)
       RETURNING *`,
-      [examId, studentId, nextAttemptNumber],
+      [examId, studentId, nextAttemptNumber, selectedQuestionIds],
     );
 
     const attempt = attemptResult.rows[0];
-
-    // Get questions (without correct answers)
-    const questionsRes = await pool.query(
-      `SELECT * FROM course_level_exam_questions
-       WHERE exam_id = $1
-       ORDER BY created_at ASC`,
-      [examId],
+    const questions = orderItemsByIds(allQuestionsRes.rows, selectedQuestionIds).map((q) =>
+      CourseLevelExamsService.mapCourseQuestionForStudent(q),
     );
 
     return {
@@ -600,19 +698,65 @@ export class CourseLevelExamsService {
       examId: exam.id,
       examTitle: exam.title,
       durationMinutes: exam.duration_minutes,
-      questionsCount: exam.questions_count,
+      questionsCount: questions.length,
       startedAt: attempt.started_at,
-      questions: questionsRes.rows.map((q) => ({
-        id: q.id,
-        type: q.type,
-        questionText: q.question_text,
-        questionImage: q.question_image,
-        optionA: q.option_a,
-        optionB: q.option_b,
-        optionC: q.option_c,
-        optionD: q.option_d,
-      })),
+      questions,
     };
+  }
+
+  private static mapCourseQuestionForStudent(q: any) {
+    return {
+      id: q.id,
+      type: q.type,
+      questionText: q.question_text,
+      questionImage: q.question_image,
+      optionA: q.option_a,
+      optionB: q.option_b,
+      optionC: q.option_c,
+      optionD: q.option_d,
+    };
+  }
+
+  private static async loadSlicedCourseQuestions(exam: any, attempt: any, studentId: number) {
+    const questionsRes = await pool.query(
+      `SELECT * FROM course_level_exam_questions
+       WHERE exam_id = $1
+       ORDER BY created_at ASC, id ASC`,
+      [exam.id],
+    );
+    const stored = parseSelectedQuestionIds(attempt?.selected_question_ids);
+    const selectedIds =
+      stored && stored.length
+        ? stored
+        : selectAttemptQuestions(
+            questionsRes.rows.map((q) => q.id),
+            exam.questions_count,
+            exam.question_display_mode,
+            attemptQuestionSeed(Number(exam.id), studentId, Number(attempt?.attempt_number || 1)),
+          );
+    return orderItemsByIds(questionsRes.rows, selectedIds).map((q) =>
+      this.mapCourseQuestionForStudent(q),
+    );
+  }
+
+  private static courseAnswerRelease(exam: any, attempt: any, now: Date) {
+    return determineAnswerRelease(
+      {
+        answersReleaseMode: exam.answers_release_mode,
+        showAnswersImmediately: !!exam.show_answers_immediately,
+        answersVisibleAt: exam.answers_visible_at,
+        answersReleaseDate: exam.answers_visible_at,
+        showAnswersAfterHours: exam.show_answers_after_hours ?? 0,
+        examExpireAt: exam.visibility_end_date,
+      },
+      attempt
+        ? {
+            status: attempt.status,
+            submittedAt: attempt.submitted_at,
+          }
+        : null,
+      now,
+    );
   }
 
   /**
@@ -656,14 +800,23 @@ export class CourseLevelExamsService {
     }
 
     // Get all questions with correct answers
-    const questionsRes = await pool.query(
+    const allQuestionsRes = await pool.query(
       `SELECT * FROM course_level_exam_questions
        WHERE exam_id = $1
-       ORDER BY created_at ASC`,
+       ORDER BY created_at ASC, id ASC`,
       [examId],
     );
-
-    const questions = questionsRes.rows;
+    const storedIds = parseSelectedQuestionIds(attempt.selected_question_ids);
+    const selectedIds =
+      storedIds && storedIds.length
+        ? storedIds
+        : selectAttemptQuestions(
+            allQuestionsRes.rows.map((q) => q.id),
+            exam.questions_count,
+            exam.question_display_mode,
+            attemptQuestionSeed(examId, studentId, Number(attempt.attempt_number || 1)),
+          );
+    const questions = orderItemsByIds(allQuestionsRes.rows, selectedIds);
     let totalGrade = 0;
     let correctCount = 0;
 
@@ -717,21 +870,9 @@ export class CourseLevelExamsService {
 
     // Check if answers should be shown
     const now = new Date();
-    let showAnswers = false;
-    let releaseReason = '';
-
-    if (exam.show_answers_immediately) {
-      showAnswers = true;
-      releaseReason = 'immediate';
-    } else if (exam.answers_visible_at) {
-      const answersVisibleAt = new Date(exam.answers_visible_at);
-      if (now >= answersVisibleAt) {
-        showAnswers = true;
-        releaseReason = 'scheduled';
-      } else {
-        releaseReason = 'scheduled_pending';
-      }
-    }
+    const releaseDecision = this.courseAnswerRelease(exam, { ...attempt, submitted_at: now }, now);
+    const showAnswers = releaseDecision.release;
+    const releaseReason = releaseDecision.release ? releaseDecision.reason : '';
 
     // Get wrong questions if answers should be shown
     let wrongQuestions: any[] = [];
@@ -1688,19 +1829,7 @@ export class CourseLevelExamsService {
       );
       const actualCount = parseInt(countRes.rows[0]?.count || '0', 10);
 
-      try {
-        await pool.query(`UPDATE course_level_exams SET questions_count = $1 WHERE id = $2`, [
-          actualCount,
-          examId,
-        ]);
-      } catch (updateError: any) {
-        console.error(
-          `[addQuestionsFromBank] Error updating questions_count:`,
-          updateError.message,
-        );
-      }
-
-      console.log(`[addQuestionsFromBank] Finished. Total questions added: ${addedCount}`);
+      console.log(`[addQuestionsFromBank] Finished. Total questions added: ${addedCount}. Bank size: ${actualCount}`);
       return { addedCount, addedQuestions };
     } catch (error: any) {
       // If it's already an HttpError, re-throw it
