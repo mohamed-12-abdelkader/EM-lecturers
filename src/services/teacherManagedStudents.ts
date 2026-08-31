@@ -3,6 +3,7 @@ import type { PoolClient } from 'pg';
 import pool from '../db/pool';
 import { HttpError } from '../utils';
 import { enforceStudentLimit } from './teacherPlanPolicy';
+import { snapshotPlatformStudentBeforeDelete } from '../modules/teacherTrash';
 
 export type RegistrationMode = 'self_registration' | 'teacher_registration';
 
@@ -714,7 +715,7 @@ export class TeacherManagedStudentsService {
   }
 
   static async deleteStudent(teacherId: number, tenantId: number, studentId: number) {
-    await this.getStudentById(teacherId, tenantId, studentId);
+    const student = await this.getStudentById(teacherId, tenantId, studentId);
 
     const client = await pool.connect();
     try {
@@ -730,6 +731,14 @@ export class TeacherManagedStudentsService {
         throw new HttpError(409, 'تعذر حذف الطالب — قد يكون مرتبطاً ببيانات أخرى');
       }
       await client.query('COMMIT');
+
+      await snapshotPlatformStudentBeforeDelete(
+        student as Record<string, unknown> & { id: number; name?: string; email?: string },
+        teacherId,
+        tenantId,
+        teacherId,
+      );
+
       return { deleted: true, student_id: studentId };
     } catch (e: unknown) {
       await client.query('ROLLBACK');

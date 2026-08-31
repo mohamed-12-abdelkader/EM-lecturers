@@ -69,6 +69,14 @@ Authorization: Bearer <token>
   - إذا كان `null` أو غير موجود: محاولات غير محدودة
   - إذا كان رقم: الحد الأقصى لعدد المحاولات (يجب أن يكون > 0)
 
+#### عرض الأسئلة للطالب:
+- `questionsCount` أو `questions_count` (number): **عدد الأسئلة المعروضة** من بنك الأسئلة (مثال: أضفت 40 سؤالاً وحددت 20 → يُعرض 20 فقط)
+- `questionDisplayMode` أو `question_display_mode` (string):
+  - `ordered` (افتراضي): أول N أسئلة حسب ترتيب الإضافة
+  - `random`: N أسئلة عشوائية **مختلفة لكل طالب** (ثابتة داخل نفس المحاولة)
+
+> عند `random` أو عندما يكون بنك الأسئلة أكبر من `questionsCount`، يجب على الطالب **بدء المحاولة** أولاً (`POST /api/exams/:examId/start`) قبل عرض الأسئلة.
+
 **مثال على الطلب:**
 ```json
 {
@@ -80,7 +88,8 @@ Authorization: Bearer <token>
   "showAnswersImmediately": false,
   "answersVisibleAt": "2025-01-15T10:00:00Z",
   "isActive": true,
-  "attemptLimit": 3
+  "attemptLimit": 3,
+  "questionDisplayMode": "random"
 }
 ```
 

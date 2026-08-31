@@ -7,7 +7,7 @@ import { authMiddleware } from '../middleware/authentication';
 import { asyncWrapper, HttpError } from '../utils';
 import { parseNumberInput } from '../utils/requestParsers';
 import { courseFilesConfig, resolveCoursePdfLocalPath } from '../config/courseFiles';
-import { CourseFilesService, type RequestUser } from '../services/courseFiles';
+import { CourseFilesService, type CourseFileRow, type RequestUser } from '../services/courseFiles';
 import { FileStorageService } from '../modules/myFiles/services/fileStorage.service';
 import { COURSE_CONTENT_ROLES } from '../services/courseAccessControl';
 import { NotificationService } from '../services/notifications';
@@ -315,6 +315,32 @@ function isInAppPdfClient(req: Request): boolean {
   );
 }
 
+/** رابط مباشر للجلب من المتصفح (Cloudinary /uploads / legacy) — يتجنب بروكسي Vite للملفات الكبيرة */
+async function resolveCourseFileDirectViewUrl(file: CourseFileRow, ttl: number): Promise<string | null> {
+  const storageOptions = {
+    provider: file.storage_provider === 'legacy' ? undefined : file.storage_provider,
+    deliveryType: file.delivery_type,
+    ttlSeconds: ttl,
+  };
+
+  if (file.file_key) {
+    const signed = await FileStorageService.getSignedViewUrl(
+      file.file_key,
+      file.file_url,
+      storageOptions,
+    );
+    if (signed) return signed;
+  }
+
+  const direct = await FileStorageService.getDirectAccessUrl(file.file_key || '', file.file_url);
+  if (direct) return direct;
+
+  if (/^https?:\/\//i.test(file.file_url)) return file.file_url;
+  if (file.file_url.startsWith('/uploads/')) return file.file_url;
+
+  return null;
+}
+
 async function viewCourseFile(req: Request, res: Response) {
   const fileId = parseId(req.params.fileId, 'معرف الملف');
   const file = await CourseFilesService.getAccessibleFile(requestUser(req), fileId);
@@ -324,13 +350,7 @@ async function viewCourseFile(req: Request, res: Response) {
   const inlineName = sanitizeContentDisposition(file.title || file.original_name || `file-${file.id}.pdf`);
 
   if (wantsJsonView(req) && !wantsRedirect(req)) {
-    const signedUrl = file.file_key
-      ? await FileStorageService.getSignedViewUrl(file.file_key, file.file_url, {
-          provider: file.storage_provider,
-          deliveryType: file.delivery_type,
-          ttlSeconds: ttl,
-        })
-      : null;
+    const signedUrl = await resolveCourseFileDirectViewUrl(file, ttl);
 
     return res.json({
       success: true,

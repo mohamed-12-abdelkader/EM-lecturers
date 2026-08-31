@@ -43,6 +43,11 @@ import {
   adminEmployeeWorkRouter,
   employeePortalRouter,
 } from './modules/employeeWork';
+import {
+  adminTaskManagementRouter,
+  employeeMyTasksRouter,
+} from './modules/taskManagement';
+import { teacherTrashRouter } from './modules/teacherTrash';
 import { router as studentGradesRouter } from './controllers/studentGrades';
 import { router as meetingRouter } from './controllers/meeting';
 import { router as competitionsRouter } from './controllers/competitions';
@@ -116,6 +121,7 @@ router.use('/user', userRouter);
 router.use('/teacher/device-restriction-settings', teacherDeviceRestrictionRouter);
 router.use('/teacher/video-playback-settings', teacherVideoPlaybackRouter);
 router.use('/teacher/students', teacherStudentsRouter);
+router.use('/teacher/trash', teacherTrashRouter);
 router.use('/teacher', teacherRouter);
 router.use('/student', studentRouter);
 router.use('/utils', utilsRouter);
@@ -175,7 +181,9 @@ router.use('/accounting', accountingRouter);
 router.use('/teacher/subscription', teacherSubscriptionRouter);
 router.use('/finance', financeRouter);
 router.use('/employee', employeePortalRouter);
+router.use('/employee/my-tasks', employeeMyTasksRouter);
 router.use('/admin/employees', adminEmployeeWorkRouter);
+router.use('/admin/task-management', adminTaskManagementRouter);
 router.use('/employees', employeesRouter);
 router.use('/admin/employees', employeesRouter);
 router.use('/tasks', tasksRouter);

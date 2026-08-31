@@ -5,6 +5,7 @@ import { CourseAccessService } from './courseAccess';
 import { CourseAccessControl } from './courseAccessControl';
 import { LectureAccessService } from './lectureAccess';
 import { CourseGroupAccessService } from './courseGroupAccess';
+import { snapshotLectureBeforeDelete } from '../modules/teacherTrash';
 
 export interface LectureData {
   course_id: number;
@@ -230,6 +231,12 @@ export class CourseContentService {
     if (!course || !(await this.userCanManageCourse(teacherId, lecture.course_id))) {
       throw new Error('لا يمكنك حذف محاضرة لكورس مدرس آخر');
     }
+
+    await snapshotLectureBeforeDelete(
+      { ...lecture, table_name: lecture.table_name },
+      teacherId,
+      teacherId,
+    );
 
     // بدء transaction لحذف البيانات المرتبطة
     const client = await pool.connect();

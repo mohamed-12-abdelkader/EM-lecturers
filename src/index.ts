@@ -733,6 +733,18 @@ const startServer = async () => {
       }
     }, 60 * 60 * 1000);
 
+    // مهام متكررة (Template → Assignment → Instance)
+    setInterval(async () => {
+      try {
+        const { TaskInstanceScheduler } = await import(
+          './modules/taskManagement/services/scheduler.service.js'
+        );
+        await TaskInstanceScheduler.runDailyMaintenance();
+      } catch (err) {
+        logger.error('Recurring task management job error:', err);
+      }
+    }, 60 * 60 * 1000);
+
     // اشتراكات المدرسين: انتهاء الباقة → فترة سماح → إيقاف المنصة
     setInterval(async () => {
       try {

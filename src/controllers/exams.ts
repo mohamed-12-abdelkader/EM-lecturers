@@ -19,6 +19,7 @@ import path from 'path';
 import fs from 'fs';
 import pool from '../db/pool';
 import { TeacherLibraryExamQuestionsService } from '../services/teacherLibraryExamQuestions';
+import { normalizeQuestionDisplayMode } from '../services/examQuestionSelection';
 
 export const router = Router();
 
@@ -220,9 +221,9 @@ router.post(
         answersVisibleAt,
         answersReleaseMode: answersReleaseModeRaw,
         showAnswersAfterHours,
-        questionDisplayMode,
         isActive,
         attemptLimit,
+        questionDisplayMode: normalizeQuestionDisplayMode(questionDisplayMode),
       });
 
       // إرسال إشعار مباشر للطلاب المشتركين في الكورس
@@ -272,12 +273,22 @@ router.post(
         showAnswersLater: req.body.showAnswersLater,
         answersReleaseDate: req.body.answersReleaseDate,
         answersReleaseMode: pickBodyValue(req.body, 'answersReleaseMode', 'answers_release_mode'),
-        questionsCount: pickBodyValue(req.body, 'questionsCount', 'questions_count'),
-        questionDisplayMode: pickBodyValue(req.body, 'questionDisplayMode', 'question_display_mode'),
         timeLimitEnabled: req.body.timeLimitEnabled,
         timeLimitMinutes: req.body.timeLimitMinutes,
         startWindow: req.body.startWindow,
         endWindow: req.body.endWindow,
+        questionsCount: (() => {
+          const raw = pickBodyValue(req.body, 'questionsCount', 'questions_count');
+          if (raw === undefined || raw === null || raw === '') return null;
+          const parsed = Number(raw);
+          if (!Number.isInteger(parsed) || parsed <= 0) {
+            throw new HttpError(400, 'questionsCount must be a positive integer');
+          }
+          return parsed;
+        })(),
+        questionDisplayMode: normalizeQuestionDisplayMode(
+          pickBodyValue(req.body, 'questionDisplayMode', 'question_display_mode'),
+        ),
       });
 
       // إرسال إشعار مباشر للطلاب المشتركين في الكورس
@@ -622,6 +633,15 @@ router.patch(
         'questionsCount',
       );
       updateData.questionsCount = questionsCount;
+    }
+
+    if (
+      req.body.questionDisplayMode !== undefined ||
+      req.body.question_display_mode !== undefined
+    ) {
+      updateData.questionDisplayMode = normalizeQuestionDisplayMode(
+        pickBodyValue(req.body, 'questionDisplayMode', 'question_display_mode'),
+      );
     }
 
     if (
