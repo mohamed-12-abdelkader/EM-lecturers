@@ -1,14 +1,19 @@
 /** إعدادات Mistral — تُقرأ عند الاستخدام (بعد تحميل dotenv) */
+export const DEFAULT_MISTRAL_CHAT_MODEL = 'mistral-medium-latest';
+
 export function getMistralConfig() {
   return {
     apiKey: (process.env.MISTRAL_API_KEY ?? '').trim(),
     ocrModel: process.env.MISTRAL_OCR_MODEL?.trim() || 'mistral-ocr-latest',
-    chatModel: process.env.MISTRAL_CHAT_MODEL?.trim() || 'mistral-large-latest',
+    chatModel: process.env.MISTRAL_CHAT_MODEL?.trim() || DEFAULT_MISTRAL_CHAT_MODEL,
     /**
      * نموذج الرؤية عند إرفاق صور الصفحات مع الاستخراج.
-     * فارغ = نفس chatModel. يُفضَّل pixtral-large-latest لتخطيط الصفحة والكلمات المسطّر تحتها.
+     * Medium 3.5 متعدد الوسائط ويُتاح على خطط لا تشمل Large / Pixtral.
      */
-    visionChatModel: process.env.MISTRAL_VISION_CHAT_MODEL?.trim() || 'pixtral-large-latest',
+    visionChatModel:
+      process.env.MISTRAL_VISION_CHAT_MODEL?.trim() ||
+      process.env.MISTRAL_CHAT_MODEL?.trim() ||
+      DEFAULT_MISTRAL_CHAT_MODEL,
     apiBaseUrl: process.env.MISTRAL_API_BASE_URL?.trim() || 'https://api.mistral.ai/v1',
     /**
      * Max upload size for OCR / extract-questions (bytes).

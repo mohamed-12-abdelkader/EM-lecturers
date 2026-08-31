@@ -178,7 +178,8 @@ export const config = cleanEnv(process.env, {
   // Mistral OCR / question extraction
   MISTRAL_API_KEY: str({ default: '' }),
   MISTRAL_OCR_MODEL: str({ default: 'mistral-ocr-latest' }),
-  MISTRAL_CHAT_MODEL: str({ default: 'mistral-large-latest' }),
+  MISTRAL_CHAT_MODEL: str({ default: 'mistral-medium-latest' }),
+  MISTRAL_VISION_CHAT_MODEL: str({ default: 'mistral-medium-latest' }),
   MISTRAL_API_BASE_URL: str({ default: 'https://api.mistral.ai/v1' }),
   /** Max OCR upload size in MB. 0 = unlimited. Default 512. */
   MISTRAL_OCR_MAX_FILE_SIZE_MB: num({ default: 512 }),

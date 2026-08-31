@@ -10,15 +10,15 @@ export type ExtractionModelOption = {
 
 const CHAT_MODELS: Omit<ExtractionModelOption, 'is_default'>[] = [
   {
-    id: 'mistral-large-latest',
-    label: 'Mistral Large',
-    description: 'أعلى دقة — مناسب للامتحانات المعقدة والقطع الطويلة',
+    id: 'mistral-medium-latest',
+    label: 'Mistral Medium',
+    description: 'الافتراضي — دقة عالية مع صور الصفحات، متاح على معظم الاشتراكات',
     type: 'chat',
   },
   {
-    id: 'mistral-medium-latest',
-    label: 'Mistral Medium',
-    description: 'توازن بين السرعة والدقة',
+    id: 'mistral-large-latest',
+    label: 'Mistral Large',
+    description: 'أعلى دقة — يتطلب اشتراك أعلى وقد يُرفض (403) على بعض الحسابات',
     type: 'chat',
   },
   {

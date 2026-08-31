@@ -1,4 +1,4 @@
-import { assertMistralConfigured, getMistralConfig } from '../config/mistral';
+import { assertMistralConfigured, DEFAULT_MISTRAL_CHAT_MODEL, getMistralConfig } from '../config/mistral';
 import { buildQuestionExtractionPrompt, resolveExtractionMode } from '../prompts/mistralQuestionExtraction.prompt';
 import {
   MistralQuestionExtractionSchema,
@@ -1036,6 +1036,11 @@ async function parseQuestionsWithChat(
 
   let response = await runChat(chatModel, userContent);
   let usedModel = chatModel;
+  const textOnlyPrompt = buildQuestionExtractionPrompt(documentText, filename, {
+    inferCorrectAnswer,
+    hasPageImages: false,
+    subject,
+  });
 
   if (!response.ok && hasPageImages && response.status >= 400 && response.status < 500) {
     const errBody = await response.text();
@@ -1044,14 +1049,17 @@ async function parseQuestionsWithChat(
       'vision question extraction failed — retrying text-only OCR',
     );
     usedModel = chatModelOverride?.trim() || defaultChatModel;
-    response = await runChat(
-      usedModel,
-      buildQuestionExtractionPrompt(documentText, filename, {
-        inferCorrectAnswer,
-        hasPageImages: false,
-        subject,
-      }),
+    response = await runChat(usedModel, textOnlyPrompt);
+  }
+
+  if (!response.ok && response.status === 403 && usedModel !== DEFAULT_MISTRAL_CHAT_MODEL) {
+    const errBody = await response.text();
+    logger.warn(
+      { status: response.status, model: usedModel, body: errBody.slice(0, 300) },
+      'chat model not allowed on this Mistral tier — retrying with medium',
     );
+    usedModel = DEFAULT_MISTRAL_CHAT_MODEL;
+    response = await runChat(usedModel, hasPageImages ? userContent : textOnlyPrompt);
   }
 
   if (!response.ok) {
