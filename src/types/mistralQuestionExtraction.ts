@@ -111,7 +111,13 @@ export const MistralQuestionExtractionSchema = z.object({
   content_type: z.enum(['reading_passage', 'general']).optional(),
   passages: z.array(MistralExtractedPassageSchema).optional().default([]),
   questions: z.array(MistralExtractedQuestionSchema),
-  notes: z.string().optional(),
+  notes: z
+    .string()
+    .nullish()
+    .transform((value) => {
+      const trimmed = value?.trim();
+      return trimmed ? trimmed : undefined;
+    }),
 });
 
 /** Full payload returned by POST /api/ocr/extract-questions (data object). */

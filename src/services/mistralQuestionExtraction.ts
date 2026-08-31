@@ -903,6 +903,7 @@ function normalizeExtractionPayload(raw: unknown): unknown {
           : 'general'),
       passages: Array.isArray(data.passages) ? data.passages : [],
       questions,
+      notes: typeof data.notes === 'string' ? data.notes : undefined,
     };
   }
 
