@@ -561,19 +561,19 @@ router.get(
       return res.status(400).json({ message: 'Invalid exam id' });
     }
 
+    const passRaw =
+      req.query.passPercentage ?? req.query.pass_percentage ?? req.query.passPercent;
+    const passParsed =
+      passRaw !== undefined && passRaw !== null && String(passRaw).trim() !== ''
+        ? Number(passRaw)
+        : undefined;
+    const passPercentage =
+      passParsed !== undefined && Number.isFinite(passParsed) && passParsed >= 0 && passParsed <= 100
+        ? passParsed
+        : undefined;
+
     // Try course-level exam first
     try {
-      const passRaw =
-        req.query.passPercentage ?? req.query.pass_percentage ?? req.query.passPercent;
-      const passParsed =
-        passRaw !== undefined && passRaw !== null && String(passRaw).trim() !== ''
-          ? Number(passRaw)
-          : undefined;
-      const passPercentage =
-        passParsed !== undefined && Number.isFinite(passParsed) && passParsed >= 0 && passParsed <= 100
-          ? passParsed
-          : undefined;
-
       const result = await CourseLevelExamsService.getExamReport(examId, req.user!, {
         passPercentage,
       });
