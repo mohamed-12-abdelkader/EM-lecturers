@@ -69,7 +69,7 @@ describe('getStudentExamAvailability', () => {
     ).toBe('open');
   });
 
-  it('allows resuming an in-progress attempt after expire', () => {
+  it('allows the helper to resume an in-progress attempt after the window (lecture exams)', () => {
     const input = {
       isVisible: true,
       expireAt: '2026-08-30T10:00:00Z',
@@ -77,6 +77,7 @@ describe('getStudentExamAvailability', () => {
       actualQuestionsCount: 2,
     };
     expect(canStudentStartExam(input, now, { hasInProgressAttempt: true })).toBe(true);
+    expect(canStudentStartExam(input, now)).toBe(false);
   });
 
   it('does not list upcoming or incomplete exams', () => {

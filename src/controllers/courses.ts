@@ -4867,6 +4867,34 @@ router.get(
   }),
 );
 
+// حفظ إجابات امتحان الكورس أثناء الحل (بدون تسليم)
+router.post(
+  '/course-exam/:examId/autosave',
+  authMiddleware(['student']),
+  asyncWrapper(async (req, res) => {
+    const examId = Number(req.params.examId);
+    if (Number.isNaN(examId)) {
+      return res.status(400).json({ message: 'Invalid exam id' });
+    }
+    try {
+      const answers = CourseLevelExamsService.parseAnswersFromRequestBody(req.body, { required: false });
+      const result = await CourseLevelExamsService.autosaveExamAnswers(
+        examId,
+        req.user!.id,
+        answers,
+        req.body.attemptId ?? req.body.attempt_id,
+      );
+      return res.json(result);
+    } catch (error: any) {
+      if (error.status) {
+        return res.status(error.status).json({ message: error.message });
+      }
+      console.error('Error autosaving course exam:', error);
+      return res.status(500).json({ message: 'Failed to autosave exam answers' });
+    }
+  }),
+);
+
 // تسليم امتحان الكورس — للطالب فقط (نفس منطق POST /api/exams/:examId/submit)
 router.post(
   '/course-exam/:examId/submit',
@@ -4876,97 +4904,11 @@ router.post(
     if (Number.isNaN(examId)) {
       return res.status(400).json({ message: 'Invalid exam id' });
     }
-    let answers: Array<{ questionId?: number; question_id?: number; selectedAnswer?: string; selected_answer?: string; answer?: string; choice?: string; option?: string; selectedOption?: string; response?: string; value?: string | number }> = [];
-    let hasAnswersPayload = false;
-    if (Array.isArray(req.body.answers)) {
-      hasAnswersPayload = true;
-      answers = req.body.answers.filter((a: any) => a != null);
-    } else if (
-      Array.isArray(req.body.questionIds) &&
-      Array.isArray(req.body.selectedAnswers) &&
-      req.body.questionIds.length === req.body.selectedAnswers.length
-    ) {
-      hasAnswersPayload = true;
-      answers = req.body.questionIds.map((qId: number, i: number) => ({
-        questionId: qId,
-        selectedAnswer: req.body.selectedAnswers[i],
-      }));
-    } else if (req.body.answers && typeof req.body.answers === 'object' && !Array.isArray(req.body.answers)) {
-      hasAnswersPayload = true;
-      answers = Object.entries(req.body.answers).map(([qId, choice]) => ({
-        questionId: Number(qId),
-        selectedAnswer: choice as string,
-      }));
-    }
-    if (!hasAnswersPayload) {
-      return res.status(400).json({
-        message:
-          'answers required: send answers as array of { questionId, selectedAnswer }, or questionIds + selectedAnswers arrays, or answers as { "questionId": "A", ... }',
-      });
-    }
-
-    const validAnswers = ['A', 'B', 'C', 'D'];
-    const validatedAnswers: { questionId: number; selectedAnswer: 'A' | 'B' | 'C' | 'D' }[] = [];
-    for (const answer of answers) {
-      // eslint-disable-next-line @typescript-eslint/ban-ts-comment
-      // @ts-expect-error
-      const questionId = Number(answer.questionId ?? answer.question_id ?? answer.id);
-      let selectedAnswer: string | number | undefined =
-        answer.selectedAnswer ??
-        answer.selected_answer ??
-        answer.answer ??
-        answer.choice ??
-        answer.option ??
-        answer.selectedOption ??
-        answer.response ??
-        answer.value ??
-        // eslint-disable-next-line @typescript-eslint/ban-ts-comment
-        // @ts-expect-error
-        answer.selected ??
-        // eslint-disable-next-line @typescript-eslint/ban-ts-comment
-        // @ts-expect-error
-        answer.selectedIndex ?? answer.index;
-      // eslint-disable-next-line @typescript-eslint/ban-ts-comment
-      // @ts-expect-error
-      if (selectedAnswer === undefined && (answer.optionA || answer.optionB || answer.optionC || answer.optionD)) {
-        // eslint-disable-next-line @typescript-eslint/ban-ts-comment
-        // @ts-expect-error
-        if (answer.optionA) selectedAnswer = 'A';
-        // eslint-disable-next-line @typescript-eslint/ban-ts-comment
-        // @ts-expect-error
-        else if (answer.optionB) selectedAnswer = 'B';
-        // eslint-disable-next-line @typescript-eslint/ban-ts-comment
-        // @ts-expect-error
-        else if (answer.optionC) selectedAnswer = 'C';
-        // eslint-disable-next-line @typescript-eslint/ban-ts-comment
-        // @ts-expect-error
-        else if (answer.optionD) selectedAnswer = 'D';
-      }
-      if (typeof selectedAnswer === 'string') {
-        selectedAnswer = selectedAnswer.trim().toUpperCase();
-        if (selectedAnswer.startsWith('OPTION')) {
-          const letter = selectedAnswer.slice(-1);
-          if (['A', 'B', 'C', 'D'].includes(letter)) selectedAnswer = letter;
-        }
-      } else if (typeof selectedAnswer === 'number' && selectedAnswer >= 0 && selectedAnswer <= 3) {
-        selectedAnswer = validAnswers[selectedAnswer];
-      }
-      if (Number.isNaN(questionId) || questionId <= 0) {
-        return res.status(400).json({ message: 'Invalid questionId in answers' });
-      }
-      if (selectedAnswer === undefined || selectedAnswer === '' || !validAnswers.includes(selectedAnswer as string)) {
-        return res.status(400).json({
-          message:
-            'Each answer must include the selected option: use selectedAnswer (or selected_answer, answer, choice, option) with value A/B/C/D or a/b/c/d or 0/1/2/3. Received for questionId ' +
-            questionId +
-            ': ' +
-            JSON.stringify(answer),
-        });
-      }
-      validatedAnswers.push({ questionId, selectedAnswer: selectedAnswer as 'A' | 'B' | 'C' | 'D' });
-    }
 
     try {
+      const validatedAnswers = CourseLevelExamsService.parseAnswersFromRequestBody(req.body, {
+        required: false,
+      });
       const attemptId = await CourseLevelExamsService.resolveActiveAttemptId(
         examId,
         req.user!.id,

@@ -86,6 +86,25 @@ const parseRequiredPositiveNumber = (value: any, field: string): number => {
   return numericValue;
 };
 
+/** null / 0 / omitted-as-null = unlimited course-level timer */
+const parseOptionalDurationMinutes = (value: any, field: string): number | null => {
+  if (value === undefined || value === null || value === '' || value === 'null' || value === 'unlimited') {
+    return null;
+  }
+  const parsed = parseNumberInput(value);
+  if (parsed === undefined) {
+    throw new HttpError(400, `${field} must be a valid number, 0, or null for unlimited`);
+  }
+  if (parsed === null || parsed === 0) {
+    return null;
+  }
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    throw new HttpError(400, `${field} must be greater than 0, or 0/null for unlimited`);
+  }
+  const minutes = Math.trunc(parsed);
+  return minutes > 0 ? minutes : null;
+};
+
 router.post(
   '/',
   authMiddleware(COURSE_CONTENT_ROLES),
@@ -119,7 +138,7 @@ router.post(
         throw new HttpError(400, 'courseId must be a valid positive integer');
       }
 
-      const durationMinutes = parseRequiredPositiveNumber(
+      const durationMinutes = parseOptionalDurationMinutes(
         pickBodyValue(req.body, 'durationMinutes', 'duration_minutes'),
         'durationMinutes',
       );
@@ -633,7 +652,7 @@ router.patch(
     }
 
     if (req.body.durationMinutes !== undefined || req.body.duration_minutes !== undefined) {
-      const duration = parseRequiredPositiveNumber(
+      const duration = parseOptionalDurationMinutes(
         pickBodyValue(req.body, 'durationMinutes', 'duration_minutes'),
         'durationMinutes',
       );
@@ -1690,6 +1709,39 @@ router.post(
   }),
 );
 
+// POST /api/exams/:examId/autosave - persist in-progress answers (course-level)
+router.post(
+  '/:examId/autosave',
+  authMiddleware(['student']),
+  asyncWrapper(async (req, res) => {
+    const examId = Number(req.params.examId);
+    if (Number.isNaN(examId)) {
+      return res.status(400).json({ message: 'Invalid exam id' });
+    }
+
+    try {
+      await CourseLevelExamsService.getExamById(examId, req.user!);
+    } catch (error: any) {
+      if (error.status === 404) {
+        return res.status(404).json({ message: 'Autosave is only supported for course-level exams' });
+      }
+      if (error.status) {
+        return res.status(error.status).json({ message: error.message });
+      }
+      throw error;
+    }
+
+    const answers = CourseLevelExamsService.parseAnswersFromRequestBody(req.body, { required: false });
+    const result = await CourseLevelExamsService.autosaveExamAnswers(
+      examId,
+      req.user!.id,
+      answers,
+      req.body.attemptId ?? req.body.attempt_id,
+    );
+    return res.json(result);
+  }),
+);
+
 // POST /api/exams/:examId/submit - Submit exam attempt (student only)
 // Note: This route handles both lecture exams and course-level exams
 router.post(
@@ -1729,15 +1781,11 @@ router.post(
     }
 
     if (!hasAnswersPayload) {
-      return res.status(400).json({
-        message:
-          'answers required: send answers as array of { questionId, selectedAnswer }, or questionIds + selectedAnswers arrays, or answers as { "questionId": "A", ... }',
-      });
+      answersList = [];
     }
 
     // Try course-level exam first
     try {
-      // Check if this is a course-level exam first
       await CourseLevelExamsService.getExamById(examId, req.user!);
 
       const resolvedAttemptId = await CourseLevelExamsService.resolveActiveAttemptId(
@@ -1746,49 +1794,8 @@ router.post(
         req.body.attemptId ?? req.body.attempt_id,
       );
 
-      // Validate answers format for course-level exams (accept multiple key names and formats)
-      const validLetters = ['A', 'B', 'C', 'D'];
-      const validatedAnswers = answersList.map((answer: any) => {
-        const questionId = Number(answer.questionId ?? answer.question_id ?? answer.id);
-        let selectedAnswer: string | number | undefined =
-          answer.selectedAnswer ??
-          answer.selected_answer ??
-          answer.answer ??
-          answer.choice ??
-          answer.option ??
-          answer.selectedOption ??
-          answer.response ??
-          answer.value ??
-          answer.selected ??
-          answer.selectedIndex;
-        if (answer.optionA || answer.optionB || answer.optionC || answer.optionD) {
-          if (answer.optionA) selectedAnswer = 'A';
-          else if (answer.optionB) selectedAnswer = 'B';
-          else if (answer.optionC) selectedAnswer = 'C';
-          else if (answer.optionD) selectedAnswer = 'D';
-        }
-        if (typeof selectedAnswer === 'string') {
-          selectedAnswer = selectedAnswer.trim().toUpperCase();
-          if (selectedAnswer.startsWith('OPTION') && validLetters.includes(selectedAnswer.slice(-1))) {
-            selectedAnswer = selectedAnswer.slice(-1);
-          }
-        } else if (typeof selectedAnswer === 'number' && selectedAnswer >= 0 && selectedAnswer <= 3) {
-          selectedAnswer = validLetters[selectedAnswer];
-        }
-        if (Number.isNaN(questionId) || questionId <= 0) {
-          throw new HttpError(400, 'Invalid questionId in answers');
-        }
-        if (!selectedAnswer || !validLetters.includes(selectedAnswer as string)) {
-          throw new HttpError(
-            400,
-            'Each answer must include selected option (selectedAnswer, selected_answer, answer, choice, option, or optionA/optionB/optionC/optionD). Value: A/B/C/D or a/b/c/d or 0/1/2/3. Received: ' +
-            JSON.stringify(answer),
-          );
-        }
-        return {
-          questionId,
-          selectedAnswer: selectedAnswer as 'A' | 'B' | 'C' | 'D',
-        };
+      const validatedAnswers = CourseLevelExamsService.parseAnswersFromRequestBody(req.body, {
+        required: false,
       });
 
       const result = await CourseLevelExamsService.submitExamAttempt(
@@ -1801,6 +1808,12 @@ router.post(
     } catch (error: any) {
       // If not found or not course-level exam, try lecture exam
       if (error.status === 404 || error.status === 403) {
+        if (!hasAnswersPayload) {
+          return res.status(400).json({
+            message:
+              'answers required: send answers as array of { questionId, selectedAnswer }, or questionIds + selectedAnswers arrays, or answers as { "questionId": "A", ... }',
+          });
+        }
         // Try lecture exam format
         const normalizedAnswers = answersList.map((answer: any) => {
           const questionId = Number(answer.questionId);
