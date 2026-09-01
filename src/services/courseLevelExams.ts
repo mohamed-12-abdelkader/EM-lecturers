@@ -489,7 +489,10 @@ export class CourseLevelExamsService {
         const inProgressAttemptId = attemptsRes.rows[0]?.in_progress_attempt_id
           ? Number(attemptsRes.rows[0].in_progress_attempt_id)
           : null;
-        const hasInProgressAttempt = Number.isInteger(inProgressAttemptId) && inProgressAttemptId > 0;
+        const hasInProgressAttempt =
+          inProgressAttemptId != null &&
+          Number.isInteger(inProgressAttemptId) &&
+          inProgressAttemptId > 0;
         const canAttemptNew =
           exam.attempt_limit === null || attemptsCount < exam.attempt_limit;
 
