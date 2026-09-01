@@ -4830,11 +4830,26 @@ router.get(
       return res.status(400).json({ message: 'Invalid examId' });
     }
 
-    const report = await ExamFlowService.getExamQuestionReport(examId, {
-      id: req.user!.id,
-      role: req.user!.role as any,
-      tenant_id: req.user!.tenant_id,
-    });
+    const passRaw =
+      req.query.passPercentage ?? req.query.pass_percentage ?? req.query.passPercent;
+    const passParsed =
+      passRaw !== undefined && passRaw !== null && String(passRaw).trim() !== ''
+        ? Number(passRaw)
+        : undefined;
+    const passPercentage =
+      passParsed !== undefined && Number.isFinite(passParsed) && passParsed >= 0 && passParsed <= 100
+        ? passParsed
+        : undefined;
+
+    const report = await ExamFlowService.getExamQuestionReport(
+      examId,
+      {
+        id: req.user!.id,
+        role: req.user!.role as any,
+        tenant_id: req.user!.tenant_id,
+      },
+      { passPercentage },
+    );
     res.json(report);
   }),
 );

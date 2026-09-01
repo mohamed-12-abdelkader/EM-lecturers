@@ -1591,7 +1591,15 @@ export class CourseLevelExamsService {
          a.student_id,
          a.status,
          a.obtained_grade,
-         a.total_grade
+         a.total_grade,
+         a.started_at,
+         a.attempt_expire_at,
+         a.last_autosave_at,
+         (
+           SELECT COUNT(*)::int
+           FROM course_level_exam_answers ans
+           WHERE ans.attempt_id = a.id AND ans.selected_answer IS NOT NULL
+         ) AS answered_count
        FROM course_level_exam_attempts a
        WHERE a.exam_id = $1
        ORDER BY a.student_id,
@@ -1627,6 +1635,11 @@ export class CourseLevelExamsService {
       studentName: string;
       studentEmail: string;
       examStatus: 'never_started' | 'in_progress';
+      startedAt?: string | null;
+      lastAutosaveAt?: string | null;
+      remainingSeconds?: number | null;
+      answeredCount?: number;
+      questionsCount?: number;
     }[] = [];
 
     for (const student of enrolledStudents) {
@@ -1657,6 +1670,11 @@ export class CourseLevelExamsService {
           studentName: student.student_name,
           studentEmail: student.student_email,
           examStatus: 'in_progress',
+          startedAt: latestAttempt.started_at ?? null,
+          lastAutosaveAt: latestAttempt.last_autosave_at ?? null,
+          remainingSeconds: remainingSeconds(latestAttempt.attempt_expire_at),
+          answeredCount: Number(latestAttempt.answered_count || 0),
+          questionsCount: Number(exam.questions_count || 0) || undefined,
         });
       } else {
         notExaminedStudents.push({
@@ -2392,17 +2410,27 @@ export class CourseLevelExamsService {
          a.id as submission_id,
          a.student_id,
          a.attempt_number,
+         a.status,
          a.total_grade,
          a.obtained_grade,
+         a.started_at,
          a.submitted_at,
-         CASE WHEN a.obtained_grade >= (a.total_grade * 0.5) THEN true ELSE false END as passed,
+         a.attempt_expire_at,
+         a.last_autosave_at,
+         CASE WHEN a.status = 'submitted' AND a.obtained_grade >= (a.total_grade * 0.5) THEN true ELSE false END as passed,
+         (
+           SELECT COUNT(*)::int
+           FROM course_level_exam_answers ans
+           WHERE ans.attempt_id = a.id AND ans.selected_answer IS NOT NULL
+         ) AS answered_count,
          u.name,
          u.email,
          u.phone
        FROM course_level_exam_attempts a
        JOIN users u ON a.student_id = u.id
-       WHERE a.exam_id = $1 AND a.status = 'submitted'
-       ORDER BY a.submitted_at DESC`,
+       WHERE a.exam_id = $1 AND a.status IN ('submitted', 'in_progress')
+       ORDER BY CASE WHEN a.status = 'in_progress' THEN 0 ELSE 1 END,
+         a.submitted_at DESC NULLS LAST, a.started_at DESC`,
       [examId],
     );
 
@@ -2468,10 +2496,14 @@ export class CourseLevelExamsService {
 
     return subsRes.rows.map((row) => {
       const wrong = wrongByAttempt.get(Number(row.submission_id)) || [];
+      const inProgress = row.status === 'in_progress';
       return {
         ...row,
-        wrong_questions: wrong,
-        wrong_questions_count: wrong.length,
+        in_progress: inProgress,
+        exam_status: inProgress ? 'in_progress' : 'submitted',
+        remaining_seconds: inProgress ? remainingSeconds(row.attempt_expire_at) : null,
+        wrong_questions: inProgress ? [] : wrong,
+        wrong_questions_count: inProgress ? 0 : wrong.length,
       };
     });
   }

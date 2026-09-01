@@ -1482,7 +1482,11 @@ export class ExamFlowService {
     };
   }
 
-  static async getExamQuestionReport(examId: number, user: RequestUser) {
+  static async getExamQuestionReport(
+    examId: number,
+    user: RequestUser,
+    options?: { passPercentage?: number },
+  ) {
     const exam = await this.getExamWithCourse(examId);
     if (!exam) {
       const error: any = new Error('Exam not found');
@@ -1541,6 +1545,7 @@ export class ExamFlowService {
     };
 
     if (!reportMap.size) {
+      const enrollment = await this.buildLectureEnrollmentSummary(exam, options?.passPercentage);
       return {
         exam: examMeta,
         overallStatistics: {
@@ -1550,6 +1555,8 @@ export class ExamFlowService {
           totalWrong: 0,
         },
         questions: [],
+        enrollmentSummary: enrollment.enrollmentSummary,
+        notExaminedStudents: enrollment.notExaminedStudents,
       };
     }
 
@@ -1642,6 +1649,7 @@ export class ExamFlowService {
     const questions = Array.from(reportMap.values());
     const totalCorrect = questions.reduce((sum, q) => sum + q.correctCount, 0);
     const totalWrong = questions.reduce((sum, q) => sum + q.incorrectCount, 0);
+    const enrollment = await this.buildLectureEnrollmentSummary(exam, options?.passPercentage);
 
     return {
       exam: examMeta,
@@ -1652,6 +1660,155 @@ export class ExamFlowService {
         totalWrong,
       },
       questions,
+      enrollmentSummary: enrollment.enrollmentSummary,
+      notExaminedStudents: enrollment.notExaminedStudents,
+    };
+  }
+
+  private static pct(count: number, total: number): number {
+    if (total <= 0) return 0;
+    return Math.round((count / total) * 100 * 100) / 100;
+  }
+
+  /**
+   * مشتركون لم يسلّموا بعد: لم يبدأوا، أو بدأوا وما زالت المحاولة in_progress.
+   */
+  private static async buildLectureEnrollmentSummary(
+    exam: any,
+    passPercentageInput?: number,
+  ) {
+    const passPercentage =
+      passPercentageInput != null &&
+      Number.isFinite(passPercentageInput) &&
+      passPercentageInput >= 0 &&
+      passPercentageInput <= 100
+        ? passPercentageInput
+        : 50;
+    const maxGrade = Number(exam.total_grade ?? 0);
+
+    const enrolledRes = await pool.query(
+      `SELECT u.id as student_id, u.name as student_name, u.email as student_email
+       FROM enrollments e
+       JOIN users u ON u.id = e.user_id
+       WHERE e.course_id = $1 AND u.role = 'student'
+       ORDER BY u.name ASC`,
+      [exam.course_id],
+    );
+    const enrolledStudents = enrolledRes.rows;
+    const enrolledTotal = enrolledStudents.length;
+
+    const attemptStatusRes = await pool.query(
+      `SELECT DISTINCT ON (es.student_id)
+         es.student_id,
+         COALESCE(es.status, 'submitted') AS status,
+         es.total_grade,
+         es.passed,
+         es.attempt_start_time,
+         es.attempt_expire_at,
+         (
+           SELECT COUNT(*)::int
+           FROM exam_answers ea
+           WHERE ea.submission_id = es.id
+         ) AS answered_count
+       FROM exam_submissions es
+       WHERE es.exam_id = $1
+       ORDER BY es.student_id,
+         CASE
+           WHEN COALESCE(es.status, 'submitted') IN ('submitted', 'late', 'expired') THEN 0
+           ELSE 1
+         END,
+         es.submitted_at DESC NULLS LAST,
+         es.id DESC`,
+      [exam.id],
+    );
+    const attemptByStudent = new Map(
+      attemptStatusRes.rows.map((row) => [Number(row.student_id), row]),
+    );
+
+    let examinedCount = 0;
+    let startedNotSubmittedCount = 0;
+    let passedCount = 0;
+    let failedCount = 0;
+    const notExaminedStudents: Array<{
+      studentId: number;
+      studentName: string;
+      studentEmail: string;
+      examStatus: 'never_started' | 'in_progress';
+      startedAt?: string | null;
+      remainingSeconds?: number | null;
+      answeredCount?: number;
+      questionsCount?: number;
+    }> = [];
+
+    for (const student of enrolledStudents) {
+      const studentId = Number(student.student_id);
+      const latest = attemptByStudent.get(studentId);
+      const status = String(latest?.status || '');
+      const completed = ['submitted', 'late', 'expired'].includes(status);
+
+      if (completed) {
+        examinedCount++;
+        const obtained = Number(latest?.total_grade ?? 0);
+        const passed =
+          latest?.passed != null
+            ? Boolean(latest.passed)
+            : maxGrade > 0 && (obtained / maxGrade) * 100 >= passPercentage;
+        if (passed) passedCount++;
+        else failedCount++;
+        continue;
+      }
+
+      if (status === 'in_progress') {
+        startedNotSubmittedCount++;
+        notExaminedStudents.push({
+          studentId,
+          studentName: student.student_name,
+          studentEmail: student.student_email,
+          examStatus: 'in_progress',
+          startedAt: latest?.attempt_start_time ?? null,
+          remainingSeconds: calculateRemainingSeconds(latest?.attempt_expire_at),
+          answeredCount: Number(latest?.answered_count || 0),
+          questionsCount: Number(exam.actual_questions_count || exam.questions_count || 0) || undefined,
+        });
+      } else {
+        notExaminedStudents.push({
+          studentId,
+          studentName: student.student_name,
+          studentEmail: student.student_email,
+          examStatus: 'never_started',
+        });
+      }
+    }
+
+    const notExaminedCount = enrolledTotal - examinedCount;
+    return {
+      notExaminedStudents,
+      enrollmentSummary: {
+        passPercentage,
+        enrolledTotal,
+        examined: {
+          count: examinedCount,
+          percentage: this.pct(examinedCount, enrolledTotal),
+        },
+        notExamined: {
+          count: notExaminedCount,
+          percentage: this.pct(notExaminedCount, enrolledTotal),
+        },
+        startedNotSubmitted: {
+          count: startedNotSubmittedCount,
+          percentage: this.pct(startedNotSubmittedCount, enrolledTotal),
+        },
+        passed: {
+          count: passedCount,
+          percentage: this.pct(passedCount, enrolledTotal),
+          percentageOfExamined: this.pct(passedCount, examinedCount),
+        },
+        failed: {
+          count: failedCount,
+          percentage: this.pct(failedCount, enrolledTotal),
+          percentageOfExamined: this.pct(failedCount, examinedCount),
+        },
+      },
     };
   }
 
@@ -2445,12 +2602,17 @@ export class ExamFlowService {
   static async listLectureExamSubmissionsWithWrongQuestions(examId: number) {
     const subsRes = await pool.query(
       `SELECT s.id as submission_id, s.student_id, s.total_grade, s.submitted_at, s.passed,
-              s.status, s.attempt_number, u.name, u.email, u.phone
+              s.status, s.attempt_number, s.attempt_start_time, s.attempt_expire_at,
+              (
+                SELECT COUNT(*)::int FROM exam_answers ea WHERE ea.submission_id = s.id
+              ) AS answered_count,
+              u.name, u.email, u.phone
        FROM exam_submissions s
        JOIN users u ON s.student_id = u.id
        WHERE s.exam_id = $1
-         AND COALESCE(s.status, 'submitted') IN ('submitted', 'late', 'expired')
-       ORDER BY s.submitted_at DESC NULLS LAST, s.id DESC`,
+         AND COALESCE(s.status, 'submitted') IN ('submitted', 'late', 'expired', 'in_progress')
+       ORDER BY CASE WHEN COALESCE(s.status, 'submitted') = 'in_progress' THEN 0 ELSE 1 END,
+         s.submitted_at DESC NULLS LAST, s.id DESC`,
       [examId],
     );
 
@@ -2517,19 +2679,25 @@ export class ExamFlowService {
 
     return subsRes.rows.map((row) => {
       const wrong = wrongBySubmission.get(Number(row.submission_id)) || [];
+      const inProgress = String(row.status || '') === 'in_progress';
       return {
         submission_id: row.submission_id,
         student_id: row.student_id,
-        total_grade: row.total_grade,
+        total_grade: inProgress ? null : row.total_grade,
         submitted_at: row.submitted_at,
-        passed: row.passed,
+        started_at: row.attempt_start_time ?? null,
+        passed: inProgress ? false : row.passed,
         status: row.status,
+        in_progress: inProgress,
+        exam_status: inProgress ? 'in_progress' : row.status,
         attempt_number: row.attempt_number,
+        answered_count: Number(row.answered_count || 0),
+        remaining_seconds: inProgress ? calculateRemainingSeconds(row.attempt_expire_at) : null,
         name: row.name,
         email: row.email,
         phone: row.phone,
-        wrong_questions: wrong,
-        wrong_questions_count: wrong.length,
+        wrong_questions: inProgress ? [] : wrong,
+        wrong_questions_count: inProgress ? 0 : wrong.length,
       };
     });
   }

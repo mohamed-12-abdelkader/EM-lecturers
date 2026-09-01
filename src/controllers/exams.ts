@@ -585,7 +585,7 @@ router.get(
           const report = await ExamFlowService.getExamQuestionReport(examId, {
             id: req.user!.id,
             role: req.user!.role,
-          });
+          }, { passPercentage });
           return res.json(report);
         } catch (lectureError: any) {
           if (lectureError.status) {
@@ -1969,10 +1969,25 @@ router.get(
       return res.status(400).json({ message: 'Invalid exam id' });
     }
 
-    const report = await ExamFlowService.getExamQuestionReport(examId, {
-      id: req.user!.id,
-      role: req.user!.role,
-    });
+    const passRaw =
+      req.query.passPercentage ?? req.query.pass_percentage ?? req.query.passPercent;
+    const passParsed =
+      passRaw !== undefined && passRaw !== null && String(passRaw).trim() !== ''
+        ? Number(passRaw)
+        : undefined;
+    const passPercentage =
+      passParsed !== undefined && Number.isFinite(passParsed) && passParsed >= 0 && passParsed <= 100
+        ? passParsed
+        : undefined;
+
+    const report = await ExamFlowService.getExamQuestionReport(
+      examId,
+      {
+        id: req.user!.id,
+        role: req.user!.role,
+      },
+      { passPercentage },
+    );
 
     res.json(report);
   }),
