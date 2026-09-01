@@ -410,6 +410,35 @@ export class CourseLevelExamsService {
 
   // ========== Student Methods ==========
 
+  /** Resolve attempt id from body or fall back to the student's active in_progress attempt. */
+  static async resolveActiveAttemptId(
+    examId: number,
+    studentId: number,
+    attemptId?: number | string | null,
+  ): Promise<number> {
+    const parsed = attemptId != null && String(attemptId).trim() !== '' ? Number(attemptId) : NaN;
+    if (Number.isInteger(parsed) && parsed > 0) {
+      return parsed;
+    }
+
+    const activeRes = await pool.query(
+      `SELECT id FROM course_level_exam_attempts
+       WHERE exam_id = $1 AND student_id = $2 AND status = 'in_progress'
+       ORDER BY started_at DESC
+       LIMIT 1`,
+      [examId, studentId],
+    );
+
+    if (!activeRes.rowCount) {
+      throw new HttpError(
+        400,
+        'attemptId is required, or start the exam first (POST /api/exams/:examId/start)',
+      );
+    }
+
+    return Number(activeRes.rows[0].id);
+  }
+
   /**
    * Get visible exams for a student in a course
    */
@@ -446,35 +475,46 @@ export class CourseLevelExamsService {
     const examsWithAttempts = await Promise.all(
       listed.map(async (exam) => {
         const attemptsRes = await pool.query(
-          `SELECT COUNT(*) as attempts_count, 
-                  MAX(attempt_number) as last_attempt_number
+          `SELECT
+             COUNT(*) FILTER (WHERE status = 'submitted')::int AS attempts_count,
+             MAX(attempt_number) FILTER (WHERE status = 'submitted') AS last_attempt_number,
+             MAX(id) FILTER (WHERE status = 'in_progress') AS in_progress_attempt_id
            FROM course_level_exam_attempts
            WHERE exam_id = $1 AND student_id = $2`,
           [exam.id, studentId],
         );
 
-        const attemptsCount = attemptsRes.rows[0]?.attempts_count || 0;
-        const lastAttemptNumber = attemptsRes.rows[0]?.last_attempt_number || 0;
-        const canAttempt = exam.attempt_limit === null || attemptsCount < exam.attempt_limit;
+        const attemptsCount = Number(attemptsRes.rows[0]?.attempts_count || 0);
+        const lastAttemptNumber = Number(attemptsRes.rows[0]?.last_attempt_number || 0);
+        const inProgressAttemptId = attemptsRes.rows[0]?.in_progress_attempt_id
+          ? Number(attemptsRes.rows[0].in_progress_attempt_id)
+          : null;
+        const hasInProgressAttempt = Number.isInteger(inProgressAttemptId) && inProgressAttemptId > 0;
+        const canAttemptNew =
+          exam.attempt_limit === null || attemptsCount < exam.attempt_limit;
 
         const availability_status = getStudentExamAvailability(
           courseLevelExamAvailabilityInput(exam),
           now,
         );
-        const canStart = canStudentStartExam(courseLevelExamAvailabilityInput(exam), now);
+        const canStart = canStudentStartExam(courseLevelExamAvailabilityInput(exam), now, {
+          hasInProgressAttempt,
+        });
 
         return {
           ...exam,
           configuredQuestionsCount: exam.questions_count,
           actualQuestionsCount: exam.actual_questions_count,
           availability_status,
-          attempts_count: Number(attemptsCount),
-          last_attempt_number: Number(lastAttemptNumber),
-          can_attempt: canAttempt && canStart,
+          attempts_count: attemptsCount,
+          last_attempt_number: lastAttemptNumber,
+          has_in_progress_attempt: hasInProgressAttempt,
+          in_progress_attempt_id: inProgressAttemptId,
+          can_attempt: (hasInProgressAttempt || canAttemptNew) && canStart,
           attempts_remaining:
             exam.attempt_limit === null
               ? null
-              : Math.max(0, exam.attempt_limit - Number(attemptsCount)),
+              : Math.max(0, exam.attempt_limit - attemptsCount),
         };
       }),
     );
@@ -553,9 +593,31 @@ export class CourseLevelExamsService {
       throw new HttpError(403, 'This exam is no longer available');
     }
 
-    // Check attempt limit and get previous attempts
+    // Resume the open attempt without counting a new one.
+    if (hasInProgressAttempt) {
+      const attempt = activeAttemptRes.rows[0];
+      const questions = await CourseLevelExamsService.loadSlicedCourseQuestions(
+        exam,
+        attempt,
+        studentId,
+      );
+      return {
+        attemptId: attempt.id,
+        examId: exam.id,
+        examTitle: exam.title,
+        durationMinutes: exam.duration_minutes,
+        questionsCount: questions.length,
+        startedAt: attempt.started_at,
+        resumed: true,
+        questions,
+      };
+    }
+
+    // Count only submitted attempts toward the limit.
     const attemptsRes = await pool.query(
-      `SELECT COUNT(*) as attempts_count, MAX(attempt_number) as last_attempt_number
+      `SELECT COUNT(*) FILTER (WHERE status = 'submitted') as attempts_count,
+              MAX(attempt_number) FILTER (WHERE status = 'submitted') as last_submitted_number,
+              MAX(attempt_number) as last_attempt_number
        FROM course_level_exam_attempts
        WHERE exam_id = $1 AND student_id = $2`,
       [examId, studentId],
@@ -578,48 +640,12 @@ export class CourseLevelExamsService {
       if (lastAttemptRes.rowCount && lastAttemptRes.rowCount > 0) {
         const lastAttempt = lastAttemptRes.rows[0];
 
-        // Check if answers should be shown
         const now = new Date();
-        let showAnswers = false;
-        let releaseReason = '';
+        const release = this.buildAnswerReleaseContext(exam, lastAttempt, now);
 
-        if (exam.show_answers_immediately) {
-          showAnswers = true;
-          releaseReason = 'immediate';
-        } else if (exam.answers_visible_at) {
-          const answersVisibleAt = new Date(exam.answers_visible_at);
-          if (now >= answersVisibleAt) {
-            showAnswers = true;
-            releaseReason = 'scheduled';
-          } else {
-            releaseReason = 'scheduled_pending';
-          }
-        }
-
-        // Get wrong questions if answers should be shown
         let wrongQuestions: any[] = [];
-        if (showAnswers) {
-          const wrongAnswersRes = await pool.query(
-            `SELECT a.*, q.*
-             FROM course_level_exam_answers a
-             JOIN course_level_exam_questions q ON a.question_id = q.id
-             WHERE a.attempt_id = $1 AND a.is_correct = FALSE
-             ORDER BY q.created_at ASC`,
-            [lastAttempt.id],
-          );
-
-          wrongQuestions = wrongAnswersRes.rows.map((row) => ({
-            questionId: row.question_id,
-            questionText: row.question_text,
-            questionImage: row.question_image,
-            type: row.type,
-            correctAnswer: row.correct_answer,
-            yourAnswer: row.selected_answer,
-            optionA: row.option_a,
-            optionB: row.option_b,
-            optionC: row.option_c,
-            optionD: row.option_d,
-          }));
+        if (release.showAnswers) {
+          wrongQuestions = await this.fetchWrongQuestionsForAttempt(lastAttempt.id);
         }
 
         const error: any = new HttpError(
@@ -632,10 +658,12 @@ export class CourseLevelExamsService {
             totalGrade: lastAttempt.obtained_grade,
             maxGrade: lastAttempt.total_grade,
             submittedAt: lastAttempt.submitted_at,
-            showAnswers,
-            releaseReason,
-            answersVisibleAt: exam.answers_visible_at,
-            wrongQuestions: showAnswers ? wrongQuestions : [],
+            showAnswers: release.showAnswers,
+            releaseReason: release.releaseReason,
+            answersReleaseMode: release.answersReleaseMode,
+            examEndAt: release.examEndAt,
+            answersVisibleAt: release.answersVisibleAt,
+            wrongQuestions,
           },
         };
         throw error;
@@ -645,24 +673,6 @@ export class CourseLevelExamsService {
     // Check if attempts limit reached
     if (exam.attempt_limit !== null && attemptsCount >= exam.attempt_limit) {
       throw new HttpError(403, 'You have used all allowed attempts for this exam');
-    }
-
-    if (hasInProgressAttempt) {
-      const attempt = activeAttemptRes.rows[0];
-      const questions = await CourseLevelExamsService.loadSlicedCourseQuestions(
-        exam,
-        attempt,
-        studentId,
-      );
-      return {
-        attemptId: attempt.id,
-        examId: exam.id,
-        examTitle: exam.title,
-        durationMinutes: exam.duration_minutes,
-        questionsCount: questions.length,
-        startedAt: attempt.started_at,
-        questions,
-      };
     }
 
     // Create new attempt
@@ -757,6 +767,176 @@ export class CourseLevelExamsService {
         : null,
       now,
     );
+  }
+
+  private static buildAnswerReleaseContext(exam: any, attempt: any, now: Date) {
+    const decision = this.courseAnswerRelease(exam, attempt, now);
+    const answersReleaseMode =
+      exam.answers_release_mode ||
+      inferAnswersReleaseMode({
+        showAnswersImmediately: exam.show_answers_immediately,
+        answersVisibleAt: exam.answers_visible_at,
+        showAnswersAfterHours: exam.show_answers_after_hours,
+      });
+
+    return {
+      showAnswers: decision.release,
+      releaseReason: decision.release ? decision.reason : null,
+      answersReleaseMode,
+      examEndAt: exam.visibility_end_date,
+      answersVisibleAt: exam.answers_visible_at,
+      showAnswersAfterHours: exam.show_answers_after_hours ?? 0,
+    };
+  }
+
+  private static pendingReleaseMessage(release: ReturnType<typeof CourseLevelExamsService.buildAnswerReleaseContext>) {
+    if (release.answersReleaseMode === 'after_end') {
+      return release.examEndAt
+        ? 'Answers will be available after the exam ends'
+        : 'Answers will be available after the exam end date is set';
+    }
+    if (release.answersReleaseMode === 'after_hours' && release.showAnswersAfterHours > 0) {
+      return `Answers will be available ${release.showAnswersAfterHours} hour(s) after submission`;
+    }
+    if (release.answersReleaseMode === 'scheduled' && release.answersVisibleAt) {
+      return 'Answers will be available after the scheduled time';
+    }
+    return 'Answers are not available yet';
+  }
+
+  private static async fetchWrongQuestionsForAttempt(attemptId: number) {
+    const wrongAnswersRes = await pool.query(
+      `SELECT a.*, q.*
+       FROM course_level_exam_answers a
+       JOIN course_level_exam_questions q ON a.question_id = q.id
+       WHERE a.attempt_id = $1 AND a.is_correct = FALSE
+       ORDER BY q.created_at ASC`,
+      [attemptId],
+    );
+
+    return wrongAnswersRes.rows.map((row) => ({
+      questionId: row.question_id,
+      questionText: row.question_text,
+      questionImage: row.question_image,
+      type: row.type,
+      correctAnswer: row.correct_answer,
+      yourAnswer: row.selected_answer,
+      optionA: row.option_a,
+      optionB: row.option_b,
+      optionC: row.option_c,
+      optionD: row.option_d,
+    }));
+  }
+
+  private static mapAttemptSummary(attempt: any) {
+    const maxGrade = Number(attempt.total_grade ?? 0);
+    const obtainedGrade = Number(attempt.obtained_grade ?? 0);
+    return {
+      attemptId: attempt.id,
+      attemptNumber: attempt.attempt_number,
+      totalGrade: obtainedGrade,
+      maxGrade,
+      correctCount: obtainedGrade,
+      wrongCount: Math.max(0, maxGrade - obtainedGrade),
+      startedAt: attempt.started_at,
+      submittedAt: attempt.submitted_at,
+    };
+  }
+
+  /**
+   * Student attempt report: grades always, wrong questions only when release policy allows.
+   */
+  static async getStudentAttemptReport(
+    examId: number,
+    studentId: number,
+    options?: { attemptId?: number },
+  ) {
+    const examRes = await pool.query(
+      `SELECT e.*, c.id as course_id, c.title as course_title
+       FROM course_level_exams e
+       JOIN courses c ON e.course_id = c.id
+       WHERE e.id = $1`,
+      [examId],
+    );
+
+    if (!examRes.rowCount) {
+      throw new HttpError(404, 'Exam not found');
+    }
+
+    const exam = examRes.rows[0];
+
+    const enrollmentCheck = await pool.query(
+      'SELECT id FROM enrollments WHERE course_id = $1 AND user_id = $2',
+      [exam.course_id, studentId],
+    );
+
+    if (!enrollmentCheck.rowCount) {
+      throw new HttpError(403, 'You are not enrolled in this course');
+    }
+
+    const attemptQuery = options?.attemptId
+      ? await pool.query(
+          `SELECT * FROM course_level_exam_attempts
+           WHERE id = $1 AND exam_id = $2 AND student_id = $3 AND status = 'submitted'`,
+          [options.attemptId, examId, studentId],
+        )
+      : await pool.query(
+          `SELECT * FROM course_level_exam_attempts
+           WHERE exam_id = $1 AND student_id = $2 AND status = 'submitted'
+           ORDER BY submitted_at DESC
+           LIMIT 1`,
+          [examId, studentId],
+        );
+
+    if (!attemptQuery.rowCount) {
+      throw new HttpError(404, 'No completed attempt found for this exam');
+    }
+
+    const attempt = attemptQuery.rows[0];
+    const now = new Date();
+    const release = this.buildAnswerReleaseContext(exam, attempt, now);
+    const attemptSummary = this.mapAttemptSummary(attempt);
+
+    if (!release.showAnswers) {
+      return {
+        examType: 'course' as const,
+        exam: {
+          id: exam.id,
+          title: exam.title,
+          courseId: exam.course_id,
+          courseTitle: exam.course_title,
+        },
+        showAnswers: false,
+        releaseReason: null,
+        answersReleaseMode: release.answersReleaseMode,
+        examEndAt: release.examEndAt,
+        answersVisibleAt: release.answersVisibleAt,
+        showAnswersAfterHours: release.showAnswersAfterHours,
+        message: this.pendingReleaseMessage(release),
+        attempt: attemptSummary,
+        wrongQuestions: [],
+      };
+    }
+
+    const wrongQuestions = await this.fetchWrongQuestionsForAttempt(attempt.id);
+
+    return {
+      examType: 'course' as const,
+      exam: {
+        id: exam.id,
+        title: exam.title,
+        courseId: exam.course_id,
+        courseTitle: exam.course_title,
+      },
+      showAnswers: true,
+      releaseReason: release.releaseReason,
+      answersReleaseMode: release.answersReleaseMode,
+      examEndAt: release.examEndAt,
+      answersVisibleAt: release.answersVisibleAt,
+      showAnswersAfterHours: release.showAnswersAfterHours,
+      attempt: attemptSummary,
+      wrongQuestions,
+    };
   }
 
   /**
@@ -920,106 +1100,35 @@ export class CourseLevelExamsService {
    * Get wrong questions for a student after answers release date
    */
   static async getWrongQuestions(examId: number, studentId: number) {
-    // Get exam with course info
-    const examRes = await pool.query(
-      `SELECT e.*, c.id as course_id
-       FROM course_level_exams e
-       JOIN courses c ON e.course_id = c.id
-       WHERE e.id = $1`,
-      [examId],
-    );
+    const report = await this.getStudentAttemptReport(examId, studentId);
 
-    if (!examRes.rowCount) {
-      throw new HttpError(404, 'Exam not found');
-    }
-
-    const exam = examRes.rows[0];
-
-    // Verify student is enrolled
-    const enrollmentCheck = await pool.query(
-      'SELECT id FROM enrollments WHERE course_id = $1 AND user_id = $2',
-      [exam.course_id, studentId],
-    );
-
-    if (!enrollmentCheck.rowCount) {
-      throw new HttpError(403, 'You are not enrolled in this course');
-    }
-
-    // Get the last submitted attempt
-    const attemptRes = await pool.query(
-      `SELECT * FROM course_level_exam_attempts
-       WHERE exam_id = $1 AND student_id = $2 AND status = 'submitted'
-       ORDER BY submitted_at DESC
-       LIMIT 1`,
-      [examId, studentId],
-    );
-
-    if (!attemptRes.rowCount) {
-      throw new HttpError(404, 'No completed attempt found for this exam');
-    }
-
-    const attempt = attemptRes.rows[0];
-
-    // Check if answers should be shown
-    const now = new Date();
-    let showAnswers = false;
-    let releaseReason = '';
-
-    if (exam.show_answers_immediately) {
-      showAnswers = true;
-      releaseReason = 'immediate';
-    } else if (exam.answers_visible_at) {
-      const answersVisibleAt = new Date(exam.answers_visible_at);
-      if (now >= answersVisibleAt) {
-        showAnswers = true;
-        releaseReason = 'scheduled';
-      } else {
-        releaseReason = 'scheduled_pending';
-      }
-    } else {
-      throw new HttpError(403, 'Answers are not configured to be shown for this exam');
-    }
-
-    if (!showAnswers) {
+    if (!report.showAnswers) {
       return {
         showAnswers: false,
-        releaseReason: 'scheduled_pending',
-        answersVisibleAt: exam.answers_visible_at,
-        message: 'Answers will be available after the scheduled time',
+        releaseReason: null,
+        answersReleaseMode: report.answersReleaseMode,
+        examEndAt: report.examEndAt,
+        answersVisibleAt: report.answersVisibleAt,
+        message: report.message,
+        attemptId: report.attempt.attemptId,
+        totalGrade: report.attempt.totalGrade,
+        maxGrade: report.attempt.maxGrade,
+        submittedAt: report.attempt.submittedAt,
+        wrongQuestions: [],
       };
     }
 
-    // Get wrong answers
-    const wrongAnswersRes = await pool.query(
-      `SELECT a.*, q.*
-       FROM course_level_exam_answers a
-       JOIN course_level_exam_questions q ON a.question_id = q.id
-       WHERE a.attempt_id = $1 AND a.is_correct = FALSE
-       ORDER BY q.created_at ASC`,
-      [attempt.id],
-    );
-
-    const wrongQuestions = wrongAnswersRes.rows.map((row) => ({
-      questionId: row.question_id,
-      questionText: row.question_text,
-      questionImage: row.question_image,
-      type: row.type,
-      correctAnswer: row.correct_answer,
-      yourAnswer: row.selected_answer,
-      optionA: row.option_a,
-      optionB: row.option_b,
-      optionC: row.option_c,
-      optionD: row.option_d,
-    }));
-
     return {
       showAnswers: true,
-      releaseReason,
-      attemptId: attempt.id,
-      totalGrade: attempt.obtained_grade,
-      maxGrade: attempt.total_grade,
-      submittedAt: attempt.submitted_at,
-      wrongQuestions,
+      releaseReason: report.releaseReason,
+      answersReleaseMode: report.answersReleaseMode,
+      examEndAt: report.examEndAt,
+      answersVisibleAt: report.answersVisibleAt,
+      attemptId: report.attempt.attemptId,
+      totalGrade: report.attempt.totalGrade,
+      maxGrade: report.attempt.maxGrade,
+      submittedAt: report.attempt.submittedAt,
+      wrongQuestions: report.wrongQuestions,
     };
   }
 
@@ -1064,17 +1173,12 @@ export class CourseLevelExamsService {
 
     const attempt = attemptRes.rows[0];
     const now = new Date();
-    let showAnswers = false;
+    const release = this.buildAnswerReleaseContext(exam, attempt, now);
 
-    if (exam.show_answers_immediately) {
-      showAnswers = true;
-    } else if (exam.answers_visible_at && now >= new Date(exam.answers_visible_at)) {
-      // eslint-disable-next-line @typescript-eslint/no-unused-vars
-      showAnswers = true;
-    } else {
+    if (!release.showAnswers) {
       throw new HttpError(
         403,
-        'لا يمكن عرض تقرير الإجابات حالياً (سيتم إظهارها في وقت لاحق أو غير مفعّل)',
+        this.pendingReleaseMessage(release),
       );
     }
 
@@ -1212,7 +1316,27 @@ export class CourseLevelExamsService {
    * تقرير الامتحان الشامل للمدرس: لكل سؤال كام صح / كام غلط ومين اللي غلط.
    * يعتمد آخر محاولة مسلَّمة لكل طالب.
    */
-  static async getExamReport(examId: number, requester: RequestUser) {
+  private static pct(count: number, total: number): number {
+    if (total <= 0) return 0;
+    return Math.round((count / total) * 100 * 100) / 100;
+  }
+
+  private static isAttemptPassed(
+    obtained: number | null | undefined,
+    total: number | null | undefined,
+    passPercentage: number,
+  ): boolean {
+    const max = Number(total ?? 0);
+    const score = Number(obtained ?? 0);
+    if (max <= 0) return false;
+    return (score / max) * 100 >= passPercentage;
+  }
+
+  static async getExamReport(
+    examId: number,
+    requester: RequestUser,
+    options?: { passPercentage?: number },
+  ) {
     const examRes = await pool.query(
       `SELECT e.id, e.title, e.course_id, e.questions_count, c.teacher_id, c.title as course_title
        FROM course_level_exams e
@@ -1227,6 +1351,135 @@ export class CourseLevelExamsService {
 
     const exam = examRes.rows[0];
     await CourseAccessControl.assertCanManageCourse(requester, Number(exam.course_id));
+
+    const passPercentage =
+      options?.passPercentage != null &&
+      Number.isFinite(options.passPercentage) &&
+      options.passPercentage >= 0 &&
+      options.passPercentage <= 100
+        ? options.passPercentage
+        : 50;
+
+    const enrolledRes = await pool.query(
+      `SELECT u.id as student_id, u.name as student_name, u.email as student_email
+       FROM enrollments e
+       JOIN users u ON u.id = e.user_id
+       WHERE e.course_id = $1 AND u.role = 'student'
+       ORDER BY u.name ASC`,
+      [exam.course_id],
+    );
+    const enrolledStudents = enrolledRes.rows;
+    const enrolledTotal = enrolledStudents.length;
+
+    const attemptStatusRes = await pool.query(
+      `SELECT DISTINCT ON (a.student_id)
+         a.student_id,
+         a.status,
+         a.obtained_grade,
+         a.total_grade
+       FROM course_level_exam_attempts a
+       WHERE a.exam_id = $1
+       ORDER BY a.student_id,
+         CASE WHEN a.status = 'submitted' THEN 0 ELSE 1 END,
+         a.submitted_at DESC NULLS LAST,
+         a.id DESC`,
+      [examId],
+    );
+    const attemptByStudent = new Map(
+      attemptStatusRes.rows.map((row) => [Number(row.student_id), row]),
+    );
+
+    const submittedAttemptsRes = await pool.query(
+      `SELECT DISTINCT ON (a.student_id)
+         a.student_id,
+         a.obtained_grade,
+         a.total_grade
+       FROM course_level_exam_attempts a
+       WHERE a.exam_id = $1 AND a.status = 'submitted'
+       ORDER BY a.student_id, a.submitted_at DESC NULLS LAST, a.id DESC`,
+      [examId],
+    );
+    const submittedByStudent = new Map(
+      submittedAttemptsRes.rows.map((row) => [Number(row.student_id), row]),
+    );
+
+    let examinedCount = 0;
+    let startedNotSubmittedCount = 0;
+    let passedCount = 0;
+    let failedCount = 0;
+    const notExaminedStudents: {
+      studentId: number;
+      studentName: string;
+      studentEmail: string;
+      examStatus: 'never_started' | 'in_progress';
+    }[] = [];
+
+    for (const student of enrolledStudents) {
+      const studentId = Number(student.student_id);
+      const latestAttempt = attemptByStudent.get(studentId);
+      const submittedAttempt = submittedByStudent.get(studentId);
+
+      if (submittedAttempt) {
+        examinedCount++;
+        if (
+          this.isAttemptPassed(
+            submittedAttempt.obtained_grade,
+            submittedAttempt.total_grade,
+            passPercentage,
+          )
+        ) {
+          passedCount++;
+        } else {
+          failedCount++;
+        }
+        continue;
+      }
+
+      if (latestAttempt?.status === 'in_progress') {
+        startedNotSubmittedCount++;
+        notExaminedStudents.push({
+          studentId,
+          studentName: student.student_name,
+          studentEmail: student.student_email,
+          examStatus: 'in_progress',
+        });
+      } else {
+        notExaminedStudents.push({
+          studentId,
+          studentName: student.student_name,
+          studentEmail: student.student_email,
+          examStatus: 'never_started',
+        });
+      }
+    }
+
+    const notExaminedCount = enrolledTotal - examinedCount;
+    const enrollmentSummary = {
+      passPercentage,
+      enrolledTotal,
+      examined: {
+        count: examinedCount,
+        percentage: this.pct(examinedCount, enrolledTotal),
+      },
+      notExamined: {
+        count: notExaminedCount,
+        percentage: this.pct(notExaminedCount, enrolledTotal),
+      },
+      startedNotSubmitted: {
+        count: startedNotSubmittedCount,
+        percentage: this.pct(startedNotSubmittedCount, enrolledTotal),
+      },
+      passed: {
+        count: passedCount,
+        percentage: this.pct(passedCount, enrolledTotal),
+        percentageOfExamined: this.pct(passedCount, examinedCount),
+      },
+      failed: {
+        count: failedCount,
+        percentage: this.pct(failedCount, enrolledTotal),
+        percentageOfExamined: this.pct(failedCount, examinedCount),
+      },
+    };
 
     const questionsRes = await pool.query(
       `SELECT id, type, question_text, question_image, option_a, option_b, option_c, option_d, correct_answer
@@ -1388,8 +1641,11 @@ export class CourseLevelExamsService {
         courseTitle: exam.course_title,
         questionsCount: exam.questions_count,
       },
+      enrollmentSummary,
+      notExaminedStudents,
       overallStatistics: {
         totalStudents: totalAttempts,
+        enrolledTotal,
         totalQuestions,
         totalAnswers,
         totalCorrect,

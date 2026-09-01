@@ -4876,47 +4876,37 @@ router.post(
     if (Number.isNaN(examId)) {
       return res.status(400).json({ message: 'Invalid exam id' });
     }
-    let attemptId = req.body.attemptId ?? req.body.attempt_id;
     let answers: Array<{ questionId?: number; question_id?: number; selectedAnswer?: string; selected_answer?: string; answer?: string; choice?: string; option?: string; selectedOption?: string; response?: string; value?: string | number }> = [];
-    if (Array.isArray(req.body.answers) && req.body.answers.length > 0) {
+    let hasAnswersPayload = false;
+    if (Array.isArray(req.body.answers)) {
+      hasAnswersPayload = true;
       answers = req.body.answers.filter((a: any) => a != null);
     } else if (
       Array.isArray(req.body.questionIds) &&
       Array.isArray(req.body.selectedAnswers) &&
       req.body.questionIds.length === req.body.selectedAnswers.length
     ) {
+      hasAnswersPayload = true;
       answers = req.body.questionIds.map((qId: number, i: number) => ({
         questionId: qId,
         selectedAnswer: req.body.selectedAnswers[i],
       }));
     } else if (req.body.answers && typeof req.body.answers === 'object' && !Array.isArray(req.body.answers)) {
+      hasAnswersPayload = true;
       answers = Object.entries(req.body.answers).map(([qId, choice]) => ({
         questionId: Number(qId),
         selectedAnswer: choice as string,
       }));
     }
-    if (answers.length === 0) {
+    if (!hasAnswersPayload) {
       return res.status(400).json({
         message:
           'answers required: send answers as array of { questionId, selectedAnswer }, or questionIds + selectedAnswers arrays, or answers as { "questionId": "A", ... }',
       });
     }
-    if (!attemptId) {
-      const activeRes = await pool.query(
-        `SELECT id FROM course_level_exam_attempts
-         WHERE exam_id = $1 AND student_id = $2 AND status = 'in_progress'
-         ORDER BY started_at DESC LIMIT 1`,
-        [examId, req.user!.id],
-      );
-      if (!activeRes.rowCount) {
-        return res.status(400).json({
-          message: 'attemptId is required, or start the exam first (POST /api/exams/:examId/start)',
-        });
-      }
-      attemptId = activeRes.rows[0].id;
-    }
-    const validatedAnswers: { questionId: number; selectedAnswer: 'A' | 'B' | 'C' | 'D' }[] = [];
+
     const validAnswers = ['A', 'B', 'C', 'D'];
+    const validatedAnswers: { questionId: number; selectedAnswer: 'A' | 'B' | 'C' | 'D' }[] = [];
     for (const answer of answers) {
       // eslint-disable-next-line @typescript-eslint/ban-ts-comment
       // @ts-expect-error
@@ -4973,13 +4963,19 @@ router.post(
             JSON.stringify(answer),
         });
       }
-      validatedAnswers.push({ questionId, selectedAnswer: (selectedAnswer as string) as 'A' | 'B' | 'C' | 'D' });
+      validatedAnswers.push({ questionId, selectedAnswer: selectedAnswer as 'A' | 'B' | 'C' | 'D' });
     }
+
     try {
+      const attemptId = await CourseLevelExamsService.resolveActiveAttemptId(
+        examId,
+        req.user!.id,
+        req.body.attemptId ?? req.body.attempt_id,
+      );
       const result = await CourseLevelExamsService.submitExamAttempt(
         examId,
         req.user!.id,
-        Number(attemptId),
+        attemptId,
         validatedAnswers,
       );
       return res.json(result);
@@ -5035,7 +5031,20 @@ router.get(
     }
 
     try {
-      const result = await CourseLevelExamsService.getExamReport(examId, req.user!);
+      const passRaw =
+        req.query.passPercentage ?? req.query.pass_percentage ?? req.query.passPercent;
+      const passParsed =
+        passRaw !== undefined && passRaw !== null && String(passRaw).trim() !== ''
+          ? Number(passRaw)
+          : undefined;
+      const passPercentage =
+        passParsed !== undefined && Number.isFinite(passParsed) && passParsed >= 0 && passParsed <= 100
+          ? passParsed
+          : undefined;
+
+      const result = await CourseLevelExamsService.getExamReport(examId, req.user!, {
+        passPercentage,
+      });
       res.json(result);
     } catch (error: any) {
       if (error.status) {

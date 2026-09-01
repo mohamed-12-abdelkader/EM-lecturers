@@ -558,6 +558,8 @@ curl -X DELETE http://localhost:8000/api/exams/1 \
 **الصلاحيات:** `teacher`, `admin` فقط
 
 **الوصف:** يجلب تقريراً تفصيلياً عن الامتحان يتضمن:
+- إحصائيات المشاركة (مشتركين / ممتحنين / لم يمتحنوا / بدأوا ولم يسلموا / ناجحين / راسبين)
+- قائمة الطلاب المشتركين الذين لم يسلّموا الامتحان
 - إحصائيات عامة عن الامتحان
 - قائمة بجميع الأسئلة مع إحصائيات كل سؤال
 - عدد الطلاب الذين أخطأوا في كل سؤال
@@ -568,7 +570,33 @@ curl -X DELETE http://localhost:8000/api/exams/1 \
 **Path Parameters:**
 - `examId` (number): معرف الامتحان
 
+**Query (اختياري):**
+- `passPercentage` أو `pass_percentage` — نسبة النجاح % (افتراضي 50)
+
+**مسار بديل:** `GET /api/course/course-exam/:examId/report`
+
 **Response (200 OK):**
+```json
+{
+  "exam": { "id": 12, "title": "امتحان شامل", "courseId": 3, "courseTitle": "فيزياء", "questionsCount": 20 },
+  "enrollmentSummary": {
+    "passPercentage": 60,
+    "enrolledTotal": 100,
+    "examined": { "count": 75, "percentage": 75 },
+    "notExamined": { "count": 25, "percentage": 25 },
+    "startedNotSubmitted": { "count": 5, "percentage": 5 },
+    "passed": { "count": 60, "percentage": 60, "percentageOfExamined": 80 },
+    "failed": { "count": 15, "percentage": 15, "percentageOfExamined": 20 }
+  },
+  "notExaminedStudents": [
+    { "studentId": 201, "studentName": "سارة", "studentEmail": "s@x.com", "examStatus": "never_started" }
+  ],
+  "overallStatistics": { "totalStudents": 75, "enrolledTotal": 100, "totalQuestions": 20 },
+  "questions": []
+}
+```
+
+**Response (200 OK) — تفصيل الأسئلة:**
 ```json
 {
   "exam": {
@@ -2078,7 +2106,79 @@ Authorization: Bearer <STUDENT_TOKEN>
 
 ---
 
-### 4. جلب الأسئلة الخاطئة بعد موعد الإظهار
+### 4. تقرير محاولة الطالب (امتحان شامل)
+
+**GET** `/api/exams/:examId/attempt-report`
+
+**الصلاحيات:** `student` فقط
+
+**الوصف:** يعرض تقريراً عن آخر محاولة مُسلَّمة: الدرجة، عدد الإجابات الصحيحة/الخاطئة، والأسئلة الخاطئة **فقط بعد** أن يسمح إعداد المدرس بإظهار الإجابات (مثل `after_end` بعد `visibility_end_date`).
+
+**Query (اختياري):**
+- `attemptId` أو `attempt_id`: محاولة محددة (افتراضياً: آخر محاولة مُسلَّمة)
+
+**Response — قبل موعد الإظهار (`answersReleaseMode = after_end`):**
+```json
+{
+  "examType": "course",
+  "exam": { "id": 1, "title": "امتحان شامل", "courseId": 12, "courseTitle": "فيزياء" },
+  "showAnswers": false,
+  "releaseReason": null,
+  "answersReleaseMode": "after_end",
+  "examEndAt": "2025-01-20T23:59:59.000Z",
+  "answersVisibleAt": null,
+  "showAnswersAfterHours": 0,
+  "message": "Answers will be available after the exam ends",
+  "attempt": {
+    "attemptId": 5,
+    "attemptNumber": 1,
+    "totalGrade": 16,
+    "maxGrade": 20,
+    "correctCount": 16,
+    "wrongCount": 4,
+    "startedAt": "2025-01-15T10:00:00.000Z",
+    "submittedAt": "2025-01-15T10:45:00.000Z"
+  },
+  "wrongQuestions": []
+}
+```
+
+**Response — بعد انتهاء الامتحان:**
+```json
+{
+  "examType": "course",
+  "showAnswers": true,
+  "releaseReason": "after_end",
+  "answersReleaseMode": "after_end",
+  "examEndAt": "2025-01-20T23:59:59.000Z",
+  "attempt": {
+    "attemptId": 5,
+    "totalGrade": 16,
+    "maxGrade": 20,
+    "correctCount": 16,
+    "wrongCount": 4,
+    "submittedAt": "2025-01-15T10:45:00.000Z"
+  },
+  "wrongQuestions": [
+    {
+      "questionId": 2,
+      "questionText": "ما هي وحدة القوة؟",
+      "correctAnswer": "A",
+      "yourAnswer": "B",
+      "optionA": "نيوتن",
+      "optionB": "جول",
+      "optionC": "وات",
+      "optionD": "باسكال"
+    }
+  ]
+}
+```
+
+> **ملاحظة:** عند الإعداد `answersReleaseMode: after_end` يجب تحديد `visibilityEndDate` (موعد انتهاء الامتحان). بعد هذا الموعد يُرجَع التقرير مع `wrongQuestions`.
+
+---
+
+### 5. جلب الأسئلة الخاطئة بعد موعد الإظهار
 
 **GET** `/api/exams/:examId/wrong-questions`
 

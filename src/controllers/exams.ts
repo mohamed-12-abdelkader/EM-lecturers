@@ -544,7 +544,20 @@ router.get(
 
     // Try course-level exam first
     try {
-      const result = await CourseLevelExamsService.getExamReport(examId, req.user!);
+      const passRaw =
+        req.query.passPercentage ?? req.query.pass_percentage ?? req.query.passPercent;
+      const passParsed =
+        passRaw !== undefined && passRaw !== null && String(passRaw).trim() !== ''
+          ? Number(passRaw)
+          : undefined;
+      const passPercentage =
+        passParsed !== undefined && Number.isFinite(passParsed) && passParsed >= 0 && passParsed <= 100
+          ? passParsed
+          : undefined;
+
+      const result = await CourseLevelExamsService.getExamReport(examId, req.user!, {
+        passPercentage,
+      });
       return res.json(result);
     } catch (error: any) {
       // If not found or not course-level exam, try lecture exam
@@ -1688,15 +1701,38 @@ router.post(
       return res.status(400).json({ message: 'Invalid exam id' });
     }
 
-    const { attemptId, answers } = req.body;
-
-    if (!Array.isArray(answers) || answers.length === 0) {
-      return res.status(400).json({ message: 'answers array is required' });
+    let answersList: any[] = [];
+    let hasAnswersPayload = false;
+    if (Array.isArray(req.body.answers)) {
+      hasAnswersPayload = true;
+      answersList = req.body.answers.filter((a: any) => a != null);
+    } else if (
+      Array.isArray(req.body.questionIds) &&
+      Array.isArray(req.body.selectedAnswers) &&
+      req.body.questionIds.length === req.body.selectedAnswers.length
+    ) {
+      hasAnswersPayload = true;
+      answersList = req.body.questionIds.map((qId: number, i: number) => ({
+        questionId: qId,
+        selectedAnswer: req.body.selectedAnswers[i],
+      }));
+    } else if (
+      req.body.answers &&
+      typeof req.body.answers === 'object' &&
+      !Array.isArray(req.body.answers)
+    ) {
+      hasAnswersPayload = true;
+      answersList = Object.entries(req.body.answers).map(([qId, choice]) => ({
+        questionId: Number(qId),
+        selectedAnswer: choice,
+      }));
     }
 
-    const answersList = answers.filter((a: any) => a != null);
-    if (answersList.length === 0) {
-      return res.status(400).json({ message: 'answers array is required' });
+    if (!hasAnswersPayload) {
+      return res.status(400).json({
+        message:
+          'answers required: send answers as array of { questionId, selectedAnswer }, or questionIds + selectedAnswers arrays, or answers as { "questionId": "A", ... }',
+      });
     }
 
     // Try course-level exam first
@@ -1704,10 +1740,11 @@ router.post(
       // Check if this is a course-level exam first
       await CourseLevelExamsService.getExamById(examId, req.user!);
 
-      // If it's a course-level exam, attemptId is required
-      if (!attemptId) {
-        throw new HttpError(400, 'attemptId is required');
-      }
+      const resolvedAttemptId = await CourseLevelExamsService.resolveActiveAttemptId(
+        examId,
+        req.user!.id,
+        req.body.attemptId ?? req.body.attempt_id,
+      );
 
       // Validate answers format for course-level exams (accept multiple key names and formats)
       const validLetters = ['A', 'B', 'C', 'D'];
@@ -1757,7 +1794,7 @@ router.post(
       const result = await CourseLevelExamsService.submitExamAttempt(
         examId,
         req.user!.id,
-        Number(attemptId),
+        resolvedAttemptId,
         validatedAnswers,
       );
       return res.json(result);
@@ -1765,7 +1802,7 @@ router.post(
       // If not found or not course-level exam, try lecture exam
       if (error.status === 404 || error.status === 403) {
         // Try lecture exam format
-        const normalizedAnswers = answers.map((answer: any) => {
+        const normalizedAnswers = answersList.map((answer: any) => {
           const questionId = Number(answer.questionId);
           const choiceId =
             answer.choiceId === null || answer.choiceId === undefined
@@ -1852,6 +1889,41 @@ router.get(
   }),
 );
 
+// GET /api/exams/:examId/attempt-report - تقرير محاولة الطالب (درجة + أسئلة خاطئة بعد انتهاء الامتحان)
+router.get(
+  '/:examId/attempt-report',
+  authMiddleware(['student']),
+  asyncWrapper(async (req, res) => {
+    const examId = Number(req.params.examId);
+    if (Number.isNaN(examId)) {
+      return res.status(400).json({ message: 'Invalid exam id' });
+    }
+
+    const attemptIdRaw = req.query.attemptId ?? req.query.attempt_id;
+    const attemptId =
+      attemptIdRaw !== undefined && attemptIdRaw !== null && attemptIdRaw !== ''
+        ? Number(attemptIdRaw)
+        : undefined;
+
+    if (attemptId !== undefined && Number.isNaN(attemptId)) {
+      return res.status(400).json({ message: 'Invalid attempt id' });
+    }
+
+    try {
+      const report = await CourseLevelExamsService.getStudentAttemptReport(examId, req.user!.id, {
+        attemptId,
+      });
+      return res.json(report);
+    } catch (error: any) {
+      if (error.status) {
+        return res.status(error.status).json({ message: error.message });
+      }
+      console.error('Error fetching student attempt report:', error);
+      return res.status(500).json({ message: 'Failed to fetch attempt report' });
+    }
+  }),
+);
+
 // GET /api/exams/:examId/wrong-questions - Get wrong questions after release date (student only)
 router.get(
   '/:examId/wrong-questions',
@@ -1890,93 +1962,6 @@ router.get(
     });
 
     res.json(report);
-  }),
-);
-
-router.post(
-  '/:examId/start',
-  authMiddleware(['student']),
-  asyncWrapper(async (req, res) => {
-    const examId = Number(req.params.examId);
-    if (Number.isNaN(examId)) {
-      return res.status(400).json({ message: 'Invalid exam id' });
-    }
-
-    // Try course-level exam first
-    try {
-      const attempt = await CourseLevelExamsService.startExamAttempt(examId, req.user!.id);
-      return res.json(attempt);
-    } catch (error: any) {
-      // If not found or not course-level exam, try lecture exam
-      if (error.status === 404 || error.status === 403) {
-        const attempt = await ExamFlowService.startAttempt(examId, req.user!.id);
-        return res.json(attempt);
-      }
-      if (error.status) {
-        return res.status(error.status).json({ message: error.message });
-      }
-      throw error;
-    }
-  }),
-);
-
-router.post(
-  '/:examId/submit',
-  authMiddleware(['student']),
-  asyncWrapper(async (req, res) => {
-    const examId = Number(req.params.examId);
-    if (Number.isNaN(examId)) {
-      return res.status(400).json({ message: 'Invalid exam id' });
-    }
-
-    const answers = req.body.answers;
-    if (!Array.isArray(answers) || answers.length === 0) {
-      return res.status(400).json({ message: 'answers array is required' });
-    }
-
-    const normalizedAnswers = answers.map((answer: any) => {
-      const questionId = Number(answer.questionId);
-      const choiceId =
-        answer.choiceId === null || answer.choiceId === undefined ? null : Number(answer.choiceId);
-
-      if (Number.isNaN(questionId)) {
-        throw Object.assign(new Error('Invalid questionId in answers'), { status: 400 });
-      }
-      if (choiceId !== null && Number.isNaN(choiceId)) {
-        throw Object.assign(new Error('Invalid choiceId in answers'), { status: 400 });
-      }
-
-      return { questionId, choiceId };
-    });
-
-    const result = await ExamFlowService.submitAttempt({
-      examId,
-      studentId: req.user!.id,
-      answers: normalizedAnswers,
-      attemptId: req.body.attemptId ?? req.body.attempt_id,
-      allowAutoStart: true,
-    });
-
-    // تحديث قفل المحاضرات فوراً: إرسال حدث للطالب لإعادة تحميل حالة القفل (بدون إعادة تحميل الصفحة)
-    const courseRow = await pool.query(
-      `SELECT l.course_id FROM exams e JOIN lectures l ON l.id = e.lecture_id WHERE e.id = $1`,
-      [examId],
-    );
-    if (courseRow.rowCount && courseRow.rows[0].course_id) {
-      emitLectureLockUpdated(req.user!.id, courseRow.rows[0].course_id);
-    }
-
-    res.json({
-      attemptId: result.attemptId,
-      status: result.status,
-      totalGrade: result.totalGrade,
-      maxGrade: result.maxGrade,
-      passed: result.passed,
-      showAnswers: result.released,
-      releaseReason: result.releaseReason,
-      wrongQuestions: result.wrongQuestions,
-      courseId: courseRow.rowCount ? courseRow.rows[0].course_id : undefined,
-    });
   }),
 );
 
