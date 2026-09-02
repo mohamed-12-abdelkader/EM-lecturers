@@ -41,6 +41,13 @@ import {
   lectureExamAvailabilityInput,
   shouldListExamForStudent,
 } from '../services/examAccessPolicy';
+import {
+  canResumeCourseAttempt,
+  isDurationUnlimited,
+  lectureDurationDbFields,
+  parseLectureDurationInput,
+  remainingSeconds,
+} from '../services/lectureExamAttemptPolicy';
 
 export const router = Router();
 
@@ -2093,6 +2100,7 @@ router.get(
             ...e,
             availability_status,
             can_start: availability_status === 'open',
+            duration_unlimited: isDurationUnlimited(e.duration),
           };
         });
       const examsList = forLec.filter((e) => e.type === 'exam');
@@ -2254,6 +2262,10 @@ router.get(
         ])
         .filter((id: number | undefined): id is number => id != null);
 
+      if (visibleAssessmentIds.length) {
+        await ExamFlowService.expireOverdueForStudentExams(studentId, visibleAssessmentIds);
+      }
+
       const [videoViewsRes, examSubsRes] = await Promise.all([
         pool.query(
           `SELECT video_id, lecture_id, viewed_at, is_completed
@@ -2264,7 +2276,8 @@ router.get(
         visibleAssessmentIds.length
           ? pool.query(
               `SELECT DISTINCT ON (exam_id)
-                      exam_id, total_grade, passed, submitted_at, status
+                      exam_id, total_grade, passed, submitted_at, status,
+                      attempt_expire_at, attempt_start_time
                FROM exam_submissions
                WHERE student_id = $1 AND exam_id = ANY($2::int[])
                ORDER BY exam_id, submitted_at DESC NULLS LAST, id DESC`,
@@ -2288,18 +2301,27 @@ router.get(
           !!submission &&
           (submission.submitted_at != null ||
             ['submitted', 'late', 'expired'].includes(submissionStatus ?? ''));
+        const inProgress = submissionStatus === 'in_progress';
+        const expireAt = inProgress ? submission?.attempt_expire_at ?? null : null;
+        const now = new Date();
 
         return {
           ...item,
           is_solved: isSubmitted,
           is_started: !!submission,
-          in_progress: submissionStatus === 'in_progress',
+          in_progress: inProgress,
+          duration_unlimited: isDurationUnlimited(item.duration),
+          can_resume: inProgress && canResumeCourseAttempt(expireAt, now),
+          remaining_seconds: inProgress ? remainingSeconds(expireAt, now) : null,
+          attempt_expires_at: expireAt,
           student_submission: submission
             ? {
                 total_grade: submission.total_grade,
                 passed: submission.passed,
                 submitted_at: submission.submitted_at,
                 status: submissionStatus,
+                attempt_expire_at: submission.attempt_expire_at ?? null,
+                started_at: submission.attempt_start_time ?? null,
               }
             : null,
         };
@@ -2375,20 +2397,35 @@ router.get(
 
       if (isStudent && courseAssignments.length > 0) {
         const ids = courseAssignments.map((a) => a.id);
+        await ExamFlowService.expireOverdueForStudentExams(user.id, ids);
         const subsRes = await pool.query(
           `SELECT DISTINCT ON (exam_id)
-             exam_id, id, total_grade, submitted_at, status, passed
+             exam_id, id, total_grade, submitted_at, status, passed,
+             attempt_expire_at, attempt_start_time
            FROM exam_submissions
            WHERE student_id = $1 AND exam_id = ANY($2::int[])
            ORDER BY exam_id, submitted_at DESC NULLS LAST, id DESC`,
           [user.id, ids],
         );
         const byExam = new Map(subsRes.rows.map((s) => [s.exam_id, s]));
+        const now = new Date();
         courseAssignments = courseAssignments.map((a) => {
           const sub = byExam.get(a.id);
+          const inProgress = sub?.status === 'in_progress';
+          const expireAt = inProgress ? sub?.attempt_expire_at ?? null : null;
+          const isSubmitted =
+            !!sub &&
+            (sub.submitted_at != null ||
+              ['submitted', 'late', 'expired'].includes(sub.status ?? ''));
           return {
             ...a,
-            is_solved: !!sub,
+            is_solved: isSubmitted,
+            is_started: !!sub,
+            in_progress: inProgress,
+            duration_unlimited: isDurationUnlimited(a.duration),
+            can_resume: inProgress && canResumeCourseAttempt(expireAt, now),
+            remaining_seconds: inProgress ? remainingSeconds(expireAt, now) : null,
+            attempt_expires_at: expireAt,
             student_submission: sub
               ? {
                   id: sub.id,
@@ -2396,6 +2433,8 @@ router.get(
                   submitted_at: sub.submitted_at,
                   status: sub.status,
                   passed: sub.passed,
+                  attempt_expire_at: sub.attempt_expire_at ?? null,
+                  started_at: sub.attempt_start_time ?? null,
                 }
               : null,
           };
@@ -3241,7 +3280,7 @@ router.post(
 
     // معالجة البيانات
     const examTotalGrade = total_grade || 100;
-    const examDuration = duration ? Number(duration) : null;
+    const durationFields = lectureDurationDbFields(parseLectureDurationInput(duration));
 
     // معالجة is_visible - افتراضياً true إذا لم يتم تحديده
     let visibility = true; // Default to true (visible)
@@ -3297,9 +3336,10 @@ router.post(
         lecture_id, course_id, type, total_grade, created_by, title, duration, is_visible,
         show_at, hide_at, lock_next_lectures,
         show_answers_immediately, show_answers_after_hours,
-        questions_count, question_display_mode, answers_release_mode
+        questions_count, question_display_mode, answers_release_mode,
+        time_limit_enabled, time_limit_minutes
       )
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) RETURNING *`,
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18) RETURNING *`,
       [
         lectureId,
         courseIdForExam,
@@ -3307,7 +3347,7 @@ router.post(
         examTotalGrade,
         req.user!.id,
         examTitle,
-        examDuration,
+        durationFields.duration,
         visibility,
         showAt,
         hideAt,
@@ -3317,6 +3357,8 @@ router.post(
         questionsCount,
         questionDisplayMode,
         answersReleaseMode,
+        durationFields.time_limit_enabled,
+        durationFields.time_limit_minutes,
       ],
     );
 
@@ -3606,8 +3648,13 @@ router.patch(
       values.push(total_grade);
     }
     if (duration !== undefined) {
+      const durationFields = lectureDurationDbFields(parseLectureDurationInput(duration));
       updateFields.push(`duration = $${i++}`);
-      values.push(duration);
+      values.push(durationFields.duration);
+      updateFields.push(`time_limit_enabled = $${i++}`);
+      values.push(durationFields.time_limit_enabled);
+      updateFields.push(`time_limit_minutes = $${i++}`);
+      values.push(durationFields.time_limit_minutes);
     }
     if (is_visible !== undefined) {
       updateFields.push(`is_visible = $${i++}`);

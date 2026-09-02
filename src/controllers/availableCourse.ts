@@ -13,6 +13,7 @@ import { LectureActivationService } from '../services/lectureActivation';
 import { LectureExamService } from '../services/lectureExam';
 import { CourseAccessService } from '../services/courseAccess';
 import { CourseGroupAccessService } from '../services/courseGroupAccess';
+import { lectureDurationDbFields, parseLectureDurationInput, isDurationUnlimited } from '../services/lectureExamAttemptPolicy';
 
 export const router = Router();
 
@@ -62,7 +63,8 @@ const CourseAssignmentSchema = z.object({
   title: z.string().min(1).optional(),
   total_grade: z.coerce.number().positive().optional(),
   totalGrade: z.coerce.number().positive().optional(),
-  duration: z.coerce.number().optional().nullable(),
+  duration: z.union([z.coerce.number(), z.string(), z.null()]).optional().nullable(),
+  duration_unlimited: z.union([z.boolean(), z.string()]).optional(),
   is_visible: z.union([z.boolean(), z.string()]).optional(),
   isVisible: z.boolean().optional(),
   show_at: z.string().optional().nullable(),
@@ -358,7 +360,11 @@ async function createCourseLevelExam(params: {
   // واجب/امتحان على مستوى الكورس لا يقفل محاضرات
   const lockNextLectures = false;
   const examTotalGrade = body.total_grade ?? body.totalGrade ?? 100;
-  const examDuration = body.duration != null ? Number(body.duration) : null;
+  const examDuration =
+    body.duration_unlimited === true || body.duration_unlimited === 'true'
+      ? null
+      : parseLectureDurationInput(body.duration);
+  const durationFields = lectureDurationDbFields(examDuration);
   const visibility = parseVisibility(body.is_visible ?? body.isVisible, true);
   const showAt = body.show_at ? new Date(body.show_at) : null;
   const hideAt = body.hide_at ? new Date(body.hide_at) : null;
@@ -384,12 +390,14 @@ async function createCourseLevelExam(params: {
        lecture_id, course_id, type, total_grade, created_by, title, duration, is_visible,
        show_at, hide_at, lock_next_lectures,
        show_answers_immediately, show_answers_after_hours,
-       questions_count, question_display_mode, answers_release_mode
+       questions_count, question_display_mode, answers_release_mode,
+       time_limit_enabled, time_limit_minutes
      ) VALUES (
        NULL, $1, $2, $3, $4, $5, $6, $7,
        $8, $9, $10,
        $11, $12,
-       $13, $14, $15
+       $13, $14, $15,
+       $16, $17
      ) RETURNING *`,
     [
       courseId,
@@ -397,7 +405,7 @@ async function createCourseLevelExam(params: {
       examTotalGrade,
       userId,
       examTitle,
-      examDuration,
+      durationFields.duration,
       visibility,
       showAt,
       hideAt,
@@ -407,6 +415,8 @@ async function createCourseLevelExam(params: {
       questionsCount,
       questionDisplayMode,
       answersReleaseMode,
+      durationFields.time_limit_enabled,
+      durationFields.time_limit_minutes,
     ],
   );
 
@@ -522,8 +532,12 @@ router.get(
       typeParam,
     });
 
-    const exams = result.rows.filter((r) => r.type === 'exam');
-    const assignments = result.rows.filter((r) => r.type === 'assignment');
+    const rows = result.rows.map((r) => ({
+      ...r,
+      duration_unlimited: isDurationUnlimited(r.duration),
+    }));
+    const exams = rows.filter((r) => r.type === 'exam');
+    const assignments = rows.filter((r) => r.type === 'assignment');
 
     res.json({
       success: true,
@@ -559,11 +573,16 @@ router.get(
       typeParam: 'assignment',
     });
 
+    const rows = result.rows.map((r) => ({
+      ...r,
+      duration_unlimited: isDurationUnlimited(r.duration),
+    }));
+
     res.json({
       success: true,
       assignment_mode: modes.assignment_mode,
-      assignments: result.rows,
-      exams: result.rows, // توافق مع شكل قائمة امتحان المحاضرة عند type=assignment
+      assignments: rows,
+      exams: rows,
     });
   }),
 );

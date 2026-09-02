@@ -20,6 +20,7 @@ import fs from 'fs';
 import pool from '../db/pool';
 import { TeacherLibraryExamQuestionsService } from '../services/teacherLibraryExamQuestions';
 import { normalizeQuestionDisplayMode } from '../services/examQuestionSelection';
+import { parseLectureDurationInput } from '../services/lectureExamAttemptPolicy';
 
 export const router = Router();
 
@@ -281,7 +282,7 @@ router.post(
         type: typeof rawType === 'string' ? rawType : undefined,
         title: req.body.title,
         totalGrade: req.body.totalGrade,
-        duration: req.body.duration,
+        duration: parseLectureDurationInput(req.body.duration),
         isVisible: req.body.isVisible,
         showAt: req.body.showAt,
         hideAt: req.body.hideAt,
@@ -1723,7 +1724,14 @@ router.post(
       await CourseLevelExamsService.getExamById(examId, req.user!);
     } catch (error: any) {
       if (error.status === 404) {
-        return res.status(404).json({ message: 'Autosave is only supported for course-level exams' });
+        const answers = ExamFlowService.parseAnswersFromRequestBody(req.body, { required: false });
+        const result = await ExamFlowService.autosaveAttemptAnswers(
+          examId,
+          req.user!.id,
+          answers,
+          req.body.attemptId ?? req.body.attempt_id,
+        );
+        return res.json(result);
       }
       if (error.status) {
         return res.status(error.status).json({ message: error.message });
@@ -1808,36 +1816,39 @@ router.post(
     } catch (error: any) {
       // If not found or not course-level exam, try lecture exam
       if (error.status === 404 || error.status === 403) {
-        if (!hasAnswersPayload) {
-          return res.status(400).json({
-            message:
-              'answers required: send answers as array of { questionId, selectedAnswer }, or questionIds + selectedAnswers arrays, or answers as { "questionId": "A", ... }',
-          });
-        }
-        // Try lecture exam format
-        const normalizedAnswers = answersList.map((answer: any) => {
-          const questionId = Number(answer.questionId);
+        const normalizedAnswers = (answersList || [])
+          .map((answer: any) => {
+          const questionId = Number(answer.questionId ?? answer.question_id);
+          const choiceRaw =
+            answer.choiceId ??
+            answer.choice_id ??
+            answer.selectedChoiceId ??
+            answer.selected_choice_id ??
+            answer.selectedAnswer ??
+            answer.selected_answer;
           const choiceId =
-            answer.choiceId === null || answer.choiceId === undefined
+            choiceRaw === null || choiceRaw === undefined || choiceRaw === ''
               ? null
-              : Number(answer.choiceId);
+              : Number(choiceRaw);
 
-          if (Number.isNaN(questionId)) {
-            throw Object.assign(new Error('Invalid questionId in answers'), { status: 400 });
+          if (!Number.isInteger(questionId) || questionId <= 0) {
+            return null;
           }
           if (choiceId !== null && Number.isNaN(choiceId)) {
-            throw Object.assign(new Error('Invalid choiceId in answers'), { status: 400 });
+            return null;
           }
+          if (choiceId === null) return null;
 
           return { questionId, choiceId };
-        });
+        })
+          .filter((row): row is { questionId: number; choiceId: number } => row != null);
 
         const result = await ExamFlowService.submitAttempt({
           examId,
           studentId: req.user!.id,
           answers: normalizedAnswers,
           attemptId: req.body.attemptId ?? req.body.attempt_id,
-          allowAutoStart: true,
+          allowAutoStart: false,
         });
 
         const courseRow = await pool.query(
@@ -1854,6 +1865,7 @@ router.post(
           totalGrade: result.totalGrade,
           maxGrade: result.maxGrade,
           passed: result.passed,
+          timedOut: result.timedOut,
           showAnswers: result.released,
           releaseReason: result.releaseReason,
           wrongQuestions: result.wrongQuestions,
