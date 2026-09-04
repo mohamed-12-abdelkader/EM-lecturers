@@ -28,6 +28,7 @@ import {
   computeLectureAttemptExpireAt,
   isAttemptExpired,
   isDurationUnlimited,
+  lectureChoiceDisplay,
   lectureDurationDbFields,
   lectureExamDurationMinutes,
   lectureExamWindowEnd,
@@ -121,6 +122,7 @@ interface WrongQuestion {
   questionImage: string | null;
   correctChoice: { id: number | null; text: string | null } | null;
   yourChoice: { id: number | null; text: string | null } | null;
+  unanswered?: boolean;
 }
 
 interface AttemptAnswersDetail {
@@ -1662,6 +1664,7 @@ export class ExamFlowService {
                ea.question_id AS exam_question_id,
                ea.is_correct,
                ea.selected_choice_id,
+               ea.answer_text,
                selected_choice.text AS selected_choice_text,
                selected_opt.text_content AS selected_choice_text_v2
              FROM exam_answers ea
@@ -1684,24 +1687,30 @@ export class ExamFlowService {
 
     reportMap.forEach((bucket, questionId) => {
       const qAnswers = answersByQuestion.get(questionId) || [];
-      const answeredSubIds = new Set(qAnswers.map((a) => Number(a.submission_id)));
+      const answeredSubIds = new Set<number>();
 
       for (const row of qAnswers) {
         const sub = subById.get(Number(row.submission_id));
+        const choiceId = choiceIdFromAnswerRow(row);
+        const fallback = lectureChoiceDisplay(choiceId);
+        const answered = choiceId != null;
         const student: QuestionReportStudent = {
           studentId: Number(sub?.student_id),
           studentName: sub?.student_name ?? null,
           studentEmail: sub?.student_email ?? null,
           submissionId: row.submission_id,
           attemptNumber: sub?.attempt_number ?? null,
-          selectedChoiceId: row.selected_choice_id ?? null,
-          selectedAnswerText: row.selected_choice_text || row.selected_choice_text_v2 || null,
+          selectedChoiceId: choiceId,
+          selectedAnswerText:
+            row.selected_choice_text || row.selected_choice_text_v2 || fallback.text,
         };
-        bucket.totalResponses += 1;
-        if (row.is_correct) {
+        if (answered) answeredSubIds.add(Number(row.submission_id));
+        if (answered && row.is_correct) {
+          bucket.totalResponses += 1;
           bucket.correctCount += 1;
           bucket.correctStudents.push(student);
-        } else {
+        } else if (answered) {
+          bucket.totalResponses += 1;
           bucket.incorrectCount += 1;
           bucket.incorrectStudents.push(student);
         }
@@ -1725,6 +1734,7 @@ export class ExamFlowService {
     const questions = Array.from(reportMap.values());
     const totalCorrect = questions.reduce((sum, q) => sum + q.correctCount, 0);
     const totalWrong = questions.reduce((sum, q) => sum + q.incorrectCount, 0);
+    const totalUnanswered = questions.reduce((sum, q) => sum + (q.unansweredCount || 0), 0);
     const enrollment = await this.buildLectureEnrollmentSummary(exam, options?.passPercentage);
 
     return {
@@ -1734,6 +1744,7 @@ export class ExamFlowService {
         totalQuestions: questions.length,
         totalCorrect,
         totalWrong,
+        totalUnanswered,
       },
       questions,
       enrollmentSummary: enrollment.enrollmentSummary,
@@ -2877,18 +2888,50 @@ export class ExamFlowService {
   }
 
   /**
-   * قائمة تسليمات امتحان المحاضرة للمدرس مع الأسئلة الخاطئة لكل طالب.
+   * قائمة تسليمات امتحان المحاضرة للمدرس مع الأسئلة الخاطئة والمتروكة لكل طالب.
    */
   static async listLectureExamSubmissionsWithWrongQuestions(examId: number) {
     await this.expireOverdueAttemptsForExam(examId);
+    const examRes = await pool.query(
+      `SELECT id, total_grade, questions_count, question_display_mode FROM exams WHERE id = $1`,
+      [examId],
+    );
+    if (!examRes.rowCount) return [];
+    const exam = examRes.rows[0];
+    const maxGrade = Number(exam.total_grade ?? 0);
+
+    const questionsRes = await pool.query(
+      `SELECT
+         eq.id AS exam_question_id,
+         COALESCE(NULLIF(eq.question_text, ''), q.text, q2.question_text) AS question_text,
+         COALESCE(eq.image, q.image, qm.media_url) AS question_image,
+         eq.grade,
+         correct_choice.id AS correct_choice_id,
+         correct_choice.text AS correct_choice_text,
+         correct_opt.id AS correct_choice_id_v2,
+         correct_opt.text_content AS correct_choice_text_v2
+       FROM exam_questions eq
+       LEFT JOIN questions q ON eq.question_id = q.id
+       LEFT JOIN question_choices correct_choice
+         ON correct_choice.question_id = eq.question_id AND correct_choice.is_correct = true
+       LEFT JOIN questions_v2 q2 ON eq.question_id_v2 = q2.id
+       LEFT JOIN question_media qm ON q2.id = qm.question_id
+       LEFT JOIN question_options correct_opt
+         ON correct_opt.question_id = q2.id
+        AND correct_opt.option_index = q2.correct_answer_index
+       WHERE eq.exam_id = $1
+       ORDER BY eq.id`,
+      [examId],
+    );
+    const questionsById = new Map(
+      questionsRes.rows.map((q) => [Number(q.exam_question_id), q]),
+    );
+    const allQuestionIds = questionsRes.rows.map((q) => Number(q.exam_question_id));
+
     const subsRes = await pool.query(
       `SELECT s.id as submission_id, s.student_id, s.total_grade, s.submitted_at, s.passed,
               s.status, s.attempt_number, s.attempt_start_time, s.attempt_expire_at, s.timed_out,
-              (
-                SELECT COUNT(*)::int FROM exam_answers ea
-                WHERE ea.submission_id = s.id
-                  AND (ea.selected_choice_id IS NOT NULL OR NULLIF(ea.answer_text, '') IS NOT NULL)
-              ) AS answered_count,
+              s.selected_question_ids, s.is_late,
               u.name, u.email, u.phone
        FROM exam_submissions s
        JOIN users u ON s.student_id = u.id
@@ -2905,78 +2948,111 @@ export class ExamFlowService {
 
     const submissionIds = subsRes.rows.map((r) => Number(r.submission_id));
     const answersRes = await pool.query(
-      `SELECT 
+      `SELECT
         ea.submission_id,
         ea.question_id as exam_question_id,
-        eq.question_text,
-        eq.image,
-        q.text as bank_text,
-        q.image as bank_image,
-        q2.question_text as bank_text_v2,
-        qm.media_url as bank_image_v2,
         ea.selected_choice_id,
+        ea.answer_text,
         ea.is_correct,
         selected_choice.text as selected_choice_text,
-        selected_opt.text_content as selected_choice_text_v2,
-        correct_choice.id as correct_choice_id,
-        correct_choice.text as correct_choice_text,
-        correct_opt.id as correct_choice_id_v2,
-        correct_opt.text_content as correct_choice_text_v2
+        selected_opt.text_content as selected_choice_text_v2
        FROM exam_answers ea
-       JOIN exam_questions eq ON ea.question_id = eq.id
-       LEFT JOIN questions q ON eq.question_id = q.id
        LEFT JOIN question_choices selected_choice ON selected_choice.id = ea.selected_choice_id
-       LEFT JOIN question_choices correct_choice 
-         ON correct_choice.question_id = eq.question_id AND correct_choice.is_correct = true
-       LEFT JOIN questions_v2 q2 ON eq.question_id_v2 = q2.id
-       LEFT JOIN question_media qm ON q2.id = qm.question_id
        LEFT JOIN question_options selected_opt ON selected_opt.id = ea.selected_choice_id
-       LEFT JOIN question_options correct_opt
-         ON correct_opt.question_id = q2.id
-        AND correct_opt.option_index = q2.correct_answer_index
-       WHERE ea.submission_id = ANY($1::int[])
-         AND ea.is_correct = FALSE
-       ORDER BY ea.submission_id, ea.question_id`,
+       WHERE ea.submission_id = ANY($1::int[])`,
       [submissionIds],
     );
 
-    const wrongBySubmission = new Map<number, WrongQuestion[]>();
+    const answersBySubmission = new Map<number, Map<number, any>>();
     for (const row of answersRes.rows) {
       const sid = Number(row.submission_id);
-      const list = wrongBySubmission.get(sid) || [];
-      const correctId = row.correct_choice_id ?? row.correct_choice_id_v2 ?? null;
-      const correctText = row.correct_choice_text || row.correct_choice_text_v2 || null;
-      list.push({
-        questionId: row.exam_question_id,
-        questionText: row.question_text || row.bank_text || row.bank_text_v2 || null,
-        questionImage: row.image || row.bank_image || row.bank_image_v2 || null,
-        correctChoice:
-          correctId != null || correctText ? { id: correctId, text: correctText } : null,
-        yourChoice: {
-          id: row.selected_choice_id,
-          text: row.selected_choice_text || row.selected_choice_text_v2 || null,
-        },
-      });
-      wrongBySubmission.set(sid, list);
+      const byQuestion = answersBySubmission.get(sid) || new Map();
+      byQuestion.set(Number(row.exam_question_id), row);
+      answersBySubmission.set(sid, byQuestion);
     }
 
     return subsRes.rows.map((row) => {
-      const wrong = wrongBySubmission.get(Number(row.submission_id)) || [];
       const inProgress = String(row.status || '') === 'in_progress';
+      const storedIds = parseSelectedQuestionIds(row.selected_question_ids);
+      const questionIds =
+        storedIds && storedIds.length
+          ? storedIds.filter((id) => allQuestionIds.includes(id))
+          : selectAttemptQuestions(
+              allQuestionIds,
+              exam.questions_count,
+              exam.question_display_mode ?? 'ordered',
+              attemptQuestionSeed(
+                Number(exam.id),
+                Number(row.student_id),
+                Number(row.attempt_number || 1),
+              ),
+            );
+      const answers = answersBySubmission.get(Number(row.submission_id)) || new Map();
+      const wrong: WrongQuestion[] = [];
+      let answeredCount = 0;
+      for (const questionId of questionIds) {
+        const question = questionsById.get(questionId);
+        if (!question) continue;
+        const answer = answers.get(questionId);
+        const choiceId = choiceIdFromAnswerRow(answer || {});
+        const answered = choiceId != null;
+        if (answered) answeredCount += 1;
+        const isCorrect = Boolean(answer?.is_correct) && answered;
+        if (isCorrect) continue;
+        const fallback = lectureChoiceDisplay(choiceId);
+        const selectedText =
+          answer?.selected_choice_text ||
+          answer?.selected_choice_text_v2 ||
+          fallback.text;
+        const correctId = question.correct_choice_id ?? question.correct_choice_id_v2 ?? null;
+        const correctText = question.correct_choice_text || question.correct_choice_text_v2 || null;
+        wrong.push({
+          questionId,
+          questionText: question.question_text || null,
+          questionImage: question.question_image || null,
+          unanswered: !answered,
+          correctChoice:
+            correctId != null || correctText ? { id: correctId, text: correctText } : null,
+          yourChoice: {
+            id: choiceId,
+            text: selectedText,
+          },
+        } as WrongQuestion);
+      }
+      const questionsCount = questionIds.length;
+      const unansweredCount = Math.max(0, questionsCount - answeredCount);
+      const obtained = Number(row.total_grade ?? 0);
+      const examMax = maxGrade > 0 ? maxGrade : questionsCount;
+      const percentage = examMax > 0 ? Math.round((obtained / examMax) * 100) : 0;
+      const timedOut = Boolean(row.timed_out);
+      const status = String(row.status || 'submitted');
+
       return {
         submission_id: row.submission_id,
         student_id: row.student_id,
-        total_grade: inProgress ? null : row.total_grade,
+        obtained_grade: inProgress ? null : obtained,
+        total_grade: examMax,
+        max_grade: examMax,
+        percentage: inProgress ? null : percentage,
         submitted_at: row.submitted_at,
         started_at: row.attempt_start_time ?? null,
-        passed: inProgress ? false : row.passed,
-        status: row.status,
+        passed: inProgress ? false : Boolean(row.passed),
+        status,
         in_progress: inProgress,
-        exam_status: inProgress ? 'in_progress' : row.status,
+        exam_status: inProgress
+          ? 'in_progress'
+          : timedOut
+            ? 'timed_out'
+            : status === 'late'
+              ? 'late'
+              : 'submitted',
         attempt_number: row.attempt_number,
-        answered_count: Number(row.answered_count || 0),
+        questions_count: questionsCount,
+        answered_count: answeredCount,
+        unanswered_count: unansweredCount,
         remaining_seconds: inProgress ? remainingSeconds(row.attempt_expire_at) : null,
-        timed_out: Boolean(row.timed_out),
+        timed_out: timedOut,
+        is_late: Boolean(row.is_late),
         name: row.name,
         email: row.email,
         phone: row.phone,

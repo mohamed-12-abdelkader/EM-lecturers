@@ -5,6 +5,7 @@ import {
   computeLectureAttemptExpireAt,
   isAttemptExpired,
   isDurationUnlimited,
+  lectureChoiceDisplay,
   lectureDurationDbFields,
   mergeSavedAndSubmittedLectureAnswers,
   normalizeDurationMinutes,
@@ -91,6 +92,12 @@ describe('choice answers merge', () => {
       questionId: 3,
       choiceId: -2,
     });
+  });
+
+  it('maps default negative choice ids to letters', () => {
+    expect(lectureChoiceDisplay(-1)).toEqual({ letter: 'A', text: 'أ' });
+    expect(lectureChoiceDisplay(-2)).toEqual({ letter: 'B', text: 'ب' });
+    expect(lectureChoiceDisplay(null)).toEqual({ letter: null, text: null });
   });
 
   it('lets submitted answers override autosaved ones', () => {

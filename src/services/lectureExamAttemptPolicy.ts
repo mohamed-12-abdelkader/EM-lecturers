@@ -22,6 +22,21 @@ export {
 };
 
 const LETTERS = ['A', 'B', 'C', 'D'] as const;
+const ARABIC_LETTERS = ['أ', 'ب', 'ج', 'د'] as const;
+
+export function lectureChoiceDisplay(choiceId: number | null | undefined): {
+  letter: string | null;
+  text: string | null;
+} {
+  if (choiceId == null || choiceId === 0) return { letter: null, text: null };
+  if (choiceId < 0) {
+    const idx = -choiceId - 1;
+    if (idx >= 0 && idx < LETTERS.length) {
+      return { letter: LETTERS[idx], text: ARABIC_LETTERS[idx] };
+    }
+  }
+  return { letter: null, text: null };
+}
 
 export function lectureExamWindowEnd(exam: {
   hide_at?: Date | string | null;

@@ -28,6 +28,7 @@ import {
   parseCourseExamAnswerItem,
   remainingSeconds,
   type CourseExamAnswer,
+  type CourseExamLetter,
 } from './courseLevelExamAttemptPolicy';
 
 interface RequestUser {
@@ -516,18 +517,23 @@ export class CourseLevelExamsService {
 
   private static async upsertAttemptAnswers(
     attemptId: number,
-    answers: CourseExamAnswer[],
+    answers: Array<{ questionId: number; selectedAnswer?: CourseExamLetter | null }>,
     correctByQuestionId?: Record<number, string | null | undefined>,
   ) {
     for (const answer of answers) {
+      const selected = answer.selectedAnswer
+        ? String(answer.selectedAnswer).trim().toUpperCase()
+        : '';
+      const letter =
+        selected === 'A' || selected === 'B' || selected === 'C' || selected === 'D'
+          ? selected
+          : null;
       const correct = correctByQuestionId
         ? String(correctByQuestionId[answer.questionId] ?? '')
             .trim()
             .toUpperCase()
         : '';
-      const isCorrect = correctByQuestionId
-        ? correct.length > 0 && answer.selectedAnswer === correct
-        : false;
+      const isCorrect = Boolean(letter && correct && letter === correct);
       await pool.query(
         `INSERT INTO course_level_exam_answers (
            attempt_id, question_id, selected_answer, is_correct
@@ -535,7 +541,7 @@ export class CourseLevelExamsService {
          ON CONFLICT (attempt_id, question_id) DO UPDATE SET
            selected_answer = EXCLUDED.selected_answer,
            is_correct = EXCLUDED.is_correct`,
-        [attemptId, answer.questionId, answer.selectedAnswer, isCorrect],
+        [attemptId, answer.questionId, letter, isCorrect],
       );
     }
   }
@@ -613,7 +619,14 @@ export class CourseLevelExamsService {
       answers: merged,
     });
 
-    await this.upsertAttemptAnswers(attempt.id, merged, correctByQuestionId);
+    await this.upsertAttemptAnswers(
+      attempt.id,
+      graded.results.map((row) => ({
+        questionId: row.questionId,
+        selectedAnswer: row.selectedAnswer,
+      })),
+      correctByQuestionId,
+    );
 
     await pool.query(
       `UPDATE course_level_exam_attempts
@@ -1037,28 +1050,108 @@ export class CourseLevelExamsService {
     return 'Answers are not available yet';
   }
 
+  private static mapCourseWrongQuestion(question: any, answer?: any) {
+    const optionText = (letter: string | null) => {
+      if (!letter) return null;
+      const key = String(letter).trim().toUpperCase();
+      if (key === 'A') return question.option_a ?? null;
+      if (key === 'B') return question.option_b ?? null;
+      if (key === 'C') return question.option_c ?? null;
+      if (key === 'D') return question.option_d ?? null;
+      return null;
+    };
+    const yourAnswer = answer?.selected_answer
+      ? String(answer.selected_answer).trim().toUpperCase()
+      : null;
+    const correctAnswer = question.correct_answer
+      ? String(question.correct_answer).trim().toUpperCase()
+      : null;
+    const unanswered = !yourAnswer;
+    return {
+      questionId: question.id ?? question.question_id,
+      questionText: question.question_text,
+      questionImage: question.question_image,
+      type: question.type,
+      correctAnswer,
+      correctAnswerText: optionText(correctAnswer),
+      yourAnswer,
+      yourAnswerText: optionText(yourAnswer),
+      unanswered,
+      optionA: question.option_a,
+      optionB: question.option_b,
+      optionC: question.option_c,
+      optionD: question.option_d,
+    };
+  }
+
+  private static resolveAttemptQuestionIds(
+    exam: { id?: number; questions_count?: number | null; question_display_mode?: string | null },
+    attempt: { student_id?: number; attempt_number?: number; selected_question_ids?: unknown },
+    allQuestionIds: number[],
+  ): number[] {
+    const stored = parseSelectedQuestionIds(attempt?.selected_question_ids);
+    if (stored && stored.length) {
+      return stored.filter((id) => allQuestionIds.includes(id));
+    }
+    return selectAttemptQuestions(
+      allQuestionIds,
+      exam.questions_count,
+      exam.question_display_mode ?? 'ordered',
+      attemptQuestionSeed(
+        Number(exam.id),
+        Number(attempt.student_id || 0),
+        Number(attempt.attempt_number || 1),
+      ),
+    );
+  }
+
   private static async fetchWrongQuestionsForAttempt(attemptId: number) {
-    const wrongAnswersRes = await pool.query(
-      `SELECT a.*, q.*
-       FROM course_level_exam_answers a
-       JOIN course_level_exam_questions q ON a.question_id = q.id
-       WHERE a.attempt_id = $1 AND a.is_correct = FALSE
-       ORDER BY q.created_at ASC`,
+    const attemptRes = await pool.query(
+      `SELECT a.id, a.exam_id, a.student_id, a.attempt_number, a.selected_question_ids,
+              e.questions_count, e.question_display_mode
+       FROM course_level_exam_attempts a
+       JOIN course_level_exams e ON e.id = a.exam_id
+       WHERE a.id = $1`,
       [attemptId],
     );
+    if (!attemptRes.rowCount) return [];
+    const attempt = attemptRes.rows[0];
+    const questionsRes = await pool.query(
+      `SELECT id, type, question_text, question_image, option_a, option_b, option_c, option_d, correct_answer
+       FROM course_level_exam_questions
+       WHERE exam_id = $1
+       ORDER BY created_at ASC, id ASC`,
+      [attempt.exam_id],
+    );
+    const questionsById = new Map(questionsRes.rows.map((q) => [Number(q.id), q]));
+    const questionIds = this.resolveAttemptQuestionIds(
+      { id: attempt.exam_id, questions_count: attempt.questions_count, question_display_mode: attempt.question_display_mode },
+      attempt,
+      questionsRes.rows.map((q) => Number(q.id)),
+    );
+    const answersRes = await pool.query(
+      `SELECT question_id, selected_answer, is_correct
+       FROM course_level_exam_answers
+       WHERE attempt_id = $1`,
+      [attemptId],
+    );
+    const answersByQuestion = new Map(
+      answersRes.rows.map((row) => [Number(row.question_id), row]),
+    );
 
-    return wrongAnswersRes.rows.map((row) => ({
-      questionId: row.question_id,
-      questionText: row.question_text,
-      questionImage: row.question_image,
-      type: row.type,
-      correctAnswer: row.correct_answer,
-      yourAnswer: row.selected_answer,
-      optionA: row.option_a,
-      optionB: row.option_b,
-      optionC: row.option_c,
-      optionD: row.option_d,
-    }));
+    return questionIds
+      .map((questionId) => {
+        const question = questionsById.get(questionId);
+        if (!question) return null;
+        const answer = answersByQuestion.get(questionId);
+        const selected = answer?.selected_answer
+          ? String(answer.selected_answer).trim().toUpperCase()
+          : null;
+        const isCorrect = Boolean(answer?.is_correct) && Boolean(selected);
+        if (isCorrect) return null;
+        return this.mapCourseWrongQuestion(question, answer);
+      })
+      .filter((row): row is NonNullable<typeof row> => row != null);
   }
 
   private static mapAttemptSummary(attempt: any) {
@@ -1783,9 +1876,10 @@ export class CourseLevelExamsService {
 
     const questionsWithStats = questions.map((question) => {
       const questionAnswers = answers.filter((a) => a.question_id === question.id);
-      const answeredStudentIds = new Set(questionAnswers.map((a) => Number(a.student_id)));
-      const correctAnswers = questionAnswers.filter((a) => a.is_correct);
-      const wrongAnswers = questionAnswers.filter((a) => !a.is_correct);
+      const answeredRows = questionAnswers.filter((a) => a.selected_answer);
+      const answeredStudentIds = new Set(answeredRows.map((a) => Number(a.student_id)));
+      const correctAnswers = answeredRows.filter((a) => a.is_correct);
+      const wrongAnswers = answeredRows.filter((a) => !a.is_correct);
       const unansweredStudents = attempts
         .filter((att) => !answeredStudentIds.has(Number(att.student_id)))
         .map((att) => ({
@@ -1798,7 +1892,7 @@ export class CourseLevelExamsService {
 
       const correctCount = correctAnswers.length;
       const wrongCount = wrongAnswers.length + unansweredStudents.length;
-      const answeredCount = questionAnswers.length;
+      const answeredCount = answeredRows.length;
       const totalStudents = totalAttempts;
 
       const answerCounts = {
@@ -1850,11 +1944,12 @@ export class CourseLevelExamsService {
     const sortedQuestions = [...questionsWithStats].sort((a, b) => b.wrongCount - a.wrongCount);
 
     const totalQuestions = questions.length;
-    const totalAnswers = answers.length;
-    const totalCorrect = answers.filter((a) => a.is_correct).length;
-    const totalWrong = answers.filter((a) => !a.is_correct).length;
+    const totalCorrect = questionsWithStats.reduce((sum, q) => sum + q.correctCount, 0);
+    const totalWrong = questionsWithStats.reduce((sum, q) => sum + q.wrongCount, 0);
+    const totalUnanswered = questionsWithStats.reduce((sum, q) => sum + q.unansweredCount, 0);
+    const scoredPairs = totalCorrect + totalWrong;
     const overallCorrectPercentage =
-      totalAnswers > 0 ? Math.round((totalCorrect / totalAnswers) * 100 * 100) / 100 : 0;
+      scoredPairs > 0 ? Math.round((totalCorrect / scoredPairs) * 100 * 100) / 100 : 0;
 
     const mostProblematicQuestions = sortedQuestions
       .filter((q) => q.wrongCount > 0)
@@ -1880,9 +1975,10 @@ export class CourseLevelExamsService {
         totalStudents: totalAttempts,
         enrolledTotal,
         totalQuestions,
-        totalAnswers,
+        totalAnswers: scoredPairs,
         totalCorrect,
         totalWrong,
+        totalUnanswered,
         overallCorrectPercentage,
         overallWrongPercentage: Math.round((100 - overallCorrectPercentage) * 100) / 100,
       },
@@ -2402,9 +2498,26 @@ export class CourseLevelExamsService {
   }
 
   /**
-   * قائمة تسليمات الامتحان الشامل للمدرس مع الأسئلة الخاطئة وإجابة كل طالب.
+   * قائمة تسليمات الامتحان الشامل للمدرس مع الأسئلة الخاطئة والمتروكة وإجابة كل طالب.
    */
   static async listSubmissionsWithWrongQuestions(examId: number) {
+    const examRes = await pool.query(
+      `SELECT id, questions_count, question_display_mode FROM course_level_exams WHERE id = $1`,
+      [examId],
+    );
+    if (!examRes.rowCount) return [];
+    const exam = examRes.rows[0];
+
+    const questionsRes = await pool.query(
+      `SELECT id, type, question_text, question_image, option_a, option_b, option_c, option_d, correct_answer
+       FROM course_level_exam_questions
+       WHERE exam_id = $1
+       ORDER BY created_at ASC, id ASC`,
+      [examId],
+    );
+    const questionsById = new Map(questionsRes.rows.map((q) => [Number(q.id), q]));
+    const allQuestionIds = questionsRes.rows.map((q) => Number(q.id));
+
     const subsRes = await pool.query(
       `SELECT
          a.id as submission_id,
@@ -2417,12 +2530,12 @@ export class CourseLevelExamsService {
          a.submitted_at,
          a.attempt_expire_at,
          a.last_autosave_at,
-         CASE WHEN a.status = 'submitted' AND a.obtained_grade >= (a.total_grade * 0.5) THEN true ELSE false END as passed,
-         (
-           SELECT COUNT(*)::int
-           FROM course_level_exam_answers ans
-           WHERE ans.attempt_id = a.id AND ans.selected_answer IS NOT NULL
-         ) AS answered_count,
+         a.timed_out,
+         a.selected_question_ids,
+         CASE
+           WHEN a.status = 'submitted' AND a.obtained_grade >= (a.total_grade * 0.5) THEN true
+           ELSE false
+         END as passed,
          u.name,
          u.email,
          u.phone
@@ -2444,64 +2557,62 @@ export class CourseLevelExamsService {
          a.attempt_id,
          a.question_id,
          a.selected_answer,
-         a.is_correct,
-         q.question_text,
-         q.question_image,
-         q.type,
-         q.option_a,
-         q.option_b,
-         q.option_c,
-         q.option_d,
-         q.correct_answer
+         a.is_correct
        FROM course_level_exam_answers a
-       JOIN course_level_exam_questions q ON a.question_id = q.id
-       WHERE a.attempt_id = ANY($1::int[])
-         AND a.is_correct = FALSE
-       ORDER BY a.attempt_id, q.id`,
+       WHERE a.attempt_id = ANY($1::int[])`,
       [attemptIds],
     );
 
-    const optionText = (row: any, letter: string | null) => {
-      if (!letter) return null;
-      const key = String(letter).trim().toUpperCase();
-      if (key === 'A') return row.option_a ?? null;
-      if (key === 'B') return row.option_b ?? null;
-      if (key === 'C') return row.option_c ?? null;
-      if (key === 'D') return row.option_d ?? null;
-      return null;
-    };
-
-    const wrongByAttempt = new Map<number, any[]>();
+    const answersByAttempt = new Map<number, Map<number, any>>();
     for (const row of answersRes.rows) {
       const attemptId = Number(row.attempt_id);
-      const list = wrongByAttempt.get(attemptId) || [];
-      const yourAnswer = row.selected_answer ? String(row.selected_answer).trim().toUpperCase() : null;
-      const correctAnswer = row.correct_answer ? String(row.correct_answer).trim().toUpperCase() : null;
-      list.push({
-        questionId: row.question_id,
-        questionText: row.question_text,
-        questionImage: row.question_image,
-        type: row.type,
-        correctAnswer,
-        correctAnswerText: optionText(row, correctAnswer),
-        yourAnswer,
-        yourAnswerText: optionText(row, yourAnswer),
-        optionA: row.option_a,
-        optionB: row.option_b,
-        optionC: row.option_c,
-        optionD: row.option_d,
-      });
-      wrongByAttempt.set(attemptId, list);
+      const byQuestion = answersByAttempt.get(attemptId) || new Map();
+      byQuestion.set(Number(row.question_id), row);
+      answersByAttempt.set(attemptId, byQuestion);
     }
 
     return subsRes.rows.map((row) => {
-      const wrong = wrongByAttempt.get(Number(row.submission_id)) || [];
       const inProgress = row.status === 'in_progress';
+      const questionIds = this.resolveAttemptQuestionIds(
+        exam,
+        row,
+        allQuestionIds,
+      );
+      const answers = answersByAttempt.get(Number(row.submission_id)) || new Map();
+      const wrong: any[] = [];
+      let answeredCount = 0;
+      for (const questionId of questionIds) {
+        const question = questionsById.get(questionId);
+        if (!question) continue;
+        const answer = answers.get(questionId);
+        const selected = answer?.selected_answer
+          ? String(answer.selected_answer).trim().toUpperCase()
+          : null;
+        if (selected) answeredCount += 1;
+        const isCorrect = Boolean(answer?.is_correct) && Boolean(selected);
+        if (!isCorrect) {
+          wrong.push(this.mapCourseWrongQuestion(question, answer));
+        }
+      }
+      const questionsCount = questionIds.length;
+      const unansweredCount = Math.max(0, questionsCount - answeredCount);
+      const obtained = Number(row.obtained_grade ?? 0);
+      const maxGrade = Number(row.total_grade ?? questionsCount);
+      const percentage = maxGrade > 0 ? Math.round((obtained / maxGrade) * 100) : 0;
+
       return {
         ...row,
+        obtained_grade: inProgress ? null : obtained,
+        total_grade: maxGrade,
+        max_grade: maxGrade,
+        percentage: inProgress ? null : percentage,
         in_progress: inProgress,
-        exam_status: inProgress ? 'in_progress' : 'submitted',
+        exam_status: inProgress ? 'in_progress' : row.timed_out ? 'timed_out' : 'submitted',
+        timed_out: Boolean(row.timed_out),
         remaining_seconds: inProgress ? remainingSeconds(row.attempt_expire_at) : null,
+        questions_count: questionsCount,
+        answered_count: answeredCount,
+        unanswered_count: inProgress ? unansweredCount : unansweredCount,
         wrong_questions: inProgress ? [] : wrong,
         wrong_questions_count: inProgress ? 0 : wrong.length,
       };
