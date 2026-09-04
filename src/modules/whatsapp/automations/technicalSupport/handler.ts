@@ -2,6 +2,7 @@ import { logger } from '../../../../utils';
 import { registerWhatsAppHandler } from '../registry';
 import type { HandlerResult, InboundContext } from '../types';
 import { runTechnicalSupportAgent } from './agent';
+import { applySupportPolicies } from './policyLayer';
 
 export const TECHNICAL_SUPPORT_BOT_KEY = 'technical_support_bot';
 
@@ -84,11 +85,19 @@ async function onInbound(ctx: InboundContext): Promise<HandlerResult> {
 
   try {
     const result = await runTechnicalSupportAgent(ctx);
+    const layered = await applySupportPolicies({
+      draft: result.reply,
+      studentText: ctx.body || '',
+      metadata: result.metadata,
+    });
     return {
       handled: true,
-      reply: result.reply,
+      reply: layered.reply,
       escalate: result.escalate,
-      metadata: result.metadata,
+      metadata: {
+        ...(result.metadata || {}),
+        ...layered.metadata,
+      },
     };
   } catch (err) {
     logger.error({ err }, 'technical_support_bot handler error');

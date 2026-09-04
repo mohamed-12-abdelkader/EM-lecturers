@@ -11,6 +11,7 @@ import { WhatsAppSessionService } from '../sessions/whatsappSession.service';
 import { WhatsAppServiceAdmin } from '../services/whatsappServiceAdmin.service';
 import { WhatsAppOutboundQueue } from '../queue/whatsappOutboundQueue';
 import { SessionPoolService } from '../routing/sessionPool.service';
+import { SupportPolicyChatService } from '../automations/supportPolicy/policyChat.service';
 
 export const whatsappAdminRouter = Router();
 
@@ -263,6 +264,35 @@ whatsappAdminRouter.get(
   asyncWrapper(async (_req, res) => {
     const stats = await WhatsAppOutboundQueue.getStats();
     res.json({ success: true, data: stats });
+  }),
+);
+
+whatsappAdminRouter.get(
+  '/support-policy',
+  asyncWrapper(async (_req, res) => {
+    const pack = await SupportPolicyChatService.getPack();
+    res.json({ success: true, data: pack });
+  }),
+);
+
+whatsappAdminRouter.get(
+  '/support-policy/messages',
+  asyncWrapper(async (_req, res) => {
+    const messages = await SupportPolicyChatService.listMessages();
+    res.json({ success: true, data: { messages } });
+  }),
+);
+
+const PolicyChatBody = z.object({
+  message: z.string().min(1).max(4000),
+});
+
+whatsappAdminRouter.post(
+  '/support-policy/chat',
+  validate(PolicyChatBody),
+  asyncWrapper(async (req, res) => {
+    const data = await SupportPolicyChatService.chat(req.user!.id, req.body.message);
+    res.json({ success: true, data });
   }),
 );
 
