@@ -28,16 +28,13 @@ import {
   isMeetingOwnerOrAdminOrGroupManager,
   singleActiveMeetingLimit,
 } from '../middleware/meetings';
-import { generateParticipantToken, getParticipantsCount, resolveMeetingTeacherDisplay } from '../services/meetings-room-services';
+import { canIssueScreenShareToken as canUserIssueScreenShareToken, generateParticipantToken, getParticipantsCount, resolveMeetingTeacherDisplay, sameUserId } from '../services/meetings-room-services';
 import {
   processMeetingRecordingAfterEgress,
   type MeetingRecordingTable,
 } from '../services/meetingRecordingUpload';
 import { enforceTeacherLiveCreationLimit } from '../services/teacherLivePackagePolicy';
-import {
-  buildScreenShareAppInfo,
-  canIssueScreenShareToken,
-} from '../services/easAppClient';
+import { buildScreenShareAppInfo } from '../services/easAppClient';
 
 const router = Router();
 
@@ -368,7 +365,12 @@ router.get(
       const meeting = req.meeting!;
       const meetingSource = (req as any).meetingSource as 'course' | 'general_course_group' | undefined;
 
-      const isOwner = user.id === meeting.created_by;
+      const isOwner = sameUserId(user.id, meeting.created_by);
+      const canScreenShare = await canUserIssueScreenShareToken({
+        user,
+        meeting,
+        meetingSource,
+      });
       const { teacherName, teacherIcon } = await resolveMeetingTeacherDisplay(
         meeting.created_by,
         req.tenant as any,
@@ -420,42 +422,43 @@ router.get(
 
       const participantIdentity = `user_${user.id}_meeting_${meetingId}`;
 
+      const hostRole = isOwner || canScreenShare;
+
       const participantToken = await generateParticipantToken({
         roomName: meetingId, // meeting.id is also the LiveKit room name
         identity: participantIdentity,
         name: participantName,
-        role: isOwner ? 'host' : 'participant',
+        role: hostRole ? 'host' : 'participant',
         allowChat: (meeting as any).allow_chat !== false,
         metadata: JSON.stringify({
           avatar: user.avatar || null,
-          role: isOwner ? 'host' : 'participant',
+          role: hostRole ? 'host' : 'participant',
         }),
       });
 
       let screenShareToken: string | undefined;
       let screenShareApp: ReturnType<typeof buildScreenShareAppInfo> | undefined;
 
-      if (isOwner) {
+      if (canScreenShare) {
         screenShareApp = buildScreenShareAppInfo(req, meetingId);
-        // مشاركة الشاشة فقط من تطبيق Expo الرسمي (EAS Project ID)
-        if (canIssueScreenShareToken(req)) {
-          screenShareToken = await generateParticipantToken({
-            roomName: meetingId, // meeting.id is also the LiveKit room name
-            identity: `${participantIdentity}_screenShare`,
-            name: participantName,
+        // الموقع يحتاج التوكن لفتح التطبيق. لا نمنع الإصدار بسبب غياب هيدر EAS.
+        screenShareToken = await generateParticipantToken({
+          roomName: meetingId,
+          identity: `${participantIdentity}_screenShare`,
+          name: participantName,
+          role: 'host',
+          ttl: '2h',
+          metadata: JSON.stringify({
             role: 'host',
-            metadata: JSON.stringify({
-              role: 'host',
-              hidden: true,
-              easProjectId: screenShareApp.easProjectId,
-            }),
-          });
-        }
+            hidden: true,
+            easProjectId: screenShareApp.easProjectId,
+          }),
+        });
       }
 
       return res.json({
         participantToken,
-        screenShareToken: screenShareToken ?? null,
+        screenShareToken: screenShareToken || null,
         screenShareApp: screenShareApp ?? null,
         serverUrl: LIVEKIT_SERVER_URL,
         roomName: meetingId,
@@ -463,7 +466,7 @@ router.get(
         teacherName,
         teacherIcon,
         participantName,
-        isOwner,
+        isOwner: hostRole,
       });
     } catch (err) {
       console.log('error', err);

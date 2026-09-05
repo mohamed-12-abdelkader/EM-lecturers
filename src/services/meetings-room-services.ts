@@ -61,6 +61,44 @@ export async function resolveMeetingTeacherDisplay(
   };
 }
 
+export function sameUserId(a: unknown, b: unknown): boolean {
+  const left = Number(a);
+  const right = Number(b);
+  return Number.isFinite(left) && Number.isFinite(right) && left === right;
+}
+
+/**
+ * من يحق له توكن مشاركة الشاشة (تطبيق الموبايل): صاحب الجلسة، أدمن،
+ * مدرس الكورس، أو مدرس مجموعة الكورس العام.
+ */
+export async function canIssueScreenShareToken(params: {
+  user: { id: unknown; role?: string | null };
+  meeting: { created_by?: unknown; course_id?: unknown; group_id?: unknown };
+  meetingSource?: 'course' | 'general_course_group';
+}): Promise<boolean> {
+  const { user, meeting, meetingSource } = params;
+  if (sameUserId(user.id, meeting.created_by)) return true;
+  if (user.role === 'admin') return true;
+
+  if (meetingSource === 'general_course_group' && meeting.group_id) {
+    const group = await pool.query(
+      `SELECT 1 FROM general_course_groups WHERE id = $1 AND teacher_id = $2 LIMIT 1`,
+      [meeting.group_id, user.id],
+    );
+    if (group.rowCount) return true;
+  }
+
+  if (meeting.course_id) {
+    const course = await pool.query(
+      `SELECT 1 FROM courses WHERE id = $1 AND teacher_id = $2 LIMIT 1`,
+      [meeting.course_id, user.id],
+    );
+    if (course.rowCount) return true;
+  }
+
+  return false;
+}
+
 export const getParticipantsCount = async (roomName: string, roomService: any) => {
   try {
     const participants = await roomService.listParticipants(roomName);

@@ -5,12 +5,9 @@ import { asyncWrapper } from '../utils';
 import pool from '../db/pool';
 import { config } from '../utils';
 import { z } from 'zod';
-import { generateParticipantToken, getParticipantsCount, resolveMeetingTeacherDisplay } from '../services/meetings-room-services';
+import { canIssueScreenShareToken as canUserIssueScreenShareToken, generateParticipantToken, getParticipantsCount, resolveMeetingTeacherDisplay, sameUserId } from '../services/meetings-room-services';
 import { enforceTeacherLiveCreationLimit } from '../services/teacherLivePackagePolicy';
-import {
-  buildScreenShareAppInfo,
-  canIssueScreenShareToken,
-} from '../services/easAppClient';
+import { buildScreenShareAppInfo } from '../services/easAppClient';
 
 const router = Router();
 const { LIVEKIT_API_KEY, LIVEKIT_API_SECRET, LIVEKIT_URL: LIVEKIT_SERVER_URL } = config;
@@ -418,7 +415,13 @@ router.get(
       return res.status(403).json({ success: false, message: 'تم إخراجك من هذه الجلسة' });
     }
 
-    const isOwner = meeting.created_by === user.id;
+    const isOwner = sameUserId(meeting.created_by, user.id);
+    const canScreenShare = await canUserIssueScreenShareToken({
+      user,
+      meeting,
+      meetingSource: 'general_course_group',
+    });
+    const hostRole = isOwner || canScreenShare;
     const { teacherName, teacherIcon } = await resolveMeetingTeacherDisplay(
       meeting.created_by,
       req.tenant as any,
@@ -440,33 +443,32 @@ router.get(
       roomName: meetingId,
       identity: participantIdentity,
       name: participantName,
-      role: isOwner ? 'host' : 'participant',
+      role: hostRole ? 'host' : 'participant',
       allowChat: meeting.allow_chat !== false,
-      metadata: JSON.stringify({ avatar: (user as any).avatar || null, role: isOwner ? 'host' : 'participant' }),
+      metadata: JSON.stringify({ avatar: (user as any).avatar || null, role: hostRole ? 'host' : 'participant' }),
     });
 
     let screenShareToken: string | undefined;
     let screenShareApp: ReturnType<typeof buildScreenShareAppInfo> | undefined;
-    if (isOwner) {
+    if (canScreenShare) {
       screenShareApp = buildScreenShareAppInfo(req, meetingId);
-      if (canIssueScreenShareToken(req)) {
-        screenShareToken = await generateParticipantToken({
-          roomName: meetingId,
-          identity: `${participantIdentity}_screenShare`,
-          name: participantName,
+      screenShareToken = await generateParticipantToken({
+        roomName: meetingId,
+        identity: `${participantIdentity}_screenShare`,
+        name: participantName,
+        role: 'host',
+        ttl: '2h',
+        metadata: JSON.stringify({
           role: 'host',
-          metadata: JSON.stringify({
-            role: 'host',
-            hidden: true,
-            easProjectId: screenShareApp.easProjectId,
-          }),
-        });
-      }
+          hidden: true,
+          easProjectId: screenShareApp.easProjectId,
+        }),
+      });
     }
 
     res.json({
       participantToken,
-      screenShareToken: screenShareToken ?? null,
+      screenShareToken: screenShareToken || null,
       screenShareApp: screenShareApp ?? null,
       serverUrl: LIVEKIT_SERVER_URL,
       roomName: meetingId,
@@ -474,7 +476,7 @@ router.get(
       teacherName,
       teacherIcon,
       participantName,
-      isOwner,
+      isOwner: hostRole,
     });
   }),
 );
