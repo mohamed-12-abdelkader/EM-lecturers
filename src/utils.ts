@@ -229,6 +229,14 @@ export const config = cleanEnv(process.env, {
   WHATSAPP_WORKER_INTERVAL_MS: num({ default: 2000 }),
   WHATSAPP_WORKER_BATCH_SIZE: num({ default: 20 }),
   WHATSAPP_MAX_ATTEMPTS: num({ default: 5 }),
+
+  /**
+   * EAS / Expo project ID للتطبيق الرسمي.
+   * مشاركة الشاشة في الميتنج تُصدر فقط للطلبات القادمة من هذا التطبيق.
+   */
+  EAS_PROJECT_ID: str({ default: '5a2cf549-223a-473b-8c3b-d51796713eca' }),
+  /** Deep link scheme لفتح التطبيق (بدون ://) */
+  EXPO_APP_SCHEME: str({ default: 'emlecturers' }),
 });
 
 // Security

@@ -7,6 +7,10 @@ import { config } from '../utils';
 import { z } from 'zod';
 import { generateParticipantToken, getParticipantsCount, resolveMeetingTeacherDisplay } from '../services/meetings-room-services';
 import { enforceTeacherLiveCreationLimit } from '../services/teacherLivePackagePolicy';
+import {
+  buildScreenShareAppInfo,
+  canIssueScreenShareToken,
+} from '../services/easAppClient';
 
 const router = Router();
 const { LIVEKIT_API_KEY, LIVEKIT_API_SECRET, LIVEKIT_URL: LIVEKIT_SERVER_URL } = config;
@@ -442,19 +446,28 @@ router.get(
     });
 
     let screenShareToken: string | undefined;
+    let screenShareApp: ReturnType<typeof buildScreenShareAppInfo> | undefined;
     if (isOwner) {
-      screenShareToken = await generateParticipantToken({
-        roomName: meetingId,
-        identity: `${participantIdentity}_screenShare`,
-        name: participantName,
-        role: 'host',
-        metadata: JSON.stringify({ role: 'host', hidden: true }),
-      });
+      screenShareApp = buildScreenShareAppInfo(req, meetingId);
+      if (canIssueScreenShareToken(req)) {
+        screenShareToken = await generateParticipantToken({
+          roomName: meetingId,
+          identity: `${participantIdentity}_screenShare`,
+          name: participantName,
+          role: 'host',
+          metadata: JSON.stringify({
+            role: 'host',
+            hidden: true,
+            easProjectId: screenShareApp.easProjectId,
+          }),
+        });
+      }
     }
 
     res.json({
       participantToken,
-      screenShareToken,
+      screenShareToken: screenShareToken ?? null,
+      screenShareApp: screenShareApp ?? null,
       serverUrl: LIVEKIT_SERVER_URL,
       roomName: meetingId,
       meetingName: meeting.title,

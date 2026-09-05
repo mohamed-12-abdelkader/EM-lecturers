@@ -34,6 +34,10 @@ import {
   type MeetingRecordingTable,
 } from '../services/meetingRecordingUpload';
 import { enforceTeacherLiveCreationLimit } from '../services/teacherLivePackagePolicy';
+import {
+  buildScreenShareAppInfo,
+  canIssueScreenShareToken,
+} from '../services/easAppClient';
 
 const router = Router();
 
@@ -428,24 +432,31 @@ router.get(
         }),
       });
 
-      let screenShareToken;
+      let screenShareToken: string | undefined;
+      let screenShareApp: ReturnType<typeof buildScreenShareAppInfo> | undefined;
 
       if (isOwner) {
-        screenShareToken = await generateParticipantToken({
-          roomName: meetingId, // meeting.id is also the LiveKit room name
-          identity: `${participantIdentity}_screenShare`,
-          name: participantName,
-          role: 'host',
-          metadata: JSON.stringify({
+        screenShareApp = buildScreenShareAppInfo(req, meetingId);
+        // مشاركة الشاشة فقط من تطبيق Expo الرسمي (EAS Project ID)
+        if (canIssueScreenShareToken(req)) {
+          screenShareToken = await generateParticipantToken({
+            roomName: meetingId, // meeting.id is also the LiveKit room name
+            identity: `${participantIdentity}_screenShare`,
+            name: participantName,
             role: 'host',
-            hidden: true,
-          }),
-        });
+            metadata: JSON.stringify({
+              role: 'host',
+              hidden: true,
+              easProjectId: screenShareApp.easProjectId,
+            }),
+          });
+        }
       }
 
       return res.json({
         participantToken,
-        screenShareToken,
+        screenShareToken: screenShareToken ?? null,
+        screenShareApp: screenShareApp ?? null,
         serverUrl: LIVEKIT_SERVER_URL,
         roomName: meetingId,
         meetingName: meeting.title,

@@ -611,21 +611,62 @@ console.log('عدد المشاركين:', data.meeting.participantsCount);
 
 **ملاحظات:**
 - يرجع LiveKit token للانضمام للميتنج
-- إذا كان المستخدم صاحب الميتنج، يرجع أيضاً `screenShareToken` لمشاركة الشاشة
+- إذا كان المستخدم صاحب الميتنج:
+  - يرجع `screenShareApp` دائماً (معلومات فتح التطبيق الرسمي)
+  - يرجع `screenShareToken` **فقط** إذا كان الطلب من تطبيق Expo الرسمي (نفس EAS Project ID)
 
-**Response (200 OK):**
+**التحقق من التطبيق الرسمي (EAS):**
+
+أرسل أحد الهيدرات التالية من التطبيق:
+```
+X-EAS-Project-Id: 5a2cf549-223a-473b-8c3b-d51796713eca
+```
+أو query: `?easProjectId=5a2cf549-223a-473b-8c3b-d51796713eca`
+
+القيمة يجب أن تطابق `EAS_PROJECT_ID` في السيرفر.
+
+**Response (200 OK) — من الويب (صاحب الميتنج بدون هيدر التطبيق):**
 ```json
 {
-  "participantToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
-  "screenShareToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+  "participantToken": "eyJ...",
+  "screenShareToken": null,
+  "screenShareApp": {
+    "requiresOfficialApp": true,
+    "isOfficialApp": false,
+    "easProjectId": "5a2cf549-223a-473b-8c3b-d51796713eca",
+    "openAppUrl": "emlecturers://meeting/screen-share?meetingId=550e8400-e29b-41d4-a716-446655440000&easProjectId=5a2cf549-223a-473b-8c3b-d51796713eca&action=screen_share",
+    "requiredHeader": "X-EAS-Project-Id"
+  },
   "serverUrl": "wss://livekit.example.com",
   "roomName": "550e8400-e29b-41d4-a716-446655440000",
   "participantName": "محمد علي",
-  "isOwner": false
+  "isOwner": true
 }
 ```
 
-**ملاحظة:** `screenShareToken` موجود فقط إذا كان `isOwner: true`
+**Response (200 OK) — من التطبيق الرسمي (مع الهيدر):**
+```json
+{
+  "participantToken": "eyJ...",
+  "screenShareToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+  "screenShareApp": {
+    "requiresOfficialApp": true,
+    "isOfficialApp": true,
+    "easProjectId": "5a2cf549-223a-473b-8c3b-d51796713eca",
+    "openAppUrl": "emlecturers://meeting/screen-share?meetingId=...&easProjectId=...&action=screen_share",
+    "requiredHeader": "X-EAS-Project-Id"
+  },
+  "serverUrl": "wss://livekit.example.com",
+  "roomName": "550e8400-e29b-41d4-a716-446655440000",
+  "participantName": "محمد علي",
+  "isOwner": true
+}
+```
+
+> **للفرونت (ويب):** لو `isOwner && !screenShareToken` → افتح `screenShareApp.openAppUrl` عشان يبدأ مشاركة الشاشة من التطبيق.  
+> **للتطبيق:** أرسل دائماً `X-EAS-Project-Id` مع طلب `/connection` عشان تستلم `screenShareToken`.
+
+**ملاحظة:** `screenShareToken` / `screenShareApp` يظهران فقط إذا كان `isOwner: true`
 
 **أمثلة الاستخدام:**
 
