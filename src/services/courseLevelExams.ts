@@ -1536,7 +1536,11 @@ export class CourseLevelExamsService {
   /**
    * Get all students' grades for an exam (teacher only)
    */
-  static async getExamGrades(examId: number, requester: RequestUser) {
+  static async getExamGrades(
+    examId: number,
+    requester: RequestUser,
+    options?: { groupId?: number; groupType?: 'study' | 'course' },
+  ) {
     // Verify exam exists and teacher owns it
     const examRes = await pool.query(
       `SELECT e.id, e.title, e.course_id, c.teacher_id, c.title as course_title
@@ -1557,7 +1561,23 @@ export class CourseLevelExamsService {
       throw new HttpError(403, 'You are not allowed to view grades for this exam');
     }
 
-    // Get all submitted attempts with student info
+    const groupFilter = await this.resolveStudyGroupFilter(
+      Number(exam.teacher_id),
+      options?.groupId,
+      {
+        courseId: Number(exam.course_id),
+        requesterId: requester.id,
+        groupType: options?.groupType,
+      },
+    );
+
+    const groupParam = groupFilter?.groupId ?? null;
+    const groupType = groupFilter?.groupType ?? 'study';
+    const membershipSql = groupFilter
+      ? this.groupMembershipSql(groupType, 'a.student_id', '$2')
+      : 'TRUE';
+
+    // Get all submitted attempts with student info (optional study-group filter)
     const attemptsRes = await pool.query(
       `SELECT 
          a.id as attempt_id,
@@ -1573,8 +1593,9 @@ export class CourseLevelExamsService {
        FROM course_level_exam_attempts a
        JOIN users u ON a.student_id = u.id
        WHERE a.exam_id = $1 AND a.status = 'submitted'
+         AND ($2::int IS NULL OR ${membershipSql})
        ORDER BY a.submitted_at DESC`,
-      [examId],
+      [examId, groupParam],
     );
 
     const attempts = attemptsRes.rows;
@@ -1596,6 +1617,7 @@ export class CourseLevelExamsService {
         courseId: exam.course_id,
         courseTitle: exam.course_title,
       },
+      groupFilter,
       students: attempts.map((a) => ({
         studentId: a.student_id,
         studentName: a.student_name,
@@ -1618,6 +1640,164 @@ export class CourseLevelExamsService {
         totalObtainedGrade: totalObtained,
       },
     };
+  }
+
+  /** تحقق من أن المجموعة صالحة لفلترة تقرير هذا الكورس (study_groups أو course_groups) */
+  private static async resolveStudyGroupFilter(
+    teacherId: number,
+    groupId?: number | null,
+    opts?: { courseId?: number; requesterId?: number; groupType?: 'study' | 'course' },
+  ): Promise<{
+    groupId: number;
+    groupName: string;
+    groupType: 'study' | 'course';
+  } | null> {
+    if (groupId == null || !Number.isFinite(groupId) || groupId <= 0) {
+      return null;
+    }
+
+    const prefer = opts?.groupType;
+    const tryStudy = !prefer || prefer === 'study';
+    const tryCourse = !prefer || prefer === 'course';
+
+    if (tryStudy) {
+      const studyRes = await pool.query<{ id: number; name: string }>(
+        `SELECT sg.id, sg.name
+         FROM study_groups sg
+         WHERE sg.id = $1
+           AND (
+             sg.teacher_id = $2
+             OR ($3::int IS NOT NULL AND sg.teacher_id = $3)
+             OR (
+               $4::int IS NOT NULL AND EXISTS (
+                 SELECT 1
+                 FROM group_students gs
+                 JOIN enrollments e ON e.user_id = gs.student_id AND e.course_id = $4
+                 WHERE gs.group_id = sg.id
+               )
+             )
+           )`,
+        [groupId, teacherId, opts?.requesterId ?? null, opts?.courseId ?? null],
+      );
+      if (studyRes.rowCount) {
+        return {
+          groupId: Number(studyRes.rows[0].id),
+          groupName: studyRes.rows[0].name,
+          groupType: 'study',
+        };
+      }
+    }
+
+    if (tryCourse) {
+      try {
+        const courseGroupRes = await pool.query<{ id: number; name: string }>(
+          `SELECT cg.id, cg.name
+           FROM course_groups cg
+           WHERE cg.id = $1
+             AND COALESCE(cg.status, 'active') = 'active'
+             AND (
+               cg.teacher_id = $2
+               OR ($3::int IS NOT NULL AND cg.teacher_id = $3)
+               OR (
+                 $4::int IS NOT NULL AND EXISTS (
+                   SELECT 1
+                   FROM student_course_group_memberships m
+                   JOIN enrollments e ON e.user_id = m.student_id AND e.course_id = $4
+                   WHERE m.group_id = cg.id
+                 )
+               )
+             )`,
+          [groupId, teacherId, opts?.requesterId ?? null, opts?.courseId ?? null],
+        );
+        if (courseGroupRes.rowCount) {
+          return {
+            groupId: Number(courseGroupRes.rows[0].id),
+            groupName: courseGroupRes.rows[0].name,
+            groupType: 'course',
+          };
+        }
+      } catch {
+        // course_groups table may not exist on older DBs
+      }
+    }
+
+    throw new HttpError(
+      404,
+      'Group is not linked to this course teacher or enrolled students',
+    );
+  }
+
+  /** مجموعات study_groups + course_groups المرتبطة بالكورس/المدرس */
+  private static async listCourseRelatedStudyGroups(
+    teacherId: number,
+    courseId: number,
+    requesterId?: number,
+  ) {
+    const studyRes = await pool.query<{ id: number; name: string; grade_id: number | null }>(
+      `SELECT DISTINCT sg.id, sg.name, sg.grade_id
+       FROM study_groups sg
+       WHERE sg.teacher_id = $1
+          OR ($3::int IS NOT NULL AND sg.teacher_id = $3)
+          OR EXISTS (
+            SELECT 1
+            FROM group_students gs
+            JOIN enrollments e ON e.user_id = gs.student_id AND e.course_id = $2
+            WHERE gs.group_id = sg.id
+          )
+       ORDER BY sg.name ASC`,
+      [teacherId, courseId, requesterId ?? null],
+    );
+
+    const courseRes = await pool
+      .query<{ id: number; name: string; grade_id: number | null }>(
+        `SELECT DISTINCT cg.id, cg.name, cg.grade_id
+         FROM course_groups cg
+         WHERE COALESCE(cg.status, 'active') = 'active'
+           AND (
+             cg.teacher_id = $1
+             OR ($3::int IS NOT NULL AND cg.teacher_id = $3)
+             OR EXISTS (
+               SELECT 1
+               FROM student_course_group_memberships m
+               JOIN enrollments e ON e.user_id = m.student_id AND e.course_id = $2
+               WHERE m.group_id = cg.id
+             )
+           )
+         ORDER BY cg.name ASC`,
+        [teacherId, courseId, requesterId ?? null],
+      )
+      .catch(() => ({ rows: [] as { id: number; name: string; grade_id: number | null }[] }));
+
+    const study = studyRes.rows.map((g) => ({
+      id: Number(g.id),
+      name: g.name,
+      gradeId: g.grade_id != null ? Number(g.grade_id) : null,
+      groupType: 'study' as const,
+    }));
+    const course = courseRes.rows.map((g) => ({
+      id: Number(g.id),
+      name: g.name,
+      gradeId: g.grade_id != null ? Number(g.grade_id) : null,
+      groupType: 'course' as const,
+    }));
+    return [...study, ...course];
+  }
+
+  private static groupMembershipSql(
+    groupType: 'study' | 'course',
+    studentExpr: string,
+    groupParam: string,
+  ): string {
+    if (groupType === 'course') {
+      return `EXISTS (
+        SELECT 1 FROM student_course_group_memberships m
+        WHERE m.student_id = ${studentExpr} AND m.group_id = ${groupParam}
+      )`;
+    }
+    return `EXISTS (
+      SELECT 1 FROM group_students gs
+      WHERE gs.student_id = ${studentExpr} AND gs.group_id = ${groupParam}
+    )`;
   }
 
   /**
@@ -1643,7 +1823,7 @@ export class CourseLevelExamsService {
   static async getExamReport(
     examId: number,
     requester: RequestUser,
-    options?: { passPercentage?: number },
+    options?: { passPercentage?: number; groupId?: number; groupType?: 'study' | 'course' },
   ) {
     const examRes = await pool.query(
       `SELECT e.id, e.title, e.course_id, e.questions_count, c.teacher_id, c.title as course_title
@@ -1668,16 +1848,40 @@ export class CourseLevelExamsService {
         ? options.passPercentage
         : 50;
 
+    const groupFilter = await this.resolveStudyGroupFilter(
+      Number(exam.teacher_id),
+      options?.groupId,
+      {
+        courseId: Number(exam.course_id),
+        requesterId: requester.id,
+        groupType: options?.groupType,
+      },
+    );
+    const availableStudyGroups = await this.listCourseRelatedStudyGroups(
+      Number(exam.teacher_id),
+      Number(exam.course_id),
+      requester.id,
+    );
+
+    const groupParam = groupFilter?.groupId ?? null;
+    const membershipForUser = groupFilter
+      ? this.groupMembershipSql(groupFilter.groupType, 'u.id', '$2')
+      : 'TRUE';
+
     const enrolledRes = await pool.query(
       `SELECT u.id as student_id, u.name as student_name, u.email as student_email
        FROM enrollments e
        JOIN users u ON u.id = e.user_id
        WHERE e.course_id = $1 AND u.role = 'student'
+         AND ($2::int IS NULL OR ${membershipForUser})
        ORDER BY u.name ASC`,
-      [exam.course_id],
+      [exam.course_id, groupParam],
     );
     const enrolledStudents = enrolledRes.rows;
     const enrolledTotal = enrolledStudents.length;
+    const enrolledStudentIds = new Set(
+      enrolledStudents.map((s) => Number(s.student_id)),
+    );
 
     const attemptStatusRes = await pool.query(
       `SELECT DISTINCT ON (a.student_id)
@@ -1723,6 +1927,16 @@ export class CourseLevelExamsService {
     let startedNotSubmittedCount = 0;
     let passedCount = 0;
     let failedCount = 0;
+    const examinedStudents: {
+      studentId: number;
+      studentName: string;
+      studentEmail: string;
+      obtainedGrade: number | null;
+      totalGrade: number | null;
+      percentage: number;
+      passed: boolean;
+      submittedAt?: string | null;
+    }[] = [];
     const notExaminedStudents: {
       studentId: number;
       studentName: string;
@@ -1742,17 +1956,31 @@ export class CourseLevelExamsService {
 
       if (submittedAttempt) {
         examinedCount++;
-        if (
-          this.isAttemptPassed(
-            submittedAttempt.obtained_grade,
-            submittedAttempt.total_grade,
-            passPercentage,
-          )
-        ) {
+        const obtained = Number(submittedAttempt.obtained_grade ?? 0);
+        const total = Number(submittedAttempt.total_grade ?? 0);
+        const passed = this.isAttemptPassed(
+          submittedAttempt.obtained_grade,
+          submittedAttempt.total_grade,
+          passPercentage,
+        );
+        if (passed) {
           passedCount++;
         } else {
           failedCount++;
         }
+        examinedStudents.push({
+          studentId,
+          studentName: student.student_name,
+          studentEmail: student.student_email,
+          obtainedGrade:
+            submittedAttempt.obtained_grade != null
+              ? Number(submittedAttempt.obtained_grade)
+              : null,
+          totalGrade:
+            submittedAttempt.total_grade != null ? Number(submittedAttempt.total_grade) : null,
+          percentage: total > 0 ? Math.round((obtained / total) * 100 * 100) / 100 : 0,
+          passed,
+        });
         continue;
       }
 
@@ -1782,6 +2010,9 @@ export class CourseLevelExamsService {
     const notExaminedCount = enrolledTotal - examinedCount;
     const enrollmentSummary = {
       passPercentage,
+      groupId: groupFilter?.groupId ?? null,
+      groupName: groupFilter?.groupName ?? null,
+      groupType: groupFilter?.groupType ?? null,
       enrolledTotal,
       examined: {
         count: examinedCount,
@@ -1816,21 +2047,39 @@ export class CourseLevelExamsService {
     );
     const questions = questionsRes.rows;
 
+    const membershipForAttempt = groupFilter
+      ? this.groupMembershipSql(groupFilter.groupType, 'a.student_id', '$2')
+      : 'TRUE';
+
     const attemptsRes = await pool.query(
       `SELECT DISTINCT ON (a.student_id)
          a.id,
          a.student_id,
          u.name as student_name,
-         u.email as student_email
+         u.email as student_email,
+         a.obtained_grade,
+         a.total_grade,
+         a.submitted_at
        FROM course_level_exam_attempts a
        JOIN users u ON a.student_id = u.id
        WHERE a.exam_id = $1 AND a.status = 'submitted'
+         AND ($2::int IS NULL OR ${membershipForAttempt})
        ORDER BY a.student_id, a.submitted_at DESC NULLS LAST, a.id DESC`,
-      [examId],
+      [examId, groupParam],
     );
-    const attempts = attemptsRes.rows;
+    const attempts = attemptsRes.rows.filter((a) =>
+      enrolledStudentIds.has(Number(a.student_id)),
+    );
     const totalAttempts = attempts.length;
     const attemptIds = attempts.map((a) => Number(a.id));
+
+    // Enrich examinedStudents with submittedAt from attempts query
+    const submittedAtByStudent = new Map(
+      attempts.map((a) => [Number(a.student_id), a.submitted_at ?? null]),
+    );
+    for (const s of examinedStudents) {
+      s.submittedAt = submittedAtByStudent.get(s.studentId) ?? null;
+    }
 
     const answersRes =
       attemptIds.length === 0
@@ -1969,7 +2218,10 @@ export class CourseLevelExamsService {
         courseTitle: exam.course_title,
         questionsCount: exam.questions_count,
       },
+      groupFilter,
+      availableStudyGroups,
       enrollmentSummary,
+      examinedStudents,
       notExaminedStudents,
       overallStatistics: {
         totalStudents: totalAttempts,
