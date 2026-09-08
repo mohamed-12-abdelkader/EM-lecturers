@@ -686,6 +686,21 @@ export class CourseLevelExamsService {
     };
   }
 
+  static async expireOverdueAttemptsForExam(examId: number) {
+    const res = await pool.query(
+      `SELECT student_id
+       FROM course_level_exam_attempts
+       WHERE exam_id = $1
+         AND status = 'in_progress'
+         AND attempt_expire_at IS NOT NULL
+         AND attempt_expire_at <= NOW()`,
+      [examId],
+    );
+    for (const row of res.rows) {
+      await this.expireOverdueAttemptIfNeeded(examId, Number(row.student_id));
+    }
+  }
+
   private static async expireOverdueAttemptIfNeeded(examId: number, studentId: number) {
     const res = await pool.query(
       `SELECT a.*, e.title, e.duration_minutes, e.questions_count, e.question_display_mode,
@@ -1659,6 +1674,7 @@ export class CourseLevelExamsService {
 
     const exam = examRes.rows[0];
     await CourseAccessControl.assertCanManageCourse(requester, Number(exam.course_id));
+    await this.expireOverdueAttemptsForExam(examId);
 
     const passPercentage =
       options?.passPercentage != null &&
@@ -2507,6 +2523,7 @@ export class CourseLevelExamsService {
     );
     if (!examRes.rowCount) return [];
     const exam = examRes.rows[0];
+    await this.expireOverdueAttemptsForExam(examId);
 
     const questionsRes = await pool.query(
       `SELECT id, type, question_text, question_image, option_a, option_b, option_c, option_d, correct_answer

@@ -2220,6 +2220,7 @@ export class ExamFlowService {
             questionImage: q.questionImage,
             correctChoice: q.correctChoice,
             yourChoice: q.yourChoice,
+            unanswered: q.selectedChoiceId == null,
           }))
       : [];
 
@@ -3145,4 +3146,5 @@ const mapWrongQuestionsFromAnswers = (answers: AttemptAnswersDetail[]): WrongQue
       questionImage: answer.questionImage,
       correctChoice: answer.correctChoice,
       yourChoice: answer.selectedChoice,
+      unanswered: answer.selectedChoice?.id == null,
     }));
