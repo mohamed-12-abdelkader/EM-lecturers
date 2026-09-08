@@ -7,6 +7,35 @@ const studentCourseAccessSql = (studentParam: string) =>
     WHERE en_access.course_id = c.id AND en_access.user_id = ${studentParam}
   ))`;
 
+/**
+ * قفل المحاضرات التالية يُطبَّق فقط عندما:
+ * - في المحاضرة تقييم واحد ظاهر (امتحان أو واجب)
+ * - و`lock_next_lectures = true`
+ * لو في أكتر من تقييم ظاهر → لا قفل (المحاضرات التالية مفتوحة).
+ *
+ * `$lecture` / `$student` / `$now` = placeholders مثل $1 $2 $3
+ */
+const blockingAssessmentsCteSql = (lecture: string, student: string, now: string) =>
+  `WITH visible_assessments AS (
+       SELECT e.id, e.type, e.title, e.lock_next_lectures, e.total_grade, e.lecture_id
+       FROM exams e
+       JOIN lectures l ON l.id = e.lecture_id
+       JOIN courses c ON c.id = l.course_id
+       WHERE e.lecture_id = ${lecture}
+       AND ${studentCourseAccessSql(student)}
+       AND ${visibleAssessmentSql(now)}
+     )`;
+
+/** تقييم ظاهر حالياً للطالب (امتحان أو واجب) داخل نافذة الظهور وجاهز للحل */
+const visibleAssessmentSql = (nowParam: string) =>
+  `e.is_visible = true
+       AND (e.show_at IS NULL OR e.show_at <= ${nowParam})
+       AND (e.hide_at IS NULL OR e.hide_at >= ${nowParam})
+       AND (
+         e.questions_count IS NULL OR e.questions_count <= 0
+         OR (SELECT COUNT(*) FROM exam_questions eq WHERE eq.exam_id = e.id) >= e.questions_count
+       )`;
+
 export interface LectureExam {
   id: number;
   lecture_id: number;
@@ -333,9 +362,8 @@ export class LectureExamService {
 
   /**
    * التحقق من إمكانية الوصول للمحاضرات التالية للطالب
-   * تفتح المحاضرات التالية فقط إذا نجح الطالب في:
-   * - كل واجبات المحاضرة الظاهرة حالياً (type = assignment)
-   * - وكل امتحانات المحاضرة ذات lock_next_lectures = true الظاهرة حالياً
+   * القفل يُطبَّق فقط لو المحاضرة فيها تقييم واحد ظاهر و`lock_next_lectures = true`.
+   * لو فيها أكتر من واجب/امتحان ظاهر → المحاضرات التالية مفتوحة.
    */
   static async canStudentAccessNextLectures(
     lectureId: number,
@@ -343,26 +371,13 @@ export class LectureExamService {
   ): Promise<boolean> {
     const now = new Date();
 
-    // كل التقييمات الظاهرة اللي لازم الطالب ينجح فيها قبل فتح المحاضرة اللي بعدها
     const examResult = await pool.query<{ id: number; type: string; title: string | null }>(
-      `SELECT e.id, e.type, e.title
-       FROM exams e
-       JOIN lectures l ON l.id = e.lecture_id
-       JOIN courses c ON c.id = l.course_id
-       WHERE e.lecture_id = $1
-       AND ${studentCourseAccessSql('$2')}
-       AND e.is_visible = true
-       AND (e.show_at IS NULL OR e.show_at <= $3)
-       AND (e.hide_at IS NULL OR e.hide_at >= $3)
-       AND (
-         e.questions_count IS NULL OR e.questions_count <= 0
-         OR (SELECT COUNT(*) FROM exam_questions eq WHERE eq.exam_id = e.id) >= e.questions_count
-       )
-       AND (
-         e.type = 'assignment'
-         OR e.lock_next_lectures = true
-       )
-       ORDER BY e.id ASC`,
+      `${blockingAssessmentsCteSql('$1', '$2', '$3')}
+       SELECT id, type, title
+       FROM visible_assessments
+       WHERE (SELECT COUNT(*) FROM visible_assessments) = 1
+         AND lock_next_lectures = true
+       ORDER BY id ASC`,
       [lectureId, studentId, now],
     );
 
@@ -418,10 +433,22 @@ export class LectureExamService {
       [lectureId, studentId, now],
     );
 
-    // فحص الامتحانات/الواجبات المانعة للوصول فقط
+    // فحص التقييمات المانعة فقط (تقييم واحد + lock_next_lectures)
     const blockingExamsResult = await pool.query(
-      `SELECT e.id, e.title, e.type, e.is_visible, e.lock_next_lectures, 
-              e.show_at, e.hide_at, l.title as lecture_title, l.position
+      `SELECT e.id, e.title, e.type, e.is_visible, e.lock_next_lectures,
+              e.show_at, e.hide_at, l.title as lecture_title, l.position,
+              (
+                SELECT COUNT(*)::int
+                FROM exams ve
+                WHERE ve.lecture_id = l.id
+                AND ve.is_visible = true
+                AND (ve.show_at IS NULL OR ve.show_at <= $3)
+                AND (ve.hide_at IS NULL OR ve.hide_at >= $3)
+                AND (
+                  ve.questions_count IS NULL OR ve.questions_count <= 0
+                  OR (SELECT COUNT(*) FROM exam_questions eq WHERE eq.exam_id = ve.id) >= ve.questions_count
+                )
+              ) AS visible_assessments_count
        FROM lectures l
        JOIN courses c ON c.id = l.course_id
        JOIN exams e ON e.lecture_id = l.id
@@ -429,17 +456,20 @@ export class LectureExamService {
        AND ${studentCourseAccessSql('$2')}
        AND (l.position, COALESCE(l.created_at, '1970-01-01'::timestamp), l.id) <
            (SELECT position, COALESCE(created_at, '1970-01-01'::timestamp), id FROM lectures WHERE id = $1)
-       AND e.is_visible = true
-       AND (e.show_at IS NULL OR e.show_at <= $3)
-       AND (e.hide_at IS NULL OR e.hide_at >= $3)
+       AND ${visibleAssessmentSql('$3')}
+       AND e.lock_next_lectures = true
        AND (
-         e.questions_count IS NULL OR e.questions_count <= 0
-         OR (SELECT COUNT(*) FROM exam_questions eq WHERE eq.exam_id = e.id) >= e.questions_count
-       )
-       AND (
-         e.type = 'assignment'
-         OR e.lock_next_lectures = true
-       )
+         SELECT COUNT(*)
+         FROM exams ve
+         WHERE ve.lecture_id = l.id
+         AND ve.is_visible = true
+         AND (ve.show_at IS NULL OR ve.show_at <= $3)
+         AND (ve.hide_at IS NULL OR ve.hide_at >= $3)
+         AND (
+           ve.questions_count IS NULL OR ve.questions_count <= 0
+           OR (SELECT COUNT(*) FROM exam_questions eq WHERE eq.exam_id = ve.id) >= ve.questions_count
+         )
+       ) = 1
        ORDER BY l.position DESC, e.id ASC`,
       [lectureId, studentId, now],
     );
@@ -452,12 +482,15 @@ export class LectureExamService {
       potentially_blocking_exams: blockingExamsResult.rows,
       can_access: blockingExamsResult.rowCount === 0,
       logic_explanation: {
-        exam_not_taken:
-          'إذا لم يخضع الطالب للامتحان بعد، المحاضرات التالية مقفلة (لأن الامتحان ظاهر)',
-        exam_passed: 'إذا نجح الطالب في الامتحان، المحاضرات التالية مفتوحة',
-        exam_failed: 'إذا فشل الطالب في الامتحان، المحاضرات التالية مقفلة',
-        exam_hidden: 'إذا كان الامتحان مخفي، المحاضرات التالية مفتوحة',
-        exam_expired: 'إذا انتهت صلاحية الامتحان، المحاضرات التالية مفتوحة',
+        single_assessment_with_lock:
+          'القفل يُطبَّق فقط لو المحاضرة فيها تقييم واحد ظاهر وlock_next_lectures=true',
+        multiple_assessments:
+          'لو المحاضرة فيها أكتر من واجب/امتحان ظاهر → المحاضرات التالية مفتوحة',
+        exam_not_taken: 'إذا لم يخضع الطالب للتقييم الواحد المقفل، المحاضرات التالية مقفلة',
+        exam_passed: 'إذا نجح الطالب في التقييم المقفل، المحاضرات التالية مفتوحة',
+        exam_failed: 'إذا فشل الطالب في التقييم المقفل، المحاضرات التالية مقفلة',
+        exam_hidden: 'إذا كان التقييم مخفي، المحاضرات التالية مفتوحة',
+        exam_expired: 'إذا انتهت صلاحية التقييم، المحاضرات التالية مفتوحة',
       },
     };
   }
@@ -469,7 +502,7 @@ export class LectureExamService {
   static async canStudentAccessLecture(lectureId: number, studentId: number): Promise<boolean> {
     const now = new Date();
 
-    // محاضرات سابقة فيها تقييمات تمنع التقدم (واجبات ظاهرة، أو امتحانات بقفل)
+    // محاضرات سابقة فيها تقييم واحد ظاهر بقفل — فقط هذه تمنع التقدم
     const blockingExamResult = await pool.query<{ lecture_id: number; position: number }>(
       `SELECT DISTINCT l.id as lecture_id, l.position
        FROM lectures l
@@ -479,17 +512,20 @@ export class LectureExamService {
        AND ${studentCourseAccessSql('$2')}
        AND (l.position, COALESCE(l.created_at, '1970-01-01'::timestamp), l.id) <
            (SELECT position, COALESCE(created_at, '1970-01-01'::timestamp), id FROM lectures WHERE id = $1)
-       AND e.is_visible = true
-       AND (e.show_at IS NULL OR e.show_at <= $3)
-       AND (e.hide_at IS NULL OR e.hide_at >= $3)
+       AND ${visibleAssessmentSql('$3')}
+       AND e.lock_next_lectures = true
        AND (
-         e.questions_count IS NULL OR e.questions_count <= 0
-         OR (SELECT COUNT(*) FROM exam_questions eq WHERE eq.exam_id = e.id) >= e.questions_count
-       )
-       AND (
-         e.type = 'assignment'
-         OR e.lock_next_lectures = true
-       )
+         SELECT COUNT(*)
+         FROM exams ve
+         WHERE ve.lecture_id = l.id
+         AND ve.is_visible = true
+         AND (ve.show_at IS NULL OR ve.show_at <= $3)
+         AND (ve.hide_at IS NULL OR ve.hide_at >= $3)
+         AND (
+           ve.questions_count IS NULL OR ve.questions_count <= 0
+           OR (SELECT COUNT(*) FROM exam_questions eq WHERE eq.exam_id = ve.id) >= ve.questions_count
+         )
+       ) = 1
        ORDER BY l.position DESC`,
       [lectureId, studentId, now],
     );
@@ -521,6 +557,18 @@ export class LectureExamService {
     const result = await pool.query(
       `SELECT e.id, e.title, e.type, e.total_grade, e.lock_next_lectures,
               l.title as lecture_title, l.position,
+              (
+                SELECT COUNT(*)::int
+                FROM exams ve
+                WHERE ve.lecture_id = l.id
+                AND ve.is_visible = true
+                AND (ve.show_at IS NULL OR ve.show_at <= $3)
+                AND (ve.hide_at IS NULL OR ve.hide_at >= $3)
+                AND (
+                  ve.questions_count IS NULL OR ve.questions_count <= 0
+                  OR (SELECT COUNT(*) FROM exam_questions eq WHERE eq.exam_id = ve.id) >= ve.questions_count
+                )
+              ) AS visible_assessments_count,
               CASE 
                 WHEN s.id IS NULL THEN 'not_taken'
                 WHEN s.passed = true THEN 'passed'
@@ -541,17 +589,20 @@ export class LectureExamService {
        AND ${studentCourseAccessSql('$2')}
        AND (l.position, COALESCE(l.created_at, '1970-01-01'::timestamp), l.id) <
            (SELECT position, COALESCE(created_at, '1970-01-01'::timestamp), id FROM lectures WHERE id = $1)
-       AND e.is_visible = true
-       AND (e.show_at IS NULL OR e.show_at <= $3)
-       AND (e.hide_at IS NULL OR e.hide_at >= $3)
+       AND ${visibleAssessmentSql('$3')}
+       AND e.lock_next_lectures = true
        AND (
-         e.questions_count IS NULL OR e.questions_count <= 0
-         OR (SELECT COUNT(*) FROM exam_questions eq WHERE eq.exam_id = e.id) >= e.questions_count
-       )
-       AND (
-         e.type = 'assignment'
-         OR e.lock_next_lectures = true
-       )
+         SELECT COUNT(*)
+         FROM exams ve
+         WHERE ve.lecture_id = l.id
+         AND ve.is_visible = true
+         AND (ve.show_at IS NULL OR ve.show_at <= $3)
+         AND (ve.hide_at IS NULL OR ve.hide_at >= $3)
+         AND (
+           ve.questions_count IS NULL OR ve.questions_count <= 0
+           OR (SELECT COUNT(*) FROM exam_questions eq WHERE eq.exam_id = ve.id) >= ve.questions_count
+         )
+       ) = 1
        ORDER BY l.position DESC, e.id ASC`,
       [lectureId, studentId, now],
     );

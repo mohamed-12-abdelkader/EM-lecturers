@@ -547,7 +547,28 @@ router.get(
       return res.status(400).json({ message: 'Invalid exam id' });
     }
 
-    const result = await CourseLevelExamsService.getExamGrades(examId, req.user!);
+    const groupRaw = req.query.groupId ?? req.query.group_id;
+    const groupParsed =
+      groupRaw !== undefined && groupRaw !== null && String(groupRaw).trim() !== ''
+        ? Number(groupRaw)
+        : undefined;
+    const groupId =
+      groupParsed !== undefined && Number.isFinite(groupParsed) && groupParsed > 0
+        ? groupParsed
+        : undefined;
+
+    const groupTypeRaw = String(req.query.groupType ?? req.query.group_type ?? '')
+      .trim()
+      .toLowerCase();
+    const groupType =
+      groupTypeRaw === 'study' || groupTypeRaw === 'course'
+        ? (groupTypeRaw as 'study' | 'course')
+        : undefined;
+
+    const result = await CourseLevelExamsService.getExamGrades(examId, req.user!, {
+      groupId,
+      groupType,
+    });
     res.json(result);
   }),
 );
@@ -573,10 +594,30 @@ router.get(
         ? passParsed
         : undefined;
 
+    const groupRaw = req.query.groupId ?? req.query.group_id;
+    const groupParsed =
+      groupRaw !== undefined && groupRaw !== null && String(groupRaw).trim() !== ''
+        ? Number(groupRaw)
+        : undefined;
+    const groupId =
+      groupParsed !== undefined && Number.isFinite(groupParsed) && groupParsed > 0
+        ? groupParsed
+        : undefined;
+
+    const groupTypeRaw = String(req.query.groupType ?? req.query.group_type ?? '')
+      .trim()
+      .toLowerCase();
+    const groupType =
+      groupTypeRaw === 'study' || groupTypeRaw === 'course'
+        ? (groupTypeRaw as 'study' | 'course')
+        : undefined;
+
     // Try course-level exam first
     try {
       const result = await CourseLevelExamsService.getExamReport(examId, req.user!, {
         passPercentage,
+        groupId,
+        groupType,
       });
       return res.json(result);
     } catch (error: any) {

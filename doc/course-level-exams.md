@@ -572,31 +572,75 @@ curl -X DELETE http://localhost:8000/api/exams/1 \
 
 **Query (اختياري):**
 - `passPercentage` أو `pass_percentage` — نسبة النجاح % (افتراضي 50)
+- `groupId` أو `group_id` — فلترة طلاب مجموعة دراسية معينة (`study_groups`) التابعة لمدرس الكورس
+
+**أمثلة:**
+```http
+GET /api/exams/12/report
+GET /api/exams/12/report?passPercentage=60
+GET /api/exams/12/report?groupId=5
+GET /api/exams/12/report?groupId=5&passPercentage=50
+GET /api/course/course-exam/12/report?groupId=5
+```
 
 **مسار بديل:** `GET /api/course/course-exam/:examId/report`
+
+> عند تمرير `groupId`: الإحصائيات + `examinedStudents` + `notExaminedStudents` + إحصائيات الأسئلة تُحسب فقط على طلاب هذه المجموعة المشتركين في الكورس.
+> بدون `groupId`: التقرير لكل المشتركين في الكورس كالسابق.
 
 **Response (200 OK):**
 ```json
 {
   "exam": { "id": 12, "title": "امتحان شامل", "courseId": 3, "courseTitle": "فيزياء", "questionsCount": 20 },
+  "groupFilter": { "groupId": 5, "groupName": "سبت 4 م" },
+  "availableStudyGroups": [
+    { "id": 5, "name": "سبت 4 م", "gradeId": 1 },
+    { "id": 6, "name": "أحد 6 م", "gradeId": 1 }
+  ],
   "enrollmentSummary": {
     "passPercentage": 60,
-    "enrolledTotal": 100,
-    "examined": { "count": 75, "percentage": 75 },
-    "notExamined": { "count": 25, "percentage": 25 },
-    "startedNotSubmitted": { "count": 5, "percentage": 5 },
-    "passed": { "count": 60, "percentage": 60, "percentageOfExamined": 80 },
-    "failed": { "count": 15, "percentage": 15, "percentageOfExamined": 20 }
+    "groupId": 5,
+    "groupName": "سبت 4 م",
+    "enrolledTotal": 20,
+    "examined": { "count": 15, "percentage": 75 },
+    "notExamined": { "count": 5, "percentage": 25 },
+    "startedNotSubmitted": { "count": 1, "percentage": 5 },
+    "passed": { "count": 12, "percentage": 60, "percentageOfExamined": 80 },
+    "failed": { "count": 3, "percentage": 15, "percentageOfExamined": 20 }
   },
+  "examinedStudents": [
+    {
+      "studentId": 101,
+      "studentName": "أحمد",
+      "studentEmail": "a@x.com",
+      "obtainedGrade": 18,
+      "totalGrade": 20,
+      "percentage": 90,
+      "passed": true,
+      "submittedAt": "2026-09-01T12:00:00.000Z"
+    }
+  ],
   "notExaminedStudents": [
     { "studentId": 201, "studentName": "سارة", "studentEmail": "s@x.com", "examStatus": "never_started" }
   ],
-  "overallStatistics": { "totalStudents": 75, "enrolledTotal": 100, "totalQuestions": 20 },
+  "overallStatistics": { "totalStudents": 15, "enrolledTotal": 20, "totalQuestions": 20 },
   "questions": []
 }
 ```
 
-**Response (200 OK) — تفصيل الأسئلة:**
+- `groupFilter`: `null` لو مفيش فلتر مجموعة، أو `{ groupId, groupName }` عند الفلترة.
+- `availableStudyGroups`: كل مجموعات المدرس لاختيار الفلتر في الواجهة.
+- `examinedStudents`: درجات الطلاب اللي سلّموا (حسب الفلتر).
+- `notExaminedStudents`: مين ما امتحنش / بدأ ولم يسلّم.
+
+**Response (404):** مجموعة غير موجودة أو مش تابعة لمدرس الكورس → `"Study group not found for this teacher"`
+
+**درجات فقط (اختياري بنفس الفلتر):**
+```http
+GET /api/exams/:examId/grades?groupId=5
+```
+
+**Response (200 OK) — تفصيل الأسئلة (قديم):**
 ```json
 {
   "exam": {
