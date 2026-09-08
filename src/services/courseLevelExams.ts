@@ -1603,27 +1603,35 @@ export class CourseLevelExamsService {
          a.obtained_grade,
          a.started_at,
          a.submitted_at,
+         a.timed_out,
          u.name as student_name,
-         u.email as student_email
+         u.email as student_email,
+         u.phone as student_phone
        FROM course_level_exam_attempts a
        JOIN users u ON a.student_id = u.id
-       WHERE a.exam_id = $1 AND a.status = 'submitted'
+       WHERE a.exam_id = $1 AND a.status IN ('submitted', 'in_progress')
          AND ($2::int IS NULL OR ${membershipSql})
-       ORDER BY a.submitted_at DESC`,
+       ORDER BY CASE WHEN a.status = 'in_progress' THEN 0 ELSE 1 END,
+         a.submitted_at DESC NULLS LAST, a.started_at DESC`,
       [examId, groupParam],
     );
 
     const attempts = attemptsRes.rows;
+    const submittedAttempts = attempts.filter((a) => String(a.status || '') === 'submitted');
 
     // Calculate statistics
-    const totalStudents = attempts.length;
-    const totalGrade = attempts.reduce((sum, a) => sum + (a.total_grade || 0), 0);
-    const totalObtained = attempts.reduce((sum, a) => sum + (a.obtained_grade || 0), 0);
+    const totalStudents = submittedAttempts.length;
+    const totalGrade = submittedAttempts.reduce((sum, a) => sum + (a.total_grade || 0), 0);
+    const totalObtained = submittedAttempts.reduce((sum, a) => sum + (a.obtained_grade || 0), 0);
     const averageGrade = totalStudents > 0 ? (totalObtained / totalGrade) * 100 : 0;
     const maxGrade =
-      attempts.length > 0 ? Math.max(...attempts.map((a) => a.obtained_grade || 0)) : 0;
+      submittedAttempts.length > 0
+        ? Math.max(...submittedAttempts.map((a) => a.obtained_grade || 0))
+        : 0;
     const minGrade =
-      attempts.length > 0 ? Math.min(...attempts.map((a) => a.obtained_grade || 0)) : 0;
+      submittedAttempts.length > 0
+        ? Math.min(...submittedAttempts.map((a) => a.obtained_grade || 0))
+        : 0;
 
     return {
       exam: {
@@ -1633,19 +1641,43 @@ export class CourseLevelExamsService {
         courseTitle: exam.course_title,
       },
       groupFilter,
-      students: attempts.map((a) => ({
-        studentId: a.student_id,
-        studentName: a.student_name,
-        studentEmail: a.student_email,
-        attemptId: a.attempt_id,
-        attemptNumber: a.attempt_number,
-        totalGrade: a.total_grade,
-        obtainedGrade: a.obtained_grade,
-        percentage:
-          a.total_grade > 0 ? Math.round((a.obtained_grade / a.total_grade) * 100 * 100) / 100 : 0,
-        startedAt: a.started_at,
-        submittedAt: a.submitted_at,
-      })),
+      students: attempts.map((a) => {
+        const inProgress = String(a.status || '') === 'in_progress';
+        const obtained = inProgress ? null : Number(a.obtained_grade ?? 0);
+        const total = Number(a.total_grade ?? 0);
+        return {
+          name: a.student_name,
+          studentName: a.student_name,
+          student_id: a.student_id,
+          studentId: a.student_id,
+          email: a.student_email,
+          studentEmail: a.student_email,
+          phone: a.student_phone,
+          studentPhone: a.student_phone,
+          attemptId: a.attempt_id,
+          submission_id: a.attempt_id,
+          attemptNumber: a.attempt_number,
+          attempt_number: a.attempt_number,
+          status: a.status,
+          in_progress: inProgress,
+          totalGrade: total,
+          total_grade: total,
+          max_grade: total,
+          obtainedGrade: obtained,
+          obtained_grade: obtained,
+          percentage:
+            !inProgress && total > 0
+              ? Math.round((Number(a.obtained_grade || 0) / total) * 100 * 100) / 100
+              : inProgress
+                ? null
+                : 0,
+          startedAt: a.started_at,
+          started_at: a.started_at,
+          submittedAt: a.submitted_at,
+          submitted_at: a.submitted_at,
+          timed_out: Boolean(a.timed_out),
+        };
+      }),
       statistics: {
         totalStudents,
         averageGrade: Math.round(averageGrade * 100) / 100,
