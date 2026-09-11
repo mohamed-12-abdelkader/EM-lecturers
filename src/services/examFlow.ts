@@ -22,6 +22,7 @@ import {
   selectAttemptQuestions,
 } from './examAccessPolicy';
 import { CourseAccessControl } from './courseAccessControl';
+import { CourseAccessService } from './courseAccess';
 import {
   choiceIdFromAnswerRow,
   collectLectureExamAnswersFromBody,
@@ -2014,12 +2015,9 @@ export class ExamFlowService {
       error.status = 403;
       throw error;
     }
-    const enrollment = await pool.query(
-      `SELECT 1 FROM enrollments WHERE course_id = $1 AND user_id = $2`,
-      [courseId, studentId],
-    );
-    if (!enrollment.rowCount) {
-      const error: any = new Error('You are not enrolled in this course');
+    const access = await CourseAccessService.checkStudentAccess(studentId, courseId);
+    if (!access.hasAccess) {
+      const error: any = new Error(access.message || 'You are not enrolled in this course');
       error.status = 403;
       throw error;
     }
