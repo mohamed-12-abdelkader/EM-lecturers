@@ -1,6 +1,7 @@
 import pool from '../db/pool';
 import { HttpError } from '../utils';
 import { CourseAccessControl } from './courseAccessControl';
+import { CourseAccessService } from './courseAccess';
 import { determineAnswerRelease } from './examPolicies';
 import {
   attemptQuestionSeed,
@@ -721,19 +722,19 @@ export class CourseLevelExamsService {
     return this.finalizeInProgressAttempt(exam, row, studentId, [], { timedOut: true });
   }
 
+  /** كورس مجاني أو طالب مشترك — يمنع 403 على الكورسات المجانية بدون enrollment */
+  private static async assertStudentCanAccessCourse(courseId: number, studentId: number) {
+    const access = await CourseAccessService.checkStudentAccess(studentId, courseId);
+    if (!access.hasAccess) {
+      throw new HttpError(403, access.message || 'You are not enrolled in this course');
+    }
+  }
+
   /**
    * Get visible exams for a student in a course
    */
   static async getVisibleExamsForStudent(courseId: number, studentId: number) {
-    // Verify student is enrolled in the course
-    const enrollmentCheck = await pool.query(
-      'SELECT id FROM enrollments WHERE course_id = $1 AND user_id = $2',
-      [courseId, studentId],
-    );
-
-    if (!enrollmentCheck.rowCount) {
-      throw new HttpError(403, 'You are not enrolled in this course');
-    }
+    await this.assertStudentCanAccessCourse(courseId, studentId);
 
     // Get visible exams
     const now = new Date();
@@ -833,14 +834,7 @@ export class CourseLevelExamsService {
 
     const exam = examRes.rows[0];
 
-    const enrollmentCheck = await pool.query(
-      'SELECT id FROM enrollments WHERE course_id = $1 AND user_id = $2',
-      [exam.course_id, studentId],
-    );
-
-    if (!enrollmentCheck.rowCount) {
-      throw new HttpError(403, 'You are not enrolled in this course');
-    }
+    await this.assertStudentCanAccessCourse(Number(exam.course_id), studentId);
 
     if (!exam.is_active) {
       throw new HttpError(403, 'This exam is not active');
@@ -1304,13 +1298,7 @@ export class CourseLevelExamsService {
     const exam = { ...row, id: row.exam_id };
     const attempt = row;
 
-    const enrollmentCheck = await pool.query(
-      'SELECT id FROM enrollments WHERE course_id = $1 AND user_id = $2',
-      [exam.course_id, studentId],
-    );
-    if (!enrollmentCheck.rowCount) {
-      throw new HttpError(403, 'You are not enrolled in this course');
-    }
+    await this.assertStudentCanAccessCourse(Number(exam.course_id), studentId);
 
     if (attempt.status === 'submitted') {
       return this.buildSubmitResultFromStored(exam, attempt);
@@ -1345,14 +1333,7 @@ export class CourseLevelExamsService {
 
     const exam = examRes.rows[0];
 
-    const enrollmentCheck = await pool.query(
-      'SELECT id FROM enrollments WHERE course_id = $1 AND user_id = $2',
-      [exam.course_id, studentId],
-    );
-
-    if (!enrollmentCheck.rowCount) {
-      throw new HttpError(403, 'You are not enrolled in this course');
-    }
+    await this.assertStudentCanAccessCourse(Number(exam.course_id), studentId);
 
     const attemptQuery = options?.attemptId
       ? await pool.query(
@@ -1473,14 +1454,7 @@ export class CourseLevelExamsService {
 
     const exam = examRes.rows[0];
 
-    const enrollmentCheck = await pool.query(
-      'SELECT id FROM enrollments WHERE course_id = $1 AND user_id = $2',
-      [exam.course_id, studentId],
-    );
-
-    if (!enrollmentCheck.rowCount) {
-      throw new HttpError(403, 'You are not enrolled in this course');
-    }
+    await this.assertStudentCanAccessCourse(Number(exam.course_id), studentId);
 
     const attemptRes = await pool.query(
       `SELECT * FROM course_level_exam_attempts
