@@ -8,7 +8,8 @@ import {
   type MistralQuestionExtractionOptions,
   type MistralQuestionExtractionResult,
 } from '../types/mistralQuestionExtraction';
-import { HttpError, logger, uploadBufferToCloudinary } from '../utils';
+import { config, HttpError, logger, uploadBufferToCloudinary } from '../utils';
+import { isDeepSeekChatModel, resolveChatModel } from '../config/questionExtractionModels';
 import { expandMultiPartQuestions, foldSingletonPassages } from '../utils/expandMultiPartQuestions';
 import { MistralOcrService, parsePdfPageRange, type MistralOcrResult } from './mistralOcr';
 import * as fs from 'node:fs';
@@ -985,11 +986,16 @@ async function parseQuestionsWithChat(
   notes?: string;
   chatModel: string;
 }> {
-  const { apiKey, apiBaseUrl, chatModel: defaultChatModel, visionChatModel } = getMistralConfig();
-  const hasPageImages = pageImages.length > 0;
-  const chatModel =
-    chatModelOverride?.trim() || (hasPageImages ? visionChatModel : defaultChatModel) || defaultChatModel;
+  const { apiKey, apiBaseUrl } = getMistralConfig();
+  const chatModel = resolveChatModel(chatModelOverride);
+  const useDeepSeek = isDeepSeekChatModel(chatModel);
+  // DeepSeek chat is text-only; keep page images only for Mistral vision models.
+  const hasPageImages = pageImages.length > 0 && !useDeepSeek;
   const mode = resolveExtractionMode(subject);
+
+  if (useDeepSeek && !config.DEEPSEEK_API_KEY?.trim()) {
+    throw new HttpError(503, 'DEEPSEEK_API_KEY غير مُعد في البيئة');
+  }
 
   const prompt = buildQuestionExtractionPrompt(documentText, filename, {
     inferCorrectAnswer,
@@ -1013,10 +1019,15 @@ async function parseQuestionsWithChat(
       : 'أنت AI متخصص في تحليل واقتطاع أسئلة الامتحانات من الصور وتحويلها إلى JSON. اكتشف قطعة القراءة إن وُجدت وضعها في passages[] مرة واحدة مع passage_id. افهم حدود كل سؤال ثم أخرج JSON صالح فقط بلا markdown.';
 
   const runChat = async (model: string, content: unknown) => {
-    const response = await fetch(`${apiBaseUrl}/chat/completions`, {
+    const deepseek = isDeepSeekChatModel(model);
+    const endpoint = deepseek
+      ? `${config.DEEPSEEK_API_URL}/v1/chat/completions`
+      : `${apiBaseUrl}/chat/completions`;
+    const bearer = deepseek ? config.DEEPSEEK_API_KEY : apiKey;
+    const response = await fetch(endpoint, {
       method: 'POST',
       headers: {
-        Authorization: `Bearer ${apiKey}`,
+        Authorization: `Bearer ${bearer}`,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
@@ -1049,11 +1060,16 @@ async function parseQuestionsWithChat(
       { status: response.status, body: errBody.slice(0, 300) },
       'vision question extraction failed — retrying text-only OCR',
     );
-    usedModel = chatModelOverride?.trim() || defaultChatModel;
+    usedModel = resolveChatModel(chatModelOverride);
     response = await runChat(usedModel, textOnlyPrompt);
   }
 
-  if (!response.ok && response.status === 403 && usedModel !== DEFAULT_MISTRAL_CHAT_MODEL) {
+  if (
+    !response.ok &&
+    response.status === 403 &&
+    !isDeepSeekChatModel(usedModel) &&
+    usedModel !== DEFAULT_MISTRAL_CHAT_MODEL
+  ) {
     const errBody = await response.text();
     logger.warn(
       { status: response.status, model: usedModel, body: errBody.slice(0, 300) },
@@ -1065,15 +1081,18 @@ async function parseQuestionsWithChat(
 
   if (!response.ok) {
     const errBody = await response.text();
+    const provider = isDeepSeekChatModel(usedModel) ? 'DeepSeek' : 'Mistral';
     if (response.status === 401) {
       throw new HttpError(
         502,
-        'Mistral رفض مفتاح API (401). تحقق من MISTRAL_API_KEY في https://console.mistral.ai',
+        isDeepSeekChatModel(usedModel)
+          ? 'DeepSeek رفض مفتاح API (401). تحقق من DEEPSEEK_API_KEY'
+          : 'Mistral رفض مفتاح API (401). تحقق من MISTRAL_API_KEY في https://console.mistral.ai',
       );
     }
     throw new HttpError(
       response.status >= 500 ? 502 : 400,
-      `Mistral Chat failed (${response.status}): ${errBody.slice(0, 500)}`,
+      `${provider} Chat failed (${response.status}): ${errBody.slice(0, 500)}`,
     );
   }
 
@@ -1082,7 +1101,10 @@ async function parseQuestionsWithChat(
   };
   const content = json.choices?.[0]?.message?.content;
   if (!content) {
-    throw new HttpError(502, 'Mistral Chat returned empty response');
+    throw new HttpError(
+      502,
+      `${isDeepSeekChatModel(usedModel) ? 'DeepSeek' : 'Mistral'} Chat returned empty response`,
+    );
   }
 
   let parsed: unknown;
@@ -1277,7 +1299,7 @@ async function parseQuestionsWithChatBatched(
     passages: folded.passages,
     questions: folded.questions,
     notes: notesParts.length ? notesParts.join('\n') : undefined,
-    chatModel: chatModel || getMistralConfig().chatModel,
+    chatModel: chatModel || resolveChatModel(),
   };
 }
 
