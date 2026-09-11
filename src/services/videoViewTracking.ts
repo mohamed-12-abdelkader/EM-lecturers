@@ -1,5 +1,5 @@
 import pool from '../db/pool';
-import { StudentPointsService } from './studentPoints';
+import { TeacherPointsService } from './teacherPoints';
 import { syncLectureWatchCompletion } from './watchProgress';
 
 export interface TrackVideoViewInput {
@@ -81,30 +81,19 @@ export class VideoViewTrackingService {
 
     let lecturePointsAwarded = false;
     try {
-      const hasPoints = await StudentPointsService.hasLecturePoints(userId, lectureId);
-
-      if (!hasPoints) {
-        const lectureVideosCount = await pool.query(
-          `SELECT COUNT(DISTINCT vv.video_id) as watched_count
-           FROM video_views vv
-           WHERE vv.user_id = $1 AND vv.lecture_id = $2`,
-          [userId, lectureId],
-        );
-
-        const totalVideosCount = await pool.query(
-          `SELECT COUNT(*) as total_count
-           FROM lecture_videos
-           WHERE lecture_id = $1`,
-          [lectureId],
-        );
-
-        const watchedCount = parseInt(lectureVideosCount.rows[0].watched_count) || 0;
-        const totalCount = parseInt(totalVideosCount.rows[0].total_count) || 0;
-        const watchPercentage = totalCount > 0 ? (watchedCount / totalCount) * 100 : 0;
-
-        if (watchPercentage >= 33.33 || watchedCount > 0) {
-          await StudentPointsService.addLectureWatchPoints(userId, lectureId, lectureTitle);
-          lecturePointsAwarded = true;
+      // First view of this video only — idempotent reference_key prevents duplicates
+      if (isFirstVideoView) {
+        const teacherId = await TeacherPointsService.resolveTeacherIdForCourse(courseId);
+        if (teacherId) {
+          const result = await TeacherPointsService.awardVideoWatch({
+            studentId: userId,
+            teacherId,
+            courseId,
+            videoId,
+            lectureId,
+            lectureTitle,
+          });
+          lecturePointsAwarded = result.awarded;
         }
       }
     } catch (pointsError) {

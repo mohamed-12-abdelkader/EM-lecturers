@@ -482,10 +482,14 @@ curl -X DELETE http://localhost:8000/api/exams/1 \
 
 **الصلاحيات:** `teacher`, `admin` فقط
 
-**الوصف:** يجلب قائمة بجميع الطلاب الذين أدوا الامتحان مع درجاتهم وإحصائيات عامة
+**الوصف:** يجلب قائمة بجميع الطلاب الذين أدوا الامتحان مع درجاتهم، والأسئلة التي أخطأوا فيها (إجابة الطالب + الإجابة الصحيحة)، وإحصائيات عامة.
 
 **Path Parameters:**
 - `examId` (number): معرف الامتحان
+
+**Query (اختياري):**
+- `groupId` / `group_id` — فلترة مجموعة
+- `groupType` / `group_type` — `study` أو `course`
 
 **Response (200 OK):**
 ```json
@@ -496,42 +500,58 @@ curl -X DELETE http://localhost:8000/api/exams/1 \
     "courseId": 12,
     "courseTitle": "كورس البرمجة"
   },
+  "groupFilter": null,
   "students": [
     {
       "studentId": 35,
       "studentName": "أحمد محمد",
       "studentEmail": "ahmed@example.com",
+      "studentPhone": "0100...",
       "attemptId": 5,
       "attemptNumber": 1,
+      "status": "submitted",
+      "in_progress": false,
       "totalGrade": 20,
       "obtainedGrade": 18,
       "percentage": 90,
       "startedAt": "2025-01-15T10:00:00.000Z",
-      "submittedAt": "2025-01-15T10:45:00.000Z"
-    },
-    {
-      "studentId": 36,
-      "studentName": "فاطمة علي",
-      "studentEmail": "fatima@example.com",
-      "attemptId": 6,
-      "attemptNumber": 1,
-      "totalGrade": 20,
-      "obtainedGrade": 15,
-      "percentage": 75,
-      "startedAt": "2025-01-15T11:00:00.000Z",
-      "submittedAt": "2025-01-15T11:50:00.000Z"
+      "submittedAt": "2025-01-15T10:45:00.000Z",
+      "questions_count": 20,
+      "answered_count": 20,
+      "unanswered_count": 0,
+      "wrong_questions_count": 2,
+      "wrongQuestions": [
+        {
+          "questionId": 101,
+          "questionText": "ما ناتج 2+2؟",
+          "questionImage": null,
+          "type": "TEXT",
+          "yourAnswer": "A",
+          "yourAnswerText": "3",
+          "correctAnswer": "B",
+          "correctAnswerText": "4",
+          "unanswered": false,
+          "optionA": "3",
+          "optionB": "4",
+          "optionC": "5",
+          "optionD": "6"
+        }
+      ],
+      "wrong_questions": []
     }
   ],
   "statistics": {
-    "totalStudents": 2,
-    "averageGrade": 82.5,
+    "totalStudents": 1,
+    "averageGrade": 90,
     "maxGrade": 18,
-    "minGrade": 15,
-    "totalGrade": 40,
-    "totalObtainedGrade": 33
+    "minGrade": 18,
+    "totalGrade": 20,
+    "totalObtainedGrade": 18
   }
 }
 ```
+
+> `wrongQuestions` و`wrong_questions` نفس القائمة. للطالب `in_progress` تكون فاضية والدرجة `null`.
 
 **أخطاء محتملة:**
 
@@ -548,7 +568,6 @@ curl -X DELETE http://localhost:8000/api/exams/1 \
   "message": "Exam not found"
 }
 ```
-
 ---
 
 ### 8. جلب تقرير تفصيلي عن الامتحان

@@ -2,6 +2,7 @@ import pool from '../db/pool';
 import { HttpError } from '../utils';
 import { CourseAccessControl } from './courseAccessControl';
 import { CourseAccessService } from './courseAccess';
+import { TeacherPointsService } from './teacherPoints';
 import { determineAnswerRelease } from './examPolicies';
 import {
   attemptQuestionSeed,
@@ -671,6 +672,14 @@ export class CourseLevelExamsService {
           })
       : [];
 
+    await this.maybeAwardCourseExamScorePoints(
+      exam,
+      stored,
+      studentId,
+      graded.obtained,
+      graded.maxGrade,
+    );
+
     return {
       attemptId: stored.id,
       totalGrade: graded.obtained,
@@ -685,6 +694,60 @@ export class CourseLevelExamsService {
       startedAt: stored.started_at,
       submittedAt: stored.submitted_at ?? now.toISOString(),
     };
+  }
+
+  private static async maybeAwardCourseExamStartPoints(
+    exam: any,
+    attempt: any,
+    studentId: number,
+  ) {
+    try {
+      const teacherId =
+        exam.teacher_id != null
+          ? Number(exam.teacher_id)
+          : await TeacherPointsService.resolveTeacherIdForCourse(Number(exam.course_id));
+      if (!teacherId) return;
+      await TeacherPointsService.awardExamOrAssignmentStart({
+        studentId,
+        teacherId,
+        courseId: Number(exam.course_id),
+        attemptId: Number(attempt.id),
+        examId: Number(exam.id),
+        isAssignment: false,
+        title: exam.title ?? null,
+      });
+    } catch (error) {
+      console.error('Error awarding course exam start points:', error);
+    }
+  }
+
+  private static async maybeAwardCourseExamScorePoints(
+    exam: any,
+    attempt: any,
+    studentId: number,
+    obtainedGrade: number,
+    totalGrade: number,
+  ) {
+    try {
+      const teacherId =
+        exam.teacher_id != null
+          ? Number(exam.teacher_id)
+          : await TeacherPointsService.resolveTeacherIdForCourse(Number(exam.course_id));
+      if (!teacherId) return;
+      await TeacherPointsService.awardExamOrAssignmentScore({
+        studentId,
+        teacherId,
+        courseId: Number(exam.course_id),
+        attemptId: Number(attempt.id),
+        examId: Number(exam.id),
+        isAssignment: false,
+        obtainedGrade,
+        totalGrade,
+        title: exam.title ?? null,
+      });
+    } catch (error) {
+      console.error('Error awarding course exam score points:', error);
+    }
   }
 
   static async expireOverdueAttemptsForExam(examId: number) {
@@ -988,6 +1051,7 @@ export class CourseLevelExamsService {
       throw error;
     }
 
+    await this.maybeAwardCourseExamStartPoints(exam, attempt, studentId);
     return this.buildStudentAttemptPayload(exam, attempt, studentId, false);
   }
 
@@ -1532,7 +1596,8 @@ export class CourseLevelExamsService {
   ) {
     // Verify exam exists and teacher owns it
     const examRes = await pool.query(
-      `SELECT e.id, e.title, e.course_id, c.teacher_id, c.title as course_title
+      `SELECT e.id, e.title, e.course_id, e.questions_count, e.question_display_mode,
+              c.teacher_id, c.title as course_title
        FROM course_level_exams e
        JOIN courses c ON e.course_id = c.id
        WHERE e.id = $1`,
@@ -1566,6 +1631,18 @@ export class CourseLevelExamsService {
       ? this.groupMembershipSql(groupType, 'a.student_id', '$2')
       : 'TRUE';
 
+    await this.expireOverdueAttemptsForExam(examId);
+
+    const questionsRes = await pool.query(
+      `SELECT id, type, question_text, question_image, option_a, option_b, option_c, option_d, correct_answer
+       FROM course_level_exam_questions
+       WHERE exam_id = $1
+       ORDER BY created_at ASC, id ASC`,
+      [examId],
+    );
+    const questionsById = new Map(questionsRes.rows.map((q) => [Number(q.id), q]));
+    const allQuestionIds = questionsRes.rows.map((q) => Number(q.id));
+
     // Get all submitted attempts with student info (optional study-group filter)
     const attemptsRes = await pool.query(
       `SELECT 
@@ -1578,6 +1655,7 @@ export class CourseLevelExamsService {
          a.started_at,
          a.submitted_at,
          a.timed_out,
+         a.selected_question_ids,
          u.name as student_name,
          u.email as student_email,
          u.phone as student_phone
@@ -1591,6 +1669,25 @@ export class CourseLevelExamsService {
     );
 
     const attempts = attemptsRes.rows;
+    const attemptIds = attempts.map((a) => Number(a.attempt_id));
+    const answersRes =
+      attemptIds.length === 0
+        ? { rows: [] as any[] }
+        : await pool.query(
+            `SELECT attempt_id, question_id, selected_answer, is_correct
+             FROM course_level_exam_answers
+             WHERE attempt_id = ANY($1::int[])`,
+            [attemptIds],
+          );
+
+    const answersByAttempt = new Map<number, Map<number, any>>();
+    for (const row of answersRes.rows) {
+      const attemptId = Number(row.attempt_id);
+      const byQuestion = answersByAttempt.get(attemptId) || new Map();
+      byQuestion.set(Number(row.question_id), row);
+      answersByAttempt.set(attemptId, byQuestion);
+    }
+
     const submittedAttempts = attempts.filter((a) => String(a.status || '') === 'submitted');
 
     // Calculate statistics
@@ -1619,6 +1716,36 @@ export class CourseLevelExamsService {
         const inProgress = String(a.status || '') === 'in_progress';
         const obtained = inProgress ? null : Number(a.obtained_grade ?? 0);
         const total = Number(a.total_grade ?? 0);
+        const questionIds = this.resolveAttemptQuestionIds(
+          exam,
+          {
+            student_id: a.student_id,
+            attempt_number: a.attempt_number,
+            selected_question_ids: a.selected_question_ids,
+          },
+          allQuestionIds,
+        );
+        const answers = answersByAttempt.get(Number(a.attempt_id)) || new Map();
+        const wrongQuestions: any[] = [];
+        let answeredCount = 0;
+        if (!inProgress) {
+          for (const questionId of questionIds) {
+            const question = questionsById.get(questionId);
+            if (!question) continue;
+            const answer = answers.get(questionId);
+            const selected = answer?.selected_answer
+              ? String(answer.selected_answer).trim().toUpperCase()
+              : null;
+            if (selected) answeredCount += 1;
+            const isCorrect = Boolean(answer?.is_correct) && Boolean(selected);
+            if (!isCorrect) {
+              wrongQuestions.push(this.mapCourseWrongQuestion(question, answer));
+            }
+          }
+        }
+        const questionsCount = questionIds.length;
+        const unansweredCount = Math.max(0, questionsCount - answeredCount);
+
         return {
           name: a.student_name,
           studentName: a.student_name,
@@ -1650,6 +1777,13 @@ export class CourseLevelExamsService {
           submittedAt: a.submitted_at,
           submitted_at: a.submitted_at,
           timed_out: Boolean(a.timed_out),
+          questions_count: questionsCount,
+          answered_count: inProgress ? 0 : answeredCount,
+          unanswered_count: inProgress ? 0 : unansweredCount,
+          wrong_questions_count: wrongQuestions.length,
+          wrongQuestionsCount: wrongQuestions.length,
+          wrong_questions: wrongQuestions,
+          wrongQuestions,
         };
       }),
       statistics: {

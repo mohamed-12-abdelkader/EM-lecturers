@@ -23,6 +23,7 @@ import {
 } from './examAccessPolicy';
 import { CourseAccessControl } from './courseAccessControl';
 import { CourseAccessService } from './courseAccess';
+import { TeacherPointsService } from './teacherPoints';
 import {
   choiceIdFromAnswerRow,
   collectLectureExamAnswersFromBody,
@@ -1292,7 +1293,9 @@ export class ExamFlowService {
         ],
       );
 
-      return this.buildStudentAttemptPayload(exam, insertResult.rows[0], studentId, false);
+      const attemptRow = insertResult.rows[0];
+      await this.maybeAwardStartPoints(exam, attemptRow, studentId);
+      return this.buildStudentAttemptPayload(exam, attemptRow, studentId, false);
     } catch (error: any) {
       if (error?.code === '23505') {
         const existing = await this.getActiveAttempt(exam.id, studentId);
@@ -2201,9 +2204,10 @@ export class ExamFlowService {
     const updatedAttempt = updateRes.rows[0] || attempt;
 
     await this.persistAttemptAnswers(updatedAttempt.id, evaluation.questions);
-    await this.maybeAddStudentPoints(
+    await this.maybeAwardScorePoints(
+      exam,
+      updatedAttempt,
       studentId,
-      exam.id,
       evaluation.totalGrade,
       evaluation.maxGrade,
     );
@@ -3061,31 +3065,64 @@ export class ExamFlowService {
     });
   }
 
-  private static async maybeAddStudentPoints(
+  private static async maybeAwardStartPoints(exam: any, attempt: any, studentId: number) {
+    try {
+      const ctx = await this.resolvePointsContext(exam);
+      if (!ctx) return;
+      const isAssignment = String(exam.type || '').toLowerCase() === 'assignment';
+      await TeacherPointsService.awardExamOrAssignmentStart({
+        studentId,
+        teacherId: ctx.teacherId,
+        courseId: ctx.courseId,
+        attemptId: Number(attempt.id),
+        examId: Number(exam.id),
+        isAssignment,
+        title: exam.title ?? null,
+      });
+    } catch (error) {
+      console.error('Error awarding exam start points:', error);
+    }
+  }
+
+  private static async maybeAwardScorePoints(
+    exam: any,
+    attempt: any,
     studentId: number,
-    examId: number,
     obtainedGrade: number,
     maxGrade: number,
   ) {
     try {
-      // @ts-expect-error dynamic import
-      const { StudentPointsService } = await import('./studentPoints');
-      const examInfo = await pool.query('SELECT title FROM exams WHERE id = $1', [examId]);
-      const examTitle = examInfo.rowCount ? examInfo.rows[0].title : null;
-      const hasPoints = await StudentPointsService.hasExamPoints(studentId, examId);
-      if (!hasPoints) {
-        await StudentPointsService.addExamPoints(
-          studentId,
-          examId,
-          obtainedGrade,
-          maxGrade,
-          examTitle,
-          'lecture_exam',
-        );
-      }
+      const ctx = await this.resolvePointsContext(exam);
+      if (!ctx) return;
+      const isAssignment = String(exam.type || '').toLowerCase() === 'assignment';
+      await TeacherPointsService.awardExamOrAssignmentScore({
+        studentId,
+        teacherId: ctx.teacherId,
+        courseId: ctx.courseId,
+        attemptId: Number(attempt.id),
+        examId: Number(exam.id),
+        isAssignment,
+        obtainedGrade,
+        totalGrade: maxGrade,
+        title: exam.title ?? null,
+      });
     } catch (error) {
-      console.error('Error adding exam points:', error);
+      console.error('Error awarding exam score points:', error);
     }
+  }
+
+  private static async resolvePointsContext(
+    exam: any,
+  ): Promise<{ teacherId: number; courseId: number | null } | null> {
+    let courseId = exam.course_id != null ? Number(exam.course_id) : null;
+    if (!courseId && exam.lecture_id) {
+      const lec = await pool.query(`SELECT course_id FROM lectures WHERE id = $1`, [exam.lecture_id]);
+      courseId = lec.rowCount ? Number(lec.rows[0].course_id) : null;
+    }
+    if (!courseId) return null;
+    const teacherId = await TeacherPointsService.resolveTeacherIdForCourse(courseId);
+    if (!teacherId) return null;
+    return { teacherId, courseId };
   }
 
   private static mapExamRow(row: any, availabilityStatus?: string) {
