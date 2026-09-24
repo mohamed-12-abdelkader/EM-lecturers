@@ -6,6 +6,9 @@ interface ErrorBody {
   status: number;
   message: string;
   name: string;
+  success?: boolean;
+  details?: Record<string, unknown> | string;
+  stack?: string;
 }
 
 const routerNotFound: RequestHandler = (_, _res, _next) => {
