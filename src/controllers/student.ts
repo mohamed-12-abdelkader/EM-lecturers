@@ -930,7 +930,7 @@ router.get(
   }),
 );
 
-// جلب نقاط الطالب
+// جلب نقاط الطالب (متوافق — يقرأ من النظام scoped)
 router.get(
   '/my-points',
   authMiddleware(['student']),
@@ -946,6 +946,8 @@ router.get(
           last_reset_at: points?.last_reset_at || null,
           created_at: points?.created_at || new Date(),
           updated_at: points?.updated_at || new Date(),
+          teacher_id: (points as any)?.teacher_id ?? null,
+          grade_id: (points as any)?.grade_id ?? null,
         },
       });
     } catch (error: any) {

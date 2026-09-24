@@ -1,4 +1,5 @@
 import pool from '../db/pool';
+import { TeacherPointsService } from './teacherPoints';
 
 export class StudentPointsService {
   // إضافة نقاط للطالب
@@ -83,24 +84,42 @@ export class StudentPointsService {
     return await this.addPoints(userId, points, 'exam_solved', examId, description);
   }
 
-  // جلب نقاط الطالب
   static async getStudentPoints(userId: number): Promise<{
     total_points: number;
     last_reset_at: Date | null;
     created_at: Date;
     updated_at: Date;
+    teacher_id?: number | null;
+    grade_id?: number | null;
   } | null> {
+    try {
+      const ctx = await TeacherPointsService.resolveStudentPointsContext(userId);
+      if (ctx) {
+        const total = await TeacherPointsService.getBalance(
+          userId,
+          ctx.teacherId,
+          ctx.gradeId,
+        );
+        return {
+          total_points: total,
+          last_reset_at: null,
+          created_at: new Date(),
+          updated_at: new Date(),
+          teacher_id: ctx.teacherId,
+          grade_id: ctx.gradeId,
+        };
+      }
+    } catch (err) {
+      console.error('TeacherPoints getStudentPoints fallback:', err);
+    }
+
+    // Fallback to legacy global wallet if scoped context unavailable
     const result = await pool.query(
       'SELECT total_points, last_reset_at, created_at, updated_at FROM student_points WHERE user_id = $1',
       [userId],
     );
 
     if (!result.rowCount) {
-      // إنشاء سجل جديد بصفر نقاط
-      await pool.query(
-        'INSERT INTO student_points (user_id, total_points) VALUES ($1, 0) ON CONFLICT DO NOTHING',
-        [userId],
-      );
       return {
         total_points: 0,
         last_reset_at: null,

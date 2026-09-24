@@ -1,4 +1,5 @@
 import pool from '../db/pool';
+import { TeacherPointsService } from './teacherPoints';
 import {
   buildValidationError,
   normalizeNonNegativeHours,
@@ -816,39 +817,42 @@ export class ExamsService {
       );
     }
 
-    // إضافة نقاط الامتحان (من 20 نقطة حسب النسبة) - فقط للإدخال الجديد
+    // نقاط النتيجة — النظام scoped (idempotent via reference_key)
     if (isNewSubmission) {
       try {
-        // eslint-disable-next-line @typescript-eslint/ban-ts-comment
-        // @ts-expect-error
-        const { StudentPointsService } = await import('./studentPoints');
-        const examInfo = await pool.query('SELECT title FROM course_exams WHERE id = $1', [examId]);
-        const examTitle = examInfo.rowCount ? examInfo.rows[0].title : null;
-
-        // جلب obtained_grade إذا كان موجوداً
-        const submissionInfo = await pool.query(
-          'SELECT COALESCE(obtained_grade, total_grade) as obtained_grade FROM course_exam_submissions WHERE exam_id = $1 AND student_id = $2',
-          [examId, studentId],
+        const examInfo = await pool.query(
+          `SELECT ce.title, ce.course_id, c.teacher_id
+           FROM course_exams ce
+           JOIN courses c ON c.id = ce.course_id
+           WHERE ce.id = $1`,
+          [examId],
         );
-        const obtainedGrade = submissionInfo.rowCount
-          ? parseInt(submissionInfo.rows[0].obtained_grade)
-          : total;
-
-        // التحقق من أن الطالب لم يحصل على نقاط لهذا الامتحان من قبل
-        const hasPoints = await StudentPointsService.hasExamPoints(studentId, examId);
-        if (!hasPoints) {
-          await StudentPointsService.addExamPoints(
-            studentId,
-            examId,
-            obtainedGrade,
-            examFullGrade,
-            examTitle,
-            'course_exam',
+        if (examInfo.rowCount) {
+          const row = examInfo.rows[0];
+          const submissionInfo = await pool.query(
+            'SELECT id, COALESCE(obtained_grade, total_grade) as obtained_grade FROM course_exam_submissions WHERE exam_id = $1 AND student_id = $2',
+            [examId, studentId],
           );
+          const obtainedGrade = submissionInfo.rowCount
+            ? parseInt(submissionInfo.rows[0].obtained_grade)
+            : total;
+          const attemptId = submissionInfo.rowCount
+            ? Number(submissionInfo.rows[0].id)
+            : examId;
+          await TeacherPointsService.awardExamOrAssignmentScore({
+            studentId,
+            teacherId: Number(row.teacher_id),
+            courseId: Number(row.course_id),
+            attemptId,
+            examId,
+            isAssignment: false,
+            obtainedGrade,
+            totalGrade: examFullGrade,
+            title: row.title ?? null,
+          });
         }
       } catch (error) {
-        // لا نوقف العملية إذا فشل إضافة النقاط
-        console.error('Error adding exam points:', error);
+        console.error('Error adding legacy course exam points:', error);
       }
     }
 
