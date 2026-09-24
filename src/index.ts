@@ -141,6 +141,9 @@ const startServer = async () => {
     const { startWhatsAppWorker } = await import('./modules/whatsapp/workers/whatsappWorker.js');
     startWhatsAppWorker();
 
+    const { startYoutubeUploadWorker } = await import('./workers/youtubeUploadWorker.js');
+    startYoutubeUploadWorker();
+
     io.use(async (socket, next) => {
       try {
         const token =

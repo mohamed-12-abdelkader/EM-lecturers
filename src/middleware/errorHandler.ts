@@ -28,7 +28,13 @@ const errorHandler = (err: Error, req: Request, res: Response<ErrorBody>, _: Nex
 
   if (err instanceof HttpError) {
     logger.warn(err, loggerMsg);
-    res.status(err.status).send({ status: err.status, message: err.message, name: err.name });
+    res.status(err.status).send({
+      status: err.status,
+      success: false,
+      message: err.message,
+      name: err.name,
+      ...(err.details ? { details: err.details } : {}),
+    });
     return;
   } else if (err instanceof ZodError) {
     logger.warn(err, loggerMsg);

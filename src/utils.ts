@@ -162,6 +162,10 @@ export const config = cleanEnv(process.env, {
   GOOGLE_CLIENT_ID: str(),
   GOOGLE_CLIENT_SECRET: str(),
   GOOGLE_API_KEY: str({ default: '' }),
+  /** Public HTTPS callback for admin YouTube OAuth (must match Google Cloud redirect URI). */
+  YOUTUBE_OAUTH_REDIRECT_URL: str({ default: '' }),
+  /** Absolute path to LiveKit recording files on this host. */
+  RECORDINGS_DIR: str({ default: '/recordings' }),
 
   LIVEKIT_API_KEY: str({ default: 'devkey' }),
   LIVEKIT_API_SECRET: str({ default: 'secret' }),
