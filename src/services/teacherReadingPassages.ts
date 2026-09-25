@@ -353,12 +353,28 @@ function formatQuestionRow(row: Record<string, unknown>, passage?: PassageSummar
       }))
     : [];
 
+  const passagePayload =
+    passage === undefined
+      ? undefined
+      : passage
+        ? {
+            id: passage.id,
+            text: passage.text,
+            passageText: passage.text,
+            content: passage.text,
+            title: passage.title ?? null,
+            lessonId: passage.lessonId,
+          }
+        : null;
+
   return {
     id: row.id,
     lessonId: row.lesson_id,
     lesson_id: row.lesson_id,
     passageId: row.passage_id ?? null,
     passage_id: row.passage_id ?? null,
+    // نص القطعة على مستوى السؤال (للعرض مع كل سؤال في الـ quiz)
+    passageText: passagePayload?.passageText ?? null,
     questionText: row.question_text,
     question_text: row.question_text,
     type: 'MCQ',
@@ -373,12 +389,7 @@ function formatQuestionRow(row: Record<string, unknown>, passage?: PassageSummar
     points: row.points,
     image_url: row.image_url,
     created_at: row.created_at,
-    passage:
-      passage === undefined
-        ? undefined
-        : passage
-          ? { id: passage.id, text: passage.text, title: passage.title ?? null }
-          : null,
+    passage: passagePayload,
   };
 }
 
@@ -503,6 +514,8 @@ export class TeacherReadingPassagesService {
       title: row.title,
       lessonId: row.lesson_id,
     };
+    // الأسئلة هي العنصر الأساسي — كل سؤال يحمل نص القطعة معه
+    const formattedQuestions = questions.map((q) => formatQuestionRow(q, summary));
     return {
       id: row.id,
       lessonId: row.lesson_id,
@@ -513,8 +526,19 @@ export class TeacherReadingPassagesService {
       order_index: row.order_index,
       created_at: row.created_at,
       updated_at: row.updated_at,
-      questions: questions.map((q) => formatQuestionRow(q, summary)),
-      questionsCount: questions.length,
+      questions: formattedQuestions,
+      questionsCount: formattedQuestions.length,
+    };
+  }
+
+  /** ردّ إنشاء/تحديث: قائمة أسئلة وكل سؤال معه القطعة */
+  static toQuestionsWithPassageResponse(formatted: ReturnType<typeof TeacherReadingPassagesService.formatPassage>) {
+    return {
+      passageId: formatted.id,
+      lessonId: formatted.lessonId,
+      title: formatted.title,
+      questions: formatted.questions,
+      questionsCount: formatted.questionsCount,
     };
   }
 
@@ -525,6 +549,86 @@ export class TeacherReadingPassagesService {
     const passageId = question.passage_id != null ? Number(question.passage_id) : null;
     const passage = passageId != null ? passageById.get(passageId) ?? null : null;
     return formatQuestionRow(question, passage);
+  }
+
+  /** إرفاق قطعة القراءة بأسئلة امتحان الكورس عبر teacher_question_id */
+  static async attachPassagesByTeacherQuestionIds<
+    T extends { teacher_question_id?: number | null },
+  >(
+    rows: T[],
+  ): Promise<
+    Array<
+      T & {
+        passage: {
+          id: number;
+          text: string;
+          passageText: string;
+          content: string;
+          title: string | null;
+        } | null;
+        passageText: string | null;
+        passageId: number | null;
+      }
+    >
+  > {
+    const teacherQuestionIds = [
+      ...new Set(
+        rows
+          .map((r) => (r.teacher_question_id != null ? Number(r.teacher_question_id) : null))
+          .filter((id): id is number => id != null && Number.isInteger(id) && id > 0),
+      ),
+    ];
+
+    const passageByTeacherQuestionId = new Map<
+      number,
+      { id: number; text: string; title: string | null }
+    >();
+
+    if (teacherQuestionIds.length) {
+      try {
+        const res = await pool.query<{
+          teacher_question_id: number;
+          passage_id: number;
+          title: string | null;
+          content: string;
+        }>(
+          `SELECT tq.id AS teacher_question_id, p.id AS passage_id, p.title, p.content
+           FROM teacher_questions tq
+           JOIN teacher_question_passages p ON p.id = tq.passage_id
+           WHERE tq.id = ANY($1::int[])`,
+          [teacherQuestionIds],
+        );
+        for (const row of res.rows) {
+          passageByTeacherQuestionId.set(row.teacher_question_id, {
+            id: row.passage_id,
+            text: row.content,
+            title: row.title,
+          });
+        }
+      } catch {
+        // older DBs may not have teacher_question_passages
+      }
+    }
+
+    return rows.map((row) => {
+      const tqId = row.teacher_question_id != null ? Number(row.teacher_question_id) : null;
+      const raw = tqId != null ? passageByTeacherQuestionId.get(tqId) ?? null : null;
+      const passage = raw
+        ? {
+            id: raw.id,
+            text: raw.text,
+            passageText: raw.text,
+            content: raw.text,
+            title: raw.title,
+          }
+        : null;
+      return {
+        ...row,
+        passage,
+        passageText: passage?.passageText ?? null,
+        passageId: passage?.id ?? null,
+      };
+    });
   }
 
   static async loadPassageMapForQuestions(
@@ -614,16 +718,7 @@ export class TeacherReadingPassagesService {
       });
 
       const formatted = this.formatPassage(passage, createdQuestions);
-      return {
-        passage: {
-          id: formatted.id,
-          lessonId: formatted.lessonId,
-          passageText: formatted.passageText,
-          title: formatted.title,
-        },
-        questions: formatted.questions,
-        questionsCount: formatted.questionsCount,
-      };
+      return this.toQuestionsWithPassageResponse(formatted);
     } catch (error) {
       await client.query('ROLLBACK');
       throw error;
@@ -643,7 +738,7 @@ export class TeacherReadingPassagesService {
       )
     ).rows;
 
-    return this.formatPassage(owned, questions);
+    return this.toQuestionsWithPassageResponse(this.formatPassage(owned, questions));
   }
 
   static async update(teacherId: number, passageId: number, body: unknown) {
@@ -757,7 +852,7 @@ export class TeacherReadingPassagesService {
         description: `عدّل قطعة قراءة #${passageId}`,
       });
 
-      return this.formatPassage(passage, questionsRows);
+      return this.toQuestionsWithPassageResponse(this.formatPassage(passage, questionsRows));
     } catch (error) {
       await client.query('ROLLBACK');
       throw error;

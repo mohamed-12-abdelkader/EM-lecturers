@@ -275,6 +275,7 @@ export class QuestionsManagementService {
         eq.question_text as text,
         eq.grade,
         eq.image,
+        eq.teacher_question_id,
         q.id as question_id,
         q.text as question_text_from_questions,
         q.image as question_image_from_questions,
@@ -315,6 +316,7 @@ export class QuestionsManagementService {
           text: hasText ? row.text || row.question_text_from_questions : null,
           image: hasImage ? row.image || row.question_image_from_questions : null,
           grade: row.grade,
+          teacher_question_id: row.teacher_question_id ?? null,
           choices: [],
         });
       }
@@ -342,7 +344,21 @@ export class QuestionsManagementService {
       }
     });
 
-    return questions;
+    const { TeacherReadingPassagesService } = await import('./teacherReadingPassages');
+    const withPassages =
+      await TeacherReadingPassagesService.attachPassagesByTeacherQuestionIds(questions);
+
+    return withPassages.map((q) => ({
+      id: q.id,
+      type: q.type,
+      text: q.text,
+      image: q.image,
+      grade: q.grade,
+      choices: q.choices,
+      passageId: q.passageId,
+      passageText: q.passageText,
+      passage: q.passage,
+    }));
   }
 
   // جلب جميع الأسئلة

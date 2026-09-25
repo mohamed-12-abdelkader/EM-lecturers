@@ -446,7 +446,8 @@ export class CourseLevelExamQuestionsService {
       [examId],
     );
 
-    return result.rows;
+    const { TeacherReadingPassagesService } = await import('./teacherReadingPassages');
+    return TeacherReadingPassagesService.attachPassagesByTeacherQuestionIds(result.rows);
   }
 
   /**

@@ -569,7 +569,9 @@ export class CourseLevelExamsService {
               Number(attempt?.attempt_number || 1),
             ),
           );
-    return orderItemsByIds(questionsRes.rows, selectedIds);
+    const ordered = orderItemsByIds(questionsRes.rows, selectedIds);
+    const { TeacherReadingPassagesService } = await import('./teacherReadingPassages');
+    return TeacherReadingPassagesService.attachPassagesByTeacherQuestionIds(ordered);
   }
 
   private static async buildStudentAttemptPayload(
@@ -1065,6 +1067,9 @@ export class CourseLevelExamsService {
       optionB: q.option_b,
       optionC: q.option_c,
       optionD: q.option_d,
+      passageId: q.passageId ?? null,
+      passageText: q.passageText ?? null,
+      passage: q.passage ?? null,
     };
   }
 
@@ -1154,6 +1159,9 @@ export class CourseLevelExamsService {
       optionB: question.option_b,
       optionC: question.option_c,
       optionD: question.option_d,
+      passageId: question.passageId ?? null,
+      passageText: question.passageText ?? null,
+      passage: question.passage ?? null,
     };
   }
 
@@ -1190,17 +1198,21 @@ export class CourseLevelExamsService {
     if (!attemptRes.rowCount) return [];
     const attempt = attemptRes.rows[0];
     const questionsRes = await pool.query(
-      `SELECT id, type, question_text, question_image, option_a, option_b, option_c, option_d, correct_answer
+      `SELECT id, type, question_text, question_image, option_a, option_b, option_c, option_d, correct_answer,
+              teacher_question_id
        FROM course_level_exam_questions
        WHERE exam_id = $1
        ORDER BY created_at ASC, id ASC`,
       [attempt.exam_id],
     );
-    const questionsById = new Map(questionsRes.rows.map((q) => [Number(q.id), q]));
+    const { TeacherReadingPassagesService } = await import('./teacherReadingPassages');
+    const questionsWithPassages =
+      await TeacherReadingPassagesService.attachPassagesByTeacherQuestionIds(questionsRes.rows);
+    const questionsById = new Map(questionsWithPassages.map((q) => [Number(q.id), q]));
     const questionIds = this.resolveAttemptQuestionIds(
       { id: attempt.exam_id, questions_count: attempt.questions_count, question_display_mode: attempt.question_display_mode },
       attempt,
-      questionsRes.rows.map((q) => Number(q.id)),
+      questionsWithPassages.map((q) => Number(q.id)),
     );
     const answersRes = await pool.query(
       `SELECT question_id, selected_answer, is_correct

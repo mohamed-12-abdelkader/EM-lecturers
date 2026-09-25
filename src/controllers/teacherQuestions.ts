@@ -357,8 +357,8 @@ router.post(
       success: true,
       message: `تمت إضافة قطعة القراءة مع ${data.questionsCount} سؤال`,
       data,
-      passage: data.passage,
       questions: data.questions,
+      questionsCount: data.questionsCount,
     });
   }),
 );
@@ -392,7 +392,16 @@ router.get(
         ).rows
       : [];
 
+    const passageMap = await TeacherReadingPassagesService.loadPassageMapForQuestions(questions);
+    const questionsWithPassage = questions.map((q) =>
+      TeacherReadingPassagesService.attachPassageToQuestion(q, passageMap),
+    );
+
     res.json({
+      // قائمة مسطّحة: كل سؤال ومعه نص القطعة
+      questions: questionsWithPassage,
+      questionsCount: questionsWithPassage.length,
+      // للتوافق مع الواجهات القديمة
       passages: passages.map((passage) =>
         TeacherReadingPassagesService.formatPassage(
           passage,
@@ -411,7 +420,7 @@ router.get(
     const passageId = Number(req.params.id);
     if (!Number.isInteger(passageId) || passageId <= 0) throw new HttpError(400, 'id غير صحيح');
     const data = await TeacherReadingPassagesService.getById(teacher_id, passageId);
-    res.json({ success: true, data, passage: data });
+    res.json({ success: true, data, questions: data.questions });
   }),
 );
 

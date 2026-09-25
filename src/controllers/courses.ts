@@ -13,6 +13,7 @@ import path from 'path';
 import fs from 'fs';
 import { ChatService } from '../services/chat';
 import { CourseLevelExamsService } from '../services/courseLevelExams';
+import { TeacherReadingPassagesService } from '../services/teacherReadingPassages';
 import { TeacherReportsService } from '../services/teacherReports';
 import { ExamsService } from '../services/exams';
 import * as ExpoPushService from '../services/expoPushService';
@@ -2519,7 +2520,8 @@ router.get(
       console.log(`[GET /course-exam/:examId/questions] Fetching questions for exam ${examId} (type: ${typeof examId})`);
 
       const questionsRes = await pool.query(
-        `SELECT id, type, question_text, question_image, option_a, option_b, option_c, option_d, correct_answer, exam_id
+        `SELECT id, type, question_text, question_image, option_a, option_b, option_c, option_d,
+                correct_answer, exam_id, teacher_question_id
          FROM course_level_exam_questions
          WHERE exam_id = $1::integer
          ORDER BY id ASC`,
@@ -2547,6 +2549,10 @@ router.get(
         }
       }
 
+      const withPassages = await TeacherReadingPassagesService.attachPassagesByTeacherQuestionIds(
+        questionsRes.rows,
+      );
+
       // Prevent caching to ensure fresh data
       res.set({
         'Cache-Control': 'no-cache, no-store, must-revalidate',
@@ -2561,7 +2567,7 @@ router.get(
           durationMinutes: exam.duration_minutes,
           questionsCount: exam.questions_count,
         },
-        questions: questionsRes.rows.map((q) => ({
+        questions: withPassages.map((q) => ({
           id: q.id,
           type: q.type,
           questionText: q.question_text,
@@ -2572,8 +2578,9 @@ router.get(
           optionD: q.option_d,
           correctAnswer: q.correct_answer,
           examId: q.exam_id,
-          questionId: q.question_id,
-          questionIdV2: q.question_id_v2,
+          passageId: q.passageId,
+          passageText: q.passageText,
+          passage: q.passage,
         })),
       });
     } catch (error: any) {
