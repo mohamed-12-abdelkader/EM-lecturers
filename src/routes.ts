@@ -15,6 +15,7 @@ import {
 } from './controllers/courseFiles';
 import { router as availableCourseRouter } from './controllers/availableCourse';
 import { router as teacherQuestionsRouter } from './controllers/teacherQuestions';
+import { router as readingPassagesRouter } from './controllers/readingPassages';
 import {
   publicRouter as teacherFreeLecturesPublicRouter,
   teacherRouter as teacherFreeLecturesRouter,
@@ -160,9 +161,11 @@ router.use('/teacher/center', centerRouter);
 router.use('/public/center', publicCenterRouter);
 router.use('/ocr', mistralOcrRouter);
 router.use('/teacher/questions', teacherQuestionsRouter);
+router.use('/teacher/questions', readingPassagesRouter);
 router.use('/teacher/free-lectures', teacherFreeLecturesRouter);
 router.use('/public/free-lectures', teacherFreeLecturesPublicRouter);
 router.use('/public/platform', publicTeacherPlatformRouter);
+router.use('/questions', readingPassagesRouter);
 router.use('/questions', questionsManagementRouter);
 router.use('/packages', packagesRouter);
 router.use('/package-subjects', packageSubjectItemsRouter);

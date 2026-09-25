@@ -2685,17 +2685,58 @@ export class ExamFlowService {
         }
       });
     }
-    return questions;
+
+    // مكتبة المدرّس: إرفاق قطعة القراءة عبر teacher_question_id إن لم تكن مرفقة من بنك الأسئلة
+    const missingPassageExamIds = questions.filter((q) => !q.passage).map((q) => q.id);
+    if (missingPassageExamIds.length > 0) {
+      try {
+        const teacherPassagesRes = await pool.query<{
+          exam_question_id: number;
+          passage_id: number;
+          title: string | null;
+          content: string;
+        }>(
+          `SELECT eq.id AS exam_question_id, p.id AS passage_id, p.title, p.content
+           FROM exam_questions eq
+           JOIN teacher_questions tq ON tq.id = eq.teacher_question_id
+           JOIN teacher_question_passages p ON p.id = tq.passage_id
+           WHERE eq.id = ANY($1::int[])`,
+          [missingPassageExamIds],
+        );
+        for (const row of teacherPassagesRes.rows) {
+          const question = map.get(row.exam_question_id);
+          if (!question || question.passage) continue;
+          question.passage_id = row.passage_id;
+          question.passage = {
+            id: row.passage_id,
+            title: row.title,
+            content: row.content,
+          };
+        }
+      } catch {
+        // teacher_question_passages may be unavailable on older DBs
+      }
+    }
+
+    return Array.from(map.values());
   }
 
   private static sanitizeOneQuestion(question: ExamQuestion, includeCorrect: boolean) {
+    const passage = question.passage
+      ? {
+          id: question.passage.id,
+          title: question.passage.title ?? null,
+          content: question.passage.content,
+          text: question.passage.content,
+        }
+      : null;
     return {
       id: question.id,
       examQuestionId: question.id,
       text: question.text,
       image: question.image,
       grade: question.grade,
-      passage: question.passage ?? null,
+      passage,
       ...(question.isVisible !== undefined && includeCorrect ? { isVisible: question.isVisible } : {}),
       choices: question.choices.map((choice) => ({
         id: choice.id,

@@ -3,6 +3,7 @@ import { authMiddleware } from '../middleware/authentication';
 import pool from '../db/pool';
 import { asyncWrapper, HttpError } from '../utils';
 import { TeacherActivityLogService } from '../services/teacherActivityLog';
+import { TeacherReadingPassagesService } from '../services/teacherReadingPassages';
 
 export const router = Router();
 
@@ -346,60 +347,19 @@ router.post(
   '/passage',
   authMiddleware(['teacher']),
   asyncWrapper(async (req, res) => {
-    const teacher_id = req.user!.id;
-    const lessonIdNum = parseNullableNumber(req.body.lesson_id, 'lesson_id')!;
-    const { title, content, questions = [] } = req.body;
-
-    if (!content || !String(content).trim()) throw new HttpError(400, 'نص القطعة مطلوب');
-    if (!(await verifyLessonOwnership(lessonIdNum, teacher_id))) {
-      throw new HttpError(404, 'الدرس غير موجود');
-    }
-
-    const client = await pool.connect();
-    try {
-      await client.query('BEGIN');
-      const passageResult = await client.query(
-        `INSERT INTO teacher_question_passages (lesson_id, title, content, order_index)
-         VALUES ($1, $2, $3, 0)
-         RETURNING *`,
-        [lessonIdNum, title || null, content],
-      );
-      const passage = passageResult.rows[0];
-      const createdQuestions = [];
-
-      for (const q of Array.isArray(questions) ? questions : []) {
-        const result = await client.query(
-          `INSERT INTO teacher_questions (
-             lesson_id, passage_id, question_text, question_type, choices, answer, image_url,
-             correct_answer_index, explanation, difficulty_level, points
-           )
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-           RETURNING *`,
-          [
-            lessonIdNum,
-            passage.id,
-            q.question_text,
-            q.question_type || (Array.isArray(q.choices) ? 'choice' : 'text'),
-            q.choices ? JSON.stringify(q.choices) : null,
-            q.answer || null,
-            q.image_url || null,
-            q.correct_answer_index ?? null,
-            q.explanation || null,
-            q.difficulty_level || 'medium',
-            q.points || 1,
-          ],
-        );
-        createdQuestions.push(result.rows[0]);
-      }
-
-      await client.query('COMMIT');
-      res.status(201).json({ success: true, passage, questions: createdQuestions });
-    } catch (error) {
-      await client.query('ROLLBACK');
-      throw error;
-    } finally {
-      client.release();
-    }
+    const body = {
+      ...req.body,
+      lessonId: req.body.lessonId ?? req.body.lesson_id,
+      passageText: req.body.passageText ?? req.body.passage_text ?? req.body.content,
+    };
+    const data = await TeacherReadingPassagesService.create(req.user!.id, body);
+    res.status(201).json({
+      success: true,
+      message: `تمت إضافة قطعة القراءة مع ${data.questionsCount} سؤال`,
+      data,
+      passage: data.passage,
+      questions: data.questions,
+    });
   }),
 );
 
@@ -433,10 +393,12 @@ router.get(
       : [];
 
     res.json({
-      passages: passages.map((passage) => ({
-        ...passage,
-        questions: questions.filter((q) => q.passage_id === passage.id),
-      })),
+      passages: passages.map((passage) =>
+        TeacherReadingPassagesService.formatPassage(
+          passage,
+          questions.filter((q) => q.passage_id === passage.id),
+        ),
+      ),
     });
   }),
 );
@@ -448,19 +410,8 @@ router.get(
     const teacher_id = req.user!.id;
     const passageId = Number(req.params.id);
     if (!Number.isInteger(passageId) || passageId <= 0) throw new HttpError(400, 'id غير صحيح');
-    const owned = await verifyPassageOwnership(passageId, teacher_id);
-    if (!owned) throw new HttpError(404, 'القطعة غير موجودة');
-
-    const passage = (
-      await pool.query('SELECT * FROM teacher_question_passages WHERE id = $1', [passageId])
-    ).rows[0];
-    const questions = (
-      await pool.query('SELECT * FROM teacher_questions WHERE passage_id = $1 ORDER BY id', [
-        passageId,
-      ])
-    ).rows;
-
-    res.json({ passage: { ...passage, questions } });
+    const data = await TeacherReadingPassagesService.getById(teacher_id, passageId);
+    res.json({ success: true, data, passage: data });
   }),
 );
 
@@ -642,7 +593,11 @@ router.get(
       'SELECT * FROM teacher_questions WHERE lesson_id = $1 ORDER BY id',
       [lessonIdNum],
     );
-    res.json({ questions: result.rows });
+    const passageMap = await TeacherReadingPassagesService.loadPassageMapForQuestions(result.rows);
+    const questions = result.rows.map((q) =>
+      TeacherReadingPassagesService.attachPassageToQuestion(q, passageMap),
+    );
+    res.json({ questions });
   }),
 );
 
@@ -720,19 +675,10 @@ router.get(
       'SELECT * FROM teacher_questions WHERE lesson_id = $1 ORDER BY id',
       [lessonIdNum],
     );
-    const questions = result.rows.map((q) => ({
-      ...q,
-      choices:
-        typeof q.choices === 'string'
-          ? (() => {
-              try {
-                return JSON.parse(q.choices);
-              } catch {
-                return q.choices;
-              }
-            })()
-          : q.choices,
-    }));
+    const passageMap = await TeacherReadingPassagesService.loadPassageMapForQuestions(result.rows);
+    const questions = result.rows.map((q) =>
+      TeacherReadingPassagesService.attachPassageToQuestion(q, passageMap),
+    );
     res.json({ questions });
   }),
 );
@@ -787,15 +733,22 @@ router.get(
       ]),
     );
 
+    const passageMap = await TeacherReadingPassagesService.loadPassageMapForQuestions(questions);
     for (const q of questions) {
-      lessonsMap[q.lesson_id]?.questions.push(q);
+      lessonsMap[q.lesson_id]?.questions.push(
+        TeacherReadingPassagesService.attachPassageToQuestion(q, passageMap),
+      );
     }
     for (const p of passages) {
       const lesson = lessonsMap[p.lesson_id];
       if (lesson) {
+        const passageQuestions = questions
+          .filter((q) => q.passage_id === p.id)
+          .map((q) => TeacherReadingPassagesService.attachPassageToQuestion(q, passageMap));
         lesson.passages.push({
           ...p,
-          questions: questions.filter((q) => q.passage_id === p.id),
+          passageText: p.content,
+          questions: passageQuestions,
         });
       }
     }

@@ -3150,14 +3150,20 @@ router.get(
     if (!courseCheck.rowCount) {
       return res.status(404).json({ message: 'Course not found or not yours' });
     }
-    // جلب الطلاب المشتركين مع كود التفعيل المستخدم
+    // جلب الطلاب المشتركين مع كود التفعيل (كود واحد لكل طالب — بدون تكرار من invite_code_usages)
     const result = await pool.query(
-      `SELECT u.id as student_id, u.name, u.email, u.phone, u.avatar, e.enrolled_at, tic.code as activation_code,
+      `SELECT u.id as student_id, u.name, u.email, u.phone, u.avatar, e.enrolled_at,
+              (
+                SELECT tic.code
+                FROM invite_code_usages icu
+                JOIN teacher_invite_codes tic ON tic.id = icu.code_id
+                WHERE icu.user_id = u.id AND tic.course_id = $1
+                ORDER BY icu.id DESC
+                LIMIT 1
+              ) AS activation_code,
               e.is_blocked_by_teacher, e.subscription_status, e.expires_at
        FROM enrollments e
        JOIN users u ON e.user_id = u.id
-       LEFT JOIN invite_code_usages icu ON icu.user_id = u.id
-       LEFT JOIN teacher_invite_codes tic ON icu.code_id = tic.id AND tic.course_id = $1
        WHERE e.course_id = $1
        ORDER BY e.enrolled_at DESC`,
       [courseId],
@@ -4343,7 +4349,7 @@ router.get(
       });
     }
 
-    // جلب قائمة الطلاب المشتركين
+    // جلب قائمة الطلاب المشتركين (كود واحد لكل طالب)
     const studentsResult = await pool.query(
       `SELECT 
         u.id,
@@ -4352,11 +4358,16 @@ router.get(
         u.phone,
         u.avatar,
         e.enrolled_at,
-        tic.code as activation_code
+        (
+          SELECT tic.code
+          FROM invite_code_usages icu
+          JOIN teacher_invite_codes tic ON tic.id = icu.code_id
+          WHERE icu.user_id = u.id AND tic.course_id = e.course_id
+          ORDER BY icu.id DESC
+          LIMIT 1
+        ) AS activation_code
        FROM enrollments e
        JOIN users u ON e.user_id = u.id
-       LEFT JOIN invite_code_usages icu ON u.id = icu.user_id
-       LEFT JOIN teacher_invite_codes tic ON icu.code_id = tic.id AND tic.course_id = e.course_id
        WHERE e.course_id = $1
        ORDER BY e.enrolled_at DESC`,
       [courseId],
