@@ -391,7 +391,9 @@ router.get(
     }
     const exam = examRes.rows[0];
     // جلب الأسئلة
-    let questions = [];
+    let questions: Awaited<
+      ReturnType<typeof QuestionsManagementService.getLectureExamQuestions>
+    > = [];
     try {
       questions = await QuestionsManagementService.getLectureExamQuestions(examId);
     } catch (_err) {

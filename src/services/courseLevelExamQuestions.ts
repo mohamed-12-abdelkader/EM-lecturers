@@ -446,7 +446,8 @@ export class CourseLevelExamQuestionsService {
       [examId],
     );
 
-    const { TeacherReadingPassagesService } = await import('./teacherReadingPassages');
+    // Dynamic import (.js) avoids circular dependency with teacherReadingPassages
+    const { TeacherReadingPassagesService } = await import('./teacherReadingPassages.js');
     return TeacherReadingPassagesService.attachPassagesByTeacherQuestionIds(result.rows);
   }
 

@@ -32,6 +32,7 @@ import {
   type CourseExamAnswer,
   type CourseExamLetter,
 } from './courseLevelExamAttemptPolicy';
+import { TeacherReadingPassagesService } from './teacherReadingPassages';
 
 interface RequestUser {
   id: number;
@@ -570,7 +571,6 @@ export class CourseLevelExamsService {
             ),
           );
     const ordered = orderItemsByIds(questionsRes.rows, selectedIds);
-    const { TeacherReadingPassagesService } = await import('./teacherReadingPassages');
     return TeacherReadingPassagesService.attachPassagesByTeacherQuestionIds(ordered);
   }
 
@@ -1205,7 +1205,6 @@ export class CourseLevelExamsService {
        ORDER BY created_at ASC, id ASC`,
       [attempt.exam_id],
     );
-    const { TeacherReadingPassagesService } = await import('./teacherReadingPassages');
     const questionsWithPassages =
       await TeacherReadingPassagesService.attachPassagesByTeacherQuestionIds(questionsRes.rows);
     const questionsById = new Map(questionsWithPassages.map((q) => [Number(q.id), q]));

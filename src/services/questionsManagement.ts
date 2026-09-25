@@ -1,6 +1,7 @@
 import pool from '../db/pool';
 import { uploadToCloudinary } from '../utils';
 import { ExamFlowService } from './examFlow';
+import { TeacherReadingPassagesService } from './teacherReadingPassages';
 
 export class QuestionsManagementService {
   // إنشاء أسئلة دفعة واحدة من نص منسق
@@ -344,7 +345,6 @@ export class QuestionsManagementService {
       }
     });
 
-    const { TeacherReadingPassagesService } = await import('./teacherReadingPassages');
     const withPassages =
       await TeacherReadingPassagesService.attachPassagesByTeacherQuestionIds(questions);
 
