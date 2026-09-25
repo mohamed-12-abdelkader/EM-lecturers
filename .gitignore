@@ -1,10 +1,27 @@
+# Dependencies / build
 node_modules
 .next
+dist/
+
+# Secrets / local env
 .env
 .env.local
 .env.development
 .env.production
 .env.ngrok.local
 token.json
-dist/
-uploads/
+
+# Temp / working dirs under uploads (do NOT ignore published media)
+uploads/_tmp/
+uploads/**/temp/
+uploads/**/*-temp/
+uploads/my-files-temp/
+uploads/course-pdfs-temp/
+uploads/mistral-ocr/
+uploads/qb-pdf-extraction/
+uploads/teacher-creative-references/
+
+# Keep category folders trackable in git (images deploy with the project)
+!uploads/
+!uploads/**/
+!uploads/**/.gitkeep

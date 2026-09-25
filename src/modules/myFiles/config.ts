@@ -10,7 +10,9 @@ export const myFilesConfig = {
   maxBulkFiles: 20,
   localDir: process.env.TEACHER_FILES_LOCAL_DIR?.trim() || 'uploads/teacher-library',
   signedUrlTtlSeconds: Number(process.env.TEACHER_FILES_SIGNED_URL_TTL_SECONDS || 3600),
-  storageProvider: (process.env.FILE_STORAGE_PROVIDER?.trim().toLowerCase() || 'local') as FileStorageProvider,
+  storageProvider: (process.env.FILE_STORAGE_PROVIDER?.trim().toLowerCase() ||
+    process.env.IMAGE_STORAGE_PROVIDER?.trim().toLowerCase() ||
+    'local') as FileStorageProvider,
   aws: {
     region: process.env.AWS_REGION?.trim() || '',
     bucket: process.env.AWS_S3_BUCKET?.trim() || '',

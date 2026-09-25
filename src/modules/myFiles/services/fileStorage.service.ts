@@ -7,6 +7,7 @@ import { GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { v2 as cloudinary } from 'cloudinary';
 import {
+  TEACHER_LIBRARY_PUBLIC_PREFIX,
   buildPublicFileUrl,
   myFilesConfig,
   resolveLocalFilePath,
@@ -159,24 +160,25 @@ export class FileStorageService {
     options?: StorageUploadOptions,
   ): Promise<StorageUploadResult> {
     const key = withFolder(storageKey, options?.folder);
-    switch (myFilesConfig.storageProvider) {
-      case 'local':
-        if (options?.localDir && options?.localUrlPrefix) {
-          return this.uploadScopedLocal(filePath, storageKey, options.localDir, options.localUrlPrefix);
-        }
-        if (options?.tenantId == null) {
-          throw new HttpError(
-            500,
-            'tenantId is required for local teacher-library uploads, or pass localDir/localUrlPrefix',
-          );
-        }
-        return this.uploadLocal(filePath, key, options.tenantId);
-      case 's3':
-        return this.uploadS3(filePath, key, mimeType);
-      case 'cloudinary':
-      default:
-        return this.uploadCloudinary(filePath, storageKey, options);
+    // External CDN/S3 disabled — all teacher-library / course files stay on local disk
+    const configured = myFilesConfig.storageProvider;
+    if (configured !== 'local') {
+      logger.warn(
+        { configured },
+        'FILE_STORAGE_PROVIDER external storage is disabled; forcing local uploads',
+      );
     }
+
+    if (options?.localDir && options?.localUrlPrefix) {
+      return this.uploadScopedLocal(filePath, storageKey, options.localDir, options.localUrlPrefix);
+    }
+    if (options?.tenantId == null) {
+      throw new HttpError(
+        500,
+        'tenantId is required for local teacher-library uploads, or pass localDir/localUrlPrefix',
+      );
+    }
+    return this.uploadLocal(filePath, key, options.tenantId);
   }
 
   static async deleteStoredObject(
@@ -184,74 +186,48 @@ export class FileStorageService {
     fileUrl: string,
     options?: { provider?: FileStorageProvider | string; deliveryType?: string | null },
   ): Promise<void> {
-    const provider = (options?.provider || myFilesConfig.storageProvider) as FileStorageProvider | string;
     try {
-      switch (provider) {
-        case 'local': {
-          const fullPath = fileUrl.startsWith('/uploads/')
-            ? path.resolve(process.cwd(), fileUrl.replace(/^\/+/, ''))
-            : resolveLocalFilePath(fileKey);
-          await fs.unlink(fullPath).catch(() => undefined);
-          break;
-        }
-        case 's3': {
-          const { DeleteObjectCommand } = await import('@aws-sdk/client-s3');
-          await getS3Client().send(
-            new DeleteObjectCommand({
-              Bucket: myFilesConfig.aws.bucket,
-              Key: fileKey,
-            }),
-          );
-          break;
-        }
-        case 'cloudinary':
-        default: {
-          if (!fileKey) break;
-          const deliveryType = resolveDeliveryType(fileUrl, options?.deliveryType);
-          const resourceTypes: Array<'raw' | 'image'> = ['raw', 'image'];
-          const types: CloudinaryDeliveryType[] = [deliveryType, 'upload', 'authenticated', 'private'];
-          for (const resourceType of resourceTypes) {
-            for (const type of [...new Set(types)]) {
-              await cloudinary.uploader
-                .destroy(fileKey, { resource_type: resourceType, type })
-                .catch(() => undefined);
-            }
-          }
-          break;
+      // Always remove local /uploads files when URL points there
+      if (fileUrl?.startsWith('/uploads/') || fileUrl?.includes('/uploads/')) {
+        const fullPath = fileUrl.startsWith('/uploads/')
+          ? path.resolve(process.cwd(), fileUrl.replace(/^\/+/, '').split('?')[0])
+          : resolveLocalFilePath(fileKey);
+        await fs.unlink(fullPath).catch(() => undefined);
+        if (fileUrl.startsWith('/uploads/') || fileUrl.includes(`${TEACHER_LIBRARY_PUBLIC_PREFIX}/`)) {
+          return;
         }
       }
+
+      const provider = (options?.provider || 'local') as FileStorageProvider | string;
+      if (provider !== 'local') {
+        // External providers disabled — local delete already attempted
+        return;
+      }
+
+      const fullPath = resolveLocalFilePath(fileKey);
+      await fs.unlink(fullPath).catch(() => undefined);
     } catch {
       // Non-blocking cleanup
     }
   }
 
   static async readBuffer(fileKey: string, fileUrl: string): Promise<Buffer> {
-    switch (myFilesConfig.storageProvider) {
-      case 'local': {
-        const fullPath = resolveLocalFilePath(fileKey);
-        return fs.readFile(fullPath);
+    if (fileUrl?.startsWith('/uploads/') || fileUrl?.includes('/uploads/')) {
+      let pathname = fileUrl;
+      try {
+        if (/^https?:\/\//i.test(fileUrl)) pathname = new URL(fileUrl).pathname;
+      } catch {
+        pathname = fileUrl;
       }
-      case 's3': {
-        const response = await getS3Client().send(
-          new GetObjectCommand({
-            Bucket: myFilesConfig.aws.bucket,
-            Key: fileKey,
-          }),
-        );
-        const body = response.Body;
-        if (!body) throw new HttpError(404, 'الملف غير موجود في التخزين');
-        if (Buffer.isBuffer(body)) return body;
-        if (body instanceof Uint8Array) return Buffer.from(body);
-        const chunks: Buffer[] = [];
-        for await (const chunk of body as Readable) {
-          chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-        }
-        return Buffer.concat(chunks);
-      }
-      case 'cloudinary':
-      default:
-        return fetchCloudinaryBuffer(fileKey, fileUrl);
+      const fullPath = pathname.startsWith('/uploads/')
+        ? path.resolve(process.cwd(), pathname.replace(/^\/+/, '').split('?')[0])
+        : resolveLocalFilePath(fileKey);
+      return fs.readFile(fullPath);
     }
+
+    // External providers disabled — resolve from local disk
+    const fullPath = resolveLocalFilePath(fileKey);
+    return fs.readFile(fullPath);
   }
 
   static async openReadStream(

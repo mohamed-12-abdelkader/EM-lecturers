@@ -1,4 +1,5 @@
 import express from 'express';
+import path from 'path';
 import { createServer } from 'http';
 import { loggerMiddleware } from './utils';
 import { errorHandlerMiddleware } from './middleware/errorHandler';
@@ -77,7 +78,7 @@ app.use('/api', router);
 app.use('/uploads/teacher-library', teacherLibraryStaticMiddleware);
 app.use(
   '/uploads',
-  express.static('uploads', {
+  express.static(path.join(process.cwd(), 'uploads'), {
     // Weak ETags (W/"...") + Accept-Ranges break Chrome's built-in PDF viewer.
     etag: false,
     lastModified: true,
@@ -88,6 +89,8 @@ app.use(
         res.setHeader('Content-Disposition', 'inline');
         res.setHeader('Cache-Control', 'public, max-age=300');
         res.removeHeader('X-Frame-Options');
+      } else if (/\.(jpe?g|png|gif|webp)$/i.test(filePath)) {
+        res.setHeader('Cache-Control', 'public, max-age=86400');
       }
     },
   }),

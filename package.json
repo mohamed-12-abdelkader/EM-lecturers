@@ -17,6 +17,8 @@
     "lint:fix": "npm run lint -- --fix",
     "test": "vitest",
     "migrate": "node-pg-migrate",
+    "migrate:images-local": "cross-env NODE_ENV=development tsx scripts/migrate-cloudinary-images-to-local.ts",
+    "migrate:images-local:dry": "cross-env NODE_ENV=development tsx scripts/migrate-cloudinary-images-to-local.ts --dry-run",
     "teacher:token": "cross-env NODE_ENV=development tsx src/scripts/generate_teacher_token.ts",
     "scientific-chatbot:tokens": "node scripts/generate-scientific-chatbot-tokens.mjs"
   },

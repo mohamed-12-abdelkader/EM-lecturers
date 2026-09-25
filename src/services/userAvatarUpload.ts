@@ -3,7 +3,6 @@ import path from 'path';
 import multer from 'multer';
 import type { NextFunction, Request, Response } from 'express';
 import pool from '../db/pool';
-import { uploadToBunnyStorage } from './bunny';
 import { buildFileUrl } from '../config/appUrls';
 
 const AVATAR_DIR = path.join('uploads', 'avatars');
@@ -108,39 +107,25 @@ export function uploadMeAvatarMiddleware(req: Request, res: Response, next: Next
   });
 }
 
-/** Bunny أولاً، ثم ملف محلي تحت /uploads/avatars */
+/** حفظ صورة البروفايل محليًا تحت /uploads/avatars (بدون CDN) */
 export async function persistAvatarFile(file: Express.Multer.File): Promise<string> {
-  const ext =
-    (path.extname(file.originalname || file.filename) || '.jpg').replace('.', '').slice(0, 8) ||
-    'jpg';
-  const bunnyCopy = `${file.path}.bunny`;
-
-  try {
-    fs.copyFileSync(file.path, bunnyCopy);
-    const url = await uploadToBunnyStorage({
-      path: bunnyCopy,
-      ext,
-      mime: file.mimetype || 'image/jpeg',
-      originalname: file.originalname,
-    });
-    try {
-      if (fs.existsSync(file.path)) fs.unlinkSync(file.path);
-    } catch {
-      // ignore
-    }
-    return url;
-  } catch (err: any) {
-    console.warn('Avatar Bunny upload failed, using local /uploads/avatars:', err?.message || err);
-    try {
-      if (fs.existsSync(bunnyCopy)) fs.unlinkSync(bunnyCopy);
-    } catch {
-      // ignore
-    }
-    if (!fs.existsSync(file.path)) {
-      throw new Error('فشل رفع صورة البروفايل');
-    }
-    return `/uploads/avatars/${file.filename}`;
+  if (!file?.path || !fs.existsSync(file.path)) {
+    throw new Error('فشل رفع صورة البروفايل');
   }
+  fs.mkdirSync(AVATAR_DIR, { recursive: true });
+  const destName =
+    file.filename ||
+    `avatar-${Date.now()}-${Math.round(Math.random() * 1e9)}${path.extname(file.originalname || '.jpg').toLowerCase()}`;
+  const destPath = path.join(AVATAR_DIR, destName);
+  if (path.resolve(file.path) !== path.resolve(destPath)) {
+    fs.copyFileSync(file.path, destPath);
+    try {
+      fs.unlinkSync(file.path);
+    } catch {
+      // ignore
+    }
+  }
+  return `/uploads/avatars/${destName}`;
 }
 
 export function publicAvatarUrl(stored: string | null | undefined): string | null {

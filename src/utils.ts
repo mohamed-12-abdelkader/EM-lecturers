@@ -14,6 +14,15 @@ import { v2 as cloudinary, UploadApiResponse } from 'cloudinary';
 import * as fs from 'node:fs';
 import * as util from 'node:util';
 import * as path from 'node:path';
+import {
+  MAX_IMAGE_FILE_SIZE_BYTES,
+  deleteLocalUploadByUrl,
+  ensureImageStorageLayout,
+  ensureUploadsDir,
+  isAllowedImageUpload,
+  saveLocalImageBuffer,
+  saveLocalImageFile,
+} from './services/localImageStorage';
 
 const projectRoot = path.resolve(__dirname, '..');
 
@@ -141,11 +150,14 @@ export const config = cleanEnv(process.env, {
   EMAILS_FROM_EMAIL: str({ default: undefined }),
   EMAILS_FROM_NAME: str({ default: undefined }),
 
-  // CDN
-  CLOUDINARY_URL: str(),
-  CLOUDINARY_CLOUD_NAME: str(),
-  CLOUDINARY_API_KEY: str(),
-  CLOUDINARY_API_SECRET: str(),
+  // CDN (optional — images are stored locally; kept for legacy env compatibility)
+  CLOUDINARY_URL: str({ default: '' }),
+  CLOUDINARY_CLOUD_NAME: str({ default: '' }),
+  CLOUDINARY_API_KEY: str({ default: '' }),
+  CLOUDINARY_API_SECRET: str({ default: '' }),
+  /** Image storage is always local disk under /uploads (Cloudinary disabled). */
+  IMAGE_STORAGE_PROVIDER: str({ default: 'local' }),
+  FILE_STORAGE_PROVIDER: str({ default: 'local' }),
 
   BUNNY_STORAGE_ZONE_NAME: str(),
   BUNNY_STORAGE_PUBLIC_HOSTNAME: str(),
@@ -340,162 +352,82 @@ export async function sendEmail(to: string, subject: string, html: string) {
   });
 }
 
-// Upload (generic)
+// Upload (generic) — images land in uploads/ then are moved by saveLocalImageFile
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
-    const dir = path.join(__dirname, '../../uploads');
-    fs.mkdirSync(dir, { recursive: true });
+    const dir = ensureUploadsDir('_tmp');
     cb(null, dir);
   },
   filename: (req, file, cb) => {
-    const uniqueName = `${Date.now()}-${file.originalname}`;
+    const uniqueName = `${Date.now()}-${Math.round(Math.random() * 1e9)}${path.extname(file.originalname).toLowerCase()}`;
     cb(null, uniqueName);
   },
 });
 
 const fileFilter = (req: any, file: any, cb: any) => {
-  if (file.mimetype.startsWith('image/')) cb(null, true);
-  else cb(new Error('Only image files are allowed'), false);
+  if (isAllowedImageUpload(file.mimetype, file.originalname)) cb(null, true);
+  else cb(new Error('Only JPEG, JPG, PNG, WEBP, or GIF images are allowed'), false);
 };
 
 export const upload = multer({
   storage,
   fileFilter,
-  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB max
+  limits: { fileSize: MAX_IMAGE_FILE_SIZE_BYTES },
 });
 
 const unlinkFile = util.promisify(fs.unlink);
+void unlinkFile; // kept for rare temp cleanup callers
 
-cloudinary.config({
-  cloud_name: config.CLOUDINARY_CLOUD_NAME,
-  api_key: config.CLOUDINARY_API_KEY,
-  api_secret: config.CLOUDINARY_API_SECRET,
-});
-
-function uploadsRootDir(): string {
-  return path.join(process.cwd(), 'uploads');
+if (config.CLOUDINARY_CLOUD_NAME && config.CLOUDINARY_API_KEY && config.CLOUDINARY_API_SECRET) {
+  cloudinary.config({
+    cloud_name: config.CLOUDINARY_CLOUD_NAME,
+    api_key: config.CLOUDINARY_API_KEY,
+    api_secret: config.CLOUDINARY_API_SECRET,
+  });
 }
 
-function isCloudinaryUnavailable(err: unknown): boolean {
-  const anyErr = err as { message?: string; http_code?: number; error?: { message?: string } };
-  const message = String(anyErr?.message || anyErr?.error?.message || err || '');
-  return (
-    message.includes('cloud_name is disabled') ||
-    message.includes('Unknown API key') ||
-    message.includes('Invalid cloud_name') ||
-    anyErr?.http_code === 401
-  );
+try {
+  ensureImageStorageLayout();
+} catch {
+  // non-fatal at boot
 }
 
-/** Keep the file under /uploads and return a Cloudinary-compatible result. */
-function localUploadResult(filePath: string): UploadApiResponse {
-  const uploadsDir = uploadsRootDir();
-  fs.mkdirSync(uploadsDir, { recursive: true });
-
-  const ext = path.extname(filePath) || '';
-  const filename = path.basename(filePath);
-  const destName = filename.startsWith('tenant-') || filename.match(/^\d+-/)
-    ? filename
-    : `${Date.now()}-${Math.round(Math.random() * 1e9)}${ext}`;
-  const destPath = path.join(uploadsDir, destName);
-
-  if (path.resolve(filePath) !== path.resolve(destPath)) {
-    fs.copyFileSync(filePath, destPath);
-    try {
-      fs.unlinkSync(filePath);
-    } catch {
-      // ignore
-    }
-  }
-
-  const url = `/uploads/${destName}`;
-  return {
-    asset_id: destName,
-    public_id: destName,
-    version: 1,
-    version_id: destName,
-    signature: '',
-    width: 0,
-    height: 0,
-    format: ext.replace('.', ''),
-    resource_type: 'image',
-    created_at: new Date().toISOString(),
-    tags: [],
-    bytes: fs.existsSync(destPath) ? fs.statSync(destPath).size : 0,
-    type: 'upload',
-    etag: '',
-    placeholder: false,
-    url,
-    secure_url: url,
-    folder: 'uploads',
-    original_filename: destName,
-    api_key: '',
-  } as unknown as UploadApiResponse;
-}
-
+/**
+ * Save an uploaded image to local /uploads/<category>/...
+ * Export name kept for backward compatibility with all existing callers.
+ * Always uses local disk storage (no Cloudinary / CDN).
+ */
 export const uploadToCloudinary = async (
   filePath: string,
   options?: {
     resource_type?: 'image' | 'video' | 'raw' | 'auto';
     type?: 'upload' | 'authenticated' | 'private';
     access_mode?: 'public' | 'authenticated';
-    /** عند false: لا نرجع لتخزين محلي إذا فشل Cloudinary (افتراضي true) */
     allowLocalFallback?: boolean;
     folder?: string;
     public_id?: string;
+    category?: string;
   },
 ): Promise<UploadApiResponse> => {
-  const uploadOptions: Record<string, unknown> = {
-    folder: options?.folder || 'media',
-  };
-
-  if (options?.resource_type) {
-    uploadOptions.resource_type = options.resource_type;
-  }
-  if (options?.type) {
-    uploadOptions.type = options.type;
-  }
-  if (options?.access_mode) {
-    uploadOptions.access_mode = options.access_mode;
-  }
-  if (options?.public_id) {
-    uploadOptions.public_id = options.public_id;
-  }
-
-  // Large files: chunked upload (Cloudinary) so platform hero/avatar aren't capped by single PUT size
-  const fileSize = fs.existsSync(filePath) ? fs.statSync(filePath).size : 0;
-  const useLarge = fileSize > 10 * 1024 * 1024;
-  if (useLarge && !uploadOptions.resource_type) {
-    uploadOptions.resource_type = 'auto';
-  }
-
-  try {
-    const result: UploadApiResponse = useLarge
-      ? ((await cloudinary.uploader.upload_large(filePath, {
-          ...uploadOptions,
-          chunk_size: 6_000_000,
-        })) as UploadApiResponse)
-      : await cloudinary.uploader.upload(filePath, uploadOptions);
-    await unlinkFile(filePath);
-    return result;
-  } catch (err) {
-    const allowFallback = options?.allowLocalFallback !== false;
-    if (!allowFallback || !isCloudinaryUnavailable(err)) {
-      throw err;
-    }
-    logger.warn(
-      { err, filePath },
-      'Cloudinary unavailable — saving upload locally under /uploads',
-    );
-    return localUploadResult(filePath);
-  }
+  return saveLocalImageFile(filePath, {
+    category: options?.category || options?.folder || 'general',
+    folder: options?.folder,
+    originalFilename: path.basename(filePath),
+  });
 };
 
-/** Delete a Cloudinary media by its delivered URL (best effort). */
+/**
+ * Delete media by stored URL. Handles local /uploads paths;
+ * best-effort Cloudinary destroy for legacy CDN URLs still in DB.
+ */
 export const deleteCloudinaryAssetByUrl = async (url?: string | null): Promise<void> => {
   if (!url) return;
+
+  if (deleteLocalUploadByUrl(url)) return;
+
+  // Legacy Cloudinary URLs — best effort only
+  if (!config.CLOUDINARY_CLOUD_NAME) return;
   try {
-    // Example: .../upload/v123456/media/path/file.jpg -> media/path/file
     const marker = '/upload/';
     const idx = url.indexOf(marker);
     if (idx < 0) return;
@@ -508,59 +440,58 @@ export const deleteCloudinaryAssetByUrl = async (url?: string | null): Promise<v
     if (!publicId) return;
     await cloudinary.uploader.destroy(publicId, { resource_type: 'image' });
   } catch {
-    // Keep operation non-blocking: data update/delete should not fail if CDN cleanup fails.
+    // non-blocking
   }
 };
 
-/** رفع buffer (مثلاً صورة صفحة PDF) إلى Cloudinary - يكتب مؤقتاً ثم يرفع ويحذف الملف */
+/** رفع buffer إلى التخزين المحلي تحت /uploads */
 export const uploadBufferToCloudinary = async (
   buffer: Buffer,
   filename: string,
-  options?: { resource_type?: 'image' | 'video' | 'raw' | 'auto' },
+  options?: { resource_type?: 'image' | 'video' | 'raw' | 'auto'; folder?: string; category?: string },
 ): Promise<UploadApiResponse> => {
-  const dir = path.join(__dirname, '../../uploads');
-  fs.mkdirSync(dir, { recursive: true });
-  const filePath = path.join(dir, filename);
-  fs.writeFileSync(filePath, buffer);
-  return uploadToCloudinary(filePath, options);
+  return saveLocalImageBuffer(buffer, filename, {
+    category: options?.category || options?.folder || 'general',
+    folder: options?.folder,
+  });
 };
 
 // Exam image upload
 const examImageStorage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    const dir = path.join(__dirname, '../../uploads');
-    fs.mkdirSync(dir, { recursive: true });
-    cb(null, dir);
+  destination: (_req, _file, cb) => {
+    cb(null, ensureUploadsDir('_tmp'));
   },
-  filename: (req, file, cb) => {
-    const uniqueName = `${Date.now()}-${file.originalname}`;
-    cb(null, uniqueName);
+  filename: (_req, file, cb) => {
+    cb(
+      null,
+      `${Date.now()}-${Math.round(Math.random() * 1e9)}${path.extname(file.originalname).toLowerCase()}`,
+    );
   },
 });
 
 export const uploadExamImage = multer({
   storage: examImageStorage,
   fileFilter,
-  limits: { fileSize: 5 * 1024 * 1024 },
+  limits: { fileSize: MAX_IMAGE_FILE_SIZE_BYTES },
 });
 
 // Teacher avatar upload
 const teacherAvatarStorage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    const dir = path.join(__dirname, '../../uploads');
-    fs.mkdirSync(dir, { recursive: true });
-    cb(null, dir);
+  destination: (_req, _file, cb) => {
+    cb(null, ensureUploadsDir('_tmp'));
   },
-  filename: (req, file, cb) => {
-    const uniqueName = `${Date.now()}-${file.originalname}`;
-    cb(null, uniqueName);
+  filename: (_req, file, cb) => {
+    cb(
+      null,
+      `${Date.now()}-${Math.round(Math.random() * 1e9)}${path.extname(file.originalname).toLowerCase()}`,
+    );
   },
 });
 
 export const uploadTeacherAvatar = multer({
   storage: teacherAvatarStorage,
   fileFilter,
-  limits: { fileSize: 5 * 1024 * 1024 },
+  limits: { fileSize: MAX_IMAGE_FILE_SIZE_BYTES },
 });
 
 export const generateRandomString = (length: number) => {
