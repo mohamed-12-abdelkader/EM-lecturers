@@ -168,13 +168,60 @@ router.patch(
         correctAnswer as 'A' | 'B' | 'C' | 'D',
       );
 
-      res.json({ question });
+      const { CourseLevelExamsService } = await import('../services/courseLevelExams.js');
+      const regrade =
+        await CourseLevelExamsService.regradeSubmittedAttemptsForQuestion(questionId);
+
+      res.json({ question, regrade });
     } catch (error: any) {
       if (error.status) {
         return res.status(error.status).json({ message: error.message });
       }
       console.error('Error setting correct answer:', error);
       res.status(500).json({ message: 'Failed to set correct answer' });
+    }
+  }),
+);
+
+/**
+ * PATCH /api/questions/:questionId/correct-answers
+ * Set exactly two correct answers and regrade submitted attempts
+ */
+router.patch(
+  '/:questionId/correct-answers',
+  authMiddleware(['teacher', 'admin', 'employee']),
+  checkPermission('question_bank_management'),
+  asyncWrapper(async (req: Request, res: Response) => {
+    const questionId = Number(req.params.questionId);
+    if (Number.isNaN(questionId)) {
+      return res.status(400).json({ message: 'Invalid question id' });
+    }
+
+    const rawList = req.body?.correctAnswers ?? req.body?.correct_answers;
+    if (!Array.isArray(rawList)) {
+      return res.status(400).json({
+        message: 'correctAnswers must be an array of exactly two distinct letters (A–D)',
+      });
+    }
+
+    try {
+      const result = await CourseLevelExamQuestionsService.setDualCorrectAnswers(
+        req.user!,
+        questionId,
+        rawList,
+      );
+      res.json({
+        message: 'تم تحديث الإجابتين الصحيحتين وإعادة تصحيح المحاولات السابقة',
+        question: result.question,
+        correctAnswers: result.correctAnswers,
+        regrade: result.regrade,
+      });
+    } catch (error: any) {
+      if (error.status) {
+        return res.status(error.status).json({ message: error.message });
+      }
+      console.error('Error setting dual correct answers:', error);
+      res.status(500).json({ message: 'Failed to set dual correct answers' });
     }
   }),
 );

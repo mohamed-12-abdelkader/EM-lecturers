@@ -260,10 +260,20 @@ export class TeacherManagedStudentsService {
             slug: row.grade_slug,
           }
         : null,
+      /** مجموعة السنتر / study_groups */
       group: row.group_id
         ? {
             id: row.group_id,
             name: row.group_name,
+          }
+        : null,
+      /** مجموعة الكورس / course_groups */
+      course_group: row.course_group_id
+        ? {
+            id: row.course_group_id,
+            name: row.course_group_name,
+            grade_id: row.course_group_grade_id ?? null,
+            status: row.course_group_status ?? null,
           }
         : null,
     };
@@ -429,13 +439,20 @@ export class TeacherManagedStudentsService {
       values,
     );
 
+    const teacherParam = i++;
+    const listValues = [...values, teacherId, limit, offset];
+    const limitParam = i++;
+    const offsetParam = i++;
+
     const listRes = await pool.query(
       `SELECT
          u.id, u.student_code, u.name, u.phone, u.parent_phone, u.email, u.avatar,
          u.account_status, u.must_change_password, u.created_at,
          u.device_ip, u.registered_ip, u.ip_registered_at, u.ip_reset_at,
          g.id AS grade_id, g.name AS grade_name, g.slug AS grade_slug,
-         sg.id AS group_id, sg.name AS group_name
+         sg.id AS group_id, sg.name AS group_name,
+         cg.id AS course_group_id, cg.name AS course_group_name,
+         cg.grade_id AS course_group_grade_id, cg.status AS course_group_status
        FROM users u
        LEFT JOIN LATERAL (
          SELECT grade_id FROM user_grades WHERE user_id = u.id ORDER BY grade_id LIMIT 1
@@ -445,10 +462,21 @@ export class TeacherManagedStudentsService {
          SELECT gs.group_id FROM group_students gs WHERE gs.student_id = u.id LIMIT 1
        ) gs_ref ON TRUE
        LEFT JOIN study_groups sg ON sg.id = gs_ref.group_id
+       LEFT JOIN LATERAL (
+         SELECT m.group_id
+         FROM student_course_group_memberships m
+         JOIN course_groups cg0 ON cg0.id = m.group_id
+         WHERE m.student_id = u.id
+           AND cg0.teacher_id = $${teacherParam}
+           AND cg0.status = 'active'
+         ORDER BY m.updated_at DESC
+         LIMIT 1
+       ) cg_ref ON TRUE
+       LEFT JOIN course_groups cg ON cg.id = cg_ref.group_id
        WHERE ${where}
        ORDER BY ${sortColumn} ${order}, u.id ASC
-       LIMIT $${i++} OFFSET $${i++}`,
-      [...values, limit, offset],
+       LIMIT $${limitParam} OFFSET $${offsetParam}`,
+      listValues,
     );
 
     const students = listRes.rows.map((row) => this.mapStudentRow(row));
@@ -474,7 +502,9 @@ export class TeacherManagedStudentsService {
          u.account_status, u.must_change_password, u.created_at,
          u.device_ip, u.registered_ip, u.ip_registered_at, u.ip_reset_at,
          g.id AS grade_id, g.name AS grade_name, g.slug AS grade_slug,
-         sg.id AS group_id, sg.name AS group_name
+         sg.id AS group_id, sg.name AS group_name,
+         cg.id AS course_group_id, cg.name AS course_group_name,
+         cg.grade_id AS course_group_grade_id, cg.status AS course_group_status
        FROM users u
        LEFT JOIN LATERAL (
          SELECT grade_id FROM user_grades WHERE user_id = u.id ORDER BY grade_id LIMIT 1
@@ -484,9 +514,20 @@ export class TeacherManagedStudentsService {
          SELECT gs.group_id FROM group_students gs WHERE gs.student_id = u.id LIMIT 1
        ) gs_ref ON TRUE
        LEFT JOIN study_groups sg ON sg.id = gs_ref.group_id
+       LEFT JOIN LATERAL (
+         SELECT m.group_id
+         FROM student_course_group_memberships m
+         JOIN course_groups cg0 ON cg0.id = m.group_id
+         WHERE m.student_id = u.id
+           AND cg0.teacher_id = $3
+           AND cg0.status = 'active'
+         ORDER BY m.updated_at DESC
+         LIMIT 1
+       ) cg_ref ON TRUE
+       LEFT JOIN course_groups cg ON cg.id = cg_ref.group_id
        WHERE u.id = $1 AND u.role = 'student' AND u.tenant_id = $2
        LIMIT 1`,
-      [studentId, tenantId],
+      [studentId, tenantId, teacherId],
     );
     if (!r.rowCount) throw new HttpError(404, 'الطالب غير موجود');
     return this.mapStudentRow(r.rows[0]);

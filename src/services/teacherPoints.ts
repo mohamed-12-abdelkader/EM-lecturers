@@ -458,6 +458,108 @@ export class TeacherPointsService {
     });
   }
 
+  /**
+   * Sync EXAM_SCORE / ASSIGNMENT_SCORE after regrade.
+   * Creates the transaction if missing; otherwise adjusts balance by delta only.
+   * Safe to call repeatedly — same score → no-op (no duplicate points).
+   */
+  static async syncExamOrAssignmentScore(opts: {
+    studentId: number;
+    teacherId: number;
+    courseId?: number | null;
+    attemptId: number;
+    examId: number;
+    isAssignment: boolean;
+    obtainedGrade: number;
+    totalGrade: number;
+    title?: string | null;
+  }): Promise<AwardResult> {
+    const settings = await this.getOrCreateSettings(opts.teacherId);
+    const enabled = opts.isAssignment
+      ? settings.assignment_score_enabled
+      : settings.exam_score_enabled;
+    if (!enabled) {
+      return { awarded: false, points: 0, totalPoints: null, reason: 'disabled' };
+    }
+
+    const newPoints = Math.max(0, Math.floor(Number(opts.obtainedGrade) || 0));
+    const eventType: PointsEventType = opts.isAssignment ? 'ASSIGNMENT_SCORE' : 'EXAM_SCORE';
+    const referenceKey = `${eventType}:attempt:${opts.attemptId}`;
+    const gradeId = await this.resolveGradeId({
+      studentId: opts.studentId,
+      teacherId: opts.teacherId,
+      courseId: opts.courseId,
+    });
+    if (!gradeId) {
+      return { awarded: false, points: 0, totalPoints: null, reason: 'missing_grade' };
+    }
+
+    const existing = await pool.query<{ id: number; points: number }>(
+      `SELECT id, points FROM point_transactions WHERE reference_key = $1 LIMIT 1`,
+      [referenceKey],
+    );
+
+    if (!existing.rowCount) {
+      if (newPoints <= 0) {
+        return { awarded: false, points: 0, totalPoints: await this.getBalance(opts.studentId, opts.teacherId, gradeId), reason: 'zero_points' };
+      }
+      return this.awardExamOrAssignmentScore(opts);
+    }
+
+    const oldPoints = Math.max(0, Math.floor(Number(existing.rows[0].points) || 0));
+    const delta = newPoints - oldPoints;
+    if (delta === 0) {
+      const bal = await this.getBalance(opts.studentId, opts.teacherId, gradeId);
+      return { awarded: false, points: 0, totalPoints: bal, reason: 'duplicate' };
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        `UPDATE point_transactions
+         SET points = $1,
+             metadata = COALESCE(metadata, '{}'::jsonb) || $2::jsonb
+         WHERE id = $3`,
+        [
+          newPoints,
+          JSON.stringify({
+            examId: opts.examId,
+            obtainedGrade: opts.obtainedGrade,
+            totalGrade: opts.totalGrade,
+            title: opts.title ?? null,
+            regraded: true,
+          }),
+          existing.rows[0].id,
+        ],
+      );
+
+      const balRes = await client.query(
+        `INSERT INTO student_point_balances (student_id, teacher_id, grade_id, total_points)
+         VALUES ($1, $2, $3, GREATEST(0, $4))
+         ON CONFLICT (student_id, teacher_id, grade_id)
+         DO UPDATE SET
+           total_points = GREATEST(0, student_point_balances.total_points + $4),
+           updated_at = NOW()
+         RETURNING total_points`,
+        [opts.studentId, opts.teacherId, gradeId, delta],
+      );
+
+      await client.query('COMMIT');
+      return {
+        awarded: delta > 0,
+        points: Math.max(0, delta),
+        totalPoints: Number(balRes.rows[0]?.total_points ?? 0),
+        reason: delta > 0 ? undefined : 'adjusted_down',
+      };
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
   static async addManualReward(opts: {
     teacherId: number;
     studentId: number;

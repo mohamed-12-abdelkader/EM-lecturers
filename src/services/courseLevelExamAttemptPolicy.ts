@@ -171,9 +171,42 @@ export function mergeSavedAndSubmittedAnswers(
   }));
 }
 
+/** Normalize one or two correct letters into a unique A–D list (order preserved). */
+export function normalizeCorrectAnswers(
+  primary: string | string[] | null | undefined,
+  secondary?: string | null | undefined,
+): CourseExamLetter[] {
+  const rawValues: unknown[] = Array.isArray(primary)
+    ? primary
+    : [primary, secondary];
+  const letters: CourseExamLetter[] = [];
+  for (const raw of rawValues) {
+    const letter = parseCourseExamSelectedAnswer(raw);
+    if (letter && !letters.includes(letter)) letters.push(letter);
+  }
+  return letters;
+}
+
+export function isSelectedAnswerCorrect(
+  selected: CourseExamLetter | string | null | undefined,
+  correctAnswers: CourseExamLetter[] | string | string[] | null | undefined,
+): boolean {
+  const selectedLetter = parseCourseExamSelectedAnswer(selected);
+  if (!selectedLetter) return false;
+  const set = Array.isArray(correctAnswers)
+    ? normalizeCorrectAnswers(correctAnswers)
+    : normalizeCorrectAnswers(correctAnswers);
+  return set.includes(selectedLetter);
+}
+
+export type CourseCorrectByQuestionId = Record<
+  number,
+  string | string[] | null | undefined
+>;
+
 export function gradeCourseAttemptAnswers(input: {
   questionIds: number[];
-  correctByQuestionId: Record<number, string | null | undefined>;
+  correctByQuestionId: CourseCorrectByQuestionId;
   answers: CourseExamAnswer[];
 }): {
   obtained: number;
@@ -182,18 +215,25 @@ export function gradeCourseAttemptAnswers(input: {
   results: Array<{
     questionId: number;
     selectedAnswer: CourseExamLetter | null;
+    /** Primary correct letter (first), for backward-compatible clients. */
     correctAnswer: string | null;
+    /** All accepted correct letters (1 or 2). */
+    correctAnswers: CourseExamLetter[];
     isCorrect: boolean;
   }>;
 } {
   const selected = new Map(input.answers.map((a) => [a.questionId, a.selectedAnswer]));
   const results = input.questionIds.map((questionId) => {
-    const correctAnswer = input.correctByQuestionId[questionId]
-      ? String(input.correctByQuestionId[questionId]).trim().toUpperCase()
-      : null;
+    const correctAnswers = normalizeCorrectAnswers(input.correctByQuestionId[questionId]);
     const selectedAnswer = selected.get(questionId) ?? null;
-    const isCorrect = !!correctAnswer && selectedAnswer === correctAnswer;
-    return { questionId, selectedAnswer, correctAnswer, isCorrect };
+    const isCorrect = isSelectedAnswerCorrect(selectedAnswer, correctAnswers);
+    return {
+      questionId,
+      selectedAnswer,
+      correctAnswer: correctAnswers[0] ?? null,
+      correctAnswers,
+      isCorrect,
+    };
   });
   const correctCount = results.filter((r) => r.isCorrect).length;
   return {

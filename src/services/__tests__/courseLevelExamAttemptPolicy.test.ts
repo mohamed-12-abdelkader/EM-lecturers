@@ -114,6 +114,21 @@ describe('answers merge and grading', () => {
     expect(graded.results[1].selectedAnswer).toBeNull();
   });
 
+  it('accepts either of two correct answers as fully correct', () => {
+    const graded = gradeCourseAttemptAnswers({
+      questionIds: [1, 2],
+      correctByQuestionId: { 1: ['A', 'B'], 2: ['C', 'D'] },
+      answers: [
+        { questionId: 1, selectedAnswer: 'B' },
+        { questionId: 2, selectedAnswer: 'A' },
+      ],
+    });
+    expect(graded.obtained).toBe(1);
+    expect(graded.results[0].isCorrect).toBe(true);
+    expect(graded.results[0].correctAnswers).toEqual(['A', 'B']);
+    expect(graded.results[1].isCorrect).toBe(false);
+  });
+
   it('collects answers from array, parallel arrays, or map payloads', () => {
     expect(
       collectCourseExamAnswersFromBody({

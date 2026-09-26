@@ -13,6 +13,7 @@ import path from 'path';
 import fs from 'fs';
 import { ChatService } from '../services/chat';
 import { CourseLevelExamsService } from '../services/courseLevelExams';
+import { CourseLevelExamQuestionsService } from '../services/courseLevelExamQuestions';
 import { TeacherReadingPassagesService } from '../services/teacherReadingPassages';
 import { TeacherReportsService } from '../services/teacherReports';
 import { ExamsService } from '../services/exams';
@@ -3097,7 +3098,7 @@ router.patch(
         // تحديث في course_level_exam_questions فقط (نسخة السؤال داخل الامتحان؛ لا يؤثر على البنك)
         const result = await pool.query(
           `UPDATE course_level_exam_questions 
-           SET correct_answer = $1, updated_at = NOW()
+           SET correct_answer = $1, correct_answer_2 = NULL, updated_at = NOW()
            WHERE id = $2
            RETURNING *`,
           [finalCorrectAnswer, questionId],
@@ -3107,7 +3108,14 @@ router.patch(
           return res.status(404).json({ message: 'Question not found' });
         }
 
-        return res.json({ message: 'تم تحديث الإجابة الصحيحة بنجاح', question: result.rows[0] });
+        const regrade =
+          await CourseLevelExamsService.regradeSubmittedAttemptsForQuestion(questionId);
+
+        return res.json({
+          message: 'تم تحديث الإجابة الصحيحة بنجاح',
+          question: result.rows[0],
+          regrade,
+        });
       } else {
         // تحديث في course_exam_questions - استخدام service method
         // البحث عن الاختيارات لهذا السؤال
@@ -3138,6 +3146,55 @@ router.patch(
         return res.status(400).json({ message: error.message });
       }
       res.status(500).json({ message: 'Failed to set correct answer' });
+    }
+  }),
+);
+
+// تحديد إجابتين صحيحتين لسؤال في الامتحان الشامل + إعادة تصحيح المحاولات السابقة
+router.patch(
+  '/course-exam/question/:questionId/correct-answers',
+  authMiddleware(COURSE_CONTENT_ROLES),
+  asyncWrapper(async (req, res) => {
+    const questionId = Number(req.params.questionId);
+    if (Number.isNaN(questionId)) {
+      return res.status(400).json({ message: 'Invalid question id' });
+    }
+
+    const body = req.body || {};
+    const rawList =
+      body.correctAnswers ??
+      body.correct_answers ??
+      (body.correctAnswer != null && body.correctAnswer2 != null
+        ? [body.correctAnswer, body.correctAnswer2]
+        : body.correct_answer != null && body.correct_answer_2 != null
+          ? [body.correct_answer, body.correct_answer_2]
+          : null);
+
+    if (!Array.isArray(rawList)) {
+      return res.status(400).json({
+        message:
+          'correctAnswers is required and must be an array of exactly two distinct letters (A–D)',
+      });
+    }
+
+    try {
+      const result = await CourseLevelExamQuestionsService.setDualCorrectAnswers(
+        req.user!,
+        questionId,
+        rawList,
+      );
+      return res.json({
+        message: 'تم تحديث الإجابتين الصحيحتين وإعادة تصحيح المحاولات السابقة',
+        question: result.question,
+        correctAnswers: result.correctAnswers,
+        regrade: result.regrade,
+      });
+    } catch (error: any) {
+      console.error('Error setting dual correct answers:', error);
+      const status = error?.status || error?.statusCode || 500;
+      return res.status(status).json({
+        message: error?.message || 'Failed to set dual correct answers',
+      });
     }
   }),
 );

@@ -404,7 +404,7 @@ export class CourseLevelExamQuestionsService {
   }
 
   /**
-   * Set/Update correct answer
+   * Set/Update correct answer (single). Clears second correct answer for compatibility.
    */
   static async setCorrectAnswer(
     requester: RequestUser,
@@ -420,7 +420,7 @@ export class CourseLevelExamQuestionsService {
 
     const result = await pool.query(
       `UPDATE course_level_exam_questions 
-       SET correct_answer = $1, updated_at = NOW()
+       SET correct_answer = $1, correct_answer_2 = NULL, updated_at = NOW()
        WHERE id = $2
        RETURNING *`,
       [correctAnswer, questionId],
@@ -431,6 +431,54 @@ export class CourseLevelExamQuestionsService {
     }
 
     return result.rows[0];
+  }
+
+  /**
+   * Set exactly two correct answers for a course-level exam question, then regrade
+   * all submitted attempts that include this question.
+   */
+  static async setDualCorrectAnswers(
+    requester: RequestUser,
+    questionId: number,
+    correctAnswers: Array<'A' | 'B' | 'C' | 'D'>,
+  ) {
+    await this.verifyQuestionOwnership(questionId, requester.id);
+
+    const unique = [
+      ...new Set(
+        (correctAnswers || [])
+          .map((v) => String(v).trim().toUpperCase())
+          .filter((v) => ['A', 'B', 'C', 'D'].includes(v)),
+      ),
+    ] as Array<'A' | 'B' | 'C' | 'D'>;
+
+    if (unique.length !== 2) {
+      throw new HttpError(
+        400,
+        'correctAnswers must contain exactly two distinct letters from A, B, C, D',
+      );
+    }
+
+    const result = await pool.query(
+      `UPDATE course_level_exam_questions
+       SET correct_answer = $1, correct_answer_2 = $2, updated_at = NOW()
+       WHERE id = $3
+       RETURNING *`,
+      [unique[0], unique[1], questionId],
+    );
+
+    if (!result.rowCount) {
+      throw new HttpError(404, 'Question not found');
+    }
+
+    const { CourseLevelExamsService } = await import('./courseLevelExams.js');
+    const regrade = await CourseLevelExamsService.regradeSubmittedAttemptsForQuestion(questionId);
+
+    return {
+      question: result.rows[0],
+      correctAnswers: unique,
+      regrade,
+    };
   }
 
   /**

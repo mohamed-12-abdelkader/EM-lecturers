@@ -25,10 +25,13 @@ import {
   gradeCourseAttemptAnswers,
   isAttemptExpired,
   isDurationUnlimited,
+  isSelectedAnswerCorrect,
   mergeSavedAndSubmittedAnswers,
+  normalizeCorrectAnswers,
   normalizeDurationMinutes,
   parseCourseExamAnswerItem,
   remainingSeconds,
+  type CourseCorrectByQuestionId,
   type CourseExamAnswer,
   type CourseExamLetter,
 } from './courseLevelExamAttemptPolicy';
@@ -518,10 +521,33 @@ export class CourseLevelExamsService {
       .filter((row): row is CourseExamAnswer => row != null);
   }
 
+  private static buildCorrectByQuestionId(questions: any[]): CourseCorrectByQuestionId {
+    const correctByQuestionId: CourseCorrectByQuestionId = {};
+    for (const q of questions) {
+      correctByQuestionId[Number(q.id)] = normalizeCorrectAnswers(
+        q.correct_answer,
+        q.correct_answer_2,
+      );
+    }
+    return correctByQuestionId;
+  }
+
+  private static formatQuestionCorrectAnswers(question: any) {
+    const correctAnswers = normalizeCorrectAnswers(
+      question?.correct_answer,
+      question?.correct_answer_2,
+    );
+    return {
+      correctAnswer: correctAnswers[0] ?? null,
+      correctAnswer2: correctAnswers[1] ?? null,
+      correctAnswers,
+    };
+  }
+
   private static async upsertAttemptAnswers(
     attemptId: number,
     answers: Array<{ questionId: number; selectedAnswer?: CourseExamLetter | null }>,
-    correctByQuestionId?: Record<number, string | null | undefined>,
+    correctByQuestionId?: CourseCorrectByQuestionId,
   ) {
     for (const answer of answers) {
       const selected = answer.selectedAnswer
@@ -529,14 +555,12 @@ export class CourseLevelExamsService {
         : '';
       const letter =
         selected === 'A' || selected === 'B' || selected === 'C' || selected === 'D'
-          ? selected
+          ? (selected as CourseExamLetter)
           : null;
-      const correct = correctByQuestionId
-        ? String(correctByQuestionId[answer.questionId] ?? '')
-            .trim()
-            .toUpperCase()
-        : '';
-      const isCorrect = Boolean(letter && correct && letter === correct);
+      const correctSet = correctByQuestionId
+        ? normalizeCorrectAnswers(correctByQuestionId[answer.questionId])
+        : [];
+      const isCorrect = isSelectedAnswerCorrect(letter, correctSet);
       await pool.query(
         `INSERT INTO course_level_exam_answers (
            attempt_id, question_id, selected_answer, is_correct
@@ -613,10 +637,7 @@ export class CourseLevelExamsService {
     const merged = mergeSavedAndSubmittedAnswers(saved, submitted).filter((a) =>
       allowed.has(a.questionId),
     );
-    const correctByQuestionId: Record<number, string | null | undefined> = {};
-    for (const q of questions) {
-      correctByQuestionId[q.id] = q.correct_answer;
-    }
+    const correctByQuestionId = this.buildCorrectByQuestionId(questions);
     const graded = gradeCourseAttemptAnswers({
       questionIds: questions.map((q) => Number(q.id)),
       correctByQuestionId,
@@ -665,6 +686,8 @@ export class CourseLevelExamsService {
               questionImage: question?.question_image,
               type: question?.type,
               correctAnswer: r.correctAnswer,
+              correctAnswers: r.correctAnswers,
+              correctAnswer2: r.correctAnswers[1] ?? null,
               yourAnswer: r.selectedAnswer,
               optionA: question?.option_a,
               optionB: question?.option_b,
@@ -729,6 +752,7 @@ export class CourseLevelExamsService {
     studentId: number,
     obtainedGrade: number,
     totalGrade: number,
+    options: { syncExisting?: boolean } = {},
   ) {
     try {
       const teacherId =
@@ -736,20 +760,139 @@ export class CourseLevelExamsService {
           ? Number(exam.teacher_id)
           : await TeacherPointsService.resolveTeacherIdForCourse(Number(exam.course_id));
       if (!teacherId) return;
-      await TeacherPointsService.awardExamOrAssignmentScore({
+      const scoreOpts = {
         studentId,
         teacherId,
         courseId: Number(exam.course_id),
         attemptId: Number(attempt.id),
         examId: Number(exam.id),
-        isAssignment: false,
+        isAssignment: false as const,
         obtainedGrade,
         totalGrade,
         title: exam.title ?? null,
-      });
+      };
+      if (options.syncExisting) {
+        await TeacherPointsService.syncExamOrAssignmentScore(scoreOpts);
+      } else {
+        await TeacherPointsService.awardExamOrAssignmentScore(scoreOpts);
+      }
     } catch (error) {
       console.error('Error awarding course exam score points:', error);
     }
+  }
+
+  /**
+   * Regrade all submitted attempts that include this question after correct answers change.
+   * Updates is_correct, attempt obtained_grade, and syncs EXAM_SCORE points (idempotent).
+   */
+  static async regradeSubmittedAttemptsForQuestion(questionId: number) {
+    const questionRes = await pool.query(
+      `SELECT q.id, q.exam_id, q.correct_answer, q.correct_answer_2,
+              e.id AS exam_row_id, e.title, e.course_id, e.questions_count,
+              e.question_display_mode, c.teacher_id
+       FROM course_level_exam_questions q
+       JOIN course_level_exams e ON e.id = q.exam_id
+       JOIN courses c ON c.id = e.course_id
+       WHERE q.id = $1`,
+      [questionId],
+    );
+    if (!questionRes.rowCount) {
+      throw new HttpError(404, 'Question not found');
+    }
+    const question = questionRes.rows[0];
+    const examId = Number(question.exam_id);
+    const correctAnswers = normalizeCorrectAnswers(
+      question.correct_answer,
+      question.correct_answer_2,
+    );
+
+    const answersRes = await pool.query(
+      `SELECT a.id AS answer_id, a.attempt_id, a.selected_answer, a.is_correct,
+              att.student_id, att.obtained_grade, att.total_grade, att.status,
+              att.selected_question_ids, att.attempt_number
+       FROM course_level_exam_answers a
+       JOIN course_level_exam_attempts att ON att.id = a.attempt_id
+       WHERE a.question_id = $1
+         AND att.status = 'submitted'`,
+      [questionId],
+    );
+
+    let updatedAnswers = 0;
+    let updatedAttempts = 0;
+    let pointsSynced = 0;
+
+    for (const row of answersRes.rows) {
+      const selected = row.selected_answer
+        ? String(row.selected_answer).trim().toUpperCase()
+        : null;
+      const wasCorrect = !!row.is_correct;
+      const nowCorrect = isSelectedAnswerCorrect(selected, correctAnswers);
+
+      if (wasCorrect !== nowCorrect) {
+        await pool.query(
+          `UPDATE course_level_exam_answers SET is_correct = $1 WHERE id = $2`,
+          [nowCorrect, row.answer_id],
+        );
+        updatedAnswers += 1;
+      }
+
+      // Recalculate attempt score from all answers that belong to this attempt's question set
+      const attemptId = Number(row.attempt_id);
+      const scoreRes = await pool.query(
+        `SELECT COALESCE(SUM(CASE WHEN is_correct THEN 1 ELSE 0 END), 0)::int AS obtained
+         FROM course_level_exam_answers
+         WHERE attempt_id = $1`,
+        [attemptId],
+      );
+      const newObtained = Number(scoreRes.rows[0]?.obtained ?? 0);
+      const prevObtained = Number(row.obtained_grade ?? 0);
+      const totalGrade =
+        row.total_grade != null
+          ? Number(row.total_grade)
+          : Number(
+              (
+                await pool.query(
+                  `SELECT COUNT(*)::int AS cnt FROM course_level_exam_answers WHERE attempt_id = $1`,
+                  [attemptId],
+                )
+              ).rows[0]?.cnt ?? 0,
+            );
+
+      if (prevObtained !== newObtained || Number(row.total_grade ?? -1) !== totalGrade) {
+        await pool.query(
+          `UPDATE course_level_exam_attempts
+           SET obtained_grade = $1, total_grade = COALESCE(total_grade, $2)
+           WHERE id = $3 AND status = 'submitted'`,
+          [newObtained, totalGrade, attemptId],
+        );
+        updatedAttempts += 1;
+      }
+
+      await this.maybeAwardCourseExamScorePoints(
+        {
+          id: examId,
+          course_id: question.course_id,
+          teacher_id: question.teacher_id,
+          title: question.title,
+        },
+        { id: attemptId },
+        Number(row.student_id),
+        newObtained,
+        totalGrade || newObtained,
+        { syncExisting: true },
+      );
+      pointsSynced += 1;
+    }
+
+    return {
+      questionId,
+      examId,
+      correctAnswers,
+      answersReviewed: answersRes.rowCount ?? 0,
+      answersUpdated: updatedAnswers,
+      attemptsUpdated: updatedAttempts,
+      pointsSynced,
+    };
   }
 
   static async expireOverdueAttemptsForExam(examId: number) {
@@ -1141,17 +1284,17 @@ export class CourseLevelExamsService {
     const yourAnswer = answer?.selected_answer
       ? String(answer.selected_answer).trim().toUpperCase()
       : null;
-    const correctAnswer = question.correct_answer
-      ? String(question.correct_answer).trim().toUpperCase()
-      : null;
+    const formatted = this.formatQuestionCorrectAnswers(question);
     const unanswered = !yourAnswer;
     return {
       questionId: question.id ?? question.question_id,
       questionText: question.question_text,
       questionImage: question.question_image,
       type: question.type,
-      correctAnswer,
-      correctAnswerText: optionText(correctAnswer),
+      correctAnswer: formatted.correctAnswer,
+      correctAnswer2: formatted.correctAnswer2,
+      correctAnswers: formatted.correctAnswers,
+      correctAnswerText: optionText(formatted.correctAnswer),
       yourAnswer,
       yourAnswerText: optionText(yourAnswer),
       unanswered,
@@ -1198,8 +1341,8 @@ export class CourseLevelExamsService {
     if (!attemptRes.rowCount) return [];
     const attempt = attemptRes.rows[0];
     const questionsRes = await pool.query(
-      `SELECT id, type, question_text, question_image, option_a, option_b, option_c, option_d, correct_answer,
-              teacher_question_id
+      `SELECT id, type, question_text, question_image, option_a, option_b, option_c, option_d,
+              correct_answer, correct_answer_2, teacher_question_id
        FROM course_level_exam_questions
        WHERE exam_id = $1
        ORDER BY created_at ASC, id ASC`,
@@ -1557,7 +1700,8 @@ export class CourseLevelExamsService {
     const allAnswersRes = await pool.query(
       `SELECT a.question_id, a.selected_answer, a.is_correct,
               q.question_text, q.question_image, q.type,
-              q.option_a, q.option_b, q.option_c, q.option_d, q.correct_answer
+              q.option_a, q.option_b, q.option_c, q.option_d,
+              q.correct_answer, q.correct_answer_2
        FROM course_level_exam_answers a
        JOIN course_level_exam_questions q ON a.question_id = q.id
        WHERE a.attempt_id = $1
@@ -1565,19 +1709,24 @@ export class CourseLevelExamsService {
       [attempt.id],
     );
 
-    const questions = allAnswersRes.rows.map((row) => ({
-      questionId: row.question_id,
-      questionText: row.question_text,
-      questionImage: row.question_image,
-      type: row.type,
-      optionA: row.option_a,
-      optionB: row.option_b,
-      optionC: row.option_c,
-      optionD: row.option_d,
-      yourAnswer: row.selected_answer || null,
-      correctAnswer: row.correct_answer || null,
-      isCorrect: !!row.is_correct,
-    }));
+    const questions = allAnswersRes.rows.map((row) => {
+      const formatted = this.formatQuestionCorrectAnswers(row);
+      return {
+        questionId: row.question_id,
+        questionText: row.question_text,
+        questionImage: row.question_image,
+        type: row.type,
+        optionA: row.option_a,
+        optionB: row.option_b,
+        optionC: row.option_c,
+        optionD: row.option_d,
+        yourAnswer: row.selected_answer || null,
+        correctAnswer: formatted.correctAnswer,
+        correctAnswer2: formatted.correctAnswer2,
+        correctAnswers: formatted.correctAnswers,
+        isCorrect: !!row.is_correct,
+      };
+    });
 
     return {
       examType: 'course' as const,
@@ -1645,7 +1794,8 @@ export class CourseLevelExamsService {
     await this.expireOverdueAttemptsForExam(examId);
 
     const questionsRes = await pool.query(
-      `SELECT id, type, question_text, question_image, option_a, option_b, option_c, option_d, correct_answer
+      `SELECT id, type, question_text, question_image, option_a, option_b, option_c, option_d,
+              correct_answer, correct_answer_2
        FROM course_level_exam_questions
        WHERE exam_id = $1
        ORDER BY created_at ASC, id ASC`,
@@ -2206,7 +2356,8 @@ export class CourseLevelExamsService {
     };
 
     const questionsRes = await pool.query(
-      `SELECT id, type, question_text, question_image, option_a, option_b, option_c, option_d, correct_answer
+      `SELECT id, type, question_text, question_image, option_a, option_b, option_c, option_d,
+              correct_answer, correct_answer_2
        FROM course_level_exam_questions
        WHERE exam_id = $1
        ORDER BY id ASC`,
@@ -2318,9 +2469,7 @@ export class CourseLevelExamsService {
         D: questionAnswers.filter((a) => a.selected_answer === 'D').length,
       };
 
-      const correctAnswer = question.correct_answer
-        ? String(question.correct_answer).trim().toUpperCase()
-        : null;
+      const formatted = this.formatQuestionCorrectAnswers(question);
 
       return {
         questionId: question.id,
@@ -2331,8 +2480,10 @@ export class CourseLevelExamsService {
         optionB: question.option_b,
         optionC: question.option_c,
         optionD: question.option_d,
-        correctAnswer,
-        correctAnswerText: optionText(question, correctAnswer),
+        correctAnswer: formatted.correctAnswer,
+        correctAnswer2: formatted.correctAnswer2,
+        correctAnswers: formatted.correctAnswers,
+        correctAnswerText: optionText(question, formatted.correctAnswer),
         correctCount,
         wrongCount,
         unansweredCount: unansweredStudents.length,
