@@ -8,7 +8,7 @@ export const securityHeadersMiddleware: RequestHandler = (req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   // PDFs/images under /uploads are opened in viewers/iframes on tenant sites.
   // DENY makes Chrome's PDF plugin hang on Range requests then fail with a network error.
-  if (!req.path.startsWith('/uploads/')) {
+  if (!req.path.startsWith('/uploads/') && !req.path.startsWith('/cdn/')) {
     res.setHeader('X-Frame-Options', 'DENY');
   }
   res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');

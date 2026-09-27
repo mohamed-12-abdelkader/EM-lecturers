@@ -1,6 +1,7 @@
 import type { CorsOptionsDelegate } from 'cors';
 import type { Request } from 'express';
 import { config } from '../utils';
+import { isImagePublicPath, toCdnPublicPath } from '../services/localImageStorage';
 
 const LOOPBACK_URL_PATTERN =
   /^https?:\/\/(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(?::\d+)?/i;
@@ -228,11 +229,32 @@ const URL_LIKE_KEYS =
 
 function shouldRewriteString(value: string): boolean {
   if (value.startsWith('/uploads/')) return true;
+  if (value.startsWith('/cdn/')) return true;
   if (LOOPBACK_URL_PATTERN.test(value)) return true;
   return false;
 }
 
 function rewriteValue(value: string): string {
+  // Absolute or relative local image → CDN public URL
+  try {
+    if (/^https?:\/\//i.test(value) || value.startsWith('/uploads/') || value.startsWith('/cdn/')) {
+      const pathname = /^https?:\/\//i.test(value) ? new URL(value).pathname : value;
+      if (pathname.startsWith('/uploads/') && isImagePublicPath(pathname)) {
+        const cdn = toCdnPublicPath(pathname);
+        if (cdn) {
+          const built = buildFileUrl(cdn);
+          return built ?? cdn;
+        }
+      }
+      if (pathname.startsWith('/cdn/')) {
+        const built = buildFileUrl(pathname);
+        return built ?? pathname;
+      }
+    }
+  } catch {
+    /* fall through */
+  }
+
   if (value.startsWith('/uploads/') || value.startsWith('/api/')) {
     const built = buildFileUrl(value);
     return built ?? value;

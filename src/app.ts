@@ -11,6 +11,7 @@ import { getCorsOriginDelegate, getServerInfo } from './config/appUrls';
 import { router } from './routes';
 import { tenantContextMiddleware } from './middleware/tenantContext';
 import { teacherLibraryStaticMiddleware } from './modules/myFiles/middleware/teacherLibraryStatic';
+import { createImageCdnStaticMiddleware } from './middleware/imageCdnStatic';
 import { whatsappWebhookRouter } from './modules/whatsapp/controllers/whatsappWebhook.controller';
 // Register WhatsApp chatbot handlers (side-effect)
 import './modules/whatsapp/automations/technicalSupport';
@@ -76,6 +77,8 @@ app.use('/api/webhooks/whatsapp', whatsappWebhookRouter);
 app.use('/api', tenantContextMiddleware);
 app.use('/api', router);
 app.use('/uploads/teacher-library', teacherLibraryStaticMiddleware);
+// Images-only CDN: /cdn/<category>/<file>.jpg → uploads/<category>/<file>.jpg
+app.use('/cdn', createImageCdnStaticMiddleware());
 app.use(
   '/uploads',
   express.static(path.join(process.cwd(), 'uploads'), {

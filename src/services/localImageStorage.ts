@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import { randomUUID } from 'crypto';
 import type { UploadApiResponse } from 'cloudinary';
+import { getImageCdnPublicPrefix } from '../config/imageCdn';
 
 /** Organized local image folders under /uploads */
 export const IMAGE_STORAGE_CATEGORIES = [
@@ -33,6 +34,8 @@ export const ALLOWED_IMAGE_MIME = new Set([
 export const ALLOWED_IMAGE_EXT = new Set(['.jpg', '.jpeg', '.png', '.webp', '.gif']);
 
 export const MAX_IMAGE_FILE_SIZE_BYTES = 5 * 1024 * 1024; // 5MB
+
+const IMAGE_EXT_RE = /\.(jpe?g|png|gif|webp)$/i;
 
 /** Absolute path to project uploads root */
 export function getUploadsRoot(): string {
@@ -73,26 +76,68 @@ export function buildUniqueFilename(originalName?: string): string {
   return `${Date.now()}-${randomUUID().replace(/-/g, '').slice(0, 12)}${ext}`;
 }
 
-/**
- * Public relative path stored in DB, e.g. /uploads/courses/....jpg
- */
-export function toPublicUploadPath(category: string, filename: string): string {
-  const cat = normalizeCategory(category);
-  return `/uploads/${cat}/${filename}`.replace(/\\/g, '/');
+export function isImagePublicPath(urlOrPath: string): boolean {
+  const pathname = extractPathname(urlOrPath);
+  return IMAGE_EXT_RE.test(pathname);
 }
 
-/** Resolve relative /uploads/... (or absolute URL ending in /uploads/...) to disk path. */
-export function resolveUploadDiskPath(storedUrl: string): string | null {
-  if (!storedUrl) return null;
-  let pathname = storedUrl.trim();
+function extractPathname(urlOrPath: string): string {
+  let pathname = String(urlOrPath || '').trim();
   try {
     if (/^https?:\/\//i.test(pathname)) {
       pathname = new URL(pathname).pathname;
     }
   } catch {
-    return null;
+    /* keep raw */
   }
-  pathname = pathname.split('?')[0].split('#')[0];
+  return pathname.split('?')[0].split('#')[0];
+}
+
+/**
+ * Public relative path stored in DB for images, e.g. /cdn/courses/....jpg
+ * Files still live on disk under uploads/<category>/.
+ */
+export function toPublicUploadPath(category: string, filename: string): string {
+  const cat = normalizeCategory(category);
+  const prefix = getImageCdnPublicPrefix();
+  return `${prefix}/${cat}/${filename}`.replace(/\\/g, '/');
+}
+
+/** Legacy disk path under /uploads (same file as /cdn). */
+export function toLegacyUploadsPath(category: string, filename: string): string {
+  const cat = normalizeCategory(category);
+  return `/uploads/${cat}/${filename}`.replace(/\\/g, '/');
+}
+
+/**
+ * Normalize any stored local image URL to the CDN public path.
+ * Leaves non-images (/uploads/course-pdfs, teacher-library, …) unchanged.
+ */
+export function toCdnPublicPath(storedUrl: string | null | undefined): string | null {
+  if (storedUrl == null || storedUrl === '') return null;
+  const pathname = extractPathname(storedUrl);
+  if (!pathname) return null;
+
+  const prefix = getImageCdnPublicPrefix();
+  if (pathname.startsWith(`${prefix}/`)) return pathname;
+
+  if (pathname.startsWith('/uploads/') && isImagePublicPath(pathname)) {
+    return `${prefix}/${pathname.slice('/uploads/'.length)}`.replace(/\\/g, '/');
+  }
+
+  return pathname.startsWith('/') ? pathname : null;
+}
+
+/** Resolve /cdn/... or /uploads/... (or absolute URL) to disk path under uploads/. */
+export function resolveUploadDiskPath(storedUrl: string): string | null {
+  if (!storedUrl) return null;
+  let pathname = extractPathname(storedUrl);
+  if (!pathname) return null;
+
+  const cdnPrefix = getImageCdnPublicPrefix();
+  if (pathname.startsWith(`${cdnPrefix}/`)) {
+    pathname = `/uploads/${pathname.slice(cdnPrefix.length + 1)}`;
+  }
   if (!pathname.startsWith('/uploads/')) return null;
 
   const relative = pathname.replace(/^\/+/, '');
@@ -113,6 +158,7 @@ export function isAllowedImageUpload(mimetype: string, originalname: string): bo
 /**
  * Persist a temp multer file (or any local path) into categorized /uploads and
  * return a Cloudinary-compatible result so existing callers keep working.
+ * secure_url / url are CDN paths (/cdn/...).
  */
 export function saveLocalImageFile(
   filePath: string,
@@ -197,7 +243,7 @@ export function saveLocalImageBuffer(
   } as unknown as UploadApiResponse;
 }
 
-/** Delete a local upload by relative or absolute /uploads URL. Returns true if deleted. */
+/** Delete a local upload by relative or absolute /cdn or /uploads URL. Returns true if deleted. */
 export function deleteLocalUploadByUrl(url?: string | null): boolean {
   const diskPath = url ? resolveUploadDiskPath(url) : null;
   if (!diskPath) return false;

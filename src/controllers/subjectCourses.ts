@@ -3,6 +3,7 @@ import { authMiddleware } from '../middleware/authentication';
 import { SubjectCourseService, CourseData } from '../services/subjectCourses';
 import { TeacherSubjectService } from '../services/teacherSubjects';
 import { logger, uploadToCloudinary } from '../utils';
+import { deleteLocalUploadByUrl } from '../services/localImageStorage';
 import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
@@ -171,10 +172,7 @@ router.delete('/:id', authMiddleware(['admin', 'teacher']), async (req: Request,
 
     // حذف الصورة إذا كانت موجودة
     if (existingCourse.image) {
-      const imagePath = existingCourse.image.replace('/uploads/', 'uploads/');
-      if (fs.existsSync(imagePath)) {
-        fs.unlinkSync(imagePath);
-      }
+      deleteLocalUploadByUrl(existingCourse.image);
     }
 
     res.json({ message: 'تم حذف الكورس بنجاح' });

@@ -4,6 +4,7 @@ import multer from 'multer';
 import type { NextFunction, Request, Response } from 'express';
 import pool from '../db/pool';
 import { buildFileUrl } from '../config/appUrls';
+import { saveLocalImageFile, toCdnPublicPath } from './localImageStorage';
 
 const AVATAR_DIR = path.join('uploads', 'avatars');
 const MAX_SIZE = 5 * 1024 * 1024;
@@ -107,29 +108,21 @@ export function uploadMeAvatarMiddleware(req: Request, res: Response, next: Next
   });
 }
 
-/** حفظ صورة البروفايل محليًا تحت /uploads/avatars (بدون CDN) */
+/** حفظ صورة البروفايل محليًا تحت uploads/avatars مع مسار CDN عام /cdn/avatars/... */
 export async function persistAvatarFile(file: Express.Multer.File): Promise<string> {
   if (!file?.path || !fs.existsSync(file.path)) {
     throw new Error('فشل رفع صورة البروفايل');
   }
-  fs.mkdirSync(AVATAR_DIR, { recursive: true });
-  const destName =
-    file.filename ||
-    `avatar-${Date.now()}-${Math.round(Math.random() * 1e9)}${path.extname(file.originalname || '.jpg').toLowerCase()}`;
-  const destPath = path.join(AVATAR_DIR, destName);
-  if (path.resolve(file.path) !== path.resolve(destPath)) {
-    fs.copyFileSync(file.path, destPath);
-    try {
-      fs.unlinkSync(file.path);
-    } catch {
-      // ignore
-    }
-  }
-  return `/uploads/avatars/${destName}`;
+  const saved = saveLocalImageFile(file.path, {
+    category: 'avatars',
+    originalFilename: file.originalname || file.filename,
+  });
+  return saved.secure_url || saved.url;
 }
 
 export function publicAvatarUrl(stored: string | null | undefined): string | null {
-  return buildFileUrl(stored);
+  const cdnPath = toCdnPublicPath(stored);
+  return buildFileUrl(cdnPath ?? stored);
 }
 
 export async function saveAvatarForUser(userId: number, file: Express.Multer.File) {

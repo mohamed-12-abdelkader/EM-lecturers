@@ -158,6 +158,10 @@ export const config = cleanEnv(process.env, {
   /** Image storage is always local disk under /uploads (Cloudinary disabled). */
   IMAGE_STORAGE_PROVIDER: str({ default: 'local' }),
   FILE_STORAGE_PROVIDER: str({ default: 'local' }),
+  /** Public path prefix for the images-only Express CDN (maps to uploads/). */
+  IMAGE_CDN_PUBLIC_PREFIX: str({ default: '/cdn' }),
+  /** Browser cache max-age for /cdn images (seconds). Default 30 days. */
+  IMAGE_CDN_MAX_AGE_SECONDS: num({ default: 60 * 60 * 24 * 30 }),
 
   BUNNY_STORAGE_ZONE_NAME: str(),
   BUNNY_STORAGE_PUBLIC_HOSTNAME: str(),
@@ -395,7 +399,7 @@ try {
 /**
  * Save an uploaded image to local /uploads/<category>/...
  * Export name kept for backward compatibility with all existing callers.
- * Always uses local disk storage (no Cloudinary / CDN).
+ * Always uses local disk storage; public URLs use /cdn/... (images CDN).
  */
 export const uploadToCloudinary = async (
   filePath: string,
