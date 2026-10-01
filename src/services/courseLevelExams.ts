@@ -544,6 +544,47 @@ export class CourseLevelExamsService {
     };
   }
 
+  /** مدة حل المحاولة من started_at إلى submitted_at (أو الآن إن كانت in_progress). */
+  private static computeAttemptTiming(
+    startedAt: Date | string | null | undefined,
+    submittedAt: Date | string | null | undefined,
+    options: { inProgress?: boolean; now?: Date } = {},
+  ) {
+    const toDate = (value: Date | string | null | undefined): Date | null => {
+      if (value == null || value === '') return null;
+      const d = value instanceof Date ? value : new Date(value);
+      return Number.isNaN(d.getTime()) ? null : d;
+    };
+
+    const started = toDate(startedAt);
+    const finished = toDate(submittedAt);
+    const end =
+      finished ?? (options.inProgress ? options.now ?? new Date() : null);
+
+    let durationSeconds: number | null = null;
+    if (started && end && end.getTime() >= started.getTime()) {
+      durationSeconds = Math.floor((end.getTime() - started.getTime()) / 1000);
+    }
+
+    const formatHms = (totalSeconds: number | null): string | null => {
+      if (totalSeconds == null || totalSeconds < 0) return null;
+      const h = Math.floor(totalSeconds / 3600);
+      const m = Math.floor((totalSeconds % 3600) / 60);
+      const s = totalSeconds % 60;
+      const pad = (n: number) => String(n).padStart(2, '0');
+      return h > 0 ? `${pad(h)}:${pad(m)}:${pad(s)}` : `${pad(m)}:${pad(s)}`;
+    };
+
+    return {
+      startedAt: started ? started.toISOString() : null,
+      finishedAt: finished ? finished.toISOString() : null,
+      durationSeconds,
+      durationMinutes:
+        durationSeconds == null ? null : Math.round((durationSeconds / 60) * 100) / 100,
+      durationFormatted: formatHms(durationSeconds),
+    };
+  }
+
   private static async upsertAttemptAnswers(
     attemptId: number,
     answers: Array<{ questionId: number; selectedAnswer?: CourseExamLetter | null }>,
@@ -1906,6 +1947,9 @@ export class CourseLevelExamsService {
         }
         const questionsCount = questionIds.length;
         const unansweredCount = Math.max(0, questionsCount - answeredCount);
+        const timing = this.computeAttemptTiming(a.started_at, a.submitted_at, {
+          inProgress,
+        });
 
         return {
           name: a.student_name,
@@ -1933,10 +1977,23 @@ export class CourseLevelExamsService {
               : inProgress
                 ? null
                 : 0,
-          startedAt: a.started_at,
-          started_at: a.started_at,
-          submittedAt: a.submitted_at,
-          submitted_at: a.submitted_at,
+          // توقيت الحل
+          startedAt: timing.startedAt,
+          started_at: timing.startedAt,
+          submittedAt: timing.finishedAt,
+          submitted_at: timing.finishedAt,
+          finishedAt: timing.finishedAt,
+          finished_at: timing.finishedAt,
+          durationSeconds: timing.durationSeconds,
+          duration_seconds: timing.durationSeconds,
+          durationMinutes: timing.durationMinutes,
+          duration_minutes: timing.durationMinutes,
+          durationFormatted: timing.durationFormatted,
+          duration_formatted: timing.durationFormatted,
+          timeSpentSeconds: timing.durationSeconds,
+          time_spent_seconds: timing.durationSeconds,
+          timeSpentFormatted: timing.durationFormatted,
+          time_spent_formatted: timing.durationFormatted,
           timed_out: Boolean(a.timed_out),
           questions_count: questionsCount,
           answered_count: inProgress ? 0 : answeredCount,
