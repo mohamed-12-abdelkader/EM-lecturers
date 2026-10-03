@@ -1767,13 +1767,17 @@ export class ExamBuilderChatbotService {
       examType = 'lecture-exam';
       await ExamFlowService.addQuestionsFromBank(teacherId, createdExamId, questionIds);
     } else if (createExam && payload.course_id) {
-      const durationMinutes = payload.duration_minutes ?? payload.duration ?? 60;
+      const durationMinutes =
+        payload.duration_minutes === null
+          ? null
+          : payload.duration_minutes ?? payload.duration ?? 60;
       const exam = await CourseLevelExamsService.createExam(
         { id: teacherId, role: 'teacher' },
         {
           title: payload.title ?? session.parsed_filters.exam_title ?? 'امتحان من بنك الأسئلة',
           courseId: payload.course_id,
-          durationMinutes: Number(durationMinutes),
+          durationMinutes:
+            durationMinutes === null ? null : Number(durationMinutes),
           questionsCount: payload.questions_count ?? questionIds.length,
           isVisibleToStudents: true,
           visibilityEndDate: payload.visibility_end_date

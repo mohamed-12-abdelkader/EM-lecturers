@@ -8,6 +8,7 @@ import { router as teacherRouter } from './controllers/teacher';
 import { router as studentRouter } from './controllers/student';
 import { router as utilsRouter } from './controllers/utils';
 import { router as coursesRouter } from './controllers/courses';
+import { router as lectureEngagementReportRouter } from './controllers/lectureEngagementReport';
 import {
   courseFilesByCourseRouter,
   courseFilesRouter,
@@ -137,6 +138,7 @@ router.use('/course', availableCourseRouter);
 router.use('/course', courseFilesByCourseRouter);
 router.use('/courses', courseFilesByCourseRouter);
 router.use('/course-files', courseFilesRouter);
+router.use('/course', lectureEngagementReportRouter);
 router.use('/course', coursesRouter);
 router.use('/chat', staffChatRouter);
 router.use('/chat', chatRouter);
