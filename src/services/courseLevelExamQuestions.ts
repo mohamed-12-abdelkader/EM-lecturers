@@ -434,8 +434,9 @@ export class CourseLevelExamQuestionsService {
   }
 
   /**
-   * Set exactly two correct answers for a course-level exam question, then regrade
+   * Set one or two correct answers for a course-level exam question, then regrade
    * all submitted attempts that include this question.
+   * Accepts 1 letter (normal) or 2 distinct letters (either accepted as correct).
    */
   static async setDualCorrectAnswers(
     requester: RequestUser,
@@ -452,10 +453,10 @@ export class CourseLevelExamQuestionsService {
       ),
     ] as Array<'A' | 'B' | 'C' | 'D'>;
 
-    if (unique.length !== 2) {
+    if (unique.length < 1 || unique.length > 2) {
       throw new HttpError(
         400,
-        'correctAnswers must contain exactly two distinct letters from A, B, C, D',
+        'correctAnswers must contain 1 or 2 distinct letters from A, B, C, D',
       );
     }
 
@@ -464,7 +465,7 @@ export class CourseLevelExamQuestionsService {
        SET correct_answer = $1, correct_answer_2 = $2, updated_at = NOW()
        WHERE id = $3
        RETURNING *`,
-      [unique[0], unique[1], questionId],
+      [unique[0], unique[1] ?? null, questionId],
     );
 
     if (!result.rowCount) {

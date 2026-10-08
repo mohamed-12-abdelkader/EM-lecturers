@@ -380,21 +380,98 @@ export class AssignmentQuestionsService {
     }
   }
 
-  // تحديث الإجابة الصحيحة فقط
-  static async updateCorrectAnswer(questionId: number, correctAnswer: 'a' | 'b' | 'c' | 'd') {
-    const result = await pool.query(
-      `UPDATE assignment_questions 
-       SET correct_answer = $1, updated_at = NOW()
-       WHERE id = $2
-       RETURNING *`,
-      [correctAnswer, questionId],
+  /**
+   * تحديث الإجابة/الإجابات الصحيحة (1 أو 2 حروف من a–d).
+   * يقبل حرفاً واحداً أو مصفوفة من حرف أو حرفين مميزين.
+   */
+  static async updateCorrectAnswer(
+    questionId: number,
+    correctAnswer:
+      | 'a'
+      | 'b'
+      | 'c'
+      | 'd'
+      | Array<'a' | 'b' | 'c' | 'd' | string>,
+  ) {
+    const unique = [
+      ...new Set(
+        (Array.isArray(correctAnswer) ? correctAnswer : [correctAnswer])
+          .map((v) => String(v).trim().toLowerCase())
+          .filter((v) => ['a', 'b', 'c', 'd'].includes(v)),
+      ),
+    ] as Array<'a' | 'b' | 'c' | 'd'>;
+
+    if (unique.length < 1 || unique.length > 2) {
+      throw Object.assign(
+        new Error('correctAnswers must contain 1 or 2 distinct letters from a, b, c, d'),
+        { status: 400 },
+      );
+    }
+
+    const primary = unique[0];
+    const secondary = unique[1] ?? null;
+
+    // مزامنة correct_option_id(_2) من حروف الإجابات
+    const optionsResult = await pool.query(
+      `SELECT id, option_letter FROM assignment_question_options WHERE question_id = $1`,
+      [questionId],
     );
+    const byLetter = new Map(
+      optionsResult.rows.map((o: { id: number; option_letter: string }) => [
+        String(o.option_letter).toLowerCase(),
+        o.id,
+      ]),
+    );
+    const correctOptionId = byLetter.get(primary) ?? null;
+    const correctOptionId2 = secondary ? byLetter.get(secondary) ?? null : null;
+
+    let result;
+    try {
+      result = await pool.query(
+        `UPDATE assignment_questions
+         SET correct_answer = $1,
+             correct_answer_2 = $2,
+             correct_option_id = COALESCE($3, correct_option_id),
+             correct_option_id_2 = $4,
+             updated_at = NOW()
+         WHERE id = $5
+         RETURNING *`,
+        [primary, secondary, correctOptionId, correctOptionId2, questionId],
+      );
+    } catch (err: any) {
+      // أعمدة الإجابة الثانية قد تكون غير موجودة قبل تشغيل migration
+      if (
+        err?.message?.includes('correct_answer_2') ||
+        err?.message?.includes('correct_option_id_2')
+      ) {
+        if (unique.length > 1) {
+          throw Object.assign(
+            new Error(
+              'Second correct answer is not available. Run migration 1779300000000_dual_correct_answers_assignment_lecture.',
+            ),
+            { status: 501 },
+          );
+        }
+        result = await pool.query(
+          `UPDATE assignment_questions
+           SET correct_answer = $1,
+               correct_option_id = COALESCE($2, correct_option_id),
+               updated_at = NOW()
+           WHERE id = $3
+           RETURNING *`,
+          [primary, correctOptionId, questionId],
+        );
+      } else {
+        throw err;
+      }
+    }
 
     if (result.rows.length === 0) {
       return null;
     }
 
     const question = result.rows[0];
+    question.correct_answers = unique;
 
     // جلب الصور إذا كان السؤال من نوع صورة
     if (question.question_type === 'image') {

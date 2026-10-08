@@ -185,7 +185,8 @@ router.patch(
 
 /**
  * PATCH /api/questions/:questionId/correct-answers
- * Set exactly two correct answers and regrade submitted attempts
+ * Set 1 or 2 correct answers and regrade submitted attempts
+ * Body: { correctAnswers: ['A'] } or { correctAnswers: ['A','C'] }
  */
 router.patch(
   '/:questionId/correct-answers',
@@ -197,10 +198,22 @@ router.patch(
       return res.status(400).json({ message: 'Invalid question id' });
     }
 
-    const rawList = req.body?.correctAnswers ?? req.body?.correct_answers;
+    const body = req.body || {};
+    const rawList =
+      body.correctAnswers ??
+      body.correct_answers ??
+      (body.correctAnswer != null
+        ? body.correctAnswer2 != null
+          ? [body.correctAnswer, body.correctAnswer2]
+          : [body.correctAnswer]
+        : body.correct_answer != null
+          ? body.correct_answer_2 != null
+            ? [body.correct_answer, body.correct_answer_2]
+            : [body.correct_answer]
+          : null);
     if (!Array.isArray(rawList)) {
       return res.status(400).json({
-        message: 'correctAnswers must be an array of exactly two distinct letters (A–D)',
+        message: 'correctAnswers must be an array of 1 or 2 distinct letters (A–D)',
       });
     }
 
@@ -210,8 +223,12 @@ router.patch(
         questionId,
         rawList,
       );
+      const msg =
+        result.correctAnswers.length === 2
+          ? 'تم تحديث الإجابتين الصحيحتين وإعادة تصحيح المحاولات السابقة'
+          : 'تم تحديث الإجابة الصحيحة وإعادة تصحيح المحاولات السابقة';
       res.json({
-        message: 'تم تحديث الإجابتين الصحيحتين وإعادة تصحيح المحاولات السابقة',
+        message: msg,
         question: result.question,
         correctAnswers: result.correctAnswers,
         regrade: result.regrade,

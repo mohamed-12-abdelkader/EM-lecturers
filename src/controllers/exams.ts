@@ -1535,28 +1535,85 @@ router.delete(
   }),
 );
 
-// PATCH /api/exams/:examId/questions/:questionId/correct-answer - Set correct answer for question in lecture exam (أسئلة من البنك - التعديل للامتحان فقط)
+// PATCH /api/exams/:examId/questions/:questionId/correct-answer
+// تحديد إجابة واحدة أو إجابتين صحيحتين لسؤال في امتحان المحاضرة (تجاوز على مستوى الامتحان فقط)
+// Body examples:
+//   { correct_answer_index: 0 }
+//   { correctAnswers: ['A'] } أو { correctAnswers: ['A','C'] }
+//   { correct_answer_indices: [0, 2] }
 router.patch(
   '/:examId/questions/:questionId/correct-answer',
   authMiddleware(COURSE_CONTENT_ROLES),
   asyncWrapper(async (req, res) => {
     const examId = Number(req.params.examId);
     const questionId = Number(req.params.questionId);
-    const correct_answer_index = req.body.correct_answer_index ?? req.body.correctAnswerIndex;
 
     if (Number.isNaN(examId) || Number.isNaN(questionId)) {
       return res.status(400).json({ message: 'Invalid identifiers' });
     }
-    const index = typeof correct_answer_index === 'number' ? correct_answer_index : Number(correct_answer_index);
-    if (Number.isNaN(index) || index < 0 || index > 3) {
+
+    const body = req.body || {};
+    const letterToIndex = (v: unknown): number | null => {
+      if (typeof v === 'number' && Number.isInteger(v) && v >= 0 && v <= 3) return v;
+      const n = Number(v);
+      if (!Number.isNaN(n) && Number.isInteger(n) && n >= 0 && n <= 3) return n;
+      const map: Record<string, number> = { A: 0, B: 1, C: 2, D: 3 };
+      const key = String(v ?? '').trim().toUpperCase();
+      return key in map ? map[key]! : null;
+    };
+
+    let indices: number[] = [];
+    const rawList =
+      body.correctAnswers ??
+      body.correct_answers ??
+      body.correct_answer_indices ??
+      body.correctAnswerIndices;
+
+    if (Array.isArray(rawList)) {
+      indices = rawList
+        .map(letterToIndex)
+        .filter((v: number | null): v is number => v != null);
+    } else {
+      const single =
+        body.correct_answer_index ??
+        body.correctAnswerIndex ??
+        body.correctAnswer ??
+        body.correct_answer;
+      const second =
+        body.correct_answer_index_2 ??
+        body.correctAnswerIndex2 ??
+        body.correctAnswer2 ??
+        body.correct_answer_2;
+      const primary = letterToIndex(single);
+      if (primary != null) indices.push(primary);
+      const secondary = letterToIndex(second);
+      if (secondary != null) indices.push(secondary);
+    }
+
+    indices = [...new Set(indices)];
+    if (indices.length < 1 || indices.length > 2) {
       return res.status(400).json({
-        message: 'correct_answer_index is required and must be 0 (أ), 1 (ب), 2 (ج), or 3 (د)',
+        message:
+          'Provide 1 or 2 correct answers via correctAnswers (A–D) or correct_answer_index / correct_answer_indices (0–3)',
       });
     }
 
     try {
-      await ExamFlowService.setQuestionCorrectAnswer(req.user!.id, examId, questionId, index);
-      res.json({ message: 'Correct answer updated successfully' });
+      const result = await ExamFlowService.setQuestionCorrectAnswers(
+        req.user!.id,
+        examId,
+        questionId,
+        indices,
+      );
+      const indexToLetter = ['A', 'B', 'C', 'D'] as const;
+      res.json({
+        message:
+          result.correctAnswers.length === 2
+            ? 'تم تحديث الإجابتين الصحيحتين بنجاح'
+            : 'تم تحديث الإجابة الصحيحة بنجاح',
+        correctAnswers: result.correctAnswers.map((i) => indexToLetter[i]),
+        correctAnswerIndices: result.correctAnswers,
+      });
     } catch (error: any) {
       if (error.status) {
         return res.status(error.status).json({ message: error.message });

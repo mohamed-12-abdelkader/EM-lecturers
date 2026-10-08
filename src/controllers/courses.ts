@@ -3150,7 +3150,7 @@ router.patch(
   }),
 );
 
-// تحديد إجابتين صحيحتين لسؤال في الامتحان الشامل + إعادة تصحيح المحاولات السابقة
+// تحديد إجابة واحدة أو إجابتين صحيحتين لسؤال في الامتحان الشامل + إعادة تصحيح المحاولات السابقة
 router.patch(
   '/course-exam/question/:questionId/correct-answers',
   authMiddleware(COURSE_CONTENT_ROLES),
@@ -3164,16 +3164,20 @@ router.patch(
     const rawList =
       body.correctAnswers ??
       body.correct_answers ??
-      (body.correctAnswer != null && body.correctAnswer2 != null
-        ? [body.correctAnswer, body.correctAnswer2]
-        : body.correct_answer != null && body.correct_answer_2 != null
-          ? [body.correct_answer, body.correct_answer_2]
+      (body.correctAnswer != null
+        ? body.correctAnswer2 != null
+          ? [body.correctAnswer, body.correctAnswer2]
+          : [body.correctAnswer]
+        : body.correct_answer != null
+          ? body.correct_answer_2 != null
+            ? [body.correct_answer, body.correct_answer_2]
+            : [body.correct_answer]
           : null);
 
     if (!Array.isArray(rawList)) {
       return res.status(400).json({
         message:
-          'correctAnswers is required and must be an array of exactly two distinct letters (A–D)',
+          'correctAnswers is required and must be an array of 1 or 2 distinct letters (A–D)',
       });
     }
 
@@ -3183,8 +3187,12 @@ router.patch(
         questionId,
         rawList,
       );
+      const msg =
+        result.correctAnswers.length === 2
+          ? 'تم تحديث الإجابتين الصحيحتين وإعادة تصحيح المحاولات السابقة'
+          : 'تم تحديث الإجابة الصحيحة وإعادة تصحيح المحاولات السابقة';
       return res.json({
-        message: 'تم تحديث الإجابتين الصحيحتين وإعادة تصحيح المحاولات السابقة',
+        message: msg,
         question: result.question,
         correctAnswers: result.correctAnswers,
         regrade: result.regrade,
