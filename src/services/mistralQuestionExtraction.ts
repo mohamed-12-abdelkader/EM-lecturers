@@ -911,6 +911,49 @@ function normalizeExtractionPayload(raw: unknown): unknown {
   return data;
 }
 
+/**
+ * Mistral/DeepSeek أحياناً ترجع question_images كمصفوفة strings (image_id)
+ * بدل objects — نحوّلها للشكل المتوقع قبل Zod.
+ */
+function normalizeLooseQuestionImages(raw: unknown): Array<Record<string, unknown>> {
+  if (!Array.isArray(raw)) return [];
+  const out: Array<Record<string, unknown>> = [];
+  for (const item of raw) {
+    if (typeof item === 'string') {
+      const image_id = item.trim();
+      if (image_id) out.push({ image_id });
+      continue;
+    }
+    if (!item || typeof item !== 'object') continue;
+    const o = item as Record<string, unknown>;
+    const image_id = String(o.image_id ?? o.id ?? o.imageId ?? '').trim();
+    if (!image_id) continue;
+    const pageRaw = o.page_index ?? o.pageIndex;
+    const page_index =
+      pageRaw == null || pageRaw === ''
+        ? null
+        : Number.isFinite(Number(pageRaw))
+          ? Number(pageRaw)
+          : null;
+    out.push({
+      ...o,
+      image_id,
+      page_index,
+      ...(typeof o.image_url === 'string'
+        ? { image_url: o.image_url }
+        : typeof o.imageUrl === 'string'
+          ? { image_url: o.imageUrl }
+          : {}),
+      ...(typeof o.image_type === 'string'
+        ? { image_type: o.image_type }
+        : typeof o.imageType === 'string'
+          ? { image_type: o.imageType }
+          : {}),
+    });
+  }
+  return out;
+}
+
 function normalizeLooseQuestion(
   raw: unknown,
   index: number,
@@ -968,6 +1011,7 @@ function normalizeLooseQuestion(
     passage_id: q.passage_id ?? q.passageId ?? defaultPassageId,
     score,
     options,
+    question_images: normalizeLooseQuestionImages(q.question_images ?? q.questionImages),
     poetry: q.poetry ?? false,
     verses: Array.isArray(q.verses) ? q.verses : [],
   };

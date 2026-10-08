@@ -15,15 +15,25 @@ export const MistralExtractedOptionSchema = z.object({
   image_id: z.string().optional(),
 });
 
-export const MistralQuestionImageSchema = z.object({
-  image_id: z.string(),
-  page_index: z.number().int().nonnegative().nullable().optional(),
-  image_url: z.string().url().optional(),
-  image_type: z.string().optional(),
-  short_description: z.string().optional(),
-  summary: z.string().optional(),
-  educational_relevance: z.string().optional(),
-});
+/** يقبل object كامل أو string (image_id فقط) لأن بعض نماذج Chat تُرجع IDs كنصوص. */
+export const MistralQuestionImageSchema = z.preprocess(
+  (val) => {
+    if (typeof val === 'string') {
+      const image_id = val.trim();
+      return image_id ? { image_id } : val;
+    }
+    return val;
+  },
+  z.object({
+    image_id: z.string().min(1),
+    page_index: z.number().int().nonnegative().nullable().optional(),
+    image_url: z.string().url().optional(),
+    image_type: z.string().optional(),
+    short_description: z.string().optional(),
+    summary: z.string().optional(),
+    educational_relevance: z.string().optional(),
+  }),
+);
 
 export const MistralExtractedPassageSchema = z.object({
   passage_id: z.string(),
