@@ -85,7 +85,7 @@ export async function applyMigrations(databaseUrl: string, direction: 'up' | 'do
        LIMIT 1`,
     );
     if ((hasPoints.rowCount ?? 0) > 0) {
-      const { TeacherPointsService } = await import('../services/teacherPoints');
+      const { TeacherPointsService } = await import('../services/teacherPoints.js');
       const consolidated =
         await TeacherPointsService.consolidateLegacyOncePerExamPoints({});
       if (consolidated.groupsProcessed > 0 || consolidated.transactionsDeleted > 0) {
