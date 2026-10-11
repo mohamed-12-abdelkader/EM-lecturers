@@ -780,6 +780,7 @@ export class CourseLevelExamsService {
         attemptId: Number(attempt.id),
         examId: Number(exam.id),
         isAssignment: false,
+        examKind: 'course',
         title: exam.title ?? null,
       });
     } catch (error) {
@@ -808,6 +809,7 @@ export class CourseLevelExamsService {
         attemptId: Number(attempt.id),
         examId: Number(exam.id),
         isAssignment: false as const,
+        examKind: 'course' as const,
         obtainedGrade,
         totalGrade,
         title: exam.title ?? null,

@@ -3272,6 +3272,7 @@ export class ExamFlowService {
         attemptId: Number(attempt.id),
         examId: Number(exam.id),
         isAssignment,
+        examKind: 'lecture',
         title: exam.title ?? null,
       });
     } catch (error) {
@@ -3297,6 +3298,7 @@ export class ExamFlowService {
         attemptId: Number(attempt.id),
         examId: Number(exam.id),
         isAssignment,
+        examKind: 'lecture',
         obtainedGrade,
         totalGrade: maxGrade,
         title: exam.title ?? null,

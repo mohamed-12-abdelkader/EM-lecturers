@@ -38,6 +38,11 @@ const ManualSchema = z.object({
   gradeId: z.number().int().positive().optional().nullable(),
 });
 
+const ResetAllPointsSchema = z.object({
+  confirm: z.literal('RESET_ALL_POINTS'),
+  gradeId: z.number().int().positive().optional().nullable(),
+});
+
 /** GET /api/teacher/points/settings */
 router.get(
   '/settings',
@@ -144,5 +149,86 @@ router.get(
       limit,
     });
     res.json({ success: true, data: { studentId, transactions } });
+  }),
+);
+
+/**
+ * DELETE /api/teacher/points/transactions/:transactionId
+ * حذف نقاط منحها المدرس يدوياً (MANUAL_REWARD) وخصمها من رصيد الطالب
+ */
+router.delete(
+  '/transactions/:transactionId',
+  authMiddleware(['teacher', 'academy', 'admin']),
+  asyncWrapper(async (req, res) => {
+    const teacherId = resolveTeacherId(req);
+    const transactionId = Number(req.params.transactionId);
+    if (!Number.isFinite(transactionId) || transactionId <= 0) {
+      return res.status(400).json({ success: false, message: 'Invalid transactionId' });
+    }
+
+    try {
+      const result = await TeacherPointsService.revokeManualReward({
+        teacherId,
+        transactionId,
+      });
+      return res.json({
+        success: true,
+        message: 'تم حذف النقاط الممنوحة بنجاح',
+        data: result,
+      });
+    } catch (error) {
+      if (error instanceof HttpError) {
+        return res.status(error.status).json({
+          success: false,
+          message: error.message,
+        });
+      }
+      throw error;
+    }
+  }),
+);
+
+/**
+ * POST /api/teacher/points/reset
+ * تصفير نقاط كل طلاب المدرس والبدء من جديد
+ * Body: { "confirm": "RESET_ALL_POINTS", "gradeId"?: number }
+ */
+router.post(
+  '/reset',
+  authMiddleware(['teacher', 'academy', 'admin']),
+  asyncWrapper(async (req, res) => {
+    const teacherId = resolveTeacherId(req);
+    const parsed = ResetAllPointsSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      return res.status(400).json({
+        success: false,
+        message: 'للتأكيد أرسل confirm: "RESET_ALL_POINTS" (واختياري gradeId)',
+        errors: parsed.error.errors,
+      });
+    }
+
+    try {
+      const result = await TeacherPointsService.resetAllStudentsPoints({
+        teacherId,
+        confirm: parsed.data.confirm,
+        gradeId: parsed.data.gradeId,
+      });
+      return res.json({
+        success: true,
+        message:
+          result.gradeId != null
+            ? 'تم تصفير نقاط طلاب الصف — يمكنهم البدء من جديد'
+            : 'تم تصفير نقاط كل الطلاب — يمكنهم البدء من جديد',
+        data: result,
+      });
+    } catch (error) {
+      if (error instanceof HttpError) {
+        return res.status(error.status).json({
+          success: false,
+          message: error.message,
+        });
+      }
+      throw error;
+    }
   }),
 );

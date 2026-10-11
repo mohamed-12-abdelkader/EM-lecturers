@@ -846,6 +846,7 @@ export class ExamsService {
             attemptId,
             examId,
             isAssignment: false,
+            examKind: 'course',
             obtainedGrade,
             totalGrade: examFullGrade,
             title: row.title ?? null,

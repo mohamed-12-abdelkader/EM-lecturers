@@ -343,6 +343,27 @@ export class TeacherPointsService {
 
   // ─── Convenience award helpers ───────────────────────────────────────────
 
+  /**
+   * مفتاح فريد مرة واحدة لكل طالب + امتحان/واجب (وليس لكل محاولة).
+   * يمنع منح نقاط البدء/الدرجة مرتين عند إعادة دخول نفس الامتحان.
+   */
+  static examPointsReferenceKey(opts: {
+    eventType: PointsEventType;
+    teacherId: number;
+    studentId: number;
+    examId: number;
+    isAssignment: boolean;
+    /** lecture = امتحان محاضرة، course = امتحان شامل — لتجنب تصادم IDs */
+    examKind?: 'lecture' | 'course';
+  }): string {
+    const kind = opts.isAssignment
+      ? 'assignment'
+      : opts.examKind === 'course'
+        ? 'course_exam'
+        : 'lecture_exam';
+    return `${opts.eventType}:teacher:${opts.teacherId}:${kind}:${opts.examId}:student:${opts.studentId}`;
+  }
+
   static async awardVideoWatch(opts: {
     studentId: number;
     teacherId: number;
@@ -385,6 +406,7 @@ export class TeacherPointsService {
     examId: number;
     isAssignment: boolean;
     title?: string | null;
+    examKind?: 'lecture' | 'course';
   }): Promise<AwardResult> {
     const settings = await this.getOrCreateSettings(opts.teacherId);
     const enabled = opts.isAssignment
@@ -402,16 +424,32 @@ export class TeacherPointsService {
       teacherId: opts.teacherId,
       courseId: opts.courseId,
     });
+    const referenceKey = this.examPointsReferenceKey({
+      eventType,
+      teacherId: opts.teacherId,
+      studentId: opts.studentId,
+      examId: opts.examId,
+      isAssignment: opts.isAssignment,
+      examKind: opts.examKind,
+    });
     return this.award({
       studentId: opts.studentId,
       teacherId: opts.teacherId,
       gradeId,
       eventType,
       points,
-      referenceKey: `${eventType}:attempt:${opts.attemptId}`,
-      referenceType: opts.isAssignment ? 'assignment_attempt' : 'exam_attempt',
-      referenceId: opts.attemptId,
-      metadata: { examId: opts.examId, title: opts.title ?? null },
+      referenceKey,
+      referenceType: opts.isAssignment
+        ? 'assignment'
+        : opts.examKind === 'course'
+          ? 'course_exam'
+          : 'lecture_exam',
+      referenceId: opts.examId,
+      metadata: {
+        examId: opts.examId,
+        attemptId: opts.attemptId,
+        title: opts.title ?? null,
+      },
     });
   }
 
@@ -425,6 +463,7 @@ export class TeacherPointsService {
     obtainedGrade: number;
     totalGrade: number;
     title?: string | null;
+    examKind?: 'lecture' | 'course';
   }): Promise<AwardResult> {
     const settings = await this.getOrCreateSettings(opts.teacherId);
     const enabled = opts.isAssignment
@@ -440,17 +479,30 @@ export class TeacherPointsService {
       teacherId: opts.teacherId,
       courseId: opts.courseId,
     });
+    const referenceKey = this.examPointsReferenceKey({
+      eventType,
+      teacherId: opts.teacherId,
+      studentId: opts.studentId,
+      examId: opts.examId,
+      isAssignment: opts.isAssignment,
+      examKind: opts.examKind,
+    });
     return this.award({
       studentId: opts.studentId,
       teacherId: opts.teacherId,
       gradeId,
       eventType,
       points,
-      referenceKey: `${eventType}:attempt:${opts.attemptId}`,
-      referenceType: opts.isAssignment ? 'assignment_attempt' : 'exam_attempt',
-      referenceId: opts.attemptId,
+      referenceKey,
+      referenceType: opts.isAssignment
+        ? 'assignment'
+        : opts.examKind === 'course'
+          ? 'course_exam'
+          : 'lecture_exam',
+      referenceId: opts.examId,
       metadata: {
         examId: opts.examId,
+        attemptId: opts.attemptId,
         obtainedGrade: opts.obtainedGrade,
         totalGrade: opts.totalGrade,
         title: opts.title ?? null,
@@ -461,7 +513,7 @@ export class TeacherPointsService {
   /**
    * Sync EXAM_SCORE / ASSIGNMENT_SCORE after regrade.
    * Creates the transaction if missing; otherwise adjusts balance by delta only.
-   * Safe to call repeatedly — same score → no-op (no duplicate points).
+   * Scoped once per student+exam (not per attempt).
    */
   static async syncExamOrAssignmentScore(opts: {
     studentId: number;
@@ -473,6 +525,7 @@ export class TeacherPointsService {
     obtainedGrade: number;
     totalGrade: number;
     title?: string | null;
+    examKind?: 'lecture' | 'course';
   }): Promise<AwardResult> {
     const settings = await this.getOrCreateSettings(opts.teacherId);
     const enabled = opts.isAssignment
@@ -484,7 +537,14 @@ export class TeacherPointsService {
 
     const newPoints = Math.max(0, Math.floor(Number(opts.obtainedGrade) || 0));
     const eventType: PointsEventType = opts.isAssignment ? 'ASSIGNMENT_SCORE' : 'EXAM_SCORE';
-    const referenceKey = `${eventType}:attempt:${opts.attemptId}`;
+    const referenceKey = this.examPointsReferenceKey({
+      eventType,
+      teacherId: opts.teacherId,
+      studentId: opts.studentId,
+      examId: opts.examId,
+      isAssignment: opts.isAssignment,
+      examKind: opts.examKind,
+    });
     const gradeId = await this.resolveGradeId({
       studentId: opts.studentId,
       teacherId: opts.teacherId,
@@ -615,6 +675,186 @@ export class TeacherPointsService {
       throw new HttpError(500, 'Failed to award manual points');
     }
     return result;
+  }
+
+  /**
+   * تصفير نقاط كل طلاب المدرس والبدء من جديد.
+   * يحذف المعاملات + الأرصدة حتى يمكن إعادة منح نقاط الامتحان/الفيديو (idempotency keys).
+   * يتطلب confirm = "RESET_ALL_POINTS".
+   */
+  static async resetAllStudentsPoints(opts: {
+    teacherId: number;
+    confirm: string;
+    gradeId?: number | null;
+  }): Promise<{
+    reset: true;
+    teacherId: number;
+    gradeId: number | null;
+    balancesCleared: number;
+    transactionsDeleted: number;
+  }> {
+    if (opts.confirm !== 'RESET_ALL_POINTS') {
+      throw new HttpError(
+        400,
+        'للتأكيد أرسل confirm: "RESET_ALL_POINTS"',
+      );
+    }
+
+    const gradeId =
+      opts.gradeId != null && Number.isFinite(Number(opts.gradeId)) && Number(opts.gradeId) > 0
+        ? Number(opts.gradeId)
+        : null;
+
+    if (gradeId != null) {
+      const ownsGrade = await pool.query(
+        `SELECT 1 FROM teacher_grades WHERE teacher_id = $1 AND grade_id = $2 LIMIT 1`,
+        [opts.teacherId, gradeId],
+      );
+      if (!ownsGrade.rowCount) {
+        throw new HttpError(403, 'هذا الصف غير مرتبط بالمدرس');
+      }
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      let transactionsDeleted = 0;
+      let balancesCleared = 0;
+
+      if (gradeId != null) {
+        const txDel = await client.query(
+          `DELETE FROM point_transactions
+           WHERE teacher_id = $1 AND grade_id = $2`,
+          [opts.teacherId, gradeId],
+        );
+        transactionsDeleted = txDel.rowCount ?? 0;
+
+        const balDel = await client.query(
+          `DELETE FROM student_point_balances
+           WHERE teacher_id = $1 AND grade_id = $2`,
+          [opts.teacherId, gradeId],
+        );
+        balancesCleared = balDel.rowCount ?? 0;
+      } else {
+        const txDel = await client.query(
+          `DELETE FROM point_transactions WHERE teacher_id = $1`,
+          [opts.teacherId],
+        );
+        transactionsDeleted = txDel.rowCount ?? 0;
+
+        const balDel = await client.query(
+          `DELETE FROM student_point_balances WHERE teacher_id = $1`,
+          [opts.teacherId],
+        );
+        balancesCleared = balDel.rowCount ?? 0;
+      }
+
+      await client.query('COMMIT');
+      return {
+        reset: true,
+        teacherId: opts.teacherId,
+        gradeId,
+        balancesCleared,
+        transactionsDeleted,
+      };
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * حذف نقاط منحها المدرس يدوياً (MANUAL_REWARD) وخصمها من رصيد الطالب.
+   */
+  static async revokeManualReward(opts: {
+    teacherId: number;
+    transactionId: number;
+  }): Promise<{
+    deleted: true;
+    transactionId: number;
+    studentId: number;
+    pointsRemoved: number;
+    totalPoints: number;
+  }> {
+    const txId = Number(opts.transactionId);
+    if (!Number.isInteger(txId) || txId <= 0) {
+      throw new HttpError(400, 'Invalid transactionId');
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      const txRes = await client.query<{
+        id: number;
+        student_id: number;
+        teacher_id: number;
+        grade_id: number;
+        points: number;
+        event_type: string;
+      }>(
+        `SELECT id, student_id, teacher_id, grade_id, points, event_type
+         FROM point_transactions
+         WHERE id = $1
+         FOR UPDATE`,
+        [txId],
+      );
+
+      if (!txRes.rowCount) {
+        throw new HttpError(404, 'معاملة النقاط غير موجودة');
+      }
+
+      const tx = txRes.rows[0];
+      if (Number(tx.teacher_id) !== opts.teacherId) {
+        throw new HttpError(403, 'لا يمكنك حذف نقاط لا تخصك');
+      }
+      if (tx.event_type !== 'MANUAL_REWARD') {
+        throw new HttpError(
+          409,
+          'يمكن حذف النقاط الممنوحة يدوياً فقط (MANUAL_REWARD)',
+        );
+      }
+
+      const pointsRemoved = Math.max(0, Math.floor(Number(tx.points) || 0));
+      const studentId = Number(tx.student_id);
+      const gradeId = Number(tx.grade_id);
+
+      await client.query(`DELETE FROM point_transactions WHERE id = $1`, [txId]);
+
+      let totalPoints = 0;
+      if (pointsRemoved > 0) {
+        const balRes = await client.query<{ total_points: number }>(
+          `UPDATE student_point_balances
+           SET total_points = GREATEST(0, total_points - $1),
+               updated_at = NOW()
+           WHERE student_id = $2 AND teacher_id = $3 AND grade_id = $4
+           RETURNING total_points`,
+          [pointsRemoved, studentId, opts.teacherId, gradeId],
+        );
+        totalPoints = balRes.rowCount
+          ? Number(balRes.rows[0].total_points)
+          : 0;
+      } else {
+        totalPoints = await this.getBalance(studentId, opts.teacherId, gradeId);
+      }
+
+      await client.query('COMMIT');
+      return {
+        deleted: true,
+        transactionId: txId,
+        studentId,
+        pointsRemoved,
+        totalPoints,
+      };
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
   }
 
   // ─── Ranking ─────────────────────────────────────────────────────────────
@@ -770,10 +1010,25 @@ export class TeacherPointsService {
          u.email AS student_email,
          u.avatar AS student_avatar,
          g.name AS grade_name,
+         cg.id AS course_group_id,
+         cg.name AS course_group_name,
+         cg.grade_id AS course_group_grade_id,
+         cg.status AS course_group_status,
          RANK() OVER (PARTITION BY b.grade_id ORDER BY b.total_points DESC, b.student_id ASC) AS rank
        FROM student_point_balances b
        JOIN users u ON u.id = b.student_id
        LEFT JOIN grades g ON g.id = b.grade_id
+       LEFT JOIN LATERAL (
+         SELECT m.group_id
+         FROM student_course_group_memberships m
+         JOIN course_groups cg0 ON cg0.id = m.group_id
+         WHERE m.student_id = b.student_id
+           AND cg0.teacher_id = $1
+           AND cg0.status = 'active'
+         ORDER BY m.updated_at DESC
+         LIMIT 1
+       ) cg_ref ON TRUE
+       LEFT JOIN course_groups cg ON cg.id = cg_ref.group_id
        WHERE ${where}
        ORDER BY b.total_points DESC, b.student_id ASC
        LIMIT $${i++} OFFSET $${i}`,
@@ -793,6 +1048,17 @@ export class TeacherPointsService {
         gradeId: Number(row.grade_id),
         gradeName: row.grade_name ?? null,
         points: Number(row.total_points),
+        courseGroup: row.course_group_id
+          ? {
+              id: Number(row.course_group_id),
+              name: row.course_group_name ?? null,
+              gradeId:
+                row.course_group_grade_id != null
+                  ? Number(row.course_group_grade_id)
+                  : null,
+              status: row.course_group_status ?? null,
+            }
+          : null,
       })),
     };
   }
