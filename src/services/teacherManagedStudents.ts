@@ -3,8 +3,6 @@ import type { PoolClient } from 'pg';
 import pool from '../db/pool';
 import { HttpError } from '../utils';
 import { enforceStudentLimit } from './teacherPlanPolicy';
-import { snapshotPlatformStudentBeforeDelete } from '../modules/teacherTrash';
-
 export type RegistrationMode = 'self_registration' | 'teacher_registration';
 
 export type ManagedStudentAccountStatus = 'active' | 'inactive' | 'suspended';
@@ -90,7 +88,8 @@ export class TeacherManagedStudentsService {
         ADD COLUMN IF NOT EXISTS managed_by_teacher_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
         ADD COLUMN IF NOT EXISTS registered_ip TEXT,
         ADD COLUMN IF NOT EXISTS ip_registered_at TIMESTAMPTZ,
-        ADD COLUMN IF NOT EXISTS ip_reset_at TIMESTAMPTZ
+        ADD COLUMN IF NOT EXISTS ip_reset_at TIMESTAMPTZ,
+        ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ NULL
     `);
     await pool.query(`
       CREATE UNIQUE INDEX IF NOT EXISTS idx_users_student_code_unique
@@ -297,7 +296,8 @@ export class TeacherManagedStudentsService {
 
     if (input.phone) {
       const phoneTaken = await pool.query(
-        `SELECT id FROM users WHERE phone = $1 AND tenant_id = $2`,
+        `SELECT id FROM users
+         WHERE phone = $1 AND tenant_id = $2 AND deleted_at IS NULL`,
         [input.phone.trim(), tenantId],
       );
       if (phoneTaken.rowCount) {
@@ -401,8 +401,8 @@ export class TeacherManagedStudentsService {
     const sortColumn =
       sort === 'name' ? 'u.name' : sort === 'student_code' ? 'u.student_code' : 'u.created_at';
 
-    // كل طلاب المنصة (تسجيل ذاتي + إنشاء المدرس)
-    const conditions = [`u.role = 'student'`, `u.tenant_id = $1`];
+    // كل طلاب المنصة (تسجيل ذاتي + إنشاء المدرس) — استثناء المحذوفين soft
+    const conditions = [`u.role = 'student'`, `u.tenant_id = $1`, `u.deleted_at IS NULL`];
     const values: unknown[] = [tenantId];
     let i = 2;
 
@@ -526,6 +526,7 @@ export class TeacherManagedStudentsService {
        ) cg_ref ON TRUE
        LEFT JOIN course_groups cg ON cg.id = cg_ref.group_id
        WHERE u.id = $1 AND u.role = 'student' AND u.tenant_id = $2
+         AND u.deleted_at IS NULL
        LIMIT 1`,
       [studentId, tenantId, teacherId],
     );
@@ -639,7 +640,8 @@ export class TeacherManagedStudentsService {
 
     if (input.phone) {
       const phoneTaken = await pool.query(
-        `SELECT id FROM users WHERE phone = $1 AND tenant_id = $2 AND id <> $3`,
+        `SELECT id FROM users
+         WHERE phone = $1 AND tenant_id = $2 AND id <> $3 AND deleted_at IS NULL`,
         [input.phone.trim(), tenantId, studentId],
       );
       if (phoneTaken.rowCount) {
@@ -755,105 +757,28 @@ export class TeacherManagedStudentsService {
     return this.getStudentById(teacherId, tenantId, studentId);
   }
 
-  /** يجمع بيانات كافية لاستعادة حساب الطالب من المحذوفات */
-  private static async buildPlatformStudentTrashSnapshot(
-    client: PoolClient | typeof pool,
-    studentId: number,
-    tenantId: number,
-    teacherId: number,
-  ): Promise<Record<string, unknown> | null> {
-    const userRes = await client.query(
-      `SELECT * FROM users WHERE id = $1 AND role = 'student' AND tenant_id = $2`,
-      [studentId, tenantId],
-    );
-    const user = userRes.rows[0];
-    if (!user) return null;
-
-    const gradeRes = await client.query<{ grade_id: number }>(
-      `SELECT grade_id FROM user_grades WHERE user_id = $1 ORDER BY grade_id LIMIT 1`,
-      [studentId],
-    );
-    const groupRes = await client.query<{ group_id: number }>(
-      `SELECT group_id FROM group_students WHERE student_id = $1 LIMIT 1`,
-      [studentId],
-    );
-    let courseGroupIds: number[] = [];
-    try {
-      const cgRes = await client.query<{ group_id: number }>(
-        `SELECT m.group_id
-         FROM student_course_group_memberships m
-         JOIN course_groups cg ON cg.id = m.group_id
-         WHERE m.student_id = $1 AND cg.teacher_id = $2`,
-        [studentId, teacherId],
-      );
-      courseGroupIds = cgRes.rows.map((r) => Number(r.group_id));
-    } catch {
-      courseGroupIds = [];
-    }
-
-    return {
-      id: user.id,
-      name: user.name,
-      email: user.email,
-      phone: user.phone,
-      student_code: user.student_code,
-      tenant_id: user.tenant_id,
-      user,
-      grade_id: gradeRes.rows[0]?.grade_id ?? null,
-      group_id: groupRes.rows[0]?.group_id ?? null,
-      course_group_ids: courseGroupIds,
-      course_group_id: courseGroupIds[0] ?? null,
-    };
-  }
-
+  /**
+   * حذف طالب المنصة = soft-delete (deleted_at).
+   * كل الاشتراكات/الدرجات/المجموعات تبقى — الاستعادة ترجع الحساب كما كان.
+   */
   static async deleteStudent(teacherId: number, tenantId: number, studentId: number) {
+    await this.ensureSchema();
     await this.getStudentById(teacherId, tenantId, studentId);
 
-    const client = await pool.connect();
-    try {
-      await client.query('BEGIN');
-
-      const trashSnapshot = await this.buildPlatformStudentTrashSnapshot(
-        client,
-        studentId,
-        tenantId,
-        teacherId,
-      );
-
-      await this.purgeStudentRelatedRows(client, [studentId]);
-      const del = await client.query(
-        `DELETE FROM users
-         WHERE id = $1 AND role = 'student' AND tenant_id = $2
-         RETURNING id`,
-        [studentId, tenantId],
-      );
-      if (!del.rowCount) {
-        throw new HttpError(409, 'تعذر حذف الطالب — قد يكون مرتبطاً ببيانات أخرى');
-      }
-      await client.query('COMMIT');
-
-      if (trashSnapshot) {
-        await snapshotPlatformStudentBeforeDelete(
-          trashSnapshot as Record<string, unknown> & { id: number; name?: string; email?: string },
-          teacherId,
-          tenantId,
-          teacherId,
-        );
-      }
-
-      return { deleted: true, student_id: studentId };
-    } catch (e: unknown) {
-      await client.query('ROLLBACK');
-      if ((e as { code?: string }).code === '23503') {
-        throw new HttpError(
-          409,
-          'لا يمكن حذف الطالب لوجود سجلات مرتبطة. يمكنك إيقاف الحساب بدلاً من ذلك.',
-        );
-      }
-      throw e;
-    } finally {
-      client.release();
+    const del = await pool.query(
+      `UPDATE users
+       SET deleted_at = NOW(),
+           account_status = 'inactive',
+           jti = NULL
+       WHERE id = $1 AND role = 'student' AND tenant_id = $2 AND deleted_at IS NULL
+       RETURNING id`,
+      [studentId, tenantId],
+    );
+    if (!del.rowCount) {
+      throw new HttpError(409, 'تعذر حذف الطالب — قد يكون محذوفاً بالفعل');
     }
+
+    return { deleted: true, student_id: studentId, soft_deleted: true };
   }
 
   /**
@@ -875,70 +800,21 @@ export class TeacherManagedStudentsService {
       );
     }
 
-    const client = await pool.connect();
-    try {
-      await client.query('BEGIN');
+    const del = await pool.query(
+      `UPDATE users
+       SET deleted_at = NOW(),
+           account_status = 'inactive',
+           jti = NULL
+       WHERE role = 'student' AND tenant_id = $1 AND deleted_at IS NULL
+       RETURNING id`,
+      [tenantId],
+    );
 
-      const idsRes = await client.query<{ id: number }>(
-        `SELECT id FROM users
-         WHERE role = 'student' AND tenant_id = $1
-         ORDER BY id
-         FOR UPDATE`,
-        [tenantId],
-      );
-      const ids = idsRes.rows.map((r) => Number(r.id));
-
-      if (!ids.length) {
-        await client.query('COMMIT');
-        return { deleted: true, deleted_count: 0 };
-      }
-
-      const trashSnapshots: Record<string, unknown>[] = [];
-      for (const id of ids) {
-        const snap = await this.buildPlatformStudentTrashSnapshot(
-          client,
-          id,
-          tenantId,
-          teacherId,
-        );
-        if (snap) trashSnapshots.push(snap);
-      }
-
-      await this.purgeStudentRelatedRows(client, ids);
-
-      const del = await client.query(
-        `DELETE FROM users
-         WHERE role = 'student' AND tenant_id = $1`,
-        [tenantId],
-      );
-
-      await client.query('COMMIT');
-
-      for (const snap of trashSnapshots) {
-        await snapshotPlatformStudentBeforeDelete(
-          snap as Record<string, unknown> & { id: number; name?: string; email?: string },
-          teacherId,
-          tenantId,
-          teacherId,
-        );
-      }
-
-      return {
-        deleted: true,
-        deleted_count: del.rowCount ?? 0,
-      };
-    } catch (e: unknown) {
-      await client.query('ROLLBACK');
-      if ((e as { code?: string }).code === '23503') {
-        throw new HttpError(
-          409,
-          'تعذر حذف بعض الحسابات لوجود سجلات مرتبطة. جرّب حذف الطلاب فردياً أو أوقف الحسابات.',
-        );
-      }
-      throw e;
-    } finally {
-      client.release();
-    }
+    return {
+      deleted: true,
+      deleted_count: del.rowCount ?? 0,
+      soft_deleted: true,
+    };
   }
 
   static async findStudentByCode(studentCode: string, tenantId: number) {
@@ -947,7 +823,7 @@ export class TeacherManagedStudentsService {
     if (!normalized) return null;
     const r = await pool.query(
       `SELECT * FROM users
-       WHERE tenant_id = $2 AND role = 'student'
+       WHERE tenant_id = $2 AND role = 'student' AND deleted_at IS NULL
          AND regexp_replace(COALESCE(student_code, ''), '[^0-9]', '', 'g') = $1
        LIMIT 1`,
       [normalized, tenantId],

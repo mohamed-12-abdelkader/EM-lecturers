@@ -87,6 +87,15 @@ export class TeacherTrashService {
       return this.restoreSnapshot(teacherId, id);
     }
 
+    // platform_student: جرّب soft-restore أولاً، ثم snapshot إن فشل (حذف نهائي قديم)
+    if (type === 'platform_student') {
+      const liveOk = await TeacherTrashRepository.restorePlatformStudentLive(id, teacherId);
+      if (liveOk) {
+        return { restored: true, type, id, entityId: id };
+      }
+      return this.restoreSnapshot(teacherId, id);
+    }
+
     if (TeacherTrashRepository.isKnownLiveType(type)) {
       const ok = await this.restoreLive(type, id, teacherId);
       if (!ok) {
@@ -116,6 +125,8 @@ export class TeacherTrashService {
         return TeacherTrashRepository.restoreTeacherFile(id, teacherId);
       case 'course_file':
         return TeacherTrashRepository.restoreCourseFile(id, teacherId);
+      case 'platform_student':
+        return TeacherTrashRepository.restorePlatformStudentLive(id, teacherId);
       default:
         return false;
     }
@@ -146,6 +157,10 @@ export class TeacherTrashService {
         entityId = await TeacherTrashRepository.restorePlatformStudentFromSnapshot(
           snapshot,
           teacherId,
+          {
+            tenantId: row.tenant_id != null ? Number(row.tenant_id) : null,
+            entityId: row.entity_id != null ? Number(row.entity_id) : null,
+          },
         );
         break;
       default:
@@ -155,9 +170,7 @@ export class TeacherTrashService {
     if (!entityId) {
       throw new HttpError(
         409,
-        row.entity_type === 'platform_student'
-          ? 'تعذّرت استعادة حساب الطالب — قد يكون الهاتف أو كود الطالب مستخدماً بالفعل، أو البيانات ناقصة'
-          : 'تعذّرت استعادة العنصر — قد يكون موجوداً بالفعل أو بياناته ناقصة',
+        'تعذّرت استعادة العنصر — قد يكون موجوداً بالفعل أو بياناته ناقصة',
       );
     }
 

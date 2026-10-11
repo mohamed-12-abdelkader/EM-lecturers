@@ -51,7 +51,7 @@ npm run migrate up
 | `course_file` | PDF كورس | ✅ إذا لم يُمسح من التخزين |
 | `course` | كورس (snapshot) | ⚠️ استعادة جزئية للسجل |
 | `lecture` | محاضرة (snapshot) | ⚠️ استعادة جزئية |
-| `platform_student` | طالب منصة | ✅ من snapshot (يستعيد الحساب + الصف/المجموعة) |
+| `platform_student` | طالب منصة | ✅ soft-delete: استعادة كاملة بكل البيانات؛ أو من snapshot للحذوفات القديمة |
 
 ### Response
 
@@ -152,7 +152,11 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
 curl -X POST -H "Authorization: Bearer $TOKEN" \
   "http://localhost:8000/api/teacher/trash/course_file/7/restore"
 
-# استعادة حساب طالب منصة (id = snapshot_id من القائمة، source=snapshot)
+# استعادة حساب طالب منصة (soft-delete — id = معرف الطالب من القائمة live)
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  "http://localhost:8000/api/teacher/trash/platform_student/124/restore"
+
+# استعادة من snapshot قديم (حذف نهائي سابق — id = snapshot_id)
 curl -X POST -H "Authorization: Bearer $TOKEN" \
   "http://localhost:8000/api/teacher/trash/platform_student/15/restore?source=snapshot"
 ```

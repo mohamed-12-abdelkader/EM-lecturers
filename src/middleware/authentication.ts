@@ -172,8 +172,8 @@ export function authMiddleware(roles: Roles[] = []): RequestHandler {
       }
 
       // Fetch user from DB
-      const result = await pool.query<UserRow>(
-        'SELECT id, role, jti, tenant_id, account_status FROM users WHERE id = $1',
+      const result = await pool.query<UserRow & { deleted_at?: Date | null }>(
+        'SELECT id, role, jti, tenant_id, account_status, deleted_at FROM users WHERE id = $1',
         [id],
       );
 
@@ -182,6 +182,13 @@ export function authMiddleware(roles: Roles[] = []): RequestHandler {
       }
 
       const user = result.rows[0];
+
+      if (user.deleted_at) {
+        return res.status(401).json({
+          message: 'الحساب محذوف',
+          code: 'ACCOUNT_DELETED',
+        });
+      }
 
       if (
         (user.role === 'teacher' || user.role === 'academy' || user.role === 'academy_teacher') &&
@@ -244,13 +251,20 @@ export function authMiddleware(roles: Roles[] = []): RequestHandler {
             return res.status(401).json({ message: 'Invalid token: invalid user id' });
           }
 
-          const result = await pool.query<UserRow>(
-            'SELECT id, role, jti, tenant_id, account_status FROM users WHERE id = $1',
+          const result = await pool.query<UserRow & { deleted_at?: Date | null }>(
+            'SELECT id, role, jti, tenant_id, account_status, deleted_at FROM users WHERE id = $1',
             [id],
           );
           if (!result.rowCount) return res.status(401).json({ message: 'User not found' });
 
           const user = result.rows[0];
+
+          if (user.deleted_at) {
+            return res.status(401).json({
+              message: 'الحساب محذوف',
+              code: 'ACCOUNT_DELETED',
+            });
+          }
 
           if (
             (user.role === 'teacher' ||
