@@ -232,3 +232,37 @@ router.post(
     }
   }),
 );
+
+const ConsolidateLegacySchema = z.object({
+  confirm: z.literal('CONSOLIDATE_EXAM_POINTS'),
+});
+
+/**
+ * POST /api/teacher/points/consolidate-legacy
+ * توحيد نقاط الامتحانات القديمة: أول محاولة فقط، وحذف تكرار المحاولات التالية
+ */
+router.post(
+  '/consolidate-legacy',
+  authMiddleware(['teacher', 'academy', 'admin']),
+  asyncWrapper(async (req, res) => {
+    const teacherId = resolveTeacherId(req);
+    const parsed = ConsolidateLegacySchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      return res.status(400).json({
+        success: false,
+        message: 'للتأكيد أرسل confirm: "CONSOLIDATE_EXAM_POINTS"',
+        errors: parsed.error.errors,
+      });
+    }
+
+    const result = await TeacherPointsService.consolidateLegacyOncePerExamPoints({
+      teacherId,
+    });
+    return res.json({
+      success: true,
+      message:
+        'تم توحيد نقاط الامتحانات: احتساب أول محاولة فقط وإلغاء تكرار المحاولات التالية',
+      data: result,
+    });
+  }),
+);

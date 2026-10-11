@@ -16,6 +16,7 @@
 | `POST` | `/teacher/points/manual` | teacher / academy / admin | منح نقاط يدوية لطالب |
 | `DELETE` | `/teacher/points/transactions/:transactionId` | teacher / academy / admin | حذف نقاط يدوية منحها المدرس |
 | `POST` | `/teacher/points/reset` | teacher / academy / admin | تصفير نقاط كل الطلاب والبدء من جديد |
+| `POST` | `/teacher/points/consolidate-legacy` | teacher / academy / admin | توحيد نقاط الامتحانات القديمة (أول محاولة فقط) |
 | `GET` | `/teacher/points/students/:studentId/transactions` | teacher / academy / admin | سجل معاملات طالب |
 | `GET` | `/student/points/summary` | student | نقاط الطالب + رتبته + المتبقي للمركز التالي |
 | `GET` | `/student/points/leaderboard` | student | أعلى 10 في صف الطالب |
@@ -377,7 +378,40 @@ Authorization: Bearer <TEACHER_TOKEN>
 | `403` | المعاملة لمدرس آخر |
 | `409` | ليست `MANUAL_REWARD` (امتحان/فيديو…) |
 
-### 3.4.2 تصفير كل النقاط والبدء من جديد
+### 3.4.2 توحيد نقاط الامتحانات القديمة (أول محاولة فقط)
+
+للامتحانات اللي الطالب امتحنها **قبل** نظام «مرة واحدة لكل امتحان»، كانت النقاط تُمنح لكل محاولة. هذا الـ endpoint (ويُشغَّل أيضاً تلقائياً عند `migrate up`) يوحّد السجلات:
+
+- يبقي نقاط **أول محاولة** لكل طالب + امتحان (`EXAM_START` / `EXAM_SCORE` / الواجب)
+- يحذف نقاط المحاولات التالية ويخصمها من الرصيد
+- يحدّث `reference_key` للشكل الجديد حتى لا تُعاد المنح
+
+```http
+POST /api/teacher/points/consolidate-legacy
+Authorization: Bearer <TEACHER_TOKEN>
+Content-Type: application/json
+```
+
+```json
+{ "confirm": "CONSOLIDATE_EXAM_POINTS" }
+```
+
+**Response `200`**
+
+```json
+{
+  "success": true,
+  "message": "تم توحيد نقاط الامتحانات: احتساب أول محاولة فقط وإلغاء تكرار المحاولات التالية",
+  "data": {
+    "groupsProcessed": 12,
+    "transactionsDeleted": 18,
+    "transactionsUpdated": 12,
+    "pointsRemovedFromBalances": 45
+  }
+}
+```
+
+### 3.4.3 تصفير كل النقاط والبدء من جديد
 
 ```http
 POST /api/teacher/points/reset

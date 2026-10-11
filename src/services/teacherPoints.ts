@@ -678,6 +678,280 @@ export class TeacherPointsService {
   }
 
   /**
+   * توحيد نقاط الامتحان/الواجب القديمة (كانت لكل محاولة) إلى مرة واحدة لكل امتحان.
+   * يبقي نقاط أول محاولة ويحذف تكرار المحاولات التالية مع تعديل الرصيد.
+   * آمن لإعادة التشغيل (idempotent).
+   */
+  static async consolidateLegacyOncePerExamPoints(opts: {
+    teacherId?: number | null;
+  } = {}): Promise<{
+    groupsProcessed: number;
+    transactionsDeleted: number;
+    transactionsUpdated: number;
+    pointsRemovedFromBalances: number;
+  }> {
+    const teacherFilter =
+      opts.teacherId != null && Number.isFinite(Number(opts.teacherId))
+        ? Number(opts.teacherId)
+        : null;
+
+    const legacyRes = await pool.query<{
+      id: number;
+      student_id: number;
+      teacher_id: number;
+      grade_id: number;
+      points: number;
+      event_type: string;
+      reference_key: string;
+      reference_id: number | null;
+      metadata: Record<string, unknown> | null;
+      created_at: Date;
+      exam_id: number | null;
+      exam_kind: string;
+      attempt_number: number;
+      is_new_format: number;
+    }>(
+      `SELECT
+         pt.id,
+         pt.student_id,
+         pt.teacher_id,
+         pt.grade_id,
+         pt.points,
+         pt.event_type,
+         pt.reference_key,
+         pt.reference_id,
+         pt.metadata,
+         pt.created_at,
+         COALESCE(
+           NULLIF(pt.metadata->>'examId', '')::int,
+           NULLIF(pt.metadata->>'exam_id', '')::int,
+           CASE WHEN pt.reference_key LIKE '%:attempt:%' THEN es.exam_id END,
+           CASE WHEN pt.reference_key LIKE '%:attempt:%' THEN clea.exam_id END,
+           CASE WHEN pt.reference_key LIKE '%:attempt:%' THEN ces.exam_id END,
+           CASE
+             WHEN pt.reference_key ~ ':(lecture_exam|course_exam|assignment):[0-9]+:student:'
+             THEN (regexp_match(
+               pt.reference_key,
+               ':(?:lecture_exam|course_exam|assignment):([0-9]+):student:'
+             ))[1]::int
+           END
+         ) AS exam_id,
+         CASE
+           WHEN pt.event_type IN ('ASSIGNMENT_START', 'ASSIGNMENT_SCORE') THEN 'assignment'
+           WHEN pt.reference_key LIKE '%:course_exam:%' THEN 'course_exam'
+           WHEN pt.reference_key LIKE '%:assignment:%' THEN 'assignment'
+           WHEN pt.reference_key LIKE '%:lecture_exam:%' THEN 'lecture_exam'
+           WHEN clea.id IS NOT NULL THEN 'course_exam'
+           WHEN ces.id IS NOT NULL THEN 'course_exam'
+           WHEN e.type IS NOT NULL AND lower(e.type::text) = 'assignment' THEN 'assignment'
+           ELSE 'lecture_exam'
+         END AS exam_kind,
+         COALESCE(
+           CASE WHEN pt.reference_key LIKE '%:attempt:%' THEN es.attempt_number END,
+           CASE WHEN pt.reference_key LIKE '%:attempt:%' THEN clea.attempt_number END,
+           NULLIF(pt.metadata->>'kept_attempt_number', '')::int,
+           CASE WHEN pt.reference_key LIKE '%:attempt:%' THEN 1 ELSE 1 END
+         ) AS attempt_number,
+         CASE WHEN pt.reference_key LIKE '%:attempt:%' THEN 0 ELSE 1 END AS is_new_format
+       FROM point_transactions pt
+       LEFT JOIN exam_submissions es
+         ON pt.reference_key LIKE '%:attempt:%' AND es.id = pt.reference_id
+       LEFT JOIN exams e ON e.id = es.exam_id
+       LEFT JOIN course_level_exam_attempts clea
+         ON pt.reference_key LIKE '%:attempt:%' AND clea.id = pt.reference_id
+       LEFT JOIN course_exam_submissions ces
+         ON pt.reference_key LIKE '%:attempt:%' AND ces.id = pt.reference_id
+       WHERE pt.event_type IN ('EXAM_START', 'EXAM_SCORE', 'ASSIGNMENT_START', 'ASSIGNMENT_SCORE')
+         AND (
+           pt.reference_key ~ '^(EXAM_START|EXAM_SCORE|ASSIGNMENT_START|ASSIGNMENT_SCORE):attempt:[0-9]+$'
+           OR pt.reference_key ~ '^(EXAM_START|EXAM_SCORE|ASSIGNMENT_START|ASSIGNMENT_SCORE):teacher:[0-9]+:(lecture_exam|course_exam|assignment):[0-9]+:student:[0-9]+$'
+         )
+         AND ($1::int IS NULL OR pt.teacher_id = $1)`,
+      [teacherFilter],
+    );
+
+    type Row = (typeof legacyRes.rows)[number];
+    const groups = new Map<string, Row[]>();
+
+    for (const row of legacyRes.rows) {
+      if (row.exam_id == null || !Number.isInteger(Number(row.exam_id))) continue;
+      const key = [
+        row.student_id,
+        row.teacher_id,
+        row.event_type,
+        row.exam_kind,
+        row.exam_id,
+      ].join(':');
+      const list = groups.get(key) ?? [];
+      list.push(row);
+      groups.set(key, list);
+    }
+
+    let groupsProcessed = 0;
+    let transactionsDeleted = 0;
+    let transactionsUpdated = 0;
+    let pointsRemovedFromBalances = 0;
+
+    for (const [, rows] of groups) {
+      if (rows.length === 0) continue;
+
+      // أول محاولة حقيقية (مفاتيح :attempt:) لها أولوية على الصفوف الجديدة بنفس الرقم
+      const sorted = [...rows].sort((a, b) => {
+        const an = Number(a.attempt_number) || 1;
+        const bn = Number(b.attempt_number) || 1;
+        if (an !== bn) return an - bn;
+        const aLegacy = Number(a.is_new_format) === 0 ? 0 : 1;
+        const bLegacy = Number(b.is_new_format) === 0 ? 0 : 1;
+        if (aLegacy !== bLegacy) return aLegacy - bLegacy;
+        const at = new Date(a.created_at).getTime();
+        const bt = new Date(b.created_at).getTime();
+        if (at !== bt) return at - bt;
+        return Number(a.id) - Number(b.id);
+      });
+
+      const first = sorted[0]!;
+      const examId = Number(first.exam_id);
+      const isAssignment =
+        first.event_type.startsWith('ASSIGNMENT_') || first.exam_kind === 'assignment';
+      const examKind: 'lecture' | 'course' =
+        first.exam_kind === 'course_exam' ? 'course' : 'lecture';
+      const newKey = this.examPointsReferenceKey({
+        eventType: first.event_type as PointsEventType,
+        teacherId: Number(first.teacher_id),
+        studentId: Number(first.student_id),
+        examId,
+        isAssignment,
+        examKind: isAssignment ? 'lecture' : examKind,
+      });
+
+      const keepPoints = Math.max(0, Math.floor(Number(first.points) || 0));
+      const totalPointsInGroup = sorted.reduce(
+        (sum, r) => sum + Math.max(0, Math.floor(Number(r.points) || 0)),
+        0,
+      );
+      const removeFromBalance = Math.max(0, totalPointsInGroup - keepPoints);
+
+      // صف واحد بالمفتاح الجديد فقط ولا زيادة → لا شيء
+      if (
+        sorted.length === 1 &&
+        sorted[0]!.reference_key === newKey &&
+        Number(sorted[0]!.points) === keepPoints
+      ) {
+        continue;
+      }
+
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+
+        const keepId = Number(first.id);
+        const deleteIds = sorted.map((r) => Number(r.id)).filter((id) => id !== keepId);
+
+        if (deleteIds.length) {
+          const del = await client.query(
+            `DELETE FROM point_transactions WHERE id = ANY($1::int[])`,
+            [deleteIds],
+          );
+          transactionsDeleted += del.rowCount ?? 0;
+        }
+
+        // إن كان يوجد صف آخر بنفس المفتاح الجديد (نادر) احذفه بعد نقل النقاط
+        const conflict = await client.query<{ id: number; points: number }>(
+          `SELECT id, points FROM point_transactions
+           WHERE reference_key = $1 AND id <> $2
+           FOR UPDATE`,
+          [newKey, keepId],
+        );
+        if (conflict.rowCount) {
+          for (const c of conflict.rows) {
+            await client.query(`DELETE FROM point_transactions WHERE id = $1`, [c.id]);
+            transactionsDeleted += 1;
+            // النقاط دي كانت ضمن المجموعة أو إضافية — إن لم تُحسب في totalPointsInGroup أزلها
+            if (!sorted.some((r) => Number(r.id) === Number(c.id))) {
+              const extra = Math.max(0, Math.floor(Number(c.points) || 0));
+              if (extra > 0) {
+                await client.query(
+                  `UPDATE student_point_balances
+                   SET total_points = GREATEST(0, total_points - $1), updated_at = NOW()
+                   WHERE student_id = $2 AND teacher_id = $3 AND grade_id = $4`,
+                  [extra, first.student_id, first.teacher_id, first.grade_id],
+                );
+                pointsRemovedFromBalances += extra;
+              }
+            }
+          }
+        }
+
+        const refType = isAssignment
+          ? 'assignment'
+          : examKind === 'course'
+            ? 'course_exam'
+            : 'lecture_exam';
+
+        await client.query(
+          `UPDATE point_transactions
+           SET points = $1,
+               reference_key = $2,
+               reference_type = $3,
+               reference_id = $4,
+               metadata = COALESCE(metadata, '{}'::jsonb) || $5::jsonb
+           WHERE id = $6`,
+          [
+            keepPoints,
+            newKey,
+            refType,
+            examId,
+            JSON.stringify({
+              examId,
+              attemptId: first.reference_id,
+              consolidated: true,
+              consolidated_from_attempts: sorted.length,
+              kept_attempt_number: Number(first.attempt_number) || 1,
+            }),
+            keepId,
+          ],
+        );
+        transactionsUpdated += 1;
+
+        if (removeFromBalance > 0) {
+          await client.query(
+            `UPDATE student_point_balances
+             SET total_points = GREATEST(0, total_points - $1),
+                 updated_at = NOW()
+             WHERE student_id = $2 AND teacher_id = $3 AND grade_id = $4`,
+            [removeFromBalance, first.student_id, first.teacher_id, first.grade_id],
+          );
+          pointsRemovedFromBalances += removeFromBalance;
+        }
+
+        await client.query('COMMIT');
+        groupsProcessed += 1;
+      } catch (err) {
+        await client.query('ROLLBACK');
+        console.error(
+          '[TeacherPoints] consolidate group failed',
+          {
+            studentId: first.student_id,
+            teacherId: first.teacher_id,
+            eventType: first.event_type,
+            examId,
+          },
+          err,
+        );
+      } finally {
+        client.release();
+      }
+    }
+
+    return {
+      groupsProcessed,
+      transactionsDeleted,
+      transactionsUpdated,
+      pointsRemovedFromBalances,
+    };
+  }
+
+  /**
    * تصفير نقاط كل طلاب المدرس والبدء من جديد.
    * يحذف المعاملات + الأرصدة حتى يمكن إعادة منح نقاط الامتحان/الفيديو (idempotency keys).
    * يتطلب confirm = "RESET_ALL_POINTS".

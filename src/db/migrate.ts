@@ -77,6 +77,27 @@ export async function applyMigrations(databaseUrl: string, direction: 'up' | 'do
 
   if (direction !== 'up') return;
 
+  // توحيد نقاط الامتحان القديمة (لكل محاولة → مرة واحدة لكل امتحان) بعد أي migrate up
+  try {
+    const hasPoints = await pool.query(
+      `SELECT 1 FROM information_schema.tables
+       WHERE table_schema = 'public' AND table_name = 'point_transactions'
+       LIMIT 1`,
+    );
+    if ((hasPoints.rowCount ?? 0) > 0) {
+      const { TeacherPointsService } = await import('../services/teacherPoints');
+      const consolidated =
+        await TeacherPointsService.consolidateLegacyOncePerExamPoints({});
+      if (consolidated.groupsProcessed > 0 || consolidated.transactionsDeleted > 0) {
+        console.log(
+          `[TeacherPoints] consolidated legacy exam points: groups=${consolidated.groupsProcessed}, deleted=${consolidated.transactionsDeleted}, removed=${consolidated.pointsRemovedFromBalances}`,
+        );
+      }
+    }
+  } catch (err) {
+    console.warn('[TeacherPoints] legacy exam points consolidation skipped:', err);
+  }
+
   const { FIRST_SUPERUSER, FIRST_SUPERUSER_PASSWORD } = config;
 
   if (!FIRST_SUPERUSER || !FIRST_SUPERUSER_PASSWORD) return;
