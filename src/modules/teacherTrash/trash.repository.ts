@@ -1,3 +1,4 @@
+import bcrypt from 'bcrypt';
 import pool from '../../db/pool';
 import type { RecordTrashSnapshotInput, TrashEntityType, TrashListItem } from './types';
 
@@ -513,6 +514,251 @@ export class TeacherTrashRepository {
       ],
     );
     return result.rows[0]?.id ?? null;
+  }
+
+  /**
+   * استعادة حساب طالب منصة من snapshot.
+   * يعيد إدراج صف users + الصف/المجموعة إن وُجدت في النسخة.
+   */
+  static async restorePlatformStudentFromSnapshot(
+    snapshot: Record<string, unknown>,
+    teacherId: number,
+  ): Promise<number | null> {
+    const user =
+      snapshot.user && typeof snapshot.user === 'object'
+        ? (snapshot.user as Record<string, unknown>)
+        : snapshot;
+
+    const preferredId = Number(user.id ?? snapshot.id);
+    const tenantId = Number(user.tenant_id ?? snapshot.tenant_id);
+    if (!Number.isInteger(tenantId) || tenantId <= 0) return null;
+
+    const owns = await pool.query(
+      `SELECT 1 FROM tenants WHERE id = $1 AND owner_user_id = $2 AND is_active = TRUE`,
+      [tenantId, teacherId],
+    );
+    if (!owns.rowCount) return null;
+
+    const name = String(user.name ?? snapshot.name ?? '').trim();
+    if (!name) return null;
+
+    const phone =
+      user.phone != null && String(user.phone).trim()
+        ? String(user.phone).trim()
+        : null;
+    const parentPhone =
+      user.parent_phone != null && String(user.parent_phone).trim()
+        ? String(user.parent_phone).trim()
+        : null;
+    const email =
+      user.email != null && String(user.email).trim()
+        ? String(user.email).trim()
+        : null;
+    let studentCode =
+      user.student_code != null && String(user.student_code).trim()
+        ? String(user.student_code).replace(/\D/g, '')
+        : null;
+    if (studentCode === '') studentCode = null;
+
+    // تعارضات فريدة مع حسابات أخرى موجودة
+    if (phone) {
+      const phoneTaken = await pool.query(
+        `SELECT id FROM users WHERE phone = $1 AND tenant_id = $2 LIMIT 1`,
+        [phone, tenantId],
+      );
+      if (phoneTaken.rowCount) return null;
+    }
+    if (studentCode) {
+      const codeTaken = await pool.query(
+        `SELECT id FROM users WHERE student_code = $1 LIMIT 1`,
+        [studentCode],
+      );
+      if (codeTaken.rowCount) return null;
+    }
+    if (email) {
+      const emailTaken = await pool.query(
+        `SELECT id FROM users WHERE email = $1 AND tenant_id = $2 LIMIT 1`,
+        [email, tenantId],
+      );
+      if (emailTaken.rowCount) return null;
+    }
+
+    let passwordHash =
+      typeof user.password === 'string' && user.password.trim()
+        ? user.password.trim()
+        : null;
+    let mustChangePassword = Boolean(user.must_change_password ?? false);
+    if (!passwordHash) {
+      // نسخ قديمة بدون كلمة مرور — كلمة مؤقتة ويُطلب تغييرها
+      const temp = Math.random().toString(36).slice(-10) + 'A1';
+      passwordHash = await bcrypt.hash(temp, 10);
+      mustChangePassword = true;
+    }
+
+    const accountStatus =
+      typeof user.account_status === 'string' && user.account_status.trim()
+        ? user.account_status.trim()
+        : 'active';
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      let newId: number | null = null;
+      const canReuseId =
+        Number.isInteger(preferredId) &&
+        preferredId > 0 &&
+        !(
+          await client.query(`SELECT 1 FROM users WHERE id = $1`, [preferredId])
+        ).rowCount;
+
+      if (canReuseId) {
+        const inserted = await client.query<{ id: number }>(
+          `INSERT INTO users (
+             id, name, phone, parent_phone, email, password, role, tenant_id,
+             student_code, must_change_password, managed_by_teacher_id,
+             account_status, avatar, created_at
+           ) VALUES (
+             $1, $2, $3, $4, $5, $6, 'student', $7,
+             $8, $9, $10, $11, $12, COALESCE($13::timestamptz, NOW())
+           )
+           RETURNING id`,
+          [
+            preferredId,
+            name,
+            phone,
+            parentPhone,
+            email,
+            passwordHash,
+            tenantId,
+            studentCode,
+            mustChangePassword,
+            user.managed_by_teacher_id ?? teacherId,
+            accountStatus === 'inactive' || accountStatus === 'suspended'
+              ? accountStatus
+              : 'active',
+            user.avatar ?? null,
+            user.created_at ?? null,
+          ],
+        );
+        newId = inserted.rows[0]?.id ?? null;
+        await client.query(
+          `SELECT setval(
+             pg_get_serial_sequence('users', 'id'),
+             GREATEST((SELECT MAX(id) FROM users), 1)
+           )`,
+        );
+      } else {
+        const inserted = await client.query<{ id: number }>(
+          `INSERT INTO users (
+             name, phone, parent_phone, email, password, role, tenant_id,
+             student_code, must_change_password, managed_by_teacher_id,
+             account_status, avatar, created_at
+           ) VALUES (
+             $1, $2, $3, $4, $5, 'student', $6,
+             $7, $8, $9, $10, $11, COALESCE($12::timestamptz, NOW())
+           )
+           RETURNING id`,
+          [
+            name,
+            phone,
+            parentPhone,
+            email,
+            passwordHash,
+            tenantId,
+            studentCode,
+            mustChangePassword,
+            user.managed_by_teacher_id ?? teacherId,
+            accountStatus === 'inactive' || accountStatus === 'suspended'
+              ? accountStatus
+              : 'active',
+            user.avatar ?? null,
+            user.created_at ?? null,
+          ],
+        );
+        newId = inserted.rows[0]?.id ?? null;
+      }
+
+      if (!newId) {
+        await client.query('ROLLBACK');
+        return null;
+      }
+
+      const nestedGrade =
+        snapshot.grade && typeof snapshot.grade === 'object'
+          ? (snapshot.grade as Record<string, unknown>).id
+          : undefined;
+      const gradeId = Number(snapshot.grade_id ?? user.grade_id ?? nestedGrade);
+      if (Number.isInteger(gradeId) && gradeId > 0) {
+        await client.query(
+          `INSERT INTO user_grades (user_id, grade_id) VALUES ($1, $2)
+           ON CONFLICT DO NOTHING`,
+          [newId, gradeId],
+        );
+      }
+
+      const nestedGroup =
+        snapshot.group && typeof snapshot.group === 'object'
+          ? (snapshot.group as Record<string, unknown>).id
+          : undefined;
+      const groupId = Number(snapshot.group_id ?? user.group_id ?? nestedGroup);
+      if (Number.isInteger(groupId) && groupId > 0) {
+        await client.query('SAVEPOINT restore_group_sp');
+        try {
+          const numRes = await client.query<{ next_num: string }>(
+            `SELECT COALESCE(MAX(number_in_group), 0) + 1 AS next_num
+             FROM group_students WHERE group_id = $1`,
+            [groupId],
+          );
+          await client.query(
+            `INSERT INTO group_students (group_id, student_id, number_in_group)
+             VALUES ($1, $2, $3)
+             ON CONFLICT (group_id, student_id) DO NOTHING`,
+            [groupId, newId, Number(numRes.rows[0]?.next_num ?? 1)],
+          );
+          await client.query('RELEASE SAVEPOINT restore_group_sp');
+        } catch {
+          await client.query('ROLLBACK TO SAVEPOINT restore_group_sp');
+        }
+      }
+
+      const nestedCourseGroup =
+        snapshot.course_group && typeof snapshot.course_group === 'object'
+          ? (snapshot.course_group as Record<string, unknown>).id
+          : undefined;
+      const courseGroupIdsRaw = snapshot.course_group_ids ?? user.course_group_ids;
+      const courseGroupIds = Array.isArray(courseGroupIdsRaw)
+        ? courseGroupIdsRaw.map((v) => Number(v)).filter((v) => Number.isInteger(v) && v > 0)
+        : Number.isInteger(
+              Number(snapshot.course_group_id ?? user.course_group_id ?? nestedCourseGroup),
+            ) &&
+            Number(snapshot.course_group_id ?? user.course_group_id ?? nestedCourseGroup) > 0
+          ? [Number(snapshot.course_group_id ?? user.course_group_id ?? nestedCourseGroup)]
+          : [];
+
+      for (const cgId of courseGroupIds) {
+        await client.query('SAVEPOINT restore_cg_sp');
+        try {
+          await client.query(
+            `INSERT INTO student_course_group_memberships (student_id, group_id, updated_at)
+             VALUES ($1, $2, NOW())
+             ON CONFLICT (student_id, group_id) DO NOTHING`,
+            [newId, cgId],
+          );
+          await client.query('RELEASE SAVEPOINT restore_cg_sp');
+        } catch {
+          await client.query('ROLLBACK TO SAVEPOINT restore_cg_sp');
+        }
+      }
+
+      await client.query('COMMIT');
+      return newId;
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
   }
 
   static async restoreLectureFromSnapshot(

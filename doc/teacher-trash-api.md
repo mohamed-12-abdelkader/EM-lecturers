@@ -51,7 +51,7 @@ npm run migrate up
 | `course_file` | PDF كورس | ✅ إذا لم يُمسح من التخزين |
 | `course` | كورس (snapshot) | ⚠️ استعادة جزئية للسجل |
 | `lecture` | محاضرة (snapshot) | ⚠️ استعادة جزئية |
-| `platform_student` | طالب منصة | ❌ للعرض فقط |
+| `platform_student` | طالب منصة | ✅ من snapshot (يستعيد الحساب + الصف/المجموعة) |
 
 ### Response
 
@@ -151,6 +151,10 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
 # استعادة ملف PDF
 curl -X POST -H "Authorization: Bearer $TOKEN" \
   "http://localhost:8000/api/teacher/trash/course_file/7/restore"
+
+# استعادة حساب طالب منصة (id = snapshot_id من القائمة، source=snapshot)
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  "http://localhost:8000/api/teacher/trash/platform_student/15/restore?source=snapshot"
 ```
 
 ---

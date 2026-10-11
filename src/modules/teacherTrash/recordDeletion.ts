@@ -52,22 +52,36 @@ export async function snapshotLectureBeforeDelete(
   });
 }
 
+/**
+ * يحفظ نسخة كاملة لحساب طالب المنصة قبل/بعد الحذف النهائي لاستعادته لاحقاً.
+ * يُفضّل أن يحتوي snapshot على { user, grade_id, group_id, course_group_ids }.
+ */
 export async function snapshotPlatformStudentBeforeDelete(
-  student: Record<string, unknown> & { id: number; name?: string; email?: string },
+  student: Record<string, unknown> & { id: number; name?: string; email?: string; phone?: string },
   teacherId: number,
   tenantId: number,
   deletedBy?: number,
 ): Promise<void> {
+  const user =
+    student.user && typeof student.user === 'object'
+      ? (student.user as Record<string, unknown>)
+      : student;
+  const studentId = Number(user.id ?? student.id);
+  const name = String(user.name ?? student.name ?? `طالب #${studentId}`);
+  const subtitle = String(
+    user.student_code ?? student.student_code ?? user.phone ?? student.phone ?? user.email ?? student.email ?? '',
+  );
+
   await recordTeacherTrashSnapshot({
     teacherId,
     tenantId,
     entityType: 'platform_student',
-    entityId: student.id,
-    title: String(student.name || student.email || `طالب #${student.id}`),
-    subtitle: String(student.email || ''),
+    entityId: studentId,
+    title: name,
+    subtitle: subtitle || null,
     snapshot: student,
     deletedBy: deletedBy ?? teacherId,
-    canRestore: false,
-    restoreBlockers: ['HARD_DELETE_NO_RECOVERY'],
+    canRestore: true,
+    restoreBlockers: [],
   });
 }

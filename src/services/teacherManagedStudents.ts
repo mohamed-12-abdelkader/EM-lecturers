@@ -755,12 +755,71 @@ export class TeacherManagedStudentsService {
     return this.getStudentById(teacherId, tenantId, studentId);
   }
 
+  /** يجمع بيانات كافية لاستعادة حساب الطالب من المحذوفات */
+  private static async buildPlatformStudentTrashSnapshot(
+    client: PoolClient | typeof pool,
+    studentId: number,
+    tenantId: number,
+    teacherId: number,
+  ): Promise<Record<string, unknown> | null> {
+    const userRes = await client.query(
+      `SELECT * FROM users WHERE id = $1 AND role = 'student' AND tenant_id = $2`,
+      [studentId, tenantId],
+    );
+    const user = userRes.rows[0];
+    if (!user) return null;
+
+    const gradeRes = await client.query<{ grade_id: number }>(
+      `SELECT grade_id FROM user_grades WHERE user_id = $1 ORDER BY grade_id LIMIT 1`,
+      [studentId],
+    );
+    const groupRes = await client.query<{ group_id: number }>(
+      `SELECT group_id FROM group_students WHERE student_id = $1 LIMIT 1`,
+      [studentId],
+    );
+    let courseGroupIds: number[] = [];
+    try {
+      const cgRes = await client.query<{ group_id: number }>(
+        `SELECT m.group_id
+         FROM student_course_group_memberships m
+         JOIN course_groups cg ON cg.id = m.group_id
+         WHERE m.student_id = $1 AND cg.teacher_id = $2`,
+        [studentId, teacherId],
+      );
+      courseGroupIds = cgRes.rows.map((r) => Number(r.group_id));
+    } catch {
+      courseGroupIds = [];
+    }
+
+    return {
+      id: user.id,
+      name: user.name,
+      email: user.email,
+      phone: user.phone,
+      student_code: user.student_code,
+      tenant_id: user.tenant_id,
+      user,
+      grade_id: gradeRes.rows[0]?.grade_id ?? null,
+      group_id: groupRes.rows[0]?.group_id ?? null,
+      course_group_ids: courseGroupIds,
+      course_group_id: courseGroupIds[0] ?? null,
+    };
+  }
+
   static async deleteStudent(teacherId: number, tenantId: number, studentId: number) {
-    const student = await this.getStudentById(teacherId, tenantId, studentId);
+    await this.getStudentById(teacherId, tenantId, studentId);
 
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
+
+      const trashSnapshot = await this.buildPlatformStudentTrashSnapshot(
+        client,
+        studentId,
+        tenantId,
+        teacherId,
+      );
+
       await this.purgeStudentRelatedRows(client, [studentId]);
       const del = await client.query(
         `DELETE FROM users
@@ -773,12 +832,14 @@ export class TeacherManagedStudentsService {
       }
       await client.query('COMMIT');
 
-      await snapshotPlatformStudentBeforeDelete(
-        student as Record<string, unknown> & { id: number; name?: string; email?: string },
-        teacherId,
-        tenantId,
-        teacherId,
-      );
+      if (trashSnapshot) {
+        await snapshotPlatformStudentBeforeDelete(
+          trashSnapshot as Record<string, unknown> & { id: number; name?: string; email?: string },
+          teacherId,
+          tenantId,
+          teacherId,
+        );
+      }
 
       return { deleted: true, student_id: studentId };
     } catch (e: unknown) {
@@ -832,6 +893,17 @@ export class TeacherManagedStudentsService {
         return { deleted: true, deleted_count: 0 };
       }
 
+      const trashSnapshots: Record<string, unknown>[] = [];
+      for (const id of ids) {
+        const snap = await this.buildPlatformStudentTrashSnapshot(
+          client,
+          id,
+          tenantId,
+          teacherId,
+        );
+        if (snap) trashSnapshots.push(snap);
+      }
+
       await this.purgeStudentRelatedRows(client, ids);
 
       const del = await client.query(
@@ -841,6 +913,16 @@ export class TeacherManagedStudentsService {
       );
 
       await client.query('COMMIT');
+
+      for (const snap of trashSnapshots) {
+        await snapshotPlatformStudentBeforeDelete(
+          snap as Record<string, unknown> & { id: number; name?: string; email?: string },
+          teacherId,
+          tenantId,
+          teacherId,
+        );
+      }
+
       return {
         deleted: true,
         deleted_count: del.rowCount ?? 0,

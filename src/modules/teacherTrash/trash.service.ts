@@ -142,12 +142,23 @@ export class TeacherTrashService {
       case 'lecture':
         entityId = await TeacherTrashRepository.restoreLectureFromSnapshot(snapshot, teacherId);
         break;
+      case 'platform_student':
+        entityId = await TeacherTrashRepository.restorePlatformStudentFromSnapshot(
+          snapshot,
+          teacherId,
+        );
+        break;
       default:
         throw new HttpError(400, `نوع الاستعادة غير مدعوم: ${row.entity_type}`);
     }
 
     if (!entityId) {
-      throw new HttpError(409, 'تعذّرت استعادة العنصر — قد يكون موجوداً بالفعل أو بياناته ناقصة');
+      throw new HttpError(
+        409,
+        row.entity_type === 'platform_student'
+          ? 'تعذّرت استعادة حساب الطالب — قد يكون الهاتف أو كود الطالب مستخدماً بالفعل، أو البيانات ناقصة'
+          : 'تعذّرت استعادة العنصر — قد يكون موجوداً بالفعل أو بياناته ناقصة',
+      );
     }
 
     await TeacherTrashRepository.markSnapshotRestored(snapshotId, teacherId);
