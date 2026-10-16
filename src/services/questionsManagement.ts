@@ -269,14 +269,16 @@ export class QuestionsManagementService {
       throw new Error('امتحان المحاضرة غير موجود');
     }
 
-    // جلب الأسئلة مع الاختيارات
-    const result = await pool.query(
-      `SELECT 
+    // جلب الأسئلة مع الاختيارات (+ روابط القطعة من المكتبة/البنك/snapshot)
+    const selectWithSnapshot = `SELECT 
         eq.id,
         eq.question_text as text,
         eq.grade,
         eq.image,
         eq.teacher_question_id,
+        eq.question_id_v2,
+        eq.passage_text,
+        eq.passage_title,
         q.id as question_id,
         q.text as question_text_from_questions,
         q.image as question_image_from_questions,
@@ -287,9 +289,32 @@ export class QuestionsManagementService {
        LEFT JOIN questions q ON eq.question_id = q.id
        LEFT JOIN question_choices qc ON q.id = qc.question_id
        WHERE eq.exam_id = $1
-       ORDER BY eq.id, qc.id`,
-      [examId],
-    );
+       ORDER BY eq.id, qc.id`;
+    const selectLegacy = `SELECT 
+        eq.id,
+        eq.question_text as text,
+        eq.grade,
+        eq.image,
+        eq.teacher_question_id,
+        eq.question_id_v2,
+        q.id as question_id,
+        q.text as question_text_from_questions,
+        q.image as question_image_from_questions,
+        qc.id as choice_id,
+        qc.text as choice_text,
+        qc.is_correct
+       FROM exam_questions eq
+       LEFT JOIN questions q ON eq.question_id = q.id
+       LEFT JOIN question_choices qc ON q.id = qc.question_id
+       WHERE eq.exam_id = $1
+       ORDER BY eq.id, qc.id`;
+
+    let result: { rowCount: number | null; rows: any[] };
+    try {
+      result = await pool.query(selectWithSnapshot, [examId]);
+    } catch {
+      result = await pool.query(selectLegacy, [examId]);
+    }
 
     if (!result.rowCount) {
       return [];
@@ -318,6 +343,9 @@ export class QuestionsManagementService {
           image: hasImage ? row.image || row.question_image_from_questions : null,
           grade: row.grade,
           teacher_question_id: row.teacher_question_id ?? null,
+          question_id_v2: row.question_id_v2 ?? null,
+          passage_text: row.passage_text ?? null,
+          passage_title: row.passage_title ?? null,
           choices: [],
         });
       }

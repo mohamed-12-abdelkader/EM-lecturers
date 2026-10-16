@@ -1704,14 +1704,27 @@ export class CourseLevelExamsService {
     );
     if (!attemptRes.rowCount) return [];
     const attempt = attemptRes.rows[0];
-    const questionsRes = await pool.query(
-      `SELECT id, type, question_text, question_image, option_a, option_b, option_c, option_d,
-              correct_answer, correct_answer_2, teacher_question_id
-       FROM course_level_exam_questions
-       WHERE exam_id = $1
-       ORDER BY created_at ASC, id ASC`,
-      [attempt.exam_id],
-    );
+    let questionsRes: { rows: any[] };
+    try {
+      questionsRes = await pool.query(
+        `SELECT id, type, question_text, question_image, option_a, option_b, option_c, option_d,
+                correct_answer, correct_answer_2, teacher_question_id, question_id_v2,
+                passage_text, passage_title
+         FROM course_level_exam_questions
+         WHERE exam_id = $1
+         ORDER BY created_at ASC, id ASC`,
+        [attempt.exam_id],
+      );
+    } catch {
+      questionsRes = await pool.query(
+        `SELECT id, type, question_text, question_image, option_a, option_b, option_c, option_d,
+                correct_answer, correct_answer_2, teacher_question_id, question_id_v2
+         FROM course_level_exam_questions
+         WHERE exam_id = $1
+         ORDER BY created_at ASC, id ASC`,
+        [attempt.exam_id],
+      );
+    }
     const questionsWithPassages =
       await TeacherReadingPassagesService.attachPassagesByTeacherQuestionIds(questionsRes.rows);
     const questionsById = new Map(questionsWithPassages.map((q) => [Number(q.id), q]));
@@ -3258,7 +3271,22 @@ export class CourseLevelExamsService {
       // @ts-ignore
             if (result.rowCount > 0) {
               addedCount++;
-              addedQuestions.push(result.rows[0]);
+              let row = result.rows[0];
+              try {
+                const snap = await pool.query(
+                  `UPDATE course_level_exam_questions cq
+                   SET passage_text = p.content, passage_title = p.title
+                   FROM questions_v2 q
+                   JOIN question_passages p ON p.id = q.passage_id
+                   WHERE cq.id = $1 AND q.id = $2
+                   RETURNING cq.*`,
+                  [row.id, question.id],
+                );
+                if (snap.rows[0]) row = snap.rows[0];
+              } catch {
+                // snapshot columns / passages may be missing
+              }
+              addedQuestions.push(row);
             }
           } catch (insertError: any) {
             console.error(

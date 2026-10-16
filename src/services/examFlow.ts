@@ -588,6 +588,19 @@ export class ExamFlowService {
       } catch {
         // الجدول قد يكون غير موجود قبل تشغيل migration 1700000007006
       }
+      // Snapshot نص القطعة من بنك الأسئلة
+      try {
+        await db.query(
+          `UPDATE exam_questions eq
+           SET passage_text = p.content, passage_title = p.title
+           FROM questions_v2 q
+           JOIN question_passages p ON p.id = q.passage_id
+           WHERE eq.id = $1 AND q.id = $2`,
+          [row.id, row.question_id_v2],
+        );
+      } catch {
+        // passage snapshot columns / question_passages may be missing
+      }
     }
 
     // 2. Identify remaining IDs that were NOT found in V2
@@ -836,6 +849,21 @@ export class ExamFlowService {
         );
         const examQuestionId = examQuestionRes.rows[0].id as number;
         examQuestionIds.push(examQuestionId);
+
+        // Snapshot نص القطعة على صف الامتحان (لا يعتمد على عمود options القديم)
+        await client.query('SAVEPOINT sp_exam_passage_snapshot');
+        try {
+          await client.query(
+            `UPDATE exam_questions
+             SET passage_text = $1, passage_title = $2
+             WHERE id = $3`,
+            [passage.content, passage.title, examQuestionId],
+          );
+          await client.query('RELEASE SAVEPOINT sp_exam_passage_snapshot');
+        } catch {
+          await client.query('ROLLBACK TO SAVEPOINT sp_exam_passage_snapshot');
+          await client.query('RELEASE SAVEPOINT sp_exam_passage_snapshot');
+        }
 
         // مهم: أي خطأ داخل transaction يفسدها بالكامل، لذا نستخدم SAVEPOINT
         // لإبقاء إدراج snapshot اختياريًا بدون كسر العملية الأساسية.
@@ -2871,16 +2899,58 @@ export class ExamFlowService {
       }
     }
 
+    // Snapshot على exam_questions.passage_text (إن وُجدت الأعمدة)
+    const stillMissing = questions.filter((q) => !q.passage).map((q) => q.id);
+    const allExamIds = questions.map((q) => q.id);
+    if (allExamIds.length > 0) {
+      try {
+        const snapRes = await pool.query<{
+          id: number;
+          passage_text: string | null;
+          passage_title: string | null;
+        }>(
+          `SELECT id, passage_text, passage_title
+           FROM exam_questions
+           WHERE id = ANY($1::int[])
+             AND passage_text IS NOT NULL
+             AND TRIM(passage_text) <> ''`,
+          [allExamIds],
+        );
+        for (const row of snapRes.rows) {
+          const question = map.get(row.id);
+          if (!question) continue;
+          // Snapshot fills gaps; also prefer non-empty snapshot if linked passage missing
+          if (!question.passage && stillMissing.includes(row.id)) {
+            question.passage = {
+              id: question.passage_id ?? null,
+              title: row.passage_title,
+              content: row.passage_text as string,
+            };
+          } else if (!question.passage) {
+            question.passage = {
+              id: question.passage_id ?? null,
+              title: row.passage_title,
+              content: row.passage_text as string,
+            };
+          }
+        }
+      } catch {
+        // passage_text columns may be missing before migration
+      }
+    }
+
     return Array.from(map.values());
   }
 
   private static sanitizeOneQuestion(question: ExamQuestion, includeCorrect: boolean) {
+    const passageContent = question.passage?.content ?? null;
     const passage = question.passage
       ? {
           id: question.passage.id,
           title: question.passage.title ?? null,
           content: question.passage.content,
           text: question.passage.content,
+          passageText: question.passage.content,
         }
       : null;
     return {
@@ -2889,6 +2959,8 @@ export class ExamFlowService {
       text: question.text,
       image: question.image,
       grade: question.grade,
+      passageId: question.passage_id ?? question.passage?.id ?? null,
+      passageText: passageContent,
       passage,
       ...(question.isVisible !== undefined && includeCorrect ? { isVisible: question.isVisible } : {}),
       choices: question.choices.map((choice) => ({

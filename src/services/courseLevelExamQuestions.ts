@@ -533,6 +533,10 @@ export class CourseLevelExamQuestionsService {
       throw new HttpError(404, 'Question not found');
     }
 
-    return result.rows[0];
+    const { TeacherReadingPassagesService } = await import('./teacherReadingPassages.js');
+    const [withPassage] = await TeacherReadingPassagesService.attachPassagesByTeacherQuestionIds(
+      result.rows,
+    );
+    return withPassage ?? result.rows[0];
   }
 }

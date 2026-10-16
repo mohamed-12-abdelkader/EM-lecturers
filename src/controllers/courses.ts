@@ -2520,14 +2520,27 @@ router.get(
       // Use explicit integer casting to ensure type matching
       console.log(`[GET /course-exam/:examId/questions] Fetching questions for exam ${examId} (type: ${typeof examId})`);
 
-      const questionsRes = await pool.query(
-        `SELECT id, type, question_text, question_image, option_a, option_b, option_c, option_d,
-                correct_answer, exam_id, teacher_question_id
-         FROM course_level_exam_questions
-         WHERE exam_id = $1::integer
-         ORDER BY id ASC`,
-        [examId],
-      );
+      let questionsRes: { rowCount: number | null; rows: any[] };
+      try {
+        questionsRes = await pool.query(
+          `SELECT id, type, question_text, question_image, option_a, option_b, option_c, option_d,
+                  correct_answer, exam_id, teacher_question_id, question_id_v2,
+                  passage_text, passage_title
+           FROM course_level_exam_questions
+           WHERE exam_id = $1::integer
+           ORDER BY id ASC`,
+          [examId],
+        );
+      } catch {
+        questionsRes = await pool.query(
+          `SELECT id, type, question_text, question_image, option_a, option_b, option_c, option_d,
+                  correct_answer, exam_id, teacher_question_id, question_id_v2
+           FROM course_level_exam_questions
+           WHERE exam_id = $1::integer
+           ORDER BY id ASC`,
+          [examId],
+        );
+      }
 
       console.log(`[GET /course-exam/:examId/questions] Found ${questionsRes.rowCount} questions for exam ${examId}`);
 

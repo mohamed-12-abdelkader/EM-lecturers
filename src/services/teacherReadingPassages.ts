@@ -5,6 +5,7 @@ import { HttpError } from '../utils';
 import { TeacherActivityLogService } from './teacherActivityLog';
 import { ExamFlowService } from './examFlow';
 import { CourseLevelExamQuestionsService } from './courseLevelExamQuestions';
+import { buildPassagePayload, coalescePassageText } from './passageHelpers';
 
 const MIN_OPTIONS = 2;
 const MAX_OPTIONS = 5;
@@ -537,6 +538,8 @@ export class TeacherReadingPassagesService {
       passageId: formatted.id,
       lessonId: formatted.lessonId,
       title: formatted.title,
+      passageText: formatted.passageText,
+      content: formatted.content,
       questions: formatted.questions,
       questionsCount: formatted.questionsCount,
     };
@@ -551,16 +554,29 @@ export class TeacherReadingPassagesService {
     return formatQuestionRow(question, passage);
   }
 
-  /** إرفاق قطعة القراءة بأسئلة امتحان الكورس عبر teacher_question_id */
+  /**
+   * إرفاق نص القطعة بأسئلة الامتحان من:
+   * 1) snapshot على صف الامتحان (passage_text)
+   * 2) مكتبة المدرّس (teacher_question_id → teacher_question_passages)
+   * 3) بنك الأسئلة (question_id_v2 → question_passages)
+   */
   static async attachPassagesByTeacherQuestionIds<
-    T extends { teacher_question_id?: number | null },
+    T extends {
+      teacher_question_id?: number | null;
+      question_id_v2?: number | null;
+      passage_text?: string | null;
+      passage_title?: string | null;
+      passageText?: string | null;
+      passageId?: number | null;
+      passage?: unknown;
+    },
   >(
     rows: T[],
   ): Promise<
     Array<
       T & {
         passage: {
-          id: number;
+          id: number | null;
           text: string;
           passageText: string;
           content: string;
@@ -579,7 +595,19 @@ export class TeacherReadingPassagesService {
       ),
     ];
 
+    const bankQuestionIds = [
+      ...new Set(
+        rows
+          .map((r) => (r.question_id_v2 != null ? Number(r.question_id_v2) : null))
+          .filter((id): id is number => id != null && Number.isInteger(id) && id > 0),
+      ),
+    ];
+
     const passageByTeacherQuestionId = new Map<
+      number,
+      { id: number; text: string; title: string | null }
+    >();
+    const passageByBankQuestionId = new Map<
       number,
       { id: number; text: string; title: string | null }
     >();
@@ -610,23 +638,71 @@ export class TeacherReadingPassagesService {
       }
     }
 
+    if (bankQuestionIds.length) {
+      try {
+        const res = await pool.query<{
+          question_id_v2: number;
+          passage_id: number;
+          title: string | null;
+          content: string;
+        }>(
+          `SELECT q.id AS question_id_v2, p.id AS passage_id, p.title, p.content
+           FROM questions_v2 q
+           JOIN question_passages p ON p.id = q.passage_id
+           WHERE q.id = ANY($1::int[])`,
+          [bankQuestionIds],
+        );
+        for (const row of res.rows) {
+          passageByBankQuestionId.set(row.question_id_v2, {
+            id: row.passage_id,
+            text: row.content,
+            title: row.title,
+          });
+        }
+      } catch {
+        // older DBs may not have question_passages
+      }
+    }
+
     return rows.map((row) => {
+      const snapshotRaw =
+        (row.passage_text != null && String(row.passage_text).trim() !== ''
+          ? String(row.passage_text)
+          : null) ??
+        (row.passageText != null && String(row.passageText).trim() !== ''
+          ? String(row.passageText)
+          : null);
+      const snapshotTitle =
+        row.passage_title != null
+          ? String(row.passage_title)
+          : null;
+
       const tqId = row.teacher_question_id != null ? Number(row.teacher_question_id) : null;
-      const raw = tqId != null ? passageByTeacherQuestionId.get(tqId) ?? null : null;
-      const passage = raw
-        ? {
-            id: raw.id,
-            text: raw.text,
-            passageText: raw.text,
-            content: raw.text,
-            title: raw.title,
-          }
-        : null;
+      const bankId = row.question_id_v2 != null ? Number(row.question_id_v2) : null;
+      const fromTeacher = tqId != null ? passageByTeacherQuestionId.get(tqId) ?? null : null;
+      const fromBank = bankId != null ? passageByBankQuestionId.get(bankId) ?? null : null;
+      const linked = fromTeacher ?? fromBank;
+
+      const text = coalescePassageText(snapshotRaw, linked?.text ?? null);
+      if (!text) {
+        return {
+          ...row,
+          passage: null,
+          passageText: null,
+          passageId: null,
+        };
+      }
+
+      const passage = buildPassagePayload(
+        linked?.id ?? (typeof row.passageId === 'number' ? row.passageId : null),
+        text,
+        snapshotTitle ?? linked?.title ?? null,
+      );
       return {
         ...row,
         passage,
-        passageText: passage?.passageText ?? null,
-        passageId: passage?.id ?? null,
+        passageText: passage.passageText,
+        passageId: passage.id,
       };
     });
   }
