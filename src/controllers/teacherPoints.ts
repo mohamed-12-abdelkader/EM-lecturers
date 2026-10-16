@@ -41,6 +41,12 @@ const ManualSchema = z.object({
 const ResetAllPointsSchema = z.object({
   confirm: z.literal('RESET_ALL_POINTS'),
   gradeId: z.number().int().positive().optional().nullable(),
+  label: z.string().trim().max(200).optional().nullable(),
+  reason: z.string().trim().max(500).optional().nullable(),
+});
+
+const RestoreSeasonSchema = z.object({
+  confirm: z.literal('RESTORE_POINTS_SEASON'),
 });
 
 /** GET /api/teacher/points/settings */
@@ -190,8 +196,8 @@ router.delete(
 
 /**
  * POST /api/teacher/points/reset
- * تصفير نقاط كل طلاب المدرس والبدء من جديد
- * Body: { "confirm": "RESET_ALL_POINTS", "gradeId"?: number }
+ * تصفير نقاط الطلاب والبدء من الصفر مع حفظ الموسم السابق في الأرشيف
+ * Body: { "confirm": "RESET_ALL_POINTS", "gradeId"?: number, "label"?: string, "reason"?: string }
  */
 router.post(
   '/reset',
@@ -202,7 +208,7 @@ router.post(
     if (!parsed.success) {
       return res.status(400).json({
         success: false,
-        message: 'للتأكيد أرسل confirm: "RESET_ALL_POINTS" (واختياري gradeId)',
+        message: 'للتأكيد أرسل confirm: "RESET_ALL_POINTS" (واختياري gradeId / label / reason)',
         errors: parsed.error.errors,
       });
     }
@@ -212,13 +218,15 @@ router.post(
         teacherId,
         confirm: parsed.data.confirm,
         gradeId: parsed.data.gradeId,
+        label: parsed.data.label,
+        reason: parsed.data.reason,
       });
       return res.json({
         success: true,
         message:
           result.gradeId != null
-            ? 'تم تصفير نقاط طلاب الصف — يمكنهم البدء من جديد'
-            : 'تم تصفير نقاط كل الطلاب — يمكنهم البدء من جديد',
+            ? 'تم حفظ سجل نقاط الصف وتصفيرها — يمكنهم البدء من جديد ويمكنك استرجاع السجل لاحقًا'
+            : 'تم حفظ سجل نقاط الطلاب وتصفيرها — يمكنهم البدء من جديد ويمكنك استرجاع السجل لاحقًا',
         data: result,
       });
     } catch (error) {
@@ -227,6 +235,130 @@ router.post(
           success: false,
           message: error.message,
         });
+      }
+      throw error;
+    }
+  }),
+);
+
+/** GET /api/teacher/points/seasons — مواسم النقاط المؤرشفة */
+router.get(
+  '/seasons',
+  authMiddleware(['teacher', 'academy', 'admin']),
+  asyncWrapper(async (req, res) => {
+    const teacherId = resolveTeacherId(req);
+    const gradeId = req.query.gradeId ? Number(req.query.gradeId) : null;
+    const limit = req.query.limit ? Number(req.query.limit) : 50;
+    const seasons = await TeacherPointsService.listPointSeasons({
+      teacherId,
+      gradeId: gradeId && Number.isFinite(gradeId) ? gradeId : null,
+      limit,
+    });
+    res.json({ success: true, data: { seasons } });
+  }),
+);
+
+/** GET /api/teacher/points/seasons/:seasonId — تفاصيل موسم + أرصدة الطلاب */
+router.get(
+  '/seasons/:seasonId',
+  authMiddleware(['teacher', 'academy', 'admin']),
+  asyncWrapper(async (req, res) => {
+    const teacherId = resolveTeacherId(req);
+    const seasonId = Number(req.params.seasonId);
+    if (!Number.isFinite(seasonId) || seasonId <= 0) {
+      return res.status(400).json({ success: false, message: 'Invalid seasonId' });
+    }
+    const includeBalances = String(req.query.includeBalances ?? 'true') !== 'false';
+    const balancesLimit = req.query.balancesLimit ? Number(req.query.balancesLimit) : 200;
+    try {
+      const data = await TeacherPointsService.getPointSeason({
+        teacherId,
+        seasonId,
+        includeBalances,
+        balancesLimit,
+      });
+      return res.json({ success: true, data });
+    } catch (error) {
+      if (error instanceof HttpError) {
+        return res.status(error.status).json({ success: false, message: error.message });
+      }
+      throw error;
+    }
+  }),
+);
+
+/** GET /api/teacher/points/seasons/:seasonId/students/:studentId/transactions */
+router.get(
+  '/seasons/:seasonId/students/:studentId/transactions',
+  authMiddleware(['teacher', 'academy', 'admin']),
+  asyncWrapper(async (req, res) => {
+    const teacherId = resolveTeacherId(req);
+    const seasonId = Number(req.params.seasonId);
+    const studentId = Number(req.params.studentId);
+    if (!Number.isFinite(seasonId) || seasonId <= 0) {
+      return res.status(400).json({ success: false, message: 'Invalid seasonId' });
+    }
+    if (!Number.isFinite(studentId) || studentId <= 0) {
+      return res.status(400).json({ success: false, message: 'Invalid studentId' });
+    }
+    const limit = req.query.limit ? Number(req.query.limit) : 200;
+    try {
+      const data = await TeacherPointsService.getSeasonStudentTransactions({
+        teacherId,
+        seasonId,
+        studentId,
+        limit,
+      });
+      return res.json({ success: true, data });
+    } catch (error) {
+      if (error instanceof HttpError) {
+        return res.status(error.status).json({ success: false, message: error.message });
+      }
+      throw error;
+    }
+  }),
+);
+
+/**
+ * POST /api/teacher/points/seasons/:seasonId/restore
+ * استرجاع موسم سابق (مع نسخة احتياطية تلقائية للنقاط الحالية)
+ * Body: { "confirm": "RESTORE_POINTS_SEASON" }
+ */
+router.post(
+  '/seasons/:seasonId/restore',
+  authMiddleware(['teacher', 'academy', 'admin']),
+  asyncWrapper(async (req, res) => {
+    const teacherId = resolveTeacherId(req);
+    const seasonId = Number(req.params.seasonId);
+    if (!Number.isFinite(seasonId) || seasonId <= 0) {
+      return res.status(400).json({ success: false, message: 'Invalid seasonId' });
+    }
+    const parsed = RestoreSeasonSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      return res.status(400).json({
+        success: false,
+        message: 'للتأكيد أرسل confirm: "RESTORE_POINTS_SEASON"',
+        errors: parsed.error.errors,
+      });
+    }
+
+    try {
+      const result = await TeacherPointsService.restorePointSeason({
+        teacherId,
+        seasonId,
+        confirm: parsed.data.confirm,
+      });
+      return res.json({
+        success: true,
+        message:
+          result.backupSeasonId != null
+            ? 'تم استرجاع الموسم — ونُسخت النقاط الحالية احتياطيًا قبل الاستبدال'
+            : 'تم استرجاع موسم النقاط بنجاح',
+        data: result,
+      });
+    } catch (error) {
+      if (error instanceof HttpError) {
+        return res.status(error.status).json({ success: false, message: error.message });
       }
       throw error;
     }

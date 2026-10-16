@@ -15,7 +15,10 @@
 | `GET` | `/teacher/points/leaderboard` | teacher / academy / admin | ترتيب طلاب المدرس (فلترة + بحث + صفحات) |
 | `POST` | `/teacher/points/manual` | teacher / academy / admin | منح نقاط يدوية لطالب |
 | `DELETE` | `/teacher/points/transactions/:transactionId` | teacher / academy / admin | حذف نقاط يدوية منحها المدرس |
-| `POST` | `/teacher/points/reset` | teacher / academy / admin | تصفير نقاط كل الطلاب والبدء من جديد |
+| `POST` | `/teacher/points/reset` | teacher / academy / admin | تصفير النقاط مع حفظ موسم أرشيفي قابل للاسترجاع |
+| `GET` | `/teacher/points/seasons` | teacher / academy / admin | قائمة مواسم النقاط المؤرشفة |
+| `GET` | `/teacher/points/seasons/:seasonId` | teacher / academy / admin | تفاصيل موسم + أرصدة الطلاب فيه |
+| `POST` | `/teacher/points/seasons/:seasonId/restore` | teacher / academy / admin | استرجاع موسم سابق ليصبح الرصيد الحالي |
 | `POST` | `/teacher/points/consolidate-legacy` | teacher / academy / admin | توحيد نقاط الامتحانات القديمة (أول محاولة فقط) |
 | `GET` | `/teacher/points/students/:studentId/transactions` | teacher / academy / admin | سجل معاملات طالب |
 | `GET` | `/student/points/summary` | student | نقاط الطالب + رتبته + المتبقي للمركز التالي |
@@ -411,7 +414,7 @@ Content-Type: application/json
 }
 ```
 
-### 3.4.3 تصفير كل النقاط والبدء من جديد
+### 3.4.3 تصفير النقاط مع حفظ السجل (موسم)
 
 ```http
 POST /api/teacher/points/reset
@@ -422,7 +425,9 @@ Content-Type: application/json
 ```json
 {
   "confirm": "RESET_ALL_POINTS",
-  "gradeId": 1
+  "gradeId": 1,
+  "label": "ترم أول 2026",
+  "reason": "بداية ترم جديد"
 }
 ```
 
@@ -430,22 +435,71 @@ Content-Type: application/json
 |-------|--------|--------|
 | `confirm` | نعم | يجب أن يكون بالضبط `"RESET_ALL_POINTS"` |
 | `gradeId` | لا | إن وُجد يصفّر صف واحد فقط؛ وإلا كل طلاب المدرس |
+| `label` | لا | اسم اختياري للموسم المؤرشف |
+| `reason` | لا | سبب التصفير |
 
-- يحذف أرصدة `student_point_balances` ومعاملات `point_transactions` للمدرس.
-- بعد التصفير يمكن للطلاب جمع نقاط الامتحان/الفيديو من جديد (مفاتيح منع التكرار تُمسح).
+- قبل التصفير تُنسخ الأرصدة والمعاملات إلى أرشيف موسم (`teacher_points_seasons`).
+- ثم تُمسح الجداول الحية حتى يبدأ الطلاب من الصفر ويمكنهم جمع نقاط الامتحان/الفيديو من جديد.
+- يمكن لاحقًا استعراض الموسم أو استرجاعه.
 
 **Response `200`**
 
 ```json
 {
   "success": true,
-  "message": "تم تصفير نقاط كل الطلاب — يمكنهم البدء من جديد",
+  "message": "تم حفظ سجل نقاط الطلاب وتصفيرها — يمكنهم البدء من جديد ويمكنك استرجاع السجل لاحقًا",
   "data": {
     "reset": true,
     "teacherId": 10,
     "gradeId": null,
+    "seasonId": 3,
     "balancesCleared": 120,
-    "transactionsDeleted": 540
+    "transactionsDeleted": 540,
+    "studentsCount": 120,
+    "totalPointsSum": 18500
+  }
+}
+```
+
+### 3.4.4 مواسم النقاط المؤرشفة
+
+```http
+GET /api/teacher/points/seasons?gradeId=1&limit=50
+Authorization: Bearer <TEACHER_TOKEN>
+```
+
+```http
+GET /api/teacher/points/seasons/3?includeBalances=true&balancesLimit=200
+Authorization: Bearer <TEACHER_TOKEN>
+```
+
+### 3.4.5 استرجاع موسم سابق
+
+```http
+POST /api/teacher/points/seasons/3/restore
+Authorization: Bearer <TEACHER_TOKEN>
+Content-Type: application/json
+```
+
+```json
+{ "confirm": "RESTORE_POINTS_SEASON" }
+```
+
+- إن وُجدت نقاط حالية تُحفظ تلقائيًا كموسم `pre_restore_backup` قبل الاستبدال.
+- ثم تُعاد أرصدة ومعاملات الموسم المطلوب إلى الجداول الحية.
+
+**Response `200`**
+
+```json
+{
+  "success": true,
+  "message": "تم استرجاع الموسم — ونُسخت النقاط الحالية احتياطيًا قبل الاستبدال",
+  "data": {
+    "restored": true,
+    "seasonId": 3,
+    "backupSeasonId": 4,
+    "balancesRestored": 120,
+    "transactionsRestored": 540
   }
 }
 ```
