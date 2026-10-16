@@ -210,7 +210,7 @@ function buildImageAnnotationFormat() {
           image_type: {
             type: 'string',
             description:
-              'Type of visual: question_figure (stem diagram/graph in the question), choice_option (answer choice A/B/C/D image), diagram, chart, graph, table, formula, map, other. Use choice_option for option thumbnails; use question_figure/chart/graph for the main figure referenced by the question text.',
+              'Type of visual: question_figure (stem diagram/graph/Venn in the question body), choice_option (one answer choice A/B/C/D when options are drawings/thumbnails in a row or grid), diagram, chart, graph, table, formula, map, other. CRITICAL: if four small drawings sit in a horizontal row each labeled أ/ب/ج/د (or A/B/C/D), mark EACH as choice_option — not one combined figure. Use question_figure only for the main stem illustration, not for option thumbnails.',
           },
           short_description: {
             type: 'string',

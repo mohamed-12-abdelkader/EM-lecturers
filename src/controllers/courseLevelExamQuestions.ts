@@ -92,6 +92,18 @@ router.put(
     } else if (req.body.questionImage === null || req.body.questionImage === 'null') {
       // Allow explicitly setting image to null
       updateData.questionImage = null;
+    } else if (
+      typeof req.body.questionImage === 'string' &&
+      req.body.questionImage.trim() &&
+      req.body.questionImage !== 'undefined'
+    ) {
+      // رابط صورة جاهز (OCR CDN) بدون إعادة رفع
+      updateData.questionImage = req.body.questionImage.trim();
+    } else if (
+      typeof req.body.question_image === 'string' &&
+      req.body.question_image.trim()
+    ) {
+      updateData.questionImage = req.body.question_image.trim();
     }
 
     try {

@@ -40,9 +40,9 @@ export class CourseLevelExamQuestionsService {
    */
   private static async verifyExamOwnership(examId: number, teacherId: number): Promise<void> {
     const examRes = await pool.query(
-      `SELECT e.*, c.teacher_id 
+      `SELECT e.*, COALESCE(e.teacher_id, c.teacher_id) AS teacher_id
        FROM course_level_exams e
-       JOIN courses c ON e.course_id = c.id
+       LEFT JOIN courses c ON e.course_id = c.id
        WHERE e.id = $1`,
       [examId],
     );
@@ -65,10 +65,10 @@ export class CourseLevelExamQuestionsService {
     teacherId: number,
   ): Promise<number> {
     const questionRes = await pool.query(
-      `SELECT q.exam_id, c.teacher_id
+      `SELECT q.exam_id, COALESCE(e.teacher_id, c.teacher_id) AS teacher_id
        FROM course_level_exam_questions q
        JOIN course_level_exams e ON q.exam_id = e.id
-       JOIN courses c ON e.course_id = c.id
+       LEFT JOIN courses c ON e.course_id = c.id
        WHERE q.id = $1`,
       [questionId],
     );
@@ -118,7 +118,9 @@ export class CourseLevelExamQuestionsService {
       [
         input.examId,
         input.questionText,
-        input.questionImage || null,
+        typeof input.questionImage === 'string' && input.questionImage.trim()
+          ? input.questionImage.trim()
+          : null,
         input.optionA,
         input.optionB,
         input.optionC,
@@ -221,6 +223,8 @@ export class CourseLevelExamQuestionsService {
       optionC: string;
       optionD: string;
       correctAnswer: 'A' | 'B' | 'C' | 'D';
+      questionImage?: string | null;
+      question_image?: string | null;
     }>,
   ) {
     if (!questions.length) {
@@ -236,6 +240,11 @@ export class CourseLevelExamQuestionsService {
       const optionC = (q.optionC || '').trim();
       const optionD = (q.optionD || '').trim();
       const correctAnswer = (q.correctAnswer || '').toUpperCase() as 'A' | 'B' | 'C' | 'D';
+      const rawImage = (q as any).questionImage ?? (q as any).question_image ?? null;
+      const questionImage =
+        typeof rawImage === 'string' && rawImage.trim() && rawImage !== 'null'
+          ? rawImage.trim()
+          : null;
 
       if (!questionText || !optionA || !optionB || !optionC || !optionD) {
         throw new HttpError(400, 'كل سؤال يحتاج: questionText, optionA, optionB, optionC, optionD');
@@ -256,9 +265,19 @@ export class CourseLevelExamQuestionsService {
           option_d,
           correct_answer,
           created_by
-        ) VALUES ($1, 'TEXT', $2, NULL, $3, $4, $5, $6, $7, $8)
+        ) VALUES ($1, 'TEXT', $2, $3, $4, $5, $6, $7, $8, $9)
         RETURNING *`,
-        [examId, questionText, optionA, optionB, optionC, optionD, correctAnswer, requester.id],
+        [
+          examId,
+          questionText,
+          questionImage,
+          optionA,
+          optionB,
+          optionC,
+          optionD,
+          correctAnswer,
+          requester.id,
+        ],
       );
       created.push(result.rows[0]);
     }

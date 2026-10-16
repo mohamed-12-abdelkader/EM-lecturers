@@ -13,6 +13,8 @@ export const MistralExtractedOptionSchema = z.object({
   text: z.string().default(''),
   /** معرف صورة الاختيار من OCR (لأسئلة image_choices) */
   image_id: z.string().optional(),
+  /** رابط الصورة بعد الرفع — يُعبَّأ في الباكند من question_images */
+  image_url: z.string().url().optional(),
 });
 
 /** يقبل object كامل أو string (image_id فقط) لأن بعض نماذج Chat تُرجع IDs كنصوص. */

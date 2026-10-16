@@ -44,7 +44,10 @@ interface RequestUser {
 
 interface CreateCourseLevelExamInput {
   title: string;
-  courseId: number;
+  courseId?: number | null;
+  gradeId?: number | null;
+  examScope?: 'course' | 'public';
+  description?: string | null;
   durationMinutes: number | null;
   questionsCount: number;
   isVisibleToStudents: boolean;
@@ -61,6 +64,8 @@ interface CreateCourseLevelExamInput {
 
 interface UpdateCourseLevelExamInput {
   title?: string;
+  description?: string | null;
+  gradeId?: number;
   durationMinutes?: number | null;
   questionsCount?: number;
   isVisibleToStudents?: boolean;
@@ -77,17 +82,47 @@ interface UpdateCourseLevelExamInput {
 
 export class CourseLevelExamsService {
   static async createExam(requester: RequestUser, input: CreateCourseLevelExamInput) {
-    const courseRes = await pool.query('SELECT id, teacher_id FROM courses WHERE id = $1', [
-      input.courseId,
-    ]);
+    const examScope = input.examScope === 'public' ? 'public' : 'course';
+    let courseId: number | null = null;
+    let gradeId: number | null = null;
+    let teacherId: number | null = null;
 
-    if (!courseRes.rowCount) {
-      throw new HttpError(404, 'Course not found');
-    }
+    if (examScope === 'public') {
+      const parsedGradeId = Number(input.gradeId);
+      if (!Number.isInteger(parsedGradeId) || parsedGradeId <= 0) {
+        throw new HttpError(400, 'gradeId is required for public exams');
+      }
+      gradeId = parsedGradeId;
 
-    const course = courseRes.rows[0];
-    if (requester.role === 'teacher' && course.teacher_id !== requester.id) {
-      throw new HttpError(403, 'You are not allowed to create exams for this course');
+      const gradeRes = await pool.query('SELECT id, name FROM grades WHERE id = $1', [gradeId]);
+      if (!gradeRes.rowCount) {
+        throw new HttpError(404, 'Grade not found');
+      }
+
+      teacherId = requester.id;
+      if (requester.role === 'teacher') {
+        await this.assertTeacherCanUseGrade(requester.id, gradeId);
+      }
+    } else {
+      const parsedCourseId = Number(input.courseId);
+      if (!Number.isInteger(parsedCourseId) || parsedCourseId <= 0) {
+        throw new HttpError(400, 'courseId is required for course exams');
+      }
+      courseId = parsedCourseId;
+
+      const courseRes = await pool.query('SELECT id, teacher_id FROM courses WHERE id = $1', [
+        courseId,
+      ]);
+
+      if (!courseRes.rowCount) {
+        throw new HttpError(404, 'Course not found');
+      }
+
+      const course = courseRes.rows[0];
+      if (requester.role === 'teacher' && course.teacher_id !== requester.id) {
+        throw new HttpError(403, 'You are not allowed to create exams for this course');
+      }
+      teacherId = Number(course.teacher_id);
     }
 
     // Validate attemptLimit if provided
@@ -115,6 +150,10 @@ export class CourseLevelExamsService {
     const result = await pool.query(
       `INSERT INTO course_level_exams (
         course_id,
+        grade_id,
+        teacher_id,
+        exam_scope,
+        description,
         title,
         duration_minutes,
         questions_count,
@@ -129,10 +168,14 @@ export class CourseLevelExamsService {
         answers_release_mode,
         show_answers_after_hours
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
       RETURNING *`,
       [
-        input.courseId,
+        courseId,
+        gradeId,
+        teacherId,
+        examScope,
+        input.description?.trim() || null,
         input.title,
         normalizeDurationMinutes(input.durationMinutes),
         input.questionsCount,
@@ -172,6 +215,7 @@ export class CourseLevelExamsService {
               (SELECT COUNT(*)::int FROM course_level_exam_questions q WHERE q.exam_id = e.id) AS actual_questions_count
        FROM course_level_exams e
        WHERE e.course_id = $1
+         AND COALESCE(e.exam_scope, 'course') = 'course'
        ORDER BY e.created_at DESC`,
       [courseId],
     );
@@ -199,10 +243,12 @@ export class CourseLevelExamsService {
         COUNT(DISTINCT q.id)::int AS actual_questions_count,
         COUNT(DISTINCT a.id) FILTER (WHERE a.status = 'submitted')::int AS submissions_count
       FROM course_level_exams e
-      INNER JOIN courses c ON e.course_id = c.id
+      LEFT JOIN courses c ON e.course_id = c.id
+      LEFT JOIN grades g ON e.grade_id = g.id
       LEFT JOIN course_level_exam_questions q ON q.exam_id = e.id
       LEFT JOIN course_level_exam_attempts a ON a.exam_id = e.id
-      WHERE c.teacher_id = $1
+      WHERE COALESCE(e.teacher_id, c.teacher_id) = $1
+        AND COALESCE(e.exam_scope, 'course') = 'course'
     `;
 
     if (filters?.courseId) {
@@ -217,6 +263,73 @@ export class CourseLevelExamsService {
 
     const result = await pool.query(query, params);
     return result.rows.map((row) => this.serializeTeacherCourseExam(row));
+  }
+
+  /** Teacher list of grade-scoped public exams */
+  static async getPublicExamsByTeacher(
+    teacherId: number,
+    filters?: { gradeId?: number },
+  ) {
+    const params: unknown[] = [teacherId];
+    let query = `
+      SELECT
+        e.*,
+        g.name AS grade_name,
+        COUNT(DISTINCT q.id)::int AS actual_questions_count,
+        COUNT(DISTINCT a.id) FILTER (WHERE a.status = 'submitted')::int AS submissions_count,
+        COUNT(DISTINCT a.student_id) FILTER (WHERE a.status = 'submitted')::int AS students_attempted_count
+      FROM course_level_exams e
+      LEFT JOIN grades g ON e.grade_id = g.id
+      LEFT JOIN course_level_exam_questions q ON q.exam_id = e.id
+      LEFT JOIN course_level_exam_attempts a ON a.exam_id = e.id
+      WHERE e.teacher_id = $1
+        AND e.exam_scope = 'public'
+    `;
+
+    if (filters?.gradeId) {
+      params.push(filters.gradeId);
+      query += ` AND e.grade_id = $${params.length}`;
+    }
+
+    query += `
+      GROUP BY e.id, g.name
+      ORDER BY e.created_at DESC
+    `;
+
+    const result = await pool.query(query, params);
+    return result.rows.map((row) => this.serializeTeacherPublicExam(row));
+  }
+
+  private static serializeTeacherPublicExam(row: Record<string, unknown>) {
+    return {
+      id: row.id,
+      title: row.title,
+      description: row.description ?? null,
+      gradeId: row.grade_id,
+      gradeName: row.grade_name,
+      examScope: 'public' as const,
+      durationMinutes: row.duration_minutes ?? null,
+      durationUnlimited: isDurationUnlimited(row.duration_minutes as number | null),
+      questionsCount: row.questions_count,
+      configuredQuestionsCount: row.questions_count,
+      actualQuestionsCount: row.actual_questions_count,
+      questionDisplayMode: row.question_display_mode || 'ordered',
+      answersReleaseMode: row.answers_release_mode,
+      availableFrom: row.available_from,
+      showAnswersAfterHours: row.show_answers_after_hours,
+      isVisibleToStudents: row.is_visible_to_students,
+      visibilityEndDate: row.visibility_end_date,
+      showAnswersImmediately: row.show_answers_immediately,
+      answersVisibleAt: row.answers_visible_at,
+      isActive: row.is_active,
+      attemptLimit: row.attempt_limit,
+      submissionsCount: row.submissions_count,
+      studentsAttemptedCount: row.students_attempted_count,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+      examKind: 'public' as const,
+      availability_status: getStudentExamAvailability(courseLevelExamAvailabilityInput(row as any)),
+    };
   }
 
   private static serializeTeacherCourseExam(row: Record<string, unknown>) {
@@ -250,9 +363,14 @@ export class CourseLevelExamsService {
 
   static async getExamById(examId: number, requester: RequestUser) {
     const examRes = await pool.query(
-      `SELECT e.*, c.teacher_id, c.title as course_title 
+      `SELECT e.*,
+              COALESCE(e.teacher_id, c.teacher_id) AS teacher_id,
+              c.title AS course_title,
+              g.name AS grade_name,
+              COALESCE(e.exam_scope, 'course') AS exam_scope
        FROM course_level_exams e
-       JOIN courses c ON e.course_id = c.id
+       LEFT JOIN courses c ON e.course_id = c.id
+       LEFT JOIN grades g ON e.grade_id = g.id
        WHERE e.id = $1`,
       [examId],
     );
@@ -276,9 +394,11 @@ export class CourseLevelExamsService {
   ) {
     // Verify exam exists and requester owns it
     const examRes = await pool.query(
-      `SELECT e.*, c.teacher_id 
+      `SELECT e.*,
+              COALESCE(e.teacher_id, c.teacher_id) AS teacher_id,
+              COALESCE(e.exam_scope, 'course') AS exam_scope
        FROM course_level_exams e
-       JOIN courses c ON e.course_id = c.id
+       LEFT JOIN courses c ON e.course_id = c.id
        WHERE e.id = $1`,
       [examId],
     );
@@ -343,6 +463,24 @@ export class CourseLevelExamsService {
     if (input.title !== undefined) {
       updates.push(`title = $${paramIndex++}`);
       values.push(input.title.trim());
+    }
+    if (input.description !== undefined) {
+      updates.push(`description = $${paramIndex++}`);
+      values.push(input.description == null ? null : String(input.description).trim() || null);
+    }
+    if (input.gradeId !== undefined) {
+      if (String(exam.exam_scope || 'course') !== 'public') {
+        throw new HttpError(400, 'gradeId can only be updated on public exams');
+      }
+      const nextGradeId = Number(input.gradeId);
+      if (!Number.isInteger(nextGradeId) || nextGradeId <= 0) {
+        throw new HttpError(400, 'gradeId must be a valid positive integer');
+      }
+      if (requester.role === 'teacher') {
+        await this.assertTeacherCanUseGrade(requester.id, nextGradeId);
+      }
+      updates.push(`grade_id = $${paramIndex++}`);
+      values.push(nextGradeId);
     }
     if (input.durationMinutes !== undefined) {
       updates.push(`duration_minutes = $${paramIndex++}`);
@@ -414,9 +552,11 @@ export class CourseLevelExamsService {
   static async deleteExam(examId: number, requester: RequestUser) {
     // Verify exam exists and requester owns it
     const examRes = await pool.query(
-      `SELECT e.*, c.teacher_id 
+      `SELECT e.*,
+              COALESCE(e.teacher_id, c.teacher_id) AS teacher_id,
+              COALESCE(e.exam_scope, 'course') AS exam_scope
        FROM course_level_exams e
-       JOIN courses c ON e.course_id = c.id
+       LEFT JOIN courses c ON e.course_id = c.id
        WHERE e.id = $1`,
       [examId],
     );
@@ -776,7 +916,7 @@ export class CourseLevelExamsService {
       await TeacherPointsService.awardExamOrAssignmentStart({
         studentId,
         teacherId,
-        courseId: Number(exam.course_id),
+        courseId: exam.course_id != null ? Number(exam.course_id) : null,
         attemptId: Number(attempt.id),
         examId: Number(exam.id),
         isAssignment: false,
@@ -805,7 +945,7 @@ export class CourseLevelExamsService {
       const scoreOpts = {
         studentId,
         teacherId,
-        courseId: Number(exam.course_id),
+        courseId: exam.course_id != null ? Number(exam.course_id) : null,
         attemptId: Number(attempt.id),
         examId: Number(exam.id),
         isAssignment: false as const,
@@ -831,11 +971,13 @@ export class CourseLevelExamsService {
   static async regradeSubmittedAttemptsForQuestion(questionId: number) {
     const questionRes = await pool.query(
       `SELECT q.id, q.exam_id, q.correct_answer, q.correct_answer_2,
-              e.id AS exam_row_id, e.title, e.course_id, e.questions_count,
-              e.question_display_mode, c.teacher_id
+              e.id AS exam_row_id, e.title, e.course_id, e.grade_id, e.questions_count,
+              e.question_display_mode,
+              COALESCE(e.exam_scope, 'course') AS exam_scope,
+              COALESCE(e.teacher_id, c.teacher_id) AS teacher_id
        FROM course_level_exam_questions q
        JOIN course_level_exams e ON e.id = q.exam_id
-       JOIN courses c ON c.id = e.course_id
+       LEFT JOIN courses c ON c.id = e.course_id
        WHERE q.id = $1`,
       [questionId],
     );
@@ -958,6 +1100,7 @@ export class CourseLevelExamsService {
       `SELECT a.*, e.title, e.duration_minutes, e.questions_count, e.question_display_mode,
               e.show_answers_immediately, e.answers_visible_at, e.answers_release_mode,
               e.show_answers_after_hours, e.visibility_end_date, e.course_id,
+              e.grade_id, COALESCE(e.exam_scope, 'course') AS exam_scope, e.teacher_id,
               e.id as exam_row_id
        FROM course_level_exam_attempts a
        JOIN course_level_exams e ON e.id = a.exam_id
@@ -981,6 +1124,81 @@ export class CourseLevelExamsService {
     }
   }
 
+  private static isPublicExam(exam: { exam_scope?: string | null }): boolean {
+    return String(exam?.exam_scope || 'course') === 'public';
+  }
+
+  private static async assertTeacherCanUseGrade(teacherId: number, gradeId: number) {
+    const tg = await pool.query(
+      `SELECT 1 FROM teacher_grades WHERE teacher_id = $1 AND grade_id = $2 LIMIT 1`,
+      [teacherId, gradeId],
+    );
+    if (tg.rowCount) return;
+
+    const cg = await pool.query(
+      `SELECT 1 FROM courses WHERE teacher_id = $1 AND grade_id = $2 LIMIT 1`,
+      [teacherId, gradeId],
+    );
+    if (cg.rowCount) return;
+
+    throw new HttpError(403, 'You are not allowed to create exams for this grade');
+  }
+
+  private static async assertTeacherOwnsExamRow(
+    exam: { teacher_id?: number | null },
+    requester: RequestUser,
+  ) {
+    if (requester.role === 'teacher' && Number(exam.teacher_id) !== requester.id) {
+      throw new HttpError(403, 'You are not allowed to manage this exam');
+    }
+  }
+
+  /** Course enrollment OR matching user_grades for public exams */
+  static async assertStudentCanAccessExam(
+    exam: {
+      exam_scope?: string | null;
+      course_id?: number | null;
+      grade_id?: number | null;
+    },
+    studentId: number,
+  ) {
+    if (this.isPublicExam(exam)) {
+      const gradeId = Number(exam.grade_id);
+      if (!Number.isInteger(gradeId) || gradeId <= 0) {
+        throw new HttpError(403, 'هذا الامتحان غير مخصص لصف دراسي صالح');
+      }
+      const gradeRes = await pool.query(
+        `SELECT 1 FROM user_grades WHERE user_id = $1 AND grade_id = $2 LIMIT 1`,
+        [studentId, gradeId],
+      );
+      if (!gradeRes.rowCount) {
+        throw new HttpError(403, 'هذا الامتحان غير مخصص لصفك الدراسي');
+      }
+      return;
+    }
+
+    const courseId = Number(exam.course_id);
+    if (!Number.isInteger(courseId) || courseId <= 0) {
+      throw new HttpError(403, 'You are not enrolled in this course');
+    }
+    await this.assertStudentCanAccessCourse(courseId, studentId);
+  }
+
+  private static async assertCanManageExam(
+    exam: {
+      exam_scope?: string | null;
+      course_id?: number | null;
+      teacher_id?: number | null;
+    },
+    requester: RequestUser,
+  ) {
+    if (this.isPublicExam(exam)) {
+      await this.assertTeacherOwnsExamRow(exam, requester);
+      return;
+    }
+    await CourseAccessControl.assertCanManageCourse(requester, Number(exam.course_id));
+  }
+
   /**
    * Get visible exams for a student in a course
    */
@@ -995,6 +1213,7 @@ export class CourseLevelExamsService {
        FROM course_level_exams e
        JOIN courses c ON e.course_id = c.id
        WHERE e.course_id = $1
+         AND COALESCE(e.exam_scope, 'course') = 'course'
          AND e.is_active = TRUE
          AND e.is_visible_to_students = TRUE
        ORDER BY e.created_at DESC`,
@@ -1068,13 +1287,115 @@ export class CourseLevelExamsService {
   }
 
   /**
+   * Published public exams matching the student's grades (no course enrollment required).
+   */
+  static async getVisiblePublicExamsForStudent(studentId: number) {
+    const gradesRes = await pool.query(
+      `SELECT grade_id FROM user_grades WHERE user_id = $1`,
+      [studentId],
+    );
+    if (!gradesRes.rowCount) {
+      return [];
+    }
+    const gradeIds = gradesRes.rows.map((r) => Number(r.grade_id)).filter((id) => id > 0);
+    if (!gradeIds.length) {
+      return [];
+    }
+
+    const now = new Date();
+    const result = await pool.query(
+      `SELECT e.*,
+              g.name AS grade_name,
+              (SELECT COUNT(*)::int FROM course_level_exam_questions q WHERE q.exam_id = e.id) AS actual_questions_count
+       FROM course_level_exams e
+       JOIN grades g ON g.id = e.grade_id
+       WHERE e.exam_scope = 'public'
+         AND e.grade_id = ANY($1::int[])
+         AND e.is_active = TRUE
+         AND e.is_visible_to_students = TRUE
+       ORDER BY e.created_at DESC`,
+      [gradeIds],
+    );
+
+    const listed = result.rows.filter((exam) =>
+      shouldListExamForStudent(courseLevelExamAvailabilityInput(exam), now),
+    );
+
+    const examsWithAttempts = await Promise.all(
+      listed.map(async (exam) => {
+        await this.expireOverdueAttemptIfNeeded(exam.id, studentId);
+        const attemptsRes = await pool.query(
+          `SELECT
+             COUNT(*) FILTER (WHERE status = 'submitted')::int AS attempts_count,
+             MAX(attempt_number) FILTER (WHERE status = 'submitted') AS last_attempt_number,
+             MAX(id) FILTER (WHERE status = 'in_progress') AS in_progress_attempt_id,
+             MAX(attempt_expire_at) FILTER (WHERE status = 'in_progress') AS in_progress_expire_at,
+             MAX(started_at) FILTER (WHERE status = 'in_progress') AS in_progress_started_at
+           FROM course_level_exam_attempts
+           WHERE exam_id = $1 AND student_id = $2`,
+          [exam.id, studentId],
+        );
+
+        const attemptsCount = Number(attemptsRes.rows[0]?.attempts_count || 0);
+        const lastAttemptNumber = Number(attemptsRes.rows[0]?.last_attempt_number || 0);
+        const inProgressAttemptId = attemptsRes.rows[0]?.in_progress_attempt_id
+          ? Number(attemptsRes.rows[0].in_progress_attempt_id)
+          : null;
+        const hasInProgressAttempt =
+          inProgressAttemptId != null &&
+          Number.isInteger(inProgressAttemptId) &&
+          inProgressAttemptId > 0;
+        const canAttemptNew =
+          exam.attempt_limit === null || attemptsCount < exam.attempt_limit;
+
+        const availability_status = getStudentExamAvailability(
+          courseLevelExamAvailabilityInput(exam),
+          now,
+        );
+        const canStartNew = canStudentStartExam(courseLevelExamAvailabilityInput(exam), now);
+        const inProgressExpireAt = attemptsRes.rows[0]?.in_progress_expire_at ?? null;
+
+        return {
+          ...exam,
+          examScope: 'public',
+          configuredQuestionsCount: exam.questions_count,
+          actualQuestionsCount: exam.actual_questions_count,
+          duration_unlimited: isDurationUnlimited(exam.duration_minutes),
+          availability_status,
+          attempts_count: attemptsCount,
+          last_attempt_number: lastAttemptNumber,
+          has_in_progress_attempt: hasInProgressAttempt,
+          in_progress_attempt_id: inProgressAttemptId,
+          attempt_expires_at: hasInProgressAttempt ? inProgressExpireAt : null,
+          remaining_seconds: hasInProgressAttempt ? remainingSeconds(inProgressExpireAt, now) : null,
+          can_resume: hasInProgressAttempt && canResumeCourseAttempt(inProgressExpireAt, now),
+          can_attempt:
+            (hasInProgressAttempt && canResumeCourseAttempt(inProgressExpireAt, now)) ||
+            (canAttemptNew && canStartNew),
+          attempts_remaining:
+            exam.attempt_limit === null
+              ? null
+              : Math.max(0, exam.attempt_limit - attemptsCount),
+        };
+      }),
+    );
+
+    return examsWithAttempts;
+  }
+
+  /**
    * Start an exam attempt for a student
    */
   static async startExamAttempt(examId: number, studentId: number) {
     const examRes = await pool.query(
-      `SELECT e.*, c.id as course_id, c.teacher_id
+      `SELECT e.*,
+              e.course_id,
+              COALESCE(e.teacher_id, c.teacher_id) AS teacher_id,
+              COALESCE(e.exam_scope, 'course') AS exam_scope,
+              g.name AS grade_name
        FROM course_level_exams e
-       JOIN courses c ON e.course_id = c.id
+       LEFT JOIN courses c ON e.course_id = c.id
+       LEFT JOIN grades g ON e.grade_id = g.id
        WHERE e.id = $1`,
       [examId],
     );
@@ -1085,7 +1406,7 @@ export class CourseLevelExamsService {
 
     const exam = examRes.rows[0];
 
-    await this.assertStudentCanAccessCourse(Number(exam.course_id), studentId);
+    await this.assertStudentCanAccessExam(exam, studentId);
 
     if (!exam.is_active) {
       throw new HttpError(403, 'This exam is not active');
@@ -1480,7 +1801,8 @@ export class CourseLevelExamsService {
     const attemptRes = await pool.query(
       `SELECT a.*, e.title, e.duration_minutes, e.questions_count, e.question_display_mode,
               e.show_answers_immediately, e.answers_visible_at, e.answers_release_mode,
-              e.show_answers_after_hours, e.visibility_end_date, e.course_id
+              e.show_answers_after_hours, e.visibility_end_date, e.course_id,
+              e.grade_id, COALESCE(e.exam_scope, 'course') AS exam_scope, e.teacher_id
        FROM course_level_exam_attempts a
        JOIN course_level_exams e ON e.id = a.exam_id
        WHERE a.id = $1 AND a.exam_id = $2 AND a.student_id = $3`,
@@ -1544,7 +1866,8 @@ export class CourseLevelExamsService {
               a.attempt_expire_at, a.timed_out,
               e.title, e.duration_minutes, e.questions_count, e.question_display_mode,
               e.show_answers_immediately, e.answers_visible_at, e.answers_release_mode,
-              e.show_answers_after_hours, e.visibility_end_date, e.course_id
+              e.show_answers_after_hours, e.visibility_end_date, e.course_id,
+              e.grade_id, COALESCE(e.exam_scope, 'course') AS exam_scope, e.teacher_id
        FROM course_level_exam_attempts a
        JOIN course_level_exams e ON a.exam_id = e.id
        WHERE a.id = $1 AND a.exam_id = $2 AND a.student_id = $3`,
@@ -1559,7 +1882,7 @@ export class CourseLevelExamsService {
     const exam = { ...row, id: row.exam_id };
     const attempt = row;
 
-    await this.assertStudentCanAccessCourse(Number(exam.course_id), studentId);
+    await this.assertStudentCanAccessExam(exam, studentId);
 
     if (attempt.status === 'submitted') {
       return this.buildSubmitResultFromStored(exam, attempt);
@@ -1581,9 +1904,15 @@ export class CourseLevelExamsService {
     options?: { attemptId?: number },
   ) {
     const examRes = await pool.query(
-      `SELECT e.*, c.id as course_id, c.title as course_title
+      `SELECT e.*,
+              e.course_id,
+              c.title AS course_title,
+              COALESCE(e.teacher_id, c.teacher_id) AS teacher_id,
+              g.name AS grade_name,
+              COALESCE(e.exam_scope, 'course') AS exam_scope
        FROM course_level_exams e
-       JOIN courses c ON e.course_id = c.id
+       LEFT JOIN courses c ON e.course_id = c.id
+       LEFT JOIN grades g ON e.grade_id = g.id
        WHERE e.id = $1`,
       [examId],
     );
@@ -1594,7 +1923,7 @@ export class CourseLevelExamsService {
 
     const exam = examRes.rows[0];
 
-    await this.assertStudentCanAccessCourse(Number(exam.course_id), studentId);
+    await this.assertStudentCanAccessExam(exam, studentId);
 
     const attemptQuery = options?.attemptId
       ? await pool.query(
@@ -1702,9 +2031,12 @@ export class CourseLevelExamsService {
    */
   static async getMyCourseReport(examId: number, studentId: number) {
     const examRes = await pool.query(
-      `SELECT e.*, c.id as course_id
+      `SELECT e.*,
+              e.course_id,
+              COALESCE(e.teacher_id, c.teacher_id) AS teacher_id,
+              COALESCE(e.exam_scope, 'course') AS exam_scope
        FROM course_level_exams e
-       JOIN courses c ON e.course_id = c.id
+       LEFT JOIN courses c ON e.course_id = c.id
        WHERE e.id = $1`,
       [examId],
     );
@@ -1715,7 +2047,7 @@ export class CourseLevelExamsService {
 
     const exam = examRes.rows[0];
 
-    await this.assertStudentCanAccessCourse(Number(exam.course_id), studentId);
+    await this.assertStudentCanAccessExam(exam, studentId);
 
     const attemptRes = await pool.query(
       `SELECT * FROM course_level_exam_attempts
@@ -1799,10 +2131,15 @@ export class CourseLevelExamsService {
   ) {
     // Verify exam exists and teacher owns it
     const examRes = await pool.query(
-      `SELECT e.id, e.title, e.course_id, e.questions_count, e.question_display_mode,
-              c.teacher_id, c.title as course_title
+      `SELECT e.id, e.title, e.course_id, e.grade_id, e.questions_count, e.question_display_mode,
+              e.description,
+              COALESCE(e.exam_scope, 'course') AS exam_scope,
+              COALESCE(e.teacher_id, c.teacher_id) AS teacher_id,
+              c.title AS course_title,
+              g.name AS grade_name
        FROM course_level_exams e
-       JOIN courses c ON e.course_id = c.id
+       LEFT JOIN courses c ON e.course_id = c.id
+       LEFT JOIN grades g ON e.grade_id = g.id
        WHERE e.id = $1`,
       [examId],
     );
@@ -1813,20 +2150,18 @@ export class CourseLevelExamsService {
 
     const exam = examRes.rows[0];
 
-    // Verify teacher owns the course
-    if (requester.role === 'teacher' && exam.teacher_id !== requester.id) {
+    // Verify teacher owns the exam (course or public)
+    if (requester.role === 'teacher' && Number(exam.teacher_id) !== requester.id) {
       throw new HttpError(403, 'You are not allowed to view grades for this exam');
     }
 
-    const groupFilter = await this.resolveStudyGroupFilter(
-      Number(exam.teacher_id),
-      options?.groupId,
-      {
-        courseId: Number(exam.course_id),
-        requesterId: requester.id,
-        groupType: options?.groupType,
-      },
-    );
+    const groupFilter = this.isPublicExam(exam)
+      ? null
+      : await this.resolveStudyGroupFilter(Number(exam.teacher_id), options?.groupId, {
+          courseId: Number(exam.course_id),
+          requesterId: requester.id,
+          groupType: options?.groupType,
+        });
 
     const groupParam = groupFilter?.groupId ?? null;
     const groupType = groupFilter?.groupType ?? 'study';
@@ -2201,9 +2536,14 @@ export class CourseLevelExamsService {
     options?: { passPercentage?: number; groupId?: number; groupType?: 'study' | 'course' },
   ) {
     const examRes = await pool.query(
-      `SELECT e.id, e.title, e.course_id, e.questions_count, c.teacher_id, c.title as course_title
+      `SELECT e.id, e.title, e.course_id, e.grade_id, e.questions_count, e.description,
+              COALESCE(e.exam_scope, 'course') AS exam_scope,
+              COALESCE(e.teacher_id, c.teacher_id) AS teacher_id,
+              c.title AS course_title,
+              g.name AS grade_name
        FROM course_level_exams e
-       JOIN courses c ON e.course_id = c.id
+       LEFT JOIN courses c ON e.course_id = c.id
+       LEFT JOIN grades g ON e.grade_id = g.id
        WHERE e.id = $1`,
       [examId],
     );
@@ -2213,7 +2553,7 @@ export class CourseLevelExamsService {
     }
 
     const exam = examRes.rows[0];
-    await CourseAccessControl.assertCanManageCourse(requester, Number(exam.course_id));
+    await this.assertCanManageExam(exam, requester);
     await this.expireOverdueAttemptsForExam(examId);
 
     const passPercentage =
@@ -2224,35 +2564,54 @@ export class CourseLevelExamsService {
         ? options.passPercentage
         : 50;
 
-    const groupFilter = await this.resolveStudyGroupFilter(
-      Number(exam.teacher_id),
-      options?.groupId,
-      {
-        courseId: Number(exam.course_id),
-        requesterId: requester.id,
-        groupType: options?.groupType,
-      },
-    );
-    const availableStudyGroups = await this.listCourseRelatedStudyGroups(
-      Number(exam.teacher_id),
-      Number(exam.course_id),
-      requester.id,
-    );
+    const isPublic = this.isPublicExam(exam);
+    const groupFilter = isPublic
+      ? null
+      : await this.resolveStudyGroupFilter(Number(exam.teacher_id), options?.groupId, {
+          courseId: Number(exam.course_id),
+          requesterId: requester.id,
+          groupType: options?.groupType,
+        });
+    const availableStudyGroups = isPublic
+      ? []
+      : await this.listCourseRelatedStudyGroups(
+          Number(exam.teacher_id),
+          Number(exam.course_id),
+          requester.id,
+        );
 
     const groupParam = groupFilter?.groupId ?? null;
     const membershipForUser = groupFilter
       ? this.groupMembershipSql(groupFilter.groupType, 'u.id', '$2')
       : 'TRUE';
 
-    const enrolledRes = await pool.query(
-      `SELECT u.id as student_id, u.name as student_name, u.email as student_email
-       FROM enrollments e
-       JOIN users u ON u.id = e.user_id
-       WHERE e.course_id = $1 AND u.role = 'student'
-         AND ($2::int IS NULL OR ${membershipForUser})
-       ORDER BY u.name ASC`,
-      [exam.course_id, groupParam],
-    );
+    const enrolledRes = isPublic
+      ? await pool.query(
+          `SELECT u.id as student_id, u.name as student_name, u.email as student_email
+           FROM user_grades ug
+           JOIN users u ON u.id = ug.user_id
+           WHERE ug.grade_id = $1
+             AND u.role = 'student'
+             AND u.deleted_at IS NULL
+             AND (
+               u.managed_by_teacher_id = $2
+               OR EXISTS (
+                 SELECT 1 FROM tenants t
+                 WHERE t.id = u.tenant_id AND t.owner_user_id = $2
+               )
+             )
+           ORDER BY u.name ASC`,
+          [exam.grade_id, exam.teacher_id],
+        )
+      : await pool.query(
+          `SELECT u.id as student_id, u.name as student_name, u.email as student_email
+           FROM enrollments e
+           JOIN users u ON u.id = e.user_id
+           WHERE e.course_id = $1 AND u.role = 'student'
+             AND ($2::int IS NULL OR ${membershipForUser})
+           ORDER BY u.name ASC`,
+          [exam.course_id, groupParam],
+        );
     const enrolledStudents = enrolledRes.rows;
     const enrolledTotal = enrolledStudents.length;
     const enrolledStudentIds = new Set(
@@ -3087,9 +3446,10 @@ export class CourseLevelExamsService {
     try {
       console.log(`[verifyExamOwnership] Checking exam ${examId} for teacher ${teacherId}`);
       const examRes = await pool.query(
-        `SELECT e.id, c.teacher_id
+        `SELECT e.id, COALESCE(e.teacher_id, c.teacher_id) AS teacher_id,
+                COALESCE(e.exam_scope, 'course') AS exam_scope
          FROM course_level_exams e
-         JOIN courses c ON e.course_id = c.id
+         LEFT JOIN courses c ON e.course_id = c.id
          WHERE e.id = $1`,
         [examId],
       );
