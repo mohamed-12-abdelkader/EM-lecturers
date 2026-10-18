@@ -16,6 +16,7 @@
 | `POST` | `/teacher/points/manual` | teacher / academy / admin | منح نقاط يدوية لطالب |
 | `DELETE` | `/teacher/points/transactions/:transactionId` | teacher / academy / admin | حذف نقاط يدوية منحها المدرس |
 | `POST` | `/teacher/points/reset` | teacher / academy / admin | تصفير النقاط مع حفظ موسم أرشيفي قابل للاسترجاع |
+| `POST` | `/teacher/points/reset-and-rebuild-last-exam` | teacher / academy / admin | حذف كل النقاط ثم منح بدء+درجة آخر امتحان فقط لكل صف |
 | `GET` | `/teacher/points/seasons` | teacher / academy / admin | قائمة مواسم النقاط المؤرشفة |
 | `GET` | `/teacher/points/seasons/:seasonId` | teacher / academy / admin | تفاصيل موسم + أرصدة الطلاب فيه |
 | `POST` | `/teacher/points/seasons/:seasonId/restore` | teacher / academy / admin | استرجاع موسم سابق ليصبح الرصيد الحالي |

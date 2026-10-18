@@ -45,6 +45,13 @@ const ResetAllPointsSchema = z.object({
   reason: z.string().trim().max(500).optional().nullable(),
 });
 
+const ResetAndRebuildLastExamSchema = z.object({
+  confirm: z.literal('RESET_AND_REBUILD_LAST_EXAM'),
+  gradeId: z.number().int().positive().optional().nullable(),
+  label: z.string().trim().max(200).optional().nullable(),
+  reason: z.string().trim().max(500).optional().nullable(),
+});
+
 const RestoreSeasonSchema = z.object({
   confirm: z.literal('RESTORE_POINTS_SEASON'),
 });
@@ -227,6 +234,51 @@ router.post(
           result.gradeId != null
             ? 'تم حفظ سجل نقاط الصف وتصفيرها — يمكنهم البدء من جديد ويمكنك استرجاع السجل لاحقًا'
             : 'تم حفظ سجل نقاط الطلاب وتصفيرها — يمكنهم البدء من جديد ويمكنك استرجاع السجل لاحقًا',
+        data: result,
+      });
+    } catch (error) {
+      if (error instanceof HttpError) {
+        return res.status(error.status).json({
+          success: false,
+          message: error.message,
+        });
+      }
+      throw error;
+    }
+  }),
+);
+
+/**
+ * POST /api/teacher/points/reset-and-rebuild-last-exam
+ * حذف كل النقاط ثم منح نقاط بدء + درجة آخر امتحان شامل فقط لكل صف
+ */
+router.post(
+  '/reset-and-rebuild-last-exam',
+  authMiddleware(['teacher', 'academy', 'admin']),
+  asyncWrapper(async (req, res) => {
+    const teacherId = resolveTeacherId(req);
+    const parsed = ResetAndRebuildLastExamSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      return res.status(400).json({
+        success: false,
+        message:
+          'للتأكيد أرسل confirm: "RESET_AND_REBUILD_LAST_EXAM" (واختياري gradeId)',
+        errors: parsed.error.errors,
+      });
+    }
+
+    try {
+      const result = await TeacherPointsService.resetAndRebuildFromLastExam({
+        teacherId,
+        confirm: parsed.data.confirm,
+        gradeId: parsed.data.gradeId,
+        label: parsed.data.label,
+        reason: parsed.data.reason,
+      });
+      return res.json({
+        success: true,
+        message:
+          'تم حذف كل النقاط وإعادة بنائها من آخر امتحان فقط (بدء + درجة) لكل صف',
         data: result,
       });
     } catch (error) {
