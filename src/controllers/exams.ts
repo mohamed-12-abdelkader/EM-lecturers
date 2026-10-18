@@ -1626,8 +1626,15 @@ router.delete(
     }
 
     try {
-      await ExamFlowService.removeQuestionFromExam(req.user!.id, examId, questionId);
-      res.json({ message: 'Question removed successfully' });
+      const result = await ExamFlowService.removeQuestionFromExam(
+        req.user!.id,
+        examId,
+        questionId,
+      );
+      res.json({
+        message: 'Question removed successfully; student results recalculated',
+        data: result,
+      });
     } catch (error: any) {
       if (error.status) {
         return res.status(error.status).json({ message: error.message });

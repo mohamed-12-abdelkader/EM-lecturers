@@ -2736,8 +2736,15 @@ router.delete(
           [questionId, req.user!.id],
         );
         if (lectureExamCheck.rowCount) {
-          await pool.query('DELETE FROM exam_questions WHERE id = $1', [questionId]);
-          return res.json({ message: 'تم حذف السؤال بنجاح' });
+          const { ExamFlowService } = await import('../services/examFlow.js');
+          const regrade = await ExamFlowService.deleteExamQuestionAndRegradeSubmissions({
+            examId: Number(lectureExamCheck.rows[0].exam_id),
+            examQuestionId: questionId,
+          });
+          return res.json({
+            message: 'تم حذف السؤال بنجاح وإعادة احتساب نتائج الطلاب',
+            data: regrade,
+          });
         }
       }
 
@@ -2757,9 +2764,15 @@ router.delete(
 
       // حذف السؤال حسب نوعه
       if (question.exam_type === 'course_level') {
-        // حذف من course_level_exam_questions (بمعرّف الصف الفعلي)
-        await pool.query('DELETE FROM course_level_exam_questions WHERE id = $1', [idToDelete]);
-        return res.json({ message: 'تم حذف السؤال بنجاح' });
+        const { CourseLevelExamQuestionsService } = await import(
+          '../services/courseLevelExamQuestions.js'
+        );
+        const result =
+          await CourseLevelExamQuestionsService.deleteQuestionAndRegrade(idToDelete);
+        return res.json({
+          message: 'تم حذف السؤال بنجاح وإعادة احتساب نتائج الطلاب',
+          data: result,
+        });
       } else {
         // حذف من course_exam_questions
         const result = await ExamsService.deleteCourseExamQuestion(questionId);

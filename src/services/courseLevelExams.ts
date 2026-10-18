@@ -965,6 +965,165 @@ export class CourseLevelExamsService {
   }
 
   /**
+   * After a question row is deleted (answers already CASCADE-removed):
+   * recompute every submitted attempt from remaining answers/questions and sync points.
+   */
+  static async regradeExamAttemptsAfterQuestionRemoved(opts: {
+    examId: number;
+    deletedQuestionId: number;
+    client?: import('pg').PoolClient;
+  }): Promise<{
+    examId: number;
+    deletedQuestionId: number;
+    attemptsReviewed: number;
+    attemptsUpdated: number;
+    pointsSynced: number;
+  }> {
+    const db = opts.client ?? pool;
+    const examRes = await db.query(
+      `SELECT e.id, e.title, e.course_id, e.questions_count,
+              COALESCE(e.exam_scope, 'course') AS exam_scope,
+              COALESCE(e.teacher_id, c.teacher_id) AS teacher_id
+       FROM course_level_exams e
+       LEFT JOIN courses c ON c.id = e.course_id
+       WHERE e.id = $1`,
+      [opts.examId],
+    );
+    if (!examRes.rowCount) {
+      throw new HttpError(404, 'Exam not found');
+    }
+    const exam = examRes.rows[0];
+
+    const remainingRes = await db.query<{ id: number }>(
+      `SELECT id FROM course_level_exam_questions WHERE exam_id = $1 ORDER BY id`,
+      [opts.examId],
+    );
+    const remainingExamQuestionIds = remainingRes.rows.map((r) => Number(r.id));
+
+    // Keep questions_count from exceeding the bank size after deletes
+    if (
+      exam.questions_count != null &&
+      Number(exam.questions_count) > remainingExamQuestionIds.length
+    ) {
+      try {
+        await db.query(
+          `UPDATE course_level_exams SET questions_count = $1, updated_at = NOW() WHERE id = $2`,
+          [remainingExamQuestionIds.length, opts.examId],
+        );
+      } catch {
+        await db.query(`UPDATE course_level_exams SET questions_count = $1 WHERE id = $2`, [
+          remainingExamQuestionIds.length,
+          opts.examId,
+        ]);
+      }
+    }
+
+    const attemptsRes = await db.query(
+      `SELECT id, student_id, obtained_grade, total_grade, selected_question_ids, status
+       FROM course_level_exam_attempts
+       WHERE exam_id = $1`,
+      [opts.examId],
+    );
+
+    const { recomputeCourseAttemptAfterQuestionDelete } = await import(
+      './examQuestionDeleteRegrade.js'
+    );
+
+    let attemptsUpdated = 0;
+    let pointsSynced = 0;
+    let attemptsReviewed = 0;
+
+    for (const attempt of attemptsRes.rows) {
+      const attemptId = Number(attempt.id);
+      const selected = attempt.selected_question_ids;
+
+      // Always strip deleted id from in-progress / submitted selected sets
+      const answersRes = await db.query<{ question_id: number; is_correct: boolean }>(
+        `SELECT question_id, is_correct FROM course_level_exam_answers WHERE attempt_id = $1`,
+        [attemptId],
+      );
+      const recomputed = recomputeCourseAttemptAfterQuestionDelete({
+        deletedQuestionId: opts.deletedQuestionId,
+        selectedQuestionIds: selected,
+        remainingExamQuestionIds,
+        remainingAnswers: answersRes.rows.map((a) => ({
+          questionId: Number(a.question_id),
+          isCorrect: !!a.is_correct,
+        })),
+      });
+
+      if (attempt.status === 'in_progress') {
+        if (recomputed.nextSelectedIds) {
+          await db.query(
+            `UPDATE course_level_exam_attempts
+             SET selected_question_ids = $1::int[]
+             WHERE id = $2`,
+            [recomputed.nextSelectedIds, attemptId],
+          );
+        }
+        continue;
+      }
+
+      if (attempt.status !== 'submitted') continue;
+      attemptsReviewed += 1;
+
+      const prevObtained = Number(attempt.obtained_grade ?? 0);
+      const prevTotal = Number(attempt.total_grade ?? 0);
+      const selectedChanged =
+        JSON.stringify(parseSelectedQuestionIds(selected) ?? null) !==
+        JSON.stringify(recomputed.nextSelectedIds);
+
+      if (
+        prevObtained !== recomputed.obtained ||
+        prevTotal !== recomputed.total ||
+        selectedChanged
+      ) {
+        await db.query(
+          `UPDATE course_level_exam_attempts
+           SET obtained_grade = $1,
+               total_grade = $2,
+               selected_question_ids = CASE
+                 WHEN $3::boolean THEN $4::int[]
+                 ELSE selected_question_ids
+               END
+           WHERE id = $5 AND status = 'submitted'`,
+          [
+            recomputed.obtained,
+            recomputed.total,
+            recomputed.nextSelectedIds != null,
+            recomputed.nextSelectedIds ?? [],
+            attemptId,
+          ],
+        );
+        attemptsUpdated += 1;
+      }
+
+      await this.maybeAwardCourseExamScorePoints(
+        {
+          id: opts.examId,
+          course_id: exam.course_id,
+          teacher_id: exam.teacher_id,
+          title: exam.title,
+        },
+        { id: attemptId },
+        Number(attempt.student_id),
+        recomputed.obtained,
+        recomputed.total || recomputed.obtained,
+        { syncExisting: true },
+      );
+      pointsSynced += 1;
+    }
+
+    return {
+      examId: opts.examId,
+      deletedQuestionId: opts.deletedQuestionId,
+      attemptsReviewed,
+      attemptsUpdated,
+      pointsSynced,
+    };
+  }
+
+  /**
    * Regrade all submitted attempts that include this question after correct answers change.
    * Updates is_correct, attempt obtained_grade, and syncs EXAM_SCORE points (idempotent).
    */

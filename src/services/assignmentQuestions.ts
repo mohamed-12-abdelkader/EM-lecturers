@@ -490,12 +490,102 @@ export class AssignmentQuestionsService {
     return question;
   }
 
-  // حذف سؤال
+  /**
+   * حذف سؤال من الواجب وإعادة احتساب كل التسليمات السابقة.
+   * لا يحذف السؤال من أي مصدر خارج الواجب.
+   */
   static async deleteQuestion(questionId: number) {
-    const result = await pool.query('DELETE FROM assignment_questions WHERE id = $1 RETURNING *', [
-      questionId,
-    ]);
-    return result.rows[0] || null;
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      const qRes = await client.query<{ id: number; assignment_id: number }>(
+        `SELECT id, assignment_id FROM assignment_questions WHERE id = $1 FOR UPDATE`,
+        [questionId],
+      );
+      if (!qRes.rowCount) {
+        await client.query('ROLLBACK');
+        return null;
+      }
+
+      const deletedQuestionId = Number(qRes.rows[0].id);
+      const assignmentId = Number(qRes.rows[0].assignment_id);
+
+      const result = await client.query(
+        `DELETE FROM assignment_questions WHERE id = $1 RETURNING *`,
+        [deletedQuestionId],
+      );
+
+      const remainingCountRes = await client.query<{ cnt: string }>(
+        `SELECT COUNT(*)::text AS cnt FROM assignment_questions WHERE assignment_id = $1`,
+        [assignmentId],
+      );
+      const remainingQuestionCount = Number(remainingCountRes.rows[0]?.cnt ?? 0);
+
+      const { recomputeAssignmentSubmissionAfterQuestionDelete } = await import(
+        './examQuestionDeleteRegrade.js'
+      );
+
+      const submissionsRes = await client.query(
+        `SELECT id, total_questions, correct_answers, wrong_answers, score
+         FROM assignment_submissions
+         WHERE assignment_id = $1`,
+        [assignmentId],
+      );
+
+      let submissionsUpdated = 0;
+      for (const sub of submissionsRes.rows) {
+        const answersRes = await client.query<{ is_correct: boolean }>(
+          `SELECT is_correct FROM assignment_submission_answers WHERE submission_id = $1`,
+          [sub.id],
+        );
+        const recomputed = recomputeAssignmentSubmissionAfterQuestionDelete({
+          remainingQuestionCount,
+          remainingAnswers: answersRes.rows.map((a) => ({ isCorrect: !!a.is_correct })),
+        });
+
+        if (
+          Number(sub.total_questions) !== recomputed.totalQuestions ||
+          Number(sub.correct_answers) !== recomputed.correctAnswers ||
+          Number(sub.wrong_answers) !== recomputed.wrongAnswers ||
+          Number(sub.score) !== recomputed.score
+        ) {
+          await client.query(
+            `UPDATE assignment_submissions
+             SET total_questions = $1,
+                 correct_answers = $2,
+                 wrong_answers = $3,
+                 score = $4
+             WHERE id = $5`,
+            [
+              recomputed.totalQuestions,
+              recomputed.correctAnswers,
+              recomputed.wrongAnswers,
+              recomputed.score,
+              sub.id,
+            ],
+          );
+          submissionsUpdated += 1;
+        }
+      }
+
+      await client.query('COMMIT');
+      const deleted = result.rows[0] || null;
+      if (deleted) {
+        (deleted as any).regrade = {
+          assignmentId,
+          deletedQuestionId,
+          submissionsUpdated,
+          remainingQuestionCount,
+        };
+      }
+      return deleted;
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
   }
 
   // التحقق من وجود الواجب

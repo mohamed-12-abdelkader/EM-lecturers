@@ -631,10 +631,10 @@ export class QuestionsManagementService {
     return { message: 'تم تحديث الإجابة الصحيحة بنجاح' };
   }
 
-  // حذف سؤال من امتحان المحاضرة (يدعم الأسئلة المضافة من البنك V1 و V2)
+  // حذف سؤال من امتحان المحاضرة فقط (لا يحذف من البنك) + إعادة احتساب نتائج الطلاب
   static async deleteLectureExamQuestion(questionId: number) {
     const examQuestionRes = await pool.query(
-      `SELECT question_id, question_id_v2 FROM exam_questions WHERE id = $1`,
+      `SELECT id, exam_id FROM exam_questions WHERE id = $1`,
       [questionId],
     );
 
@@ -642,22 +642,17 @@ export class QuestionsManagementService {
       throw new Error('السؤال غير موجود');
     }
 
-    const actualQuestionId = examQuestionRes.rows[0].question_id;
+    const examId = Number(examQuestionRes.rows[0].exam_id);
+    const { ExamFlowService } = await import('./examFlow.js');
+    const regrade = await ExamFlowService.deleteExamQuestionAndRegradeSubmissions({
+      examId,
+      examQuestionId: questionId,
+    });
 
-    // إن كان السؤال مربوطاً بجدول questions (V1)، احذف الاختيارات والسؤال من الجدول
-    if (actualQuestionId) {
-      await pool.query(`DELETE FROM question_choices WHERE question_id = $1`, [actualQuestionId]);
-      await pool.query(`DELETE FROM questions WHERE id = $1`, [actualQuestionId]);
-    }
-
-    // حذف الصف من exam_questions (سواء السؤال من V1 أو V2 من البنك)
-    const result = await pool.query(`DELETE FROM exam_questions WHERE id = $1 RETURNING *`, [
-      questionId,
-    ]);
-    if (!result.rowCount) {
-      throw new Error('السؤال غير موجود');
-    }
-    return { message: 'تم حذف السؤال بنجاح' };
+    return {
+      message: 'تم حذف السؤال بنجاح وإعادة احتساب نتائج الطلاب',
+      ...regrade,
+    };
   }
 
   // إضافة سؤال جديد في امتحان المحاضرة مع صورة

@@ -412,14 +412,58 @@ export class CourseLevelExamQuestionsService {
   }
 
   /**
-   * Delete a question
+   * Delete a question from a course-level exam and regrade all past submitted attempts.
+   * Does not delete the source bank/library question.
+   * Caller must already have authorized access (ownership / course manager).
    */
+  static async deleteQuestionAndRegrade(questionId: number) {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      const qRes = await client.query<{ id: number; exam_id: number }>(
+        `SELECT id, exam_id FROM course_level_exam_questions WHERE id = $1 FOR UPDATE`,
+        [questionId],
+      );
+      if (!qRes.rowCount) {
+        throw new HttpError(404, 'Question not found');
+      }
+      const examId = Number(qRes.rows[0].exam_id);
+      const deletedQuestionId = Number(qRes.rows[0].id);
+
+      const del = await client.query(
+        `DELETE FROM course_level_exam_questions WHERE id = $1 RETURNING id`,
+        [deletedQuestionId],
+      );
+      if (!del.rowCount) {
+        throw new HttpError(404, 'Question not found');
+      }
+
+      const { CourseLevelExamsService } = await import('./courseLevelExams.js');
+      const regrade = await CourseLevelExamsService.regradeExamAttemptsAfterQuestionRemoved({
+        examId,
+        deletedQuestionId,
+        client,
+      });
+
+      await client.query('COMMIT');
+      return {
+        message: 'Question deleted successfully',
+        examId,
+        deletedQuestionId,
+        regrade,
+      };
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
   static async deleteQuestion(requester: RequestUser, questionId: number) {
     await this.verifyQuestionOwnership(questionId, requester.id);
-
-    await pool.query('DELETE FROM course_level_exam_questions WHERE id = $1', [questionId]);
-
-    return { message: 'Question deleted successfully' };
+    return this.deleteQuestionAndRegrade(questionId);
   }
 
   /**

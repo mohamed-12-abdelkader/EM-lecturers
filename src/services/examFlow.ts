@@ -910,18 +910,211 @@ export class ExamFlowService {
       throw error;
     }
 
-    const result = await pool.query(
-      'DELETE FROM exam_questions WHERE id = $1 AND exam_id = $2',
-      [questionId, examId],
-    );
+    return this.deleteExamQuestionAndRegradeSubmissions({
+      examId,
+      examQuestionId: questionId,
+      exam,
+    });
+  }
 
-    if (result.rowCount === 0) {
-      const error: any = new Error('Question not found in this exam');
-      error.status = 404;
-      throw error;
+  /**
+   * حذف سؤال من امتحان/واجب المحاضرة وإعادة احتساب كل التسليمات السابقة.
+   * لا يحذف السؤال من بنك الأسئلة أو مكتبة المدرّس.
+   */
+  static async deleteExamQuestionAndRegradeSubmissions(opts: {
+    examId: number;
+    examQuestionId: number;
+    exam?: any;
+  }): Promise<{
+    deleted: true;
+    examId: number;
+    deletedQuestionId: number;
+    examTotalGrade: number;
+    submissionsUpdated: number;
+    pointsSynced: number;
+  }> {
+    const {
+      recomputeLectureSubmissionAfterQuestionDelete,
+      sumRemainingQuestionGrades,
+    } = await import('./examQuestionDeleteRegrade.js');
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      const qRes = await client.query<{ id: number; exam_id: number; grade: number | null }>(
+        `SELECT id, exam_id, grade FROM exam_questions
+         WHERE id = $1 AND exam_id = $2
+         FOR UPDATE`,
+        [opts.examQuestionId, opts.examId],
+      );
+      if (!qRes.rowCount) {
+        const error: any = new Error('Question not found in this exam');
+        error.status = 404;
+        throw error;
+      }
+      const deletedQuestionId = Number(qRes.rows[0].id);
+      const deletedQuestionGrade = Number(qRes.rows[0].grade ?? 1) || 1;
+
+      await client.query(`DELETE FROM exam_questions WHERE id = $1 AND exam_id = $2`, [
+        deletedQuestionId,
+        opts.examId,
+      ]);
+
+      const remainingRes = await client.query<{ id: number; grade: number | null }>(
+        `SELECT id, grade FROM exam_questions WHERE exam_id = $1 ORDER BY id`,
+        [opts.examId],
+      );
+      const remainingQuestions = remainingRes.rows.map((r) => ({
+        id: Number(r.id),
+        grade: Number(r.grade ?? 1) || 1,
+      }));
+      const examTotalGrade = sumRemainingQuestionGrades(remainingQuestions);
+
+      try {
+        await client.query(
+          `UPDATE exams
+           SET total_grade = $1,
+               questions_count = $2
+           WHERE id = $3`,
+          [examTotalGrade, remainingQuestions.length, opts.examId],
+        );
+      } catch {
+        await client.query(`UPDATE exams SET total_grade = $1 WHERE id = $2`, [
+          examTotalGrade,
+          opts.examId,
+        ]);
+      }
+
+      let submissionsRes: { rows: any[] };
+      try {
+        submissionsRes = await client.query(
+          `SELECT id, student_id, total_grade, passed, status, submitted_at, selected_question_ids
+           FROM exam_submissions
+           WHERE exam_id = $1`,
+          [opts.examId],
+        );
+      } catch {
+        submissionsRes = await client.query(
+          `SELECT id, student_id, total_grade, passed, status, submitted_at
+           FROM exam_submissions
+           WHERE exam_id = $1`,
+          [opts.examId],
+        );
+      }
+
+      const exam = opts.exam ?? (await this.getExamWithCourse(opts.examId));
+      let submissionsUpdated = 0;
+      let pointsSynced = 0;
+
+      for (const sub of submissionsRes.rows) {
+        const submissionId = Number(sub.id);
+        const answersRes = await client.query<{
+          question_id: number;
+          is_correct: boolean;
+          grade: number | null;
+        }>(
+          `SELECT question_id, is_correct, grade FROM exam_answers WHERE submission_id = $1`,
+          [submissionId],
+        );
+
+        const recomputed = recomputeLectureSubmissionAfterQuestionDelete({
+          deletedQuestionId,
+          deletedQuestionGrade,
+          selectedQuestionIds: sub.selected_question_ids,
+          remainingQuestions,
+          remainingAnswers: answersRes.rows.map((a) => ({
+            questionId: Number(a.question_id),
+            isCorrect: !!a.is_correct,
+            grade: Number(a.grade ?? 0) || 0,
+          })),
+        });
+
+        const status = String(sub.status || '').toLowerCase();
+        const isInProgress = status === 'in_progress' || (sub.submitted_at == null && status !== 'submitted');
+
+        if (isInProgress && status === 'in_progress') {
+          if (recomputed.nextSelectedIds) {
+            try {
+              await client.query(
+                `UPDATE exam_submissions SET selected_question_ids = $1::int[] WHERE id = $2`,
+                [recomputed.nextSelectedIds, submissionId],
+              );
+            } catch {
+              // selected_question_ids may be missing on older schemas
+            }
+          }
+          continue;
+        }
+
+        const isSubmitted =
+          status === 'submitted' ||
+          status === 'completed' ||
+          sub.submitted_at != null;
+
+        if (!isSubmitted) continue;
+
+        const prevObtained = Number(sub.total_grade ?? 0);
+        if (
+          prevObtained !== recomputed.obtained ||
+          Boolean(sub.passed) !== recomputed.passed ||
+          recomputed.nextSelectedIds != null
+        ) {
+          try {
+            await client.query(
+              `UPDATE exam_submissions
+               SET total_grade = $1,
+                   passed = $2,
+                   selected_question_ids = CASE
+                     WHEN $3::boolean THEN $4::int[]
+                     ELSE selected_question_ids
+                   END
+               WHERE id = $5`,
+              [
+                recomputed.obtained,
+                recomputed.passed,
+                recomputed.nextSelectedIds != null,
+                recomputed.nextSelectedIds ?? [],
+                submissionId,
+              ],
+            );
+          } catch {
+            await client.query(
+              `UPDATE exam_submissions SET total_grade = $1, passed = $2 WHERE id = $3`,
+              [recomputed.obtained, recomputed.passed, submissionId],
+            );
+          }
+          submissionsUpdated += 1;
+        }
+
+        if (exam && sub.student_id != null) {
+          await this.maybeAwardScorePoints(
+            { ...exam, id: opts.examId, total_grade: examTotalGrade },
+            { id: submissionId },
+            Number(sub.student_id),
+            recomputed.obtained,
+            recomputed.maxGrade || examTotalGrade,
+            { syncExisting: true },
+          );
+          pointsSynced += 1;
+        }
+      }
+
+      await client.query('COMMIT');
+      return {
+        deleted: true,
+        examId: opts.examId,
+        deletedQuestionId,
+        examTotalGrade,
+        submissionsUpdated,
+        pointsSynced,
+      };
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
     }
-
-    return true;
   }
 
   /**
@@ -3358,23 +3551,29 @@ export class ExamFlowService {
     studentId: number,
     obtainedGrade: number,
     maxGrade: number,
+    options: { syncExisting?: boolean } = {},
   ) {
     try {
       const ctx = await this.resolvePointsContext(exam);
       if (!ctx) return;
       const isAssignment = String(exam.type || '').toLowerCase() === 'assignment';
-      await TeacherPointsService.awardExamOrAssignmentScore({
+      const scoreOpts = {
         studentId,
         teacherId: ctx.teacherId,
         courseId: ctx.courseId,
         attemptId: Number(attempt.id),
         examId: Number(exam.id),
         isAssignment,
-        examKind: 'lecture',
+        examKind: 'lecture' as const,
         obtainedGrade,
         totalGrade: maxGrade,
         title: exam.title ?? null,
-      });
+      };
+      if (options.syncExisting) {
+        await TeacherPointsService.syncExamOrAssignmentScore(scoreOpts);
+      } else {
+        await TeacherPointsService.awardExamOrAssignmentScore(scoreOpts);
+      }
     } catch (error) {
       console.error('Error awarding exam score points:', error);
     }
