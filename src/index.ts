@@ -108,6 +108,36 @@ const startServer = async () => {
           }
         })();
       }
+
+      // تنظيف نقاط الترتيب عند الإقلاع: آخر امتحان شامل فقط (يحذف نقاط المحاضرات/القديمة)
+      void (async () => {
+        try {
+          const { TeacherPointsService } = await import('./services/teacherPoints.js');
+          const teachers = await pool.query<{ teacher_id: number }>(
+            `SELECT DISTINCT teacher_id FROM (
+               SELECT teacher_id FROM student_point_balances
+               UNION
+               SELECT teacher_id FROM point_transactions
+               UNION
+               SELECT teacher_id FROM teacher_points_settings
+             ) t WHERE teacher_id IS NOT NULL`,
+          );
+          for (const row of teachers.rows) {
+            const teacherId = Number(row.teacher_id);
+            const result = await TeacherPointsService.healTeacherExamPointsToLastOnly({
+              teacherId,
+            });
+            if (result.purged > 0) {
+              logger.info(
+                `🧹 Points heal teacher=${teacherId}: purged=${result.purged} allowedExams=${result.allowedExamIds.join(',')}`,
+              );
+            }
+          }
+          logger.info('✅ Points heal-on-boot finished (last comprehensive exam only)');
+        } catch (healErr: any) {
+          logger.warn('⚠️  Points heal-on-boot skipped:', healErr?.message || healErr);
+        }
+      })();
     });
 
     // Socket.IO setup for both Chat and Game systems

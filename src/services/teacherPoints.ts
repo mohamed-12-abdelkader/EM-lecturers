@@ -408,6 +408,10 @@ export class TeacherPointsService {
     title?: string | null;
     examKind?: 'lecture' | 'course';
   }): Promise<AwardResult> {
+    // الترتيب يعتمد على آخر امتحان شامل (course) فقط — امتحانات المحاضرات لا تُحتسب
+    if (!opts.isAssignment && opts.examKind !== 'course') {
+      return { awarded: false, points: 0, totalPoints: null, reason: 'lecture_exams_excluded' };
+    }
     const settings = await this.getOrCreateSettings(opts.teacherId);
     const enabled = opts.isAssignment
       ? settings.assignment_start_enabled
@@ -415,15 +419,31 @@ export class TeacherPointsService {
     if (!enabled) {
       return { awarded: false, points: 0, totalPoints: null, reason: 'disabled' };
     }
-    const points = opts.isAssignment
-      ? settings.assignment_start_points
-      : settings.exam_start_points;
-    const eventType: PointsEventType = opts.isAssignment ? 'ASSIGNMENT_START' : 'EXAM_START';
     const gradeId = await this.resolveGradeId({
       studentId: opts.studentId,
       teacherId: opts.teacherId,
       courseId: opts.courseId,
     });
+    if (!opts.isAssignment && gradeId) {
+      const allowed = await this.isLatestCourseExamForGrade({
+        teacherId: opts.teacherId,
+        gradeId,
+        examId: opts.examId,
+        courseId: opts.courseId,
+      });
+      if (!allowed) {
+        return {
+          awarded: false,
+          points: 0,
+          totalPoints: null,
+          reason: 'not_last_comprehensive_exam',
+        };
+      }
+    }
+    const points = opts.isAssignment
+      ? settings.assignment_start_points
+      : settings.exam_start_points;
+    const eventType: PointsEventType = opts.isAssignment ? 'ASSIGNMENT_START' : 'EXAM_START';
     const referenceKey = this.examPointsReferenceKey({
       eventType,
       teacherId: opts.teacherId,
@@ -432,7 +452,7 @@ export class TeacherPointsService {
       isAssignment: opts.isAssignment,
       examKind: opts.examKind,
     });
-    return this.award({
+    const result = await this.award({
       studentId: opts.studentId,
       teacherId: opts.teacherId,
       gradeId,
@@ -451,6 +471,15 @@ export class TeacherPointsService {
         title: opts.title ?? null,
       },
     });
+    if (!opts.isAssignment && result.awarded && gradeId) {
+      await this.purgeStudentExamPointsExceptAllowed(
+        opts.teacherId,
+        opts.studentId,
+        gradeId,
+        [opts.examId],
+      );
+    }
+    return result;
   }
 
   static async awardExamOrAssignmentScore(opts: {
@@ -465,6 +494,10 @@ export class TeacherPointsService {
     title?: string | null;
     examKind?: 'lecture' | 'course';
   }): Promise<AwardResult> {
+    // الترتيب يعتمد على آخر امتحان شامل (course) فقط — امتحانات المحاضرات لا تُحتسب
+    if (!opts.isAssignment && opts.examKind !== 'course') {
+      return { awarded: false, points: 0, totalPoints: null, reason: 'lecture_exams_excluded' };
+    }
     const settings = await this.getOrCreateSettings(opts.teacherId);
     const enabled = opts.isAssignment
       ? settings.assignment_score_enabled
@@ -472,13 +505,29 @@ export class TeacherPointsService {
     if (!enabled) {
       return { awarded: false, points: 0, totalPoints: null, reason: 'disabled' };
     }
-    const points = Math.max(0, Math.floor(Number(opts.obtainedGrade) || 0));
-    const eventType: PointsEventType = opts.isAssignment ? 'ASSIGNMENT_SCORE' : 'EXAM_SCORE';
     const gradeId = await this.resolveGradeId({
       studentId: opts.studentId,
       teacherId: opts.teacherId,
       courseId: opts.courseId,
     });
+    if (!opts.isAssignment && gradeId) {
+      const allowed = await this.isLatestCourseExamForGrade({
+        teacherId: opts.teacherId,
+        gradeId,
+        examId: opts.examId,
+        courseId: opts.courseId,
+      });
+      if (!allowed) {
+        return {
+          awarded: false,
+          points: 0,
+          totalPoints: null,
+          reason: 'not_last_comprehensive_exam',
+        };
+      }
+    }
+    const points = Math.max(0, Math.floor(Number(opts.obtainedGrade) || 0));
+    const eventType: PointsEventType = opts.isAssignment ? 'ASSIGNMENT_SCORE' : 'EXAM_SCORE';
     const referenceKey = this.examPointsReferenceKey({
       eventType,
       teacherId: opts.teacherId,
@@ -487,7 +536,7 @@ export class TeacherPointsService {
       isAssignment: opts.isAssignment,
       examKind: opts.examKind,
     });
-    return this.award({
+    const result = await this.award({
       studentId: opts.studentId,
       teacherId: opts.teacherId,
       gradeId,
@@ -508,6 +557,15 @@ export class TeacherPointsService {
         title: opts.title ?? null,
       },
     });
+    if (!opts.isAssignment && result.awarded && gradeId) {
+      await this.purgeStudentExamPointsExceptAllowed(
+        opts.teacherId,
+        opts.studentId,
+        gradeId,
+        [opts.examId],
+      );
+    }
+    return result;
   }
 
   /**
@@ -526,12 +584,39 @@ export class TeacherPointsService {
     title?: string | null;
     examKind?: 'lecture' | 'course';
   }): Promise<AwardResult> {
+    // امتحانات المحاضرات لا تدخل الترتيب — لا تعدّل نقاطها
+    if (!opts.isAssignment && opts.examKind !== 'course') {
+      return { awarded: false, points: 0, totalPoints: null, reason: 'lecture_exams_excluded' };
+    }
     const settings = await this.getOrCreateSettings(opts.teacherId);
     const enabled = opts.isAssignment
       ? settings.assignment_score_enabled
       : settings.exam_score_enabled;
     if (!enabled) {
       return { awarded: false, points: 0, totalPoints: null, reason: 'disabled' };
+    }
+    if (!opts.isAssignment) {
+      const gradeIdForCheck = await this.resolveGradeId({
+        studentId: opts.studentId,
+        teacherId: opts.teacherId,
+        courseId: opts.courseId,
+      });
+      if (gradeIdForCheck) {
+        const allowed = await this.isLatestCourseExamForGrade({
+          teacherId: opts.teacherId,
+          gradeId: gradeIdForCheck,
+          examId: opts.examId,
+          courseId: opts.courseId,
+        });
+        if (!allowed) {
+          return {
+            awarded: false,
+            points: 0,
+            totalPoints: null,
+            reason: 'not_last_comprehensive_exam',
+          };
+        }
+      }
     }
 
     const newPoints = Math.max(0, Math.floor(Number(opts.obtainedGrade) || 0));
@@ -1385,6 +1470,170 @@ export class TeacherPointsService {
     }
   }
 
+  /**
+   * هل هذا الامتحان الشامل هو الأحدث في صف الطالب (أو في نفس الكورس إن وُجد)؟
+   * لا يشترط وجود محاولات سابقة — يكفي أنه أحدث course_level_exam بالإنشاء.
+   */
+  static async isLatestCourseExamForGrade(opts: {
+    teacherId: number;
+    gradeId: number;
+    examId: number;
+    courseId?: number | null;
+  }): Promise<boolean> {
+    const last = await this.findLatestCourseExamForGrade(opts.teacherId, opts.gradeId, {
+      courseId: opts.courseId ?? null,
+      requireSubmitted: false,
+    });
+    return last != null && Number(last.id) === Number(opts.examId);
+  }
+
+  /**
+   * يحذف نقاط امتحان/واجب لطالب معيّن ما عدا امتحانات course_exam المسموحة،
+   * مع الإبقاء على MANUAL_REWARD و VIDEO_WATCH، ثم يعيد بناء رصيد الصف.
+   */
+  private static async purgeStudentExamPointsExceptAllowed(
+    teacherId: number,
+    studentId: number,
+    gradeId: number,
+    allowedExamIds: number[],
+  ): Promise<number> {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const del = await client.query(
+        `DELETE FROM point_transactions
+         WHERE teacher_id = $1
+           AND student_id = $2
+           AND grade_id = $3
+           AND event_type IN (
+             'EXAM_START', 'EXAM_SCORE', 'ASSIGNMENT_START', 'ASSIGNMENT_SCORE'
+           )
+           AND NOT (
+             event_type IN ('EXAM_START', 'EXAM_SCORE')
+             AND reference_type = 'course_exam'
+             AND reference_id = ANY($4::int[])
+           )`,
+        [teacherId, studentId, gradeId, allowedExamIds.length ? allowedExamIds : [-1]],
+      );
+      await client.query(
+        `INSERT INTO student_point_balances (student_id, teacher_id, grade_id, total_points)
+         SELECT $1, $2, $3, COALESCE((
+           SELECT GREATEST(0, SUM(points)::int)
+           FROM point_transactions
+           WHERE teacher_id = $2 AND student_id = $1 AND grade_id = $3
+         ), 0)
+         ON CONFLICT (student_id, teacher_id, grade_id)
+         DO UPDATE SET
+           total_points = EXCLUDED.total_points,
+           updated_at = NOW()`,
+        [studentId, teacherId, gradeId],
+      );
+      await client.query('COMMIT');
+      return del.rowCount ?? 0;
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * عند فتح سجل نقاط طالب: أبقِ فقط نقاط آخر امتحان شامل + اليدوي/الفيديو.
+   */
+  static async healStudentToLastCourseExamOnly(opts: {
+    teacherId: number;
+    studentId: number;
+    gradeId?: number | null;
+  }): Promise<{ purged: number; allowedExamId: number | null }> {
+    const gradeId =
+      opts.gradeId ??
+      (await this.resolveGradeId({
+        studentId: opts.studentId,
+        teacherId: opts.teacherId,
+      }));
+    if (!gradeId) return { purged: 0, allowedExamId: null };
+
+    const lastExam = await this.findLastCourseExamForGrade(opts.teacherId, gradeId);
+    const allowed = lastExam ? [Number(lastExam.id)] : [];
+    const purged = await this.purgeStudentExamPointsExceptAllowed(
+      opts.teacherId,
+      opts.studentId,
+      gradeId,
+      allowed,
+    );
+    return { purged, allowedExamId: lastExam ? Number(lastExam.id) : null };
+  }
+
+  /**
+   * تنظيف جماعي: احذف نقاط امتحانات المحاضرات/القديمة لكل طلاب المدرس،
+   * وأبقِ فقط EXAM_* لآخر امتحان شامل لكل صف (+ يدوي/فيديو).
+   */
+  static async healTeacherExamPointsToLastOnly(opts: {
+    teacherId: number;
+    gradeId?: number | null;
+  }): Promise<{ purged: number; allowedExamIds: number[] }> {
+    const gradeFilter =
+      opts.gradeId != null && Number.isFinite(Number(opts.gradeId))
+        ? Number(opts.gradeId)
+        : null;
+
+    const gradesRes =
+      gradeFilter != null
+        ? { rows: [{ grade_id: gradeFilter }] }
+        : await pool.query<{ grade_id: number }>(
+            `SELECT grade_id FROM teacher_grades WHERE teacher_id = $1 ORDER BY grade_id`,
+            [opts.teacherId],
+          );
+
+    const allowedExamIds: number[] = [];
+    for (const g of gradesRes.rows) {
+      const last = await this.findLastCourseExamForGrade(opts.teacherId, Number(g.grade_id));
+      if (last) allowedExamIds.push(Number(last.id));
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const del = await client.query(
+        `DELETE FROM point_transactions
+         WHERE teacher_id = $1
+           AND ($3::int IS NULL OR grade_id = $3)
+           AND event_type IN (
+             'EXAM_START', 'EXAM_SCORE', 'ASSIGNMENT_START', 'ASSIGNMENT_SCORE'
+           )
+           AND NOT (
+             event_type IN ('EXAM_START', 'EXAM_SCORE')
+             AND reference_type = 'course_exam'
+             AND reference_id = ANY($2::int[])
+           )`,
+        [opts.teacherId, allowedExamIds.length ? allowedExamIds : [-1], gradeFilter],
+      );
+
+      // أعد بناء أرصدة الصف/الصفوف المعنية من المتبقي (يشمل اليدوي/الفيديو)
+      await client.query(
+        `DELETE FROM student_point_balances
+         WHERE teacher_id = $1 AND ($2::int IS NULL OR grade_id = $2)`,
+        [opts.teacherId, gradeFilter],
+      );
+      await client.query(
+        `INSERT INTO student_point_balances (student_id, teacher_id, grade_id, total_points)
+         SELECT student_id, teacher_id, grade_id, GREATEST(0, SUM(points)::int)
+         FROM point_transactions
+         WHERE teacher_id = $1 AND ($2::int IS NULL OR grade_id = $2)
+         GROUP BY student_id, teacher_id, grade_id`,
+        [opts.teacherId, gradeFilter],
+      );
+      await client.query('COMMIT');
+      return { purged: del.rowCount ?? 0, allowedExamIds };
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
   /** أحدث امتحان شامل/عام في الصف (حسب الإنشاء) وله محاولات مُسلَّمة */
   private static async findLastCourseExamForGrade(
     teacherId: number,
@@ -1394,7 +1643,32 @@ export class TeacherPointsService {
     title: string | null;
     course_id: number | null;
   } | null> {
+    return this.findLatestCourseExamForGrade(teacherId, gradeId, {
+      requireSubmitted: true,
+    });
+  }
+
+  private static async findLatestCourseExamForGrade(
+    teacherId: number,
+    gradeId: number,
+    opts: { courseId?: number | null; requireSubmitted?: boolean } = {},
+  ): Promise<{
+    id: number;
+    title: string | null;
+    course_id: number | null;
+  } | null> {
     const orderBy = `ORDER BY e.created_at DESC NULLS LAST, e.id DESC LIMIT 1`;
+    const requireSubmitted = opts.requireSubmitted !== false;
+    const submittedClause = requireSubmitted
+      ? `AND EXISTS (
+           SELECT 1 FROM course_level_exam_attempts a
+           WHERE a.exam_id = e.id AND a.status = 'submitted'
+         )`
+      : '';
+    const courseClause =
+      opts.courseId != null && Number.isFinite(Number(opts.courseId))
+        ? `AND e.course_id = ${Number(opts.courseId)}`
+        : '';
 
     const sqlWithCourseGrades = `SELECT e.id, e.title, e.course_id
        FROM course_level_exams e
@@ -1408,10 +1682,8 @@ export class TeacherPointsService {
              WHERE cg.course_id = e.course_id AND cg.grade_id = $2
            )
          )
-         AND EXISTS (
-           SELECT 1 FROM course_level_exam_attempts a
-           WHERE a.exam_id = e.id AND a.status = 'submitted'
-         )
+         ${courseClause}
+         ${submittedClause}
        ${orderBy}`;
 
     const sqlSimple = `SELECT e.id, e.title, e.course_id
@@ -1419,10 +1691,8 @@ export class TeacherPointsService {
        LEFT JOIN courses c ON c.id = e.course_id
        WHERE COALESCE(e.teacher_id, c.teacher_id) = $1
          AND (e.grade_id = $2 OR c.grade_id = $2)
-         AND EXISTS (
-           SELECT 1 FROM course_level_exam_attempts a
-           WHERE a.exam_id = e.id AND a.status = 'submitted'
-         )
+         ${courseClause}
+         ${submittedClause}
        ${orderBy}`;
 
     try {
@@ -1956,6 +2226,9 @@ export class TeacherPointsService {
     };
   }
 
+  /** تجنب إعادة تنظيف الترتيب في كل طلب خلال دقيقة */
+  private static leaderboardHealAt = new Map<string, number>();
+
   static async getTeacherLeaderboard(opts: {
     teacherId: number;
     gradeId?: number | null;
@@ -1964,6 +2237,21 @@ export class TeacherPointsService {
     page?: number;
     limit?: number;
   }) {
+    // تنظيف تلقائي قبل عرض الترتيب: آخر امتحان شامل فقط (مرة/دقيقة لكل مدرس+صف)
+    const healKey = `${opts.teacherId}:${opts.gradeId ?? 'all'}`;
+    const lastHeal = this.leaderboardHealAt.get(healKey) ?? 0;
+    if (Date.now() - lastHeal > 60_000) {
+      try {
+        await this.healTeacherExamPointsToLastOnly({
+          teacherId: opts.teacherId,
+          gradeId: opts.gradeId ?? null,
+        });
+        this.leaderboardHealAt.set(healKey, Date.now());
+      } catch (err) {
+        console.error('healTeacherExamPointsToLastOnly failed:', err);
+      }
+    }
+
     const page = Math.max(1, opts.page ?? 1);
     const limit = Math.min(Math.max(opts.limit ?? 50, 1), 200);
     const offset = (page - 1) * limit;
@@ -2072,6 +2360,17 @@ export class TeacherPointsService {
     gradeId?: number | null;
     limit?: number;
   }) {
+    // تصفية تلقائية: السجل يعرض آخر امتحان شامل فقط (+ يدوي/فيديو)
+    try {
+      await this.healStudentToLastCourseExamOnly({
+        teacherId: opts.teacherId,
+        studentId: opts.studentId,
+        gradeId: opts.gradeId ?? null,
+      });
+    } catch (err) {
+      console.error('healStudentToLastCourseExamOnly failed:', err);
+    }
+
     const limit = Math.min(Math.max(opts.limit ?? 100, 1), 500);
     const params: unknown[] = [opts.teacherId, opts.studentId];
     let where = `teacher_id = $1 AND student_id = $2`;

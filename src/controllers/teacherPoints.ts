@@ -293,6 +293,43 @@ router.post(
   }),
 );
 
+/**
+ * POST /api/teacher/points/heal-last-exam-only
+ * تنظيف ناعم: يحذف نقاط امتحانات المحاضرات/القديمة ويُبقي آخر امتحان شامل + اليدوي/الفيديو
+ */
+router.post(
+  '/heal-last-exam-only',
+  authMiddleware(['teacher', 'academy', 'admin']),
+  asyncWrapper(async (req, res) => {
+    const teacherId = resolveTeacherId(req);
+    const gradeIdRaw = req.body?.gradeId ?? req.query.gradeId;
+    const gradeId =
+      gradeIdRaw != null && Number.isFinite(Number(gradeIdRaw))
+        ? Number(gradeIdRaw)
+        : null;
+    try {
+      const result = await TeacherPointsService.healTeacherExamPointsToLastOnly({
+        teacherId,
+        gradeId,
+      });
+      return res.json({
+        success: true,
+        message:
+          'تم حذف نقاط الامتحانات القديمة/المحاضرات والإبقاء على آخر امتحان شامل فقط',
+        data: result,
+      });
+    } catch (error) {
+      if (error instanceof HttpError) {
+        return res.status(error.status).json({
+          success: false,
+          message: error.message,
+        });
+      }
+      throw error;
+    }
+  }),
+);
+
 /** GET /api/teacher/points/seasons — مواسم النقاط المؤرشفة */
 router.get(
   '/seasons',

@@ -23,7 +23,6 @@ import {
 } from './examAccessPolicy';
 import { CourseAccessControl } from './courseAccessControl';
 import { CourseAccessService } from './courseAccess';
-import { TeacherPointsService } from './teacherPoints';
 import {
   choiceIdFromAnswerRow,
   collectLectureExamAnswersFromBody,
@@ -1087,17 +1086,7 @@ export class ExamFlowService {
           submissionsUpdated += 1;
         }
 
-        if (exam && sub.student_id != null) {
-          await this.maybeAwardScorePoints(
-            { ...exam, id: opts.examId, total_grade: examTotalGrade },
-            { id: submissionId },
-            Number(sub.student_id),
-            recomputed.obtained,
-            recomputed.maxGrade || examTotalGrade,
-            { syncExisting: true },
-          );
-          pointsSynced += 1;
-        }
+        // نقاط الترتيب من آخر امتحان شامل فقط — امتحانات المحاضرات مستبعدة
       }
 
       await client.query('COMMIT');
@@ -1247,17 +1236,7 @@ export class ExamFlowService {
         submissionsUpdated += 1;
       }
 
-      if (sub.student_id != null) {
-        await this.maybeAwardScorePoints(
-          { ...exam, id: examId, total_grade: examTotalGrade },
-          { id: submissionId },
-          Number(sub.student_id),
-          recomputed.obtained,
-          recomputed.maxGrade || examTotalGrade,
-          { syncExisting: true },
-        );
-        pointsSynced += 1;
-      }
+      // نقاط الترتيب من آخر امتحان شامل فقط — امتحانات المحاضرات مستبعدة
     }
 
     return {
@@ -1755,7 +1734,7 @@ export class ExamFlowService {
       );
 
       const attemptRow = insertResult.rows[0];
-      await this.maybeAwardStartPoints(exam, attemptRow, studentId);
+      // نقاط الترتيب من آخر امتحان شامل فقط — امتحانات المحاضرات مستبعدة
       return this.buildStudentAttemptPayload(exam, attemptRow, studentId, false);
     } catch (error: any) {
       if (error?.code === '23505') {
@@ -2665,13 +2644,7 @@ export class ExamFlowService {
     const updatedAttempt = updateRes.rows[0] || attempt;
 
     await this.persistAttemptAnswers(updatedAttempt.id, evaluation.questions);
-    await this.maybeAwardScorePoints(
-      exam,
-      updatedAttempt,
-      studentId,
-      evaluation.totalGrade,
-      evaluation.maxGrade,
-    );
+    // نقاط الترتيب من آخر امتحان شامل فقط — امتحانات المحاضرات مستبعدة
 
     const releaseDecision = this.shouldReleaseAnswers(exam, updatedAttempt, now);
     const wrongQuestions = releaseDecision.release
@@ -3675,74 +3648,6 @@ export class ExamFlowService {
         wrong_questions_count: inProgress ? 0 : wrong.length,
       };
     });
-  }
-
-  private static async maybeAwardStartPoints(exam: any, attempt: any, studentId: number) {
-    try {
-      const ctx = await this.resolvePointsContext(exam);
-      if (!ctx) return;
-      const isAssignment = String(exam.type || '').toLowerCase() === 'assignment';
-      await TeacherPointsService.awardExamOrAssignmentStart({
-        studentId,
-        teacherId: ctx.teacherId,
-        courseId: ctx.courseId,
-        attemptId: Number(attempt.id),
-        examId: Number(exam.id),
-        isAssignment,
-        examKind: 'lecture',
-        title: exam.title ?? null,
-      });
-    } catch (error) {
-      console.error('Error awarding exam start points:', error);
-    }
-  }
-
-  private static async maybeAwardScorePoints(
-    exam: any,
-    attempt: any,
-    studentId: number,
-    obtainedGrade: number,
-    maxGrade: number,
-    options: { syncExisting?: boolean } = {},
-  ) {
-    try {
-      const ctx = await this.resolvePointsContext(exam);
-      if (!ctx) return;
-      const isAssignment = String(exam.type || '').toLowerCase() === 'assignment';
-      const scoreOpts = {
-        studentId,
-        teacherId: ctx.teacherId,
-        courseId: ctx.courseId,
-        attemptId: Number(attempt.id),
-        examId: Number(exam.id),
-        isAssignment,
-        examKind: 'lecture' as const,
-        obtainedGrade,
-        totalGrade: maxGrade,
-        title: exam.title ?? null,
-      };
-      if (options.syncExisting) {
-        await TeacherPointsService.syncExamOrAssignmentScore(scoreOpts);
-      } else {
-        await TeacherPointsService.awardExamOrAssignmentScore(scoreOpts);
-      }
-    } catch (error) {
-      console.error('Error awarding exam score points:', error);
-    }
-  }
-
-  private static async resolvePointsContext(
-    exam: any,
-  ): Promise<{ teacherId: number; courseId: number | null } | null> {
-    let courseId = exam.course_id != null ? Number(exam.course_id) : null;
-    if (!courseId && exam.lecture_id) {
-      const lec = await pool.query(`SELECT course_id FROM lectures WHERE id = $1`, [exam.lecture_id]);
-      courseId = lec.rowCount ? Number(lec.rows[0].course_id) : null;
-    }
-    if (!courseId) return null;
-    const teacherId = await TeacherPointsService.resolveTeacherIdForCourse(courseId);
-    if (!teacherId) return null;
-    return { teacherId, courseId };
   }
 
   private static mapExamRow(row: any, availabilityStatus?: string) {
