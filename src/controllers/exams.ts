@@ -1645,6 +1645,40 @@ router.delete(
   }),
 );
 
+/**
+ * POST /api/exams/:examId/recalculate-results
+ * إعادة احتساب درجات كل الطلاب + النقاط من الأسئلة المتبقية
+ * (مفيد للامتحانات القديمة التي حُذفت أسئلتها قبل آلية الحذف الجديدة)
+ */
+router.post(
+  '/:examId/recalculate-results',
+  authMiddleware(COURSE_CONTENT_ROLES),
+  asyncWrapper(async (req, res) => {
+    const examId = Number(req.params.examId);
+    if (Number.isNaN(examId)) {
+      return res.status(400).json({ message: 'Invalid exam id' });
+    }
+    try {
+      const result = await ExamFlowService.recalculateResultsFromRemainingQuestions(
+        req.user!.id,
+        examId,
+      );
+      res.json({
+        success: true,
+        message:
+          'تم إعادة احتساب درجات الطلاب والنقاط حسب الأسئلة المتبقية في الامتحان',
+        data: result,
+      });
+    } catch (error: any) {
+      if (error.status) {
+        return res.status(error.status).json({ message: error.message });
+      }
+      console.error('Error recalculating exam results:', error);
+      res.status(500).json({ message: 'Failed to recalculate exam results' });
+    }
+  }),
+);
+
 // PATCH /api/exams/:examId/questions/:questionId/correct-answer
 // تحديد إجابة واحدة أو إجابتين صحيحتين لسؤال في امتحان المحاضرة (تجاوز على مستوى الامتحان فقط)
 // Body examples:

@@ -3,7 +3,9 @@ import { describe, expect, it } from 'vitest';
 import {
   recomputeAssignmentSubmissionAfterQuestionDelete,
   recomputeCourseAttemptAfterQuestionDelete,
+  recomputeCourseAttemptFromRemainingQuestions,
   recomputeLectureSubmissionAfterQuestionDelete,
+  recomputeLectureSubmissionFromRemainingQuestions,
   sumRemainingQuestionGrades,
 } from '../examQuestionDeleteRegrade';
 
@@ -137,5 +139,39 @@ describe('recomputeAssignmentSubmissionAfterQuestionDelete', () => {
 describe('sumRemainingQuestionGrades', () => {
   it('sums grades and defaults missing to 1', () => {
     expect(sumRemainingQuestionGrades([{ grade: 1 }, { grade: 1 }, { grade: null }])).toBe(3);
+  });
+});
+
+describe('recompute*FromRemainingQuestions (legacy backfill)', () => {
+  it('fixes stale 20-max attempt down to 18 remaining questions', () => {
+    const remainingIds = Array.from({ length: 18 }, (_, i) => i + 1);
+    const result = recomputeCourseAttemptFromRemainingQuestions({
+      selectedQuestionIds: Array.from({ length: 20 }, (_, i) => i + 1),
+      remainingExamQuestionIds: remainingIds,
+      remainingAnswers: remainingIds.map((id) => ({
+        questionId: id,
+        isCorrect: id <= 14,
+      })),
+    });
+    expect(result.total).toBe(18);
+    expect(result.obtained).toBe(14);
+    expect(result.nextSelectedIds).toEqual(remainingIds);
+  });
+
+  it('recomputes lecture obtained/max from remaining questions only', () => {
+    const result = recomputeLectureSubmissionFromRemainingQuestions({
+      selectedQuestionIds: [1, 2, 3],
+      remainingQuestions: [
+        { id: 1, grade: 1 },
+        { id: 2, grade: 1 },
+      ],
+      remainingAnswers: [
+        { questionId: 1, isCorrect: true, grade: 1 },
+        { questionId: 2, isCorrect: true, grade: 1 },
+      ],
+    });
+    expect(result.maxGrade).toBe(2);
+    expect(result.obtained).toBe(2);
+    expect(result.nextSelectedIds).toEqual([1, 2]);
   });
 });

@@ -1118,6 +1118,158 @@ export class ExamFlowService {
   }
 
   /**
+   * إعادة احتساب نتائج امتحان/واجب المحاضرة من الأسئلة المتبقية حاليًا
+   * (للامتحانات القديمة التي حُذفت أسئلتها قبل آلية الحذف الجديدة).
+   * يحدّث exams.total_grade ودرجات الطلاب ويزامِن النقاط.
+   */
+  static async recalculateResultsFromRemainingQuestions(
+    teacherId: number,
+    examId: number,
+  ): Promise<{
+    examId: number;
+    examTotalGrade: number;
+    remainingQuestions: number;
+    submissionsUpdated: number;
+    pointsSynced: number;
+  }> {
+    const exam = await this.getExamWithCourse(examId);
+    if (!exam) {
+      const error: any = new Error('Exam not found');
+      error.status = 404;
+      throw error;
+    }
+    if (
+      !(await this.canUserManageCourse(teacherId, Number(exam.course_id))) &&
+      exam.teacher_id !== teacherId
+    ) {
+      const error: any = new Error('You do not own this exam');
+      error.status = 403;
+      throw error;
+    }
+
+    const {
+      recomputeLectureSubmissionFromRemainingQuestions,
+      sumRemainingQuestionGrades,
+    } = await import('./examQuestionDeleteRegrade.js');
+
+    const remainingRes = await pool.query<{ id: number; grade: number | null }>(
+      `SELECT id, grade FROM exam_questions WHERE exam_id = $1 ORDER BY id`,
+      [examId],
+    );
+    const remainingQuestions = remainingRes.rows.map((r) => ({
+      id: Number(r.id),
+      grade: Number(r.grade ?? 1) || 1,
+    }));
+    const examTotalGrade = sumRemainingQuestionGrades(remainingQuestions);
+
+    try {
+      await pool.query(
+        `UPDATE exams SET total_grade = $1, questions_count = $2 WHERE id = $3`,
+        [examTotalGrade, remainingQuestions.length, examId],
+      );
+    } catch {
+      await pool.query(`UPDATE exams SET total_grade = $1 WHERE id = $2`, [
+        examTotalGrade,
+        examId,
+      ]);
+    }
+
+    let submissionsRes: { rows: any[] };
+    try {
+      submissionsRes = await pool.query(
+        `SELECT id, student_id, total_grade, passed, status, submitted_at, selected_question_ids
+         FROM exam_submissions WHERE exam_id = $1`,
+        [examId],
+      );
+    } catch {
+      submissionsRes = await pool.query(
+        `SELECT id, student_id, total_grade, passed, status, submitted_at
+         FROM exam_submissions WHERE exam_id = $1`,
+        [examId],
+      );
+    }
+
+    let submissionsUpdated = 0;
+    let pointsSynced = 0;
+
+    for (const sub of submissionsRes.rows) {
+      const status = String(sub.status || '').toLowerCase();
+      const isSubmitted =
+        status === 'submitted' || status === 'completed' || sub.submitted_at != null;
+      if (!isSubmitted) continue;
+
+      const submissionId = Number(sub.id);
+      const answersRes = await pool.query<{
+        question_id: number;
+        is_correct: boolean;
+        grade: number | null;
+      }>(
+        `SELECT question_id, is_correct, grade FROM exam_answers WHERE submission_id = $1`,
+        [submissionId],
+      );
+
+      const recomputed = recomputeLectureSubmissionFromRemainingQuestions({
+        selectedQuestionIds: sub.selected_question_ids,
+        remainingQuestions,
+        remainingAnswers: answersRes.rows.map((a) => ({
+          questionId: Number(a.question_id),
+          isCorrect: !!a.is_correct,
+          grade: Number(a.grade ?? 0) || 0,
+        })),
+      });
+
+      const prevObtained = Number(sub.total_grade ?? 0);
+      if (prevObtained !== recomputed.obtained || Boolean(sub.passed) !== recomputed.passed) {
+        try {
+          await pool.query(
+            `UPDATE exam_submissions
+             SET total_grade = $1,
+                 passed = $2,
+                 selected_question_ids = CASE
+                   WHEN $3::boolean THEN $4::int[]
+                   ELSE selected_question_ids
+                 END
+             WHERE id = $5`,
+            [
+              recomputed.obtained,
+              recomputed.passed,
+              recomputed.nextSelectedIds != null,
+              recomputed.nextSelectedIds ?? [],
+              submissionId,
+            ],
+          );
+        } catch {
+          await pool.query(
+            `UPDATE exam_submissions SET total_grade = $1, passed = $2 WHERE id = $3`,
+            [recomputed.obtained, recomputed.passed, submissionId],
+          );
+        }
+        submissionsUpdated += 1;
+      }
+
+      if (sub.student_id != null) {
+        await this.maybeAwardScorePoints(
+          { ...exam, id: examId, total_grade: examTotalGrade },
+          { id: submissionId },
+          Number(sub.student_id),
+          recomputed.obtained,
+          recomputed.maxGrade || examTotalGrade,
+          { syncExisting: true },
+        );
+        pointsSynced += 1;
+      }
+    }
+
+    return {
+      examId,
+      examTotalGrade,
+      remainingQuestions: remainingQuestions.length,
+      submissionsUpdated,
+      pointsSynced,
+    };
+  }
+
+  /**
    * تحديد الإجابة الصحيحة لسؤال في امتحان المحاضرة (للسؤال المُضاف من بنك الأسئلة).
    * التعديل يطبق على هذا الامتحان فقط ولا يغيّر بنك الأسئلة.
    * @param correct_answer_index 0=أ، 1=ب، 2=ج، 3=د

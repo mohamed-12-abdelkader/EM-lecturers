@@ -55,6 +55,72 @@ export function recomputeCourseAttemptAfterQuestionDelete(
   };
 }
 
+/**
+ * Full recalculation from questions that still exist (for legacy exams where
+ * questions were deleted before delete-time regrade existed).
+ */
+export function recomputeCourseAttemptFromRemainingQuestions(input: {
+  selectedQuestionIds: unknown;
+  remainingExamQuestionIds: number[];
+  remainingAnswers: Array<{ questionId: number; isCorrect: boolean }>;
+}): Omit<CourseAttemptRegradeResult, 'affected'> {
+  const remainingSet = new Set(input.remainingExamQuestionIds);
+  const selected = parseSelectedQuestionIds(input.selectedQuestionIds);
+  const nextSelectedIds = selected
+    ? selected.filter((id) => remainingSet.has(id))
+    : null;
+
+  const scopedAnswers = nextSelectedIds
+    ? input.remainingAnswers.filter((a) => nextSelectedIds.includes(a.questionId))
+    : input.remainingAnswers.filter((a) => remainingSet.has(a.questionId));
+
+  const obtained = scopedAnswers.reduce((sum, a) => sum + (a.isCorrect ? 1 : 0), 0);
+  const total = nextSelectedIds ? nextSelectedIds.length : remainingSet.size;
+
+  return {
+    obtained,
+    total: Math.max(0, total),
+    nextSelectedIds,
+  };
+}
+
+export function recomputeLectureSubmissionFromRemainingQuestions(input: {
+  selectedQuestionIds: unknown;
+  remainingQuestions: Array<{ id: number; grade: number }>;
+  remainingAnswers: Array<{ questionId: number; isCorrect: boolean; grade: number }>;
+}): Omit<LectureSubmissionRegradeResult, 'affected'> {
+  const remainingById = new Map(input.remainingQuestions.map((q) => [q.id, q.grade]));
+  const selected = parseSelectedQuestionIds(input.selectedQuestionIds);
+  const nextSelectedIds = selected
+    ? selected.filter((id) => remainingById.has(id))
+    : null;
+
+  const questionIdsForMax = nextSelectedIds ?? [...remainingById.keys()];
+  const maxGrade = questionIdsForMax.reduce(
+    (sum, id) => sum + (remainingById.get(id) ?? 0),
+    0,
+  );
+
+  const scopedAnswers = input.remainingAnswers.filter((a) =>
+    questionIdsForMax.includes(a.questionId),
+  );
+  const obtained = scopedAnswers.reduce((sum, a) => {
+    if (!a.isCorrect) return sum;
+    const g = Number(a.grade);
+    if (Number.isFinite(g) && g > 0) return sum + g;
+    return sum + (remainingById.get(a.questionId) ?? 1);
+  }, 0);
+
+  const passed = maxGrade > 0 ? obtained >= Math.ceil(maxGrade / 2) : false;
+
+  return {
+    obtained,
+    maxGrade: Math.max(0, maxGrade),
+    passed,
+    nextSelectedIds,
+  };
+}
+
 export type LectureSubmissionRegradeInput = {
   deletedQuestionId: number;
   deletedQuestionGrade: number;

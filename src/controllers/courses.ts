@@ -2604,6 +2604,39 @@ router.get(
   }),
 );
 
+/**
+ * POST /api/course/course-exam/:examId/recalculate-results
+ * إعادة احتساب درجات كل الطلاب + النقاط من الأسئلة المتبقية
+ * (للامتحانات الشاملة/العامة القديمة التي حُذفت أسئلتها قبل آلية الحذف الجديدة)
+ */
+router.post(
+  '/course-exam/:examId/recalculate-results',
+  authMiddleware(COURSE_CONTENT_ROLES),
+  asyncWrapper(async (req, res) => {
+    const examId = Number(req.params.examId);
+    if (Number.isNaN(examId)) {
+      return res.status(400).json({ message: 'Invalid exam id' });
+    }
+    try {
+      await CourseLevelExamsService.getExamById(examId, req.user!);
+      const result =
+        await CourseLevelExamsService.recalculateResultsFromRemainingQuestions(examId);
+      res.json({
+        success: true,
+        message:
+          'تم إعادة احتساب درجات الطلاب والنقاط حسب الأسئلة المتبقية في الامتحان',
+        data: result,
+      });
+    } catch (error: any) {
+      if (error.status) {
+        return res.status(error.status).json({ message: error.message });
+      }
+      console.error('Error recalculating course exam results:', error);
+      res.status(500).json({ message: 'Failed to recalculate exam results' });
+    }
+  }),
+);
+
 // حذف سؤال من امتحان الكورس الشامل
 router.delete(
   '/course-exam/question/:questionId',
