@@ -512,8 +512,7 @@ export class TeacherPointsService {
 
   /**
    * Sync EXAM_SCORE / ASSIGNMENT_SCORE after regrade.
-   * Creates the transaction if missing; otherwise adjusts balance by delta only.
-   * Scoped once per student+exam (not per attempt).
+   * Adjusts an existing transaction only — never creates a new one (avoids resurrecting points after reset).
    */
   static async syncExamOrAssignmentScore(opts: {
     studentId: number;
@@ -1178,7 +1177,7 @@ export class TeacherPointsService {
 
   /**
    * تصفير كل نقاط طلاب المدرس ثم منح نقاط بدء + درجة آخر امتحان شامل فقط لكل صف.
-   * يصلح حالة عودة نقاط امتحانات قديمة بعد التصفير بسبب إعادة التصحيح.
+   * يختار أحدث امتحان حسب تاريخ إنشائه (ليس آخر تسليم فردي)، ثم يحذف أي نقاط امتحان أخرى.
    */
   static async resetAndRebuildFromLastExam(opts: {
     teacherId: number;
@@ -1195,6 +1194,7 @@ export class TeacherPointsService {
     studentsAwarded: number;
     startAwards: number;
     scoreAwards: number;
+    purgedOtherExamTransactions: number;
     examsUsed: Array<{
       gradeId: number;
       examId: number;
@@ -1208,16 +1208,15 @@ export class TeacherPointsService {
 
     const gradeFilter = await this.assertTeacherOwnsGrade(opts.teacherId, opts.gradeId ?? null);
 
-    // 1) تصفير كل النقاط (مع أرشفة)
+    // 1) تصفير كامل لكل نقاط المدرس دائمًا (حتى لو طُلب صف واحد) لمنع بقاء امتحانات قديمة
     const reset = await this.resetAllStudentsPoints({
       teacherId: opts.teacherId,
       confirm: 'RESET_ALL_POINTS',
-      gradeId: gradeFilter,
-      label: opts.label ?? 'إعادة بناء من آخر امتحان',
+      gradeId: null,
+      label: opts.label ?? 'إعادة بناء من آخر امتحان فقط',
       reason: opts.reason ?? 'wipe_and_rebuild_last_exam',
     });
 
-    // 2) الصفوف المطلوب معالجتها
     const gradesRes =
       gradeFilter != null
         ? { rows: [{ grade_id: gradeFilter }] }
@@ -1229,6 +1228,7 @@ export class TeacherPointsService {
     let studentsAwarded = 0;
     let startAwards = 0;
     let scoreAwards = 0;
+    const allowedExamIds = new Set<number>();
     const examsUsed: Array<{
       gradeId: number;
       examId: number;
@@ -1240,7 +1240,9 @@ export class TeacherPointsService {
       const gradeId = Number(g.grade_id);
       const lastExam = await this.findLastCourseExamForGrade(opts.teacherId, gradeId);
       if (!lastExam) continue;
+      allowedExamIds.add(lastExam.id);
 
+      // لكل طالب: آخر محاولة مُسلَّمة على هذا الامتحان فقط
       const attemptsRes = await pool.query<{
         id: number;
         student_id: number;
@@ -1260,10 +1262,7 @@ export class TeacherPointsService {
         const studentId = Number(attempt.student_id);
         const attemptId = Number(attempt.id);
         const obtained = Math.max(0, Math.floor(Number(attempt.obtained_grade ?? 0)));
-        const total = Math.max(
-          obtained,
-          Math.floor(Number(attempt.total_grade ?? 0)),
-        );
+        const total = Math.max(obtained, Math.floor(Number(attempt.total_grade ?? 0)));
 
         const start = await this.awardExamOrAssignmentStart({
           studentId,
@@ -1305,6 +1304,12 @@ export class TeacherPointsService {
       });
     }
 
+    // 3) احذف أي نقاط امتحان/واجب/فيديو تبقى خارج آخر امتحان مسموح فقط
+    const purgedOtherExamTransactions = await this.purgePointsExceptAllowedCourseExams(
+      opts.teacherId,
+      [...allowedExamIds],
+    );
+
     return {
       reset: true,
       rebuilt: true,
@@ -1314,11 +1319,73 @@ export class TeacherPointsService {
       studentsAwarded,
       startAwards,
       scoreAwards,
+      purgedOtherExamTransactions,
       examsUsed,
     };
   }
 
-  /** آخر امتحان شامل/عام في الصف له محاولات مُسلَّمة */
+  /**
+   * يحذف كل معاملات النقاط للمدرس ما عدا EXAM_START/EXAM_SCORE لآخر امتحان/امتحانات مسموحة،
+   * ثم يعيد بناء الأرصدة من المعاملات المتبقية فقط.
+   */
+  private static async purgePointsExceptAllowedCourseExams(
+    teacherId: number,
+    allowedExamIds: number[],
+  ): Promise<number> {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      let deleted = 0;
+      if (!allowedExamIds.length) {
+        // لا امتحان مسموح → امسح كل شيء وأعد الأرصدة لصفر
+        const delAll = await client.query(
+          `DELETE FROM point_transactions WHERE teacher_id = $1`,
+          [teacherId],
+        );
+        deleted = delAll.rowCount ?? 0;
+        await client.query(`DELETE FROM student_point_balances WHERE teacher_id = $1`, [
+          teacherId,
+        ]);
+      } else {
+        // احذف أي شيء ليس EXAM_START/SCORE لـ course_exam من القائمة المسموحة
+        const del = await client.query(
+          `DELETE FROM point_transactions pt
+           WHERE pt.teacher_id = $1
+             AND NOT (
+               pt.event_type IN ('EXAM_START', 'EXAM_SCORE')
+               AND pt.reference_type = 'course_exam'
+               AND pt.reference_id = ANY($2::int[])
+             )`,
+          [teacherId, allowedExamIds],
+        );
+        deleted = del.rowCount ?? 0;
+
+        // أعد بناء الأرصدة من المعاملات المتبقية فقط
+        await client.query(`DELETE FROM student_point_balances WHERE teacher_id = $1`, [
+          teacherId,
+        ]);
+        await client.query(
+          `INSERT INTO student_point_balances (student_id, teacher_id, grade_id, total_points)
+           SELECT student_id, teacher_id, grade_id, GREATEST(0, SUM(points)::int)
+           FROM point_transactions
+           WHERE teacher_id = $1
+           GROUP BY student_id, teacher_id, grade_id`,
+          [teacherId],
+        );
+      }
+
+      await client.query('COMMIT');
+      return deleted;
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
+  /** أحدث امتحان شامل/عام في الصف (حسب الإنشاء) وله محاولات مُسلَّمة */
   private static async findLastCourseExamForGrade(
     teacherId: number,
     gradeId: number,
@@ -1327,6 +1394,8 @@ export class TeacherPointsService {
     title: string | null;
     course_id: number | null;
   } | null> {
+    const orderBy = `ORDER BY e.created_at DESC NULLS LAST, e.id DESC LIMIT 1`;
+
     const sqlWithCourseGrades = `SELECT e.id, e.title, e.course_id
        FROM course_level_exams e
        LEFT JOIN courses c ON c.id = e.course_id
@@ -1343,13 +1412,7 @@ export class TeacherPointsService {
            SELECT 1 FROM course_level_exam_attempts a
            WHERE a.exam_id = e.id AND a.status = 'submitted'
          )
-       ORDER BY (
-         SELECT MAX(a.submitted_at)
-         FROM course_level_exam_attempts a
-         WHERE a.exam_id = e.id AND a.status = 'submitted'
-       ) DESC NULLS LAST,
-       e.id DESC
-       LIMIT 1`;
+       ${orderBy}`;
 
     const sqlSimple = `SELECT e.id, e.title, e.course_id
        FROM course_level_exams e
@@ -1360,13 +1423,7 @@ export class TeacherPointsService {
            SELECT 1 FROM course_level_exam_attempts a
            WHERE a.exam_id = e.id AND a.status = 'submitted'
          )
-       ORDER BY (
-         SELECT MAX(a.submitted_at)
-         FROM course_level_exam_attempts a
-         WHERE a.exam_id = e.id AND a.status = 'submitted'
-       ) DESC NULLS LAST,
-       e.id DESC
-       LIMIT 1`;
+       ${orderBy}`;
 
     try {
       const res = await pool.query<{ id: number; title: string | null; course_id: number | null }>(
@@ -1375,11 +1432,33 @@ export class TeacherPointsService {
       );
       return res.rows[0] ?? null;
     } catch {
-      const res = await pool.query<{ id: number; title: string | null; course_id: number | null }>(
-        sqlSimple,
-        [teacherId, gradeId],
-      );
-      return res.rows[0] ?? null;
+      try {
+        const res = await pool.query<{ id: number; title: string | null; course_id: number | null }>(
+          sqlSimple,
+          [teacherId, gradeId],
+        );
+        return res.rows[0] ?? null;
+      } catch {
+        const fallback = await pool.query<{
+          id: number;
+          title: string | null;
+          course_id: number | null;
+        }>(
+          `SELECT e.id, e.title, e.course_id
+           FROM course_level_exams e
+           LEFT JOIN courses c ON c.id = e.course_id
+           WHERE COALESCE(e.teacher_id, c.teacher_id) = $1
+             AND (e.grade_id = $2 OR c.grade_id = $2)
+             AND EXISTS (
+               SELECT 1 FROM course_level_exam_attempts a
+               WHERE a.exam_id = e.id AND a.status = 'submitted'
+             )
+           ORDER BY e.id DESC
+           LIMIT 1`,
+          [teacherId, gradeId],
+        );
+        return fallback.rows[0] ?? null;
+      }
     }
   }
 
