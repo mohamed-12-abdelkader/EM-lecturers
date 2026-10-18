@@ -439,14 +439,14 @@ export class CourseLevelExamQuestionsService {
         throw new HttpError(404, 'Question not found');
       }
 
-      const { CourseLevelExamsService } = await import('./courseLevelExams.js');
-      const regrade = await CourseLevelExamsService.regradeExamAttemptsAfterQuestionRemoved({
-        examId,
-        deletedQuestionId,
-        client,
-      });
-
+      // Commit delete first so CASCADE answer removal is visible to recalculate (uses pool)
       await client.query('COMMIT');
+
+      const { CourseLevelExamsService } = await import('./courseLevelExams.js');
+      // Full recalc from remaining questions — equalizes pre/post-delete attempts + syncs points
+      const regrade =
+        await CourseLevelExamsService.recalculateResultsFromRemainingQuestions(examId);
+
       return {
         message: 'Question deleted successfully',
         examId,
@@ -454,7 +454,11 @@ export class CourseLevelExamQuestionsService {
         regrade,
       };
     } catch (err) {
-      await client.query('ROLLBACK');
+      try {
+        await client.query('ROLLBACK');
+      } catch {
+        // already committed or no active transaction
+      }
       throw err;
     } finally {
       client.release();

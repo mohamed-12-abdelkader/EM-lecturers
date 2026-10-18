@@ -935,13 +935,13 @@ export class CourseLevelExamsService {
     obtainedGrade: number,
     totalGrade: number,
     options: { syncExisting?: boolean } = {},
-  ) {
+  ): Promise<{ awarded: boolean; points: number; reason?: string } | null> {
     try {
       const teacherId =
         exam.teacher_id != null
           ? Number(exam.teacher_id)
           : await TeacherPointsService.resolveTeacherIdForCourse(Number(exam.course_id));
-      if (!teacherId) return;
+      if (!teacherId) return null;
       const scoreOpts = {
         studentId,
         teacherId,
@@ -955,12 +955,12 @@ export class CourseLevelExamsService {
         title: exam.title ?? null,
       };
       if (options.syncExisting) {
-        await TeacherPointsService.syncExamOrAssignmentScore(scoreOpts);
-      } else {
-        await TeacherPointsService.awardExamOrAssignmentScore(scoreOpts);
+        return TeacherPointsService.syncExamOrAssignmentScore(scoreOpts);
       }
+      return TeacherPointsService.awardExamOrAssignmentScore(scoreOpts);
     } catch (error) {
       console.error('Error awarding course exam score points:', error);
+      return null;
     }
   }
 
@@ -1127,6 +1127,9 @@ export class CourseLevelExamsService {
    * إعادة احتساب كل محاولات امتحان الكورس من الأسئلة المتبقية حاليًا
    * (للامتحانات القديمة التي حُذفت أسئلتها قبل آلية الحذف الجديدة).
    * يحدّث الدرجات ويزامِن نقاط EXAM_SCORE (خصم الزيادة إن وُجدت).
+   *
+   * قاعدة التكافؤ: كل الطلاب على نفس الامتحان يُقيَّمون بنفس الأسئلة المتبقية
+   * (مثلًا بعد حذف سؤالين من 20 → الجميع من 18، وتُخصم درجات السؤالين المحذوفين).
    */
   static async recalculateResultsFromRemainingQuestions(examId: number): Promise<{
     examId: number;
@@ -1134,6 +1137,7 @@ export class CourseLevelExamsService {
     attemptsReviewed: number;
     attemptsUpdated: number;
     pointsSynced: number;
+    pointsAdjustedDown: number;
   }> {
     const examRes = await pool.query(
       `SELECT e.id, e.title, e.course_id, e.questions_count,
@@ -1153,6 +1157,7 @@ export class CourseLevelExamsService {
       [examId],
     );
     const remainingExamQuestionIds = remainingRes.rows.map((r) => Number(r.id));
+    const remainingSet = new Set(remainingExamQuestionIds);
 
     if (
       exam.questions_count != null &&
@@ -1184,6 +1189,7 @@ export class CourseLevelExamsService {
 
     let attemptsUpdated = 0;
     let pointsSynced = 0;
+    let pointsAdjustedDown = 0;
 
     for (const attempt of attemptsRes.rows) {
       const attemptId = Number(attempt.id);
@@ -1191,39 +1197,72 @@ export class CourseLevelExamsService {
         `SELECT question_id, is_correct FROM course_level_exam_answers WHERE attempt_id = $1`,
         [attemptId],
       );
+
+      // Drop orphan answers pointing at deleted questions (safety if CASCADE missed)
+      const orphanIds = answersRes.rows
+        .map((a) => Number(a.question_id))
+        .filter((id) => !remainingSet.has(id));
+      if (orphanIds.length) {
+        await pool.query(
+          `DELETE FROM course_level_exam_answers
+           WHERE attempt_id = $1 AND question_id = ANY($2::int[])`,
+          [attemptId, orphanIds],
+        );
+      }
+
+      const liveAnswers = answersRes.rows.filter((a) => remainingSet.has(Number(a.question_id)));
+
+      const selected = parseSelectedQuestionIds(attempt.selected_question_ids);
+      // Full-exam attempts (no selection / selection covered the whole old bank):
+      // force denominator = remaining questions so everyone is graded out of the same max.
+      const treatAsFullExam =
+        !selected ||
+        selected.length >= remainingExamQuestionIds.length ||
+        (Number(attempt.total_grade) > remainingExamQuestionIds.length &&
+          remainingExamQuestionIds.length > 0);
+
       const recomputed = recomputeCourseAttemptFromRemainingQuestions({
-        selectedQuestionIds: attempt.selected_question_ids,
+        selectedQuestionIds: treatAsFullExam ? null : selected,
         remainingExamQuestionIds,
-        remainingAnswers: answersRes.rows.map((a) => ({
+        remainingAnswers: liveAnswers.map((a) => ({
           questionId: Number(a.question_id),
           isCorrect: !!a.is_correct,
         })),
       });
 
+      // Always persist cleaned selected ids for full-exam fairness
+      const nextSelected =
+        treatAsFullExam && remainingExamQuestionIds.length
+          ? remainingExamQuestionIds
+          : recomputed.nextSelectedIds;
+
       const prevObtained = Number(attempt.obtained_grade ?? 0);
       const prevTotal = Number(attempt.total_grade ?? 0);
-      if (prevObtained !== recomputed.obtained || prevTotal !== recomputed.total) {
+      const selectedDirty =
+        selected != null && selected.some((id) => !remainingSet.has(id));
+
+      if (
+        prevObtained !== recomputed.obtained ||
+        prevTotal !== recomputed.total ||
+        selectedDirty
+      ) {
         await pool.query(
           `UPDATE course_level_exam_attempts
            SET obtained_grade = $1,
                total_grade = $2,
-               selected_question_ids = CASE
-                 WHEN $3::boolean THEN $4::int[]
-                 ELSE selected_question_ids
-               END
-           WHERE id = $5 AND status = 'submitted'`,
+               selected_question_ids = $3::int[]
+           WHERE id = $4 AND status = 'submitted'`,
           [
             recomputed.obtained,
             recomputed.total,
-            recomputed.nextSelectedIds != null,
-            recomputed.nextSelectedIds ?? [],
+            nextSelected ?? remainingExamQuestionIds,
             attemptId,
           ],
         );
         attemptsUpdated += 1;
       }
 
-      await this.maybeAwardCourseExamScorePoints(
+      const pointsResult = await this.maybeAwardCourseExamScorePoints(
         {
           id: examId,
           course_id: exam.course_id,
@@ -1237,12 +1276,67 @@ export class CourseLevelExamsService {
         { syncExisting: true },
       );
       pointsSynced += 1;
+      if (pointsResult && pointsResult.reason === 'adjusted_down') {
+        pointsAdjustedDown += 1;
+      }
     }
 
     return {
       examId,
       remainingQuestions: remainingExamQuestionIds.length,
       attemptsReviewed: attemptsRes.rowCount ?? 0,
+      attemptsUpdated,
+      pointsSynced,
+      pointsAdjustedDown,
+    };
+  }
+
+  /**
+   * Backfill: find course/public exams where submitted attempts still use a higher
+   * max total than remaining questions (legacy deletes), and recalculate + sync points.
+   */
+  static async backfillStaleResultsAfterQuestionDeletes(): Promise<{
+    examsScanned: number;
+    examsFixed: number;
+    attemptsUpdated: number;
+    pointsSynced: number;
+  }> {
+    const staleRes = await pool.query<{ exam_id: number }>(
+      `SELECT DISTINCT a.exam_id
+       FROM course_level_exam_attempts a
+       WHERE a.status = 'submitted'
+         AND (
+           a.total_grade > (
+             SELECT COUNT(*)::int FROM course_level_exam_questions q WHERE q.exam_id = a.exam_id
+           )
+           OR a.obtained_grade IS DISTINCT FROM (
+             SELECT COALESCE(SUM(CASE WHEN ans.is_correct THEN 1 ELSE 0 END), 0)::int
+             FROM course_level_exam_answers ans
+             WHERE ans.attempt_id = a.id
+               AND EXISTS (
+                 SELECT 1 FROM course_level_exam_questions q
+                 WHERE q.id = ans.question_id AND q.exam_id = a.exam_id
+               )
+           )
+         )`,
+    );
+
+    let examsFixed = 0;
+    let attemptsUpdated = 0;
+    let pointsSynced = 0;
+
+    for (const row of staleRes.rows) {
+      const result = await this.recalculateResultsFromRemainingQuestions(Number(row.exam_id));
+      if (result.attemptsUpdated > 0 || result.pointsAdjustedDown > 0) {
+        examsFixed += 1;
+      }
+      attemptsUpdated += result.attemptsUpdated;
+      pointsSynced += result.pointsSynced;
+    }
+
+    return {
+      examsScanned: staleRes.rowCount ?? 0,
+      examsFixed,
       attemptsUpdated,
       pointsSynced,
     };
@@ -2852,6 +2946,26 @@ export class CourseLevelExamsService {
     const exam = examRes.rows[0];
     await this.assertCanManageExam(exam, requester);
     await this.expireOverdueAttemptsForExam(examId);
+
+    // Auto-heal legacy attempts still scored against deleted questions (e.g. /20 after 2 deletes)
+    try {
+      const stale = await pool.query(
+        `SELECT 1
+         FROM course_level_exam_attempts a
+         WHERE a.exam_id = $1
+           AND a.status = 'submitted'
+           AND a.total_grade > (
+             SELECT COUNT(*)::int FROM course_level_exam_questions q WHERE q.exam_id = $1
+           )
+         LIMIT 1`,
+        [examId],
+      );
+      if (stale.rowCount) {
+        await this.recalculateResultsFromRemainingQuestions(examId);
+      }
+    } catch (err) {
+      console.warn('[CourseLevelExams] auto-recalculate after deletes skipped:', err);
+    }
 
     const passPercentage =
       options?.passPercentage != null &&

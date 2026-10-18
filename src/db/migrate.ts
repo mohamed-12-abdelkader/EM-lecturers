@@ -98,6 +98,26 @@ export async function applyMigrations(databaseUrl: string, direction: 'up' | 'do
     console.warn('[TeacherPoints] legacy exam points consolidation skipped:', err);
   }
 
+  // تكافؤ فرص الامتحانات الشاملة: إعادة احتساب المحاولات القديمة بعد حذف أسئلة
+  try {
+    const hasAttempts = await pool.query(
+      `SELECT 1 FROM information_schema.tables
+       WHERE table_schema = 'public' AND table_name = 'course_level_exam_attempts'
+       LIMIT 1`,
+    );
+    if ((hasAttempts.rowCount ?? 0) > 0) {
+      const { CourseLevelExamsService } = await import('../services/courseLevelExams.js');
+      const fixed = await CourseLevelExamsService.backfillStaleResultsAfterQuestionDeletes();
+      if (fixed.examsFixed > 0 || fixed.attemptsUpdated > 0) {
+        console.log(
+          `[CourseLevelExams] backfilled stale results after question deletes: exams=${fixed.examsFixed}/${fixed.examsScanned}, attemptsUpdated=${fixed.attemptsUpdated}, pointsSynced=${fixed.pointsSynced}`,
+        );
+      }
+    }
+  } catch (err) {
+    console.warn('[CourseLevelExams] stale results backfill skipped:', err);
+  }
+
   const { FIRST_SUPERUSER, FIRST_SUPERUSER_PASSWORD } = config;
 
   if (!FIRST_SUPERUSER || !FIRST_SUPERUSER_PASSWORD) return;

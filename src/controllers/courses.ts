@@ -2605,9 +2605,33 @@ router.get(
 );
 
 /**
+ * POST /api/course/course-exam/recalculate-all-stale-results
+ * إصلاح كل الامتحانات الشاملة التي ما زالت درجات طلابها على أساس أسئلة محذوفة
+ * (يجب تسجيله قبل مسار :examId)
+ */
+router.post(
+  '/course-exam/recalculate-all-stale-results',
+  authMiddleware(COURSE_CONTENT_ROLES),
+  asyncWrapper(async (req, res) => {
+    try {
+      const result =
+        await CourseLevelExamsService.backfillStaleResultsAfterQuestionDeletes();
+      res.json({
+        success: true,
+        message:
+          'تم فحص وتصحيح الامتحانات الشاملة ذات الدرجات القديمة غير المتكافئة',
+        data: result,
+      });
+    } catch (error: any) {
+      console.error('Error backfilling stale course exam results:', error);
+      res.status(500).json({ message: 'Failed to backfill stale exam results' });
+    }
+  }),
+);
+
+/**
  * POST /api/course/course-exam/:examId/recalculate-results
  * إعادة احتساب درجات كل الطلاب + النقاط من الأسئلة المتبقية
- * (للامتحانات الشاملة/العامة القديمة التي حُذفت أسئلتها قبل آلية الحذف الجديدة)
  */
 router.post(
   '/course-exam/:examId/recalculate-results',
@@ -2624,7 +2648,7 @@ router.post(
       res.json({
         success: true,
         message:
-          'تم إعادة احتساب درجات الطلاب والنقاط حسب الأسئلة المتبقية في الامتحان',
+          'تم توحيد الدرجات: كل الطلاب على الأسئلة المتبقية فقط، وتم خصم درجات الأسئلة المحذوفة والنقاط الزائدة',
         data: result,
       });
     } catch (error: any) {
