@@ -1,3 +1,4 @@
+-- Up Migration
 -- Parents/guardians notifications for comprehensive exams (paced, no-reply)
 
 INSERT INTO wa_services (key, name, description, type, scope, is_enabled, config)
