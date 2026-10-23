@@ -2,6 +2,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { assertMistralConfigured, getMistralConfig } from '../config/mistral';
 import { HttpError } from '../utils';
+import { cropPageRegionToJpegDataUri } from './ocrTableCrop';
 
 const PDF_MIMES = new Set(['application/pdf']);
 const IMAGE_MIMES = new Set([
@@ -48,10 +49,34 @@ export type MistralOcrImage = {
   annotation?: MistralOcrImageAnnotation | null;
 };
 
+export type MistralOcrTable = {
+  id: string;
+  page_index: number;
+  content: string;
+  format: 'html' | 'markdown' | string;
+  top_left_x?: number;
+  top_left_y?: number;
+  bottom_right_x?: number;
+  bottom_right_y?: number;
+};
+
+export type MistralOcrBlock = {
+  type: string;
+  content?: string;
+  table_id?: string | null;
+  image_id?: string | null;
+  top_left_x?: number;
+  top_left_y?: number;
+  bottom_right_x?: number;
+  bottom_right_y?: number;
+};
+
 export type MistralOcrPage = {
   index: number;
   markdown: string;
   images: MistralOcrImage[];
+  tables: MistralOcrTable[];
+  blocks?: MistralOcrBlock[];
   dimensions?: {
     dpi?: number;
     height?: number;
@@ -89,6 +114,25 @@ type MistralOcrApiResponse = {
       image_annotation?: unknown;
       bbox_annotation?: unknown;
     }>;
+    tables?: Array<{
+      id?: string;
+      content?: string;
+      format?: string;
+      top_left_x?: number;
+      top_left_y?: number;
+      bottom_right_x?: number;
+      bottom_right_y?: number;
+    }>;
+    blocks?: Array<{
+      type?: string;
+      content?: string;
+      table_id?: string | null;
+      image_id?: string | null;
+      top_left_x?: number;
+      top_left_y?: number;
+      bottom_right_x?: number;
+      bottom_right_y?: number;
+    }>;
     dimensions?: MistralOcrPage['dimensions'];
   }>;
   usage_info?: MistralOcrResult['usage_info'];
@@ -97,6 +141,8 @@ type MistralOcrApiResponse = {
 type MistralOcrOptions = {
   includeImageBase64?: boolean;
   annotateImages?: boolean;
+  /** Extract tables separately (html/markdown). Default true when includeImageBase64. */
+  extractTables?: boolean;
   ocrModel?: string;
   /** Mistral OCR page indices (0-based). */
   pages?: number[];
@@ -210,7 +256,7 @@ function buildImageAnnotationFormat() {
           image_type: {
             type: 'string',
             description:
-              'Type of visual: question_figure (stem diagram/graph in the question), choice_option (answer choice A/B/C/D image), diagram, chart, graph, table, formula, map, other. Use choice_option for option thumbnails; use question_figure/chart/graph for the main figure referenced by the question text.',
+              'Type of visual: question_figure (stem diagram/graph in the question), choice_option (answer choice A/B/C/D image), diagram, chart, graph, table, formula, map, other. Use choice_option for option thumbnails; use question_figure/chart/graph/table for the main figure or data table referenced by the question text.',
           },
           short_description: {
             type: 'string',
@@ -261,26 +307,89 @@ function normalizeAnnotation(raw: unknown): MistralOcrImageAnnotation | null {
   return null;
 }
 
+function normalizeBlocks(
+  rawBlocks: NonNullable<NonNullable<MistralOcrApiResponse['pages']>[number]['blocks']>,
+): MistralOcrBlock[] {
+  return (rawBlocks ?? [])
+    .filter((block) => block && typeof block.type === 'string')
+    .map((block) => ({
+      type: block.type as string,
+      content: block.content,
+      table_id: block.table_id ?? null,
+      image_id: block.image_id ?? null,
+      top_left_x: block.top_left_x,
+      top_left_y: block.top_left_y,
+      bottom_right_x: block.bottom_right_x,
+      bottom_right_y: block.bottom_right_y,
+    }));
+}
+
+function bboxFromBlock(block?: MistralOcrBlock | null): Partial<MistralOcrTable> {
+  if (!block) return {};
+  return {
+    top_left_x: block.top_left_x,
+    top_left_y: block.top_left_y,
+    bottom_right_x: block.bottom_right_x,
+    bottom_right_y: block.bottom_right_y,
+  };
+}
+
+function normalizeTables(
+  pageIndex: number,
+  rawTables: NonNullable<NonNullable<MistralOcrApiResponse['pages']>[number]['tables']>,
+  blocks: MistralOcrBlock[],
+): MistralOcrTable[] {
+  const tableBlocksById = new Map<string, MistralOcrBlock>();
+  for (const block of blocks) {
+    if (block.type === 'table' && block.table_id) {
+      tableBlocksById.set(block.table_id, block);
+    }
+  }
+
+  return (rawTables ?? [])
+    .filter((table) => table.id)
+    .map((table) => {
+      const id = table.id as string;
+      const fromBlock = bboxFromBlock(tableBlocksById.get(id));
+      return {
+        id,
+        page_index: pageIndex,
+        content: table.content ?? '',
+        format: table.format ?? 'html',
+        top_left_x: table.top_left_x ?? fromBlock.top_left_x,
+        top_left_y: table.top_left_y ?? fromBlock.top_left_y,
+        bottom_right_x: table.bottom_right_x ?? fromBlock.bottom_right_x,
+        bottom_right_y: table.bottom_right_y ?? fromBlock.bottom_right_y,
+      };
+    });
+}
+
 function normalizePages(rawPages: MistralOcrApiResponse['pages']): MistralOcrPage[] {
-  return (rawPages ?? []).map((page, i) => ({
-    index: page.index ?? i,
-    markdown: page.markdown ?? '',
-    images: (page.images ?? [])
-      .filter((image) => image.id)
-      .map((image) => ({
-        id: image.id as string,
-        page_index: page.index ?? i,
-        top_left_x: image.top_left_x,
-        top_left_y: image.top_left_y,
-        bottom_right_x: image.bottom_right_x,
-        bottom_right_y: image.bottom_right_y,
-        image_base64: image.image_base64,
-        annotation: normalizeAnnotation(
-          image.annotation ?? image.image_annotation ?? image.bbox_annotation,
-        ),
-      })),
-    dimensions: page.dimensions ?? null,
-  }));
+  return (rawPages ?? []).map((page, i) => {
+    const index = page.index ?? i;
+    const blocks = normalizeBlocks(page.blocks ?? []);
+    return {
+      index,
+      markdown: page.markdown ?? '',
+      images: (page.images ?? [])
+        .filter((image) => image.id)
+        .map((image) => ({
+          id: image.id as string,
+          page_index: index,
+          top_left_x: image.top_left_x,
+          top_left_y: image.top_left_y,
+          bottom_right_x: image.bottom_right_x,
+          bottom_right_y: image.bottom_right_y,
+          image_base64: image.image_base64,
+          annotation: normalizeAnnotation(
+            image.annotation ?? image.image_annotation ?? image.bbox_annotation,
+          ),
+        })),
+      tables: normalizeTables(index, page.tables ?? [], blocks),
+      blocks,
+      dimensions: page.dimensions ?? null,
+    };
+  });
 }
 
 function isFullDocumentSingleBatch(
@@ -293,6 +402,17 @@ function isFullDocumentSingleBatch(
     targetPages.length <= maxPages &&
     targetPages.every((p, i) => p === i)
   );
+}
+
+/** Rewrite ![img](id) / [tbl](id) placeholders after remapping asset ids. */
+function remapOcrAssetIdsInMarkdown(markdown: string, idMap: Map<string, string>): string {
+  if (!markdown || idMap.size === 0) return markdown;
+  let out = markdown;
+  for (const [from, to] of idMap) {
+    if (from === to) continue;
+    out = out.split(from).join(to);
+  }
+  return out;
 }
 
 export class MistralOcrService {
@@ -325,14 +445,21 @@ export class MistralOcrService {
     const { apiKey, apiBaseUrl } = getMistralConfig();
     const dataUri = buildDataUri(mime, buffer);
     const document = buildDocumentPayload(mime, dataUri);
+    const includeImageBase64 = options.includeImageBase64 ?? false;
+    const extractTables = options.extractTables ?? includeImageBase64;
     const body: Record<string, unknown> = {
       model: ocrModel,
       document,
-      include_image_base64: options.includeImageBase64 ?? false,
+      include_image_base64: includeImageBase64,
     };
 
     if (options.annotateImages) {
       body.bbox_annotation_format = buildImageAnnotationFormat();
+    }
+    if (extractTables) {
+      // Separate tables + block bboxes so we can crop them into question_images
+      body.table_format = 'html';
+      body.include_blocks = true;
     }
     if (options.pages?.length) {
       body.pages = options.pages;
@@ -436,16 +563,31 @@ export class MistralOcrService {
       for (let i = 0; i < result.pages.length; i++) {
         const absoluteIndex = batch[Math.min(i, batch.length - 1)] ?? batch[0];
         const page = result.pages[i];
+        const prefixId = (id: string) =>
+          id.includes(`p${absoluteIndex}-`) ? id : `p${absoluteIndex}-${id}`;
+        const idMap = new Map<string, string>();
+        for (const image of page.images) idMap.set(image.id, prefixId(image.id));
+        for (const table of page.tables) idMap.set(table.id, prefixId(table.id));
+
         mergedPages.push({
           ...page,
           index: absoluteIndex,
           images: page.images.map((image) => ({
             ...image,
             page_index: absoluteIndex,
-            id: image.id.includes(`p${absoluteIndex}-`)
-              ? image.id
-              : `p${absoluteIndex}-${image.id}`,
+            id: idMap.get(image.id) ?? prefixId(image.id),
           })),
+          tables: page.tables.map((table) => ({
+            ...table,
+            page_index: absoluteIndex,
+            id: idMap.get(table.id) ?? prefixId(table.id),
+          })),
+          blocks: page.blocks?.map((block) => ({
+            ...block,
+            table_id: block.table_id ? idMap.get(block.table_id) ?? prefixId(block.table_id) : block.table_id,
+            image_id: block.image_id ? idMap.get(block.image_id) ?? prefixId(block.image_id) : block.image_id,
+          })),
+          markdown: remapOcrAssetIdsInMarkdown(page.markdown, idMap),
         });
       }
     }
@@ -488,14 +630,34 @@ export class MistralOcrService {
       const result = results[fileIndex];
       for (const page of result.pages) {
         const mergedIndex = pageOffset++;
+        const prefix = `f${fileIndex}-`;
+        const idMap = new Map<string, string>();
+        for (const image of page.images) idMap.set(image.id, `${prefix}${image.id}`);
+        for (const table of page.tables ?? []) idMap.set(table.id, `${prefix}${table.id}`);
+
         mergedPages.push({
           ...page,
           index: mergedIndex,
           images: page.images.map((image) => ({
             ...image,
             page_index: mergedIndex,
-            id: `f${fileIndex}-${image.id}`,
+            id: idMap.get(image.id) ?? `${prefix}${image.id}`,
           })),
+          tables: (page.tables ?? []).map((table) => ({
+            ...table,
+            page_index: mergedIndex,
+            id: idMap.get(table.id) ?? `${prefix}${table.id}`,
+          })),
+          blocks: page.blocks?.map((block) => ({
+            ...block,
+            table_id: block.table_id
+              ? idMap.get(block.table_id) ?? `${prefix}${block.table_id}`
+              : block.table_id,
+            image_id: block.image_id
+              ? idMap.get(block.image_id) ?? `${prefix}${block.image_id}`
+              : block.image_id,
+          })),
+          markdown: remapOcrAssetIdsInMarkdown(page.markdown, idMap),
         });
       }
     }
@@ -539,5 +701,72 @@ export class MistralOcrService {
       : results[0].document_type;
 
     return this.mergeOcrResults(results, { document_type: documentType });
+  }
+
+  /**
+   * Crop OCR tables (using block bboxes) from page rasters and append them
+   * to page.images so the question-extraction pipeline can attach them as
+   * question_images (image_type = table).
+   */
+  static async materializeTablesAsImages(
+    ocr: MistralOcrResult,
+    pageBuffers: Map<number, Buffer>,
+  ): Promise<MistralOcrResult> {
+    for (const page of ocr.pages) {
+      if (!page.tables?.length) continue;
+      const pageBuffer = pageBuffers.get(page.index);
+      if (!pageBuffer) continue;
+
+      const existingIds = new Set(page.images.map((image) => image.id));
+
+      for (const table of page.tables) {
+        if (existingIds.has(table.id)) continue;
+        if (
+          table.top_left_x == null ||
+          table.top_left_y == null ||
+          table.bottom_right_x == null ||
+          table.bottom_right_y == null
+        ) {
+          continue;
+        }
+
+        try {
+          const imageBase64 = await cropPageRegionToJpegDataUri(
+            pageBuffer,
+            {
+              top_left_x: table.top_left_x,
+              top_left_y: table.top_left_y,
+              bottom_right_x: table.bottom_right_x,
+              bottom_right_y: table.bottom_right_y,
+            },
+            page.dimensions,
+          );
+          if (!imageBase64) continue;
+
+          page.images.push({
+            id: table.id,
+            page_index: page.index,
+            top_left_x: table.top_left_x,
+            top_left_y: table.top_left_y,
+            bottom_right_x: table.bottom_right_x,
+            bottom_right_y: table.bottom_right_y,
+            image_base64: imageBase64,
+            annotation: {
+              image_type: 'table',
+              short_description: 'جدول من صفحة السؤال',
+              summary: table.content?.slice(0, 500) || 'جدول مرتبط بالسؤال',
+              educational_relevance: 'بيانات الجدول لازمة لحل السؤال أو لاختياراته',
+              contains_text: true,
+              extracted_text: table.content || null,
+            },
+          });
+          existingIds.add(table.id);
+        } catch {
+          // Keep extraction going if a single crop fails
+        }
+      }
+    }
+
+    return ocr;
   }
 }

@@ -1,6 +1,8 @@
 import { assertMistralConfigured, DEFAULT_MISTRAL_CHAT_MODEL, getMistralConfig } from '../config/mistral';
 import { buildQuestionExtractionPrompt, resolveExtractionMode } from '../prompts/mistralQuestionExtraction.prompt';
 import {
+  MAX_MCQ_OPTIONS,
+  MIN_MCQ_OPTIONS,
   MistralQuestionExtractionSchema,
   type MistralExtractedPassage,
   type MistralExtractedQuestion,
@@ -557,15 +559,246 @@ function buildDocumentContext(ocr: MistralOcrResult): string {
         })
         .join('\n');
 
+      const tableContext = (page.tables ?? [])
+        .map((table) =>
+          [
+            `- table_id: ${table.id}`,
+            `page_index: ${table.page_index}`,
+            'type: table',
+            table.content ? `table_html: ${table.content.slice(0, 800)}` : null,
+          ]
+            .filter(Boolean)
+            .join('; '),
+        )
+        .join('\n');
+
       return [
         `PAGE ${page.index}`,
         page.markdown,
         imageContext ? `IMAGE_CONTEXT:\n${imageContext}` : null,
+        tableContext ? `TABLE_CONTEXT:\n${tableContext}` : null,
       ]
         .filter(Boolean)
         .join('\n\n');
     })
     .join('\n\n---\n\n');
+}
+
+function normalizeEasternDigits(value: string): string {
+  return value
+    .replace(/[٠-٩]/g, (d) => String('٠١٢٣٤٥٦٧٨٩'.indexOf(d)))
+    .replace(/[۰-۹]/g, (d) => String('۰۱۲۳۴۵۶۷۸۹'.indexOf(d)));
+}
+
+type QuestionStartMarker = { num: string; y: number; x: number };
+
+function collectQuestionStartMarkers(page: MistralOcrResult['pages'][number]): QuestionStartMarker[] {
+  const markers: QuestionStartMarker[] = [];
+  for (const block of page.blocks ?? []) {
+    if (block.top_left_y == null) continue;
+    if (block.type !== 'text' && block.type !== 'header') continue;
+    const match = normalizeEasternDigits(block.content || '').match(/^\s*(\d{1,3})\b/);
+    if (!match) continue;
+    markers.push({
+      num: match[1],
+      y: block.top_left_y,
+      x: block.top_left_x ?? 0,
+    });
+  }
+  markers.sort((a, b) => a.y - b.y || a.x - b.x);
+  return markers;
+}
+
+function resolveQuestionIndexForTable(opts: {
+  tableId: string;
+  tableY?: number;
+  tableBottom?: number;
+  markdownPos?: number;
+  normalizedMd?: string;
+  markers: QuestionStartMarker[];
+  bySourceNumber: Map<string, number>;
+  questionsSortedIdx: number[];
+  outLength: number;
+}): number | undefined {
+  const {
+    tableY,
+    tableBottom,
+    markdownPos,
+    normalizedMd,
+    markers,
+    bySourceNumber,
+    questionsSortedIdx,
+    outLength,
+  } = opts;
+
+  if (outLength === 1) return 0;
+
+  if (normalizedMd != null && markdownPos != null) {
+    const windowBefore = normalizedMd.slice(Math.max(0, markdownPos - 400), markdownPos);
+    const windowAfter = normalizedMd.slice(
+      markdownPos,
+      Math.min(normalizedMd.length, markdownPos + 500),
+    );
+    const numberAfter = windowAfter.match(/(?:^|\n)\s*(\d{1,3})\s/);
+    const numberBefore = [...windowBefore.matchAll(/(?:^|\n)\s*(\d{1,3})\s/g)].pop();
+    if (numberAfter?.[1] && bySourceNumber.has(numberAfter[1])) {
+      return bySourceNumber.get(numberAfter[1]);
+    }
+    if (numberBefore?.[1] && bySourceNumber.has(numberBefore[1])) {
+      return bySourceNumber.get(numberBefore[1]);
+    }
+  }
+
+  // Spatial: nearest question-start block at/above the table
+  if (tableY != null && markers.length > 0) {
+    const bottom = tableBottom ?? tableY + 1;
+    let best: { marker: QuestionStartMarker; score: number } | null = null;
+    for (const marker of markers) {
+      if (marker.y > bottom + 24) continue;
+      const score = Math.abs(marker.y - tableY);
+      if (!best || score < best.score) best = { marker, score };
+    }
+    if (best) {
+      if (bySourceNumber.has(best.marker.num)) {
+        return bySourceNumber.get(best.marker.num);
+      }
+      // OCR number may disagree with printed badge — map by reading order
+      const markerIdx = markers.indexOf(best.marker);
+      if (markerIdx >= 0 && markerIdx < questionsSortedIdx.length) {
+        return questionsSortedIdx[markerIdx];
+      }
+    }
+  }
+
+  return undefined;
+}
+
+/**
+ * Link OCR table crops (tbl-*.html) to the nearest question when the model
+ * forgets to put them in question_images.
+ */
+function attachTablesByMarkdownProximity(
+  questions: MistralExtractedQuestion[],
+  ocr: MistralOcrResult,
+  ocrImages: InternalQuestionImage[],
+): MistralExtractedQuestion[] {
+  if (questions.length === 0) return questions;
+
+  const tableImages = ocrImages.filter((image) => {
+    const type = (image.image_type || '').toLowerCase();
+    return (
+      type === 'table' ||
+      /^tbl[-_]?\d+/i.test(image.image_id) ||
+      /\.html$/i.test(image.image_id)
+    );
+  });
+  if (tableImages.length === 0) return questions;
+
+  const assigned = new Set(
+    questions.flatMap((q) => (q.question_images ?? []).map((img) => img.image_id)),
+  );
+
+  const bySourceNumber = new Map<string, number>();
+  questions.forEach((q, idx) => {
+    const keys = [q.source_number, String(q.number)]
+      .filter(Boolean)
+      .map((v) => normalizeEasternDigits(String(v).trim()));
+    for (const key of keys) {
+      if (key) bySourceNumber.set(key, idx);
+    }
+  });
+
+  const questionsSortedIdx = [...questions.keys()].sort((a, b) => {
+    const na = questions[a].number ?? a;
+    const nb = questions[b].number ?? b;
+    return na - nb;
+  });
+
+  const out = questions.map((q) => ({
+    ...q,
+    question_images: [...(q.question_images ?? [])],
+  }));
+
+  const pushTable = (questionIdx: number, tableImage: InternalQuestionImage, pageIndex: number) => {
+    if (questionIdx < 0 || questionIdx >= out.length) return;
+    if (assigned.has(tableImage.image_id)) return;
+    out[questionIdx].question_images.push({
+      image_id: tableImage.image_id,
+      page_index: tableImage.page_index ?? pageIndex,
+      image_type: tableImage.image_type || 'table',
+      short_description: tableImage.short_description,
+      summary: tableImage.summary,
+      educational_relevance: tableImage.educational_relevance,
+    });
+    assigned.add(tableImage.image_id);
+  };
+
+  for (const page of ocr.pages) {
+    const markers = collectQuestionStartMarkers(page);
+    const tablesById = new Map((page.tables ?? []).map((table) => [table.id, table]));
+    const markdown = page.markdown || '';
+    const normalizedMd = normalizeEasternDigits(markdown);
+    const tableMatches = [...normalizedMd.matchAll(/\[?(tbl-[^\])\s]+)\]?(?:\([^)]*\))?/gi)];
+
+    for (const match of tableMatches) {
+      const rawId = match[1]?.trim();
+      if (!rawId) continue;
+
+      const tableImage =
+        tableImages.find((img) => img.image_id === rawId) ||
+        tableImages.find((img) => img.image_id.endsWith(rawId) || rawId.endsWith(img.image_id));
+      if (!tableImage || assigned.has(tableImage.image_id)) continue;
+
+      const tableMeta = tablesById.get(tableImage.image_id) || tablesById.get(rawId);
+      const questionIdx = resolveQuestionIndexForTable({
+        tableId: tableImage.image_id,
+        tableY: tableMeta?.top_left_y,
+        tableBottom: tableMeta?.bottom_right_y,
+        markdownPos: match.index ?? 0,
+        normalizedMd,
+        markers,
+        bySourceNumber,
+        questionsSortedIdx,
+        outLength: out.length,
+      });
+
+      if (questionIdx != null) {
+        pushTable(questionIdx, tableImage, page.index);
+      }
+    }
+
+    // Remaining tables (no markdown placeholder or unresolved above)
+    const remaining = [...(page.tables ?? [])]
+      .filter((table) => !assigned.has(table.id))
+      .sort((a, b) => (a.top_left_y ?? 0) - (b.top_left_y ?? 0));
+
+    for (const table of remaining) {
+      const tableImage = tableImages.find((img) => img.image_id === table.id);
+      if (!tableImage) continue;
+
+      let questionIdx = resolveQuestionIndexForTable({
+        tableId: table.id,
+        tableY: table.top_left_y,
+        tableBottom: table.bottom_right_y,
+        markers,
+        bySourceNumber,
+        questionsSortedIdx,
+        outLength: out.length,
+      });
+
+      if (questionIdx == null) {
+        // Last resort: later questions on the page that still lack table images
+        const withoutTable = questionsSortedIdx.filter(
+          (idx) => !(out[idx].question_images ?? []).some((img) => (img.image_type || '').includes('table')),
+        );
+        questionIdx = withoutTable[withoutTable.length - remaining.indexOf(table) - 1] ?? withoutTable.at(-1);
+      }
+
+      if (questionIdx != null) pushTable(questionIdx, tableImage, page.index);
+    }
+  }
+
+  return out;
 }
 
 function attachOcrImages(
@@ -954,12 +1187,58 @@ function normalizeLooseQuestion(
     return {
       label,
       text: String(o.text ?? '').trim(),
-      ...(typeof o.image_id === 'string' ? { image_id: o.image_id } : {}),
+      ...(typeof o.image_id === 'string' ? { image_id: o.image_id.trim() } : {}),
     };
   });
 
-    const promptCandidate = q.prompt_text ?? q.promptText ?? questionText;
-    return {
+  const questionImages = normalizeLooseQuestionImages(q.question_images ?? q.questionImages);
+
+  // Image-only MCQ: model returns question_images as choice diagrams but options=[].
+  // Synthesize أ/ب/ج/د options from those images so import/UI still work.
+  let resolvedOptions = options;
+  if (
+    resolvedOptions.length === 0 &&
+    questionImages.length >= MIN_MCQ_OPTIONS &&
+    questionImages.length <= MAX_MCQ_OPTIONS
+  ) {
+    const choiceLike = questionImages.every((img) => {
+      const t = String(img.image_type ?? '').toLowerCase();
+      return !t || t.includes('choice') || t.includes('option') || t.includes('diagram');
+    });
+    if (choiceLike) {
+      resolvedOptions = questionImages.map((img, i) => ({
+        label: ARABIC_OPTION_LABELS[i] || String(i + 1),
+        text: '',
+        image_id: img.image_id,
+      }));
+      for (const img of questionImages) {
+        if (!img.image_type) img.image_type = 'choice_option';
+      }
+    }
+  }
+
+  // If options are image-choice placeholders without image_id, attach ids from question_images in order.
+  if (questionImages.length > 0) {
+    for (let i = 0; i < resolvedOptions.length; i++) {
+      const opt = resolvedOptions[i];
+      if (opt.image_id) continue;
+      const text = (opt.text || '').trim();
+      const looksEmptyOrImagePlaceholder =
+        !text ||
+        /^[\[(]?(image|صورة|شكل|diagram|img)[\])]?$/i.test(text) ||
+        questionImages.some((img) => img.image_id === text);
+      if (!looksEmptyOrImagePlaceholder) continue;
+      const img = questionImages[i];
+      if (!img) continue;
+      opt.image_id = img.image_id;
+      if (questionImages.some((candidate) => candidate.image_id === text)) {
+        opt.text = '';
+      }
+    }
+  }
+
+  const promptCandidate = q.prompt_text ?? q.promptText ?? questionText;
+  return {
     ...q,
     number,
     source_number: String(q.source_number ?? q.question_number ?? q.questionNumber ?? number),
@@ -967,10 +1246,59 @@ function normalizeLooseQuestion(
     prompt_text: String(promptCandidate ?? '').trim() || null,
     passage_id: q.passage_id ?? q.passageId ?? defaultPassageId,
     score,
-    options,
+    options: resolvedOptions,
+    question_images: questionImages,
     poetry: q.poetry ?? false,
     verses: Array.isArray(q.verses) ? q.verses : [],
   };
+}
+
+type LooseQuestionImage = {
+  image_id: string;
+  page_index?: unknown;
+  image_url?: string;
+  image_type?: string;
+  short_description?: unknown;
+  summary?: unknown;
+  educational_relevance?: unknown;
+  [key: string]: unknown;
+};
+
+/** Coerce Chat quirks: ["img-0", {image_id:"img-1"}] → objects with image_id. */
+function normalizeLooseQuestionImages(raw: unknown): LooseQuestionImage[] {
+  if (!Array.isArray(raw)) return [];
+  const out: LooseQuestionImage[] = [];
+  for (const item of raw) {
+    if (typeof item === 'string') {
+      const imageId = item.trim();
+      if (imageId) out.push({ image_id: imageId });
+      continue;
+    }
+    if (!item || typeof item !== 'object') continue;
+    const img = item as Record<string, unknown>;
+    const imageId = String(img.image_id ?? img.imageId ?? img.id ?? '').trim();
+    if (!imageId) continue;
+    out.push({
+      ...img,
+      image_id: imageId,
+      ...(img.page_index !== undefined
+        ? { page_index: img.page_index }
+        : img.pageIndex !== undefined
+          ? { page_index: img.pageIndex }
+          : {}),
+      ...(typeof img.image_url === 'string'
+        ? { image_url: img.image_url }
+        : typeof img.imageUrl === 'string'
+          ? { image_url: img.imageUrl }
+          : {}),
+      ...(typeof img.image_type === 'string'
+        ? { image_type: img.image_type }
+        : typeof img.imageType === 'string'
+          ? { image_type: img.imageType }
+          : {}),
+    });
+  }
+  return out;
 }
 
 async function parseQuestionsWithChat(
@@ -1141,6 +1469,66 @@ async function parseQuestionsWithChat(
 }
 
 type VisionPageImage = { pageIndex: number; mime: string; base64: string };
+
+function readUploadedFileBuffer(file: Express.Multer.File): Buffer | null {
+  if (file.buffer?.length) return file.buffer;
+  if (file.path && fs.existsSync(file.path)) return fs.readFileSync(file.path);
+  return null;
+}
+
+/**
+ * Page rasters used to crop OCR tables into question_images.
+ * Keys = OCR page.index values.
+ */
+async function collectPageRasterBuffers(
+  files: Express.Multer.File[],
+  ocr: MistralOcrResult,
+): Promise<Map<number, Buffer>> {
+  const map = new Map<number, Buffer>();
+  const needed = ocr.pages.filter((page) => (page.tables?.length ?? 0) > 0).map((page) => page.index);
+  if (needed.length === 0 || files.length === 0) return map;
+
+  const primary = files[0];
+  const primaryMime = MistralOcrService.resolveSupportedMime(primary);
+
+  if (files.length === 1 && primaryMime.includes('pdf')) {
+    const pdfPath = primary.path;
+    if (!pdfPath || !fs.existsSync(pdfPath)) return map;
+    try {
+      // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+      // @ts-ignore — pdf-to-img has no bundled types in this project
+      const pdfModule = await import('pdf-to-img');
+      const doc = await pdfModule.pdf(pdfPath, { scale: 2 });
+      const buffers: Buffer[] = [];
+      for await (const image of doc) {
+        buffers.push(image as Buffer);
+      }
+      for (const pageIndex of needed) {
+        if (buffers[pageIndex]) map.set(pageIndex, buffers[pageIndex]);
+      }
+    } catch (error: any) {
+      logger.warn('Failed to rasterize PDF for table crops:', error?.message || error);
+    }
+    return map;
+  }
+
+  if (files.length === 1) {
+    const buffer = readUploadedFileBuffer(primary);
+    if (!buffer) return map;
+    for (const pageIndex of needed) {
+      map.set(pageIndex, buffer);
+    }
+    return map;
+  }
+
+  // Multi-image merge uses sequential page indices 0..n-1
+  files.forEach((file, fileIndex) => {
+    if (!needed.includes(fileIndex)) return;
+    const buffer = readUploadedFileBuffer(file);
+    if (buffer) map.set(fileIndex, buffer);
+  });
+  return map;
+}
 
 const MAX_VISION_FILE_BYTES = 5 * 1024 * 1024;
 
@@ -1362,10 +1750,17 @@ export class MistralQuestionExtractionService {
       pages,
     };
 
-    const ocr =
+    let ocr =
       files.length === 1
         ? await MistralOcrService.extractTextFromFile(files[0], ocrOptions)
         : await MistralOcrService.extractTextFromFiles(files, ocrOptions);
+
+    if (includeQuestionImages) {
+      const pageBuffers = await collectPageRasterBuffers(files, ocr);
+      if (pageBuffers.size > 0) {
+        ocr = await MistralOcrService.materializeTablesAsImages(ocr, pageBuffers);
+      }
+    }
 
     return this.extractQuestionsFromOcr(ocr, {
       inferCorrectAnswer,
@@ -1415,7 +1810,10 @@ export class MistralQuestionExtractionService {
     );
     const questionsWithPassages = fillMissingPassageIds(questions, passages);
     const attachedQuestions = opts.includeQuestionImages
-      ? attachOcrImages(questionsWithPassages, extractedImages)
+      ? attachOcrImages(
+          attachTablesByMarkdownProximity(questionsWithPassages, ocr, extractedImages),
+          extractedImages,
+        )
       : questionsWithPassages.map((q) => ({ ...q, question_images: [] }));
 
     let questionsWithImages = attachedQuestions;

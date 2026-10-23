@@ -225,6 +225,25 @@ ${visionPriority}
 تعامل مع كل الصفحات/الصور كمستند واحد. حافظ على الترتيب.
 سؤال يبدأ في صورة ويكمل في التالية = سؤال واحد. لا تكرر سؤالًا.
 
+### question_images وخيارات الصور (إلزامي)
+
+- question_images يجب أن تكون مصفوفة كائنات فقط، وليست مصفوفة نصوص.
+  صحيح: "question_images": [{ "image_id": "img-0.jpeg", "image_type": "choice_option" }]
+  خطأ: "question_images": ["img-0.jpeg", "img-1.jpeg"]
+- إذا كانت الاختيارات رسومًا/أشكالًا بدون نص: اجعل options[].text فارغًا أو وصفًا قصيرًا،
+  وضع options[].image_id = معرف صورة OCR المطابق، وأدرج نفس المعرف داخل question_images ككائن.
+- لا تضع image_id كنص خام داخل question_images.
+
+### الجداول (إلزامي عند وجودها)
+
+- إن ظهر في markdown أو IMAGE_CONTEXT معرف جدول مثل tbl-0.html / [tbl-0.html](tbl-0.html):
+  أرفقه في question_images للسؤال الذي يحتوي الجدول أو يعتمد عليه.
+  مثال: "question_images": [{ "image_id": "tbl-0.html", "image_type": "table" }]
+- جدول بيانات بجانب/داخل نص السؤال (مثل جدول المقاومة النوعية) = صورة للسؤال (question_figure/table) وليس قطعة قراءة.
+- جدول اختيارات (أعمدة R/I مع أ/ب/ج/د): أرفق الجدول كـ question_images image_type=table،
+  واستخرج نص الخيارات من صفوف الجدول إلى options[] إن أمكن.
+- لا تترك جدولًا ظاهرًا في الصفحة بدون ربطه بسؤال.
+
 ${answerRules}
 
 correct_answer_index: 0-based حسب ترتيب options[].

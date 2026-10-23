@@ -101,26 +101,45 @@ router.put(
 
     let newAvatarUrl: string | undefined;
     if (req.file) {
-      const uploaded = await uploadToCloudinary(req.file.path);
+      const uploaded = await uploadToCloudinary(req.file.path, {
+        category: 'teachers',
+        folder: 'teachers',
+      });
       newAvatarUrl = uploaded.secure_url;
     }
 
+    // Empty strings from multipart: skip email/phone updates (do not null them out —
+    // that trips users.email_or_phone_check when both become null).
     const payload = {
       name: body.name,
-      email: body.email === '' ? null : body.email,
-      phone: body.phone === '' ? null : body.phone,
+      email: body.email === undefined || body.email === '' ? undefined : body.email,
+      phone: body.phone === undefined || body.phone === '' ? undefined : body.phone,
       password: body.password,
-      subject: body.subject === '' ? null : body.subject,
-      description: body.description === '' ? null : body.description,
+      subject: body.subject === undefined ? undefined : body.subject === '' ? null : body.subject,
+      description:
+        body.description === undefined ? undefined : body.description === '' ? null : body.description,
       avatar: newAvatarUrl,
       account_status: body.account_status as TeacherAccountStatus | undefined,
       subscription_package: body.subscription_package as TeacherSubscriptionPackage | undefined,
       grade_ids: body.grade_ids,
-      facebook_url: body.facebook_url === '' ? null : body.facebook_url,
-      instagram_url: body.instagram_url === '' ? null : body.instagram_url,
-      youtube_url: body.youtube_url === '' ? null : body.youtube_url,
-      tiktok_url: body.tiktok_url === '' ? null : body.tiktok_url,
-      whatsapp_number: body.whatsapp_number === '' ? null : body.whatsapp_number,
+      facebook_url:
+        body.facebook_url === undefined ? undefined : body.facebook_url === '' ? null : body.facebook_url,
+      instagram_url:
+        body.instagram_url === undefined
+          ? undefined
+          : body.instagram_url === ''
+            ? null
+            : body.instagram_url,
+      youtube_url:
+        body.youtube_url === undefined ? undefined : body.youtube_url === '' ? null : body.youtube_url,
+      tiktok_url:
+        body.tiktok_url === undefined ? undefined : body.tiktok_url === '' ? null : body.tiktok_url,
+      whatsapp_number:
+        body.whatsapp_number === undefined
+          ? undefined
+          : body.whatsapp_number === ''
+            ? null
+            : body.whatsapp_number,
     };
 
     const { previousAvatar } = await AdminTeachersService.updateTeacher(teacherId, tenantId, payload);

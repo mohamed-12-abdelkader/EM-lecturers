@@ -82,6 +82,11 @@ location ^~ /cdn/ {
 **Cleaner nginx pattern** (recommended — rewrite `/cdn/` → uploads root):
 
 ```nginx
+# Bare /cdn must NOT fall through to the SPA try_files → index.html
+location = /cdn {
+    return 404;
+}
+
 location ^~ /cdn/ {
     # /cdn/courses/x.jpg → /home/.../uploads/courses/x.jpg
     rewrite ^/cdn/(.*)$ /$1 break;
@@ -100,6 +105,8 @@ location ^~ /cdn/ {
     access_log off;
 }
 ```
+
+Add the same blocks on the **frontend** host (`em-online.online` / `emlec`) *before* `location / { try_files ... /index.html; }`. Otherwise `https://em-online.online/cdn` (no path) used to return the React SPA.
 
 Then:
 

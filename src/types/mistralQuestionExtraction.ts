@@ -15,7 +15,7 @@ export const MistralExtractedOptionSchema = z.object({
   image_id: z.string().optional(),
 });
 
-export const MistralQuestionImageSchema = z.object({
+const MistralQuestionImageObjectSchema = z.object({
   image_id: z.string(),
   page_index: z.number().int().nonnegative().nullable().optional(),
   image_url: z.string().url().optional(),
@@ -24,6 +24,18 @@ export const MistralQuestionImageSchema = z.object({
   summary: z.string().optional(),
   educational_relevance: z.string().optional(),
 });
+
+/**
+ * Chat models sometimes return image refs as bare strings (OCR ids) instead of objects.
+ * Accept either and normalize to the object shape.
+ */
+export const MistralQuestionImageSchema = z.preprocess((value) => {
+  if (typeof value === 'string') {
+    const imageId = value.trim();
+    return imageId ? { image_id: imageId } : value;
+  }
+  return value;
+}, MistralQuestionImageObjectSchema);
 
 export const MistralExtractedPassageSchema = z.object({
   passage_id: z.string(),

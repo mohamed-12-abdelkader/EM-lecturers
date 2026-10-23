@@ -1,0 +1,8 @@
+{
+  "login_ok": true,
+  "put_status": 200,
+  "avatar_url": "https://api.em-online.online/cdn/teachers/1790546391461-2375443dd90d.jpg",
+  "cdn_http": 200,
+  "cdn_bytes": 16439,
+  "notes": "PUT multipart=true ct=multipart/form-data; boundary=----WebKitFormBoundaryE4XtHU7gzh12Ttf4; CDN content-type=image/jpeg"
+}
