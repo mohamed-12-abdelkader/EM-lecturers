@@ -1691,13 +1691,24 @@ function normalizeExtractionPayload(raw: unknown): unknown {
   return data;
 }
 
+type LooseQuestionImage = {
+  image_id: string;
+  page_index?: number | null;
+  image_url?: string;
+  image_type?: string;
+  short_description?: string;
+  summary?: string;
+  educational_relevance?: string;
+  [key: string]: unknown;
+};
+
 /**
  * Mistral/DeepSeek أحياناً ترجع question_images كمصفوفة strings (image_id)
  * بدل objects — نحوّلها للشكل المتوقع قبل Zod.
  */
-function normalizeLooseQuestionImages(raw: unknown): Array<Record<string, unknown>> {
+function normalizeLooseQuestionImages(raw: unknown): LooseQuestionImage[] {
   if (!Array.isArray(raw)) return [];
-  const out: Array<Record<string, unknown>> = [];
+  const out: LooseQuestionImage[] = [];
   for (const item of raw) {
     if (typeof item === 'string') {
       const image_id = item.trim();
