@@ -19,6 +19,7 @@ import './modules/whatsapp/automations/teacherCreative';
 import './modules/whatsapp/automations/teacherDataAnalyst';
 import './modules/whatsapp/automations/studentScientific';
 import './modules/whatsapp/automations/teacherExamBuilder';
+import './modules/whatsapp/automations/parentsExamNotify';
 
 export const app = express();
 export const server = createServer(app);

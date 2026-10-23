@@ -12,6 +12,7 @@ import { WhatsAppServiceAdmin } from '../services/whatsappServiceAdmin.service';
 import { WhatsAppOutboundQueue } from '../queue/whatsappOutboundQueue';
 import { SessionPoolService } from '../routing/sessionPool.service';
 import { SupportPolicyChatService } from '../automations/supportPolicy/policyChat.service';
+import { ParentsExamNotifyService } from '../automations/parentsExamNotify/service';
 
 export const whatsappAdminRouter = Router();
 
@@ -386,5 +387,141 @@ whatsappAdminRouter.post(
       message: 'تم إدراج الرسالة في قائمة الإرسال',
       data: { job_id: jobId, session_slug: sessionSlug, service_id: serviceId },
     });
+  }),
+);
+
+const ParentsExamSettingsBody = z.object({
+  auto_send: z.boolean().optional(),
+  notify_passed: z.boolean().optional(),
+  notify_failed: z.boolean().optional(),
+  notify_absent: z.boolean().optional(),
+  pass_percentage: z.number().min(0).max(100).optional(),
+  interval_seconds: z.number().int().min(15).max(300).optional(),
+  jitter_seconds: z.number().int().min(0).max(120).optional(),
+  daily_cap: z.number().int().min(1).max(5000).optional(),
+  quiet_hours: z
+    .object({
+      enabled: z.boolean().optional(),
+      start: z.string().regex(/^\d{2}:\d{2}$/).optional(),
+      end: z.string().regex(/^\d{2}:\d{2}$/).optional(),
+      tz: z.string().min(1).max(64).optional(),
+    })
+    .optional(),
+});
+
+whatsappAdminRouter.get(
+  '/parents-exam/settings',
+  asyncWrapper(async (_req, res) => {
+    const data = await ParentsExamNotifyService.getSettings();
+    res.json({ success: true, data });
+  }),
+);
+
+whatsappAdminRouter.put(
+  '/parents-exam/settings',
+  validate(ParentsExamSettingsBody),
+  asyncWrapper(async (req, res) => {
+    const data = await ParentsExamNotifyService.saveSettings(req.body);
+    res.json({ success: true, data });
+  }),
+);
+
+whatsappAdminRouter.get(
+  '/parents-exam/queue',
+  asyncWrapper(async (_req, res) => {
+    const data = await ParentsExamNotifyService.queue();
+    res.json({ success: true, data });
+  }),
+);
+
+whatsappAdminRouter.get(
+  '/parents-exam/exams',
+  asyncWrapper(async (_req, res) => {
+    const exams = await ParentsExamNotifyService.listExams(50);
+    res.json({ success: true, data: { exams } });
+  }),
+);
+
+whatsappAdminRouter.put(
+  '/parents-exam/exams/:examId',
+  validate(z.object({ enabled: z.boolean() })),
+  asyncWrapper(async (req, res) => {
+    const examId = Number(req.params.examId);
+    if (!examId) throw new HttpError(400, 'معرف الامتحان غير صحيح');
+    const exam = await ParentsExamNotifyService.setExamEnabled(examId, req.body.enabled);
+    res.json({ success: true, data: exam });
+  }),
+);
+
+whatsappAdminRouter.get(
+  '/parents-exam/exams/:examId/preview',
+  asyncWrapper(async (req, res) => {
+    const examId = Number(req.params.examId);
+    if (!examId) throw new HttpError(400, 'معرف الامتحان غير صحيح');
+    const data = await ParentsExamNotifyService.preview(examId);
+    res.json({ success: true, data });
+  }),
+);
+
+whatsappAdminRouter.post(
+  '/parents-exam/exams/:examId/test',
+  validate(
+    z.object({
+      studentId: z.number().int().positive(),
+      cohort: z.enum(['passed', 'failed', 'absent']),
+    }),
+  ),
+  asyncWrapper(async (req, res) => {
+    const examId = Number(req.params.examId);
+    if (!examId) throw new HttpError(400, 'معرف الامتحان غير صحيح');
+    const data = await ParentsExamNotifyService.testSend(examId, req.body.studentId, req.body.cohort);
+    res.status(202).json({ success: true, data });
+  }),
+);
+
+whatsappAdminRouter.post(
+  '/parents-exam/exams/:examId/send',
+  validate(
+    z.object({
+      passed: z.boolean().optional(),
+      failed: z.boolean().optional(),
+      absent: z.boolean().optional(),
+    }),
+  ),
+  asyncWrapper(async (req, res) => {
+    const examId = Number(req.params.examId);
+    if (!examId) throw new HttpError(400, 'معرف الامتحان غير صحيح');
+    const data = await ParentsExamNotifyService.sendCohorts(examId, req.body);
+    res.status(202).json({ success: true, data });
+  }),
+);
+
+whatsappAdminRouter.post(
+  '/parents-exam/exams/:examId/pause',
+  asyncWrapper(async (req, res) => {
+    const examId = Number(req.params.examId);
+    if (!examId) throw new HttpError(400, 'معرف الامتحان غير صحيح');
+    const exam = await ParentsExamNotifyService.pause(examId);
+    res.json({ success: true, data: exam });
+  }),
+);
+
+whatsappAdminRouter.post(
+  '/parents-exam/exams/:examId/resume',
+  asyncWrapper(async (req, res) => {
+    const examId = Number(req.params.examId);
+    if (!examId) throw new HttpError(400, 'معرف الامتحان غير صحيح');
+    const exam = await ParentsExamNotifyService.resume(examId);
+    res.json({ success: true, data: exam });
+  }),
+);
+
+whatsappAdminRouter.post(
+  '/parents-exam/exams/:examId/cancel-pending',
+  asyncWrapper(async (req, res) => {
+    const examId = Number(req.params.examId);
+    if (!examId) throw new HttpError(400, 'معرف الامتحان غير صحيح');
+    const data = await ParentsExamNotifyService.cancelPending(examId);
+    res.json({ success: true, data });
   }),
 );

@@ -834,7 +834,7 @@ export class CourseLevelExamsService {
       correctByQuestionId,
     );
 
-    await pool.query(
+    const finalized = await pool.query(
       `UPDATE course_level_exam_attempts
        SET status = 'submitted',
            submitted_at = NOW(),
@@ -844,6 +844,16 @@ export class CourseLevelExamsService {
        WHERE id = $4 AND status = 'in_progress'`,
       [graded.maxGrade, graded.obtained, !!options.timedOut, attempt.id],
     );
+    if ((finalized.rowCount ?? 0) > 0) {
+      try {
+        const { onAttemptFinalized } = await import(
+          '../modules/whatsapp/automations/parentsExamNotify/service.js'
+        );
+        await onAttemptFinalized(Number(exam.id), Number(studentId));
+      } catch (err) {
+        console.error('parents exam notify hook failed', err);
+      }
+    }
 
     const updated = await pool.query(`SELECT * FROM course_level_exam_attempts WHERE id = $1`, [
       attempt.id,

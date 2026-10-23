@@ -171,6 +171,11 @@ const startServer = async () => {
     const { startWhatsAppWorker } = await import('./modules/whatsapp/workers/whatsappWorker.js');
     startWhatsAppWorker();
 
+    const { startParentsExamSweeper } = await import(
+      './modules/whatsapp/automations/parentsExamNotify/index.js'
+    );
+    startParentsExamSweeper();
+
     const { startYoutubeUploadWorker } = await import('./workers/youtubeUploadWorker.js');
     startYoutubeUploadWorker();
 

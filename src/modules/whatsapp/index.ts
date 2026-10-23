@@ -14,3 +14,4 @@ import './automations/teacherCreative';
 import './automations/teacherDataAnalyst';
 import './automations/studentScientific';
 import './automations/teacherExamBuilder';
+import './automations/parentsExamNotify';

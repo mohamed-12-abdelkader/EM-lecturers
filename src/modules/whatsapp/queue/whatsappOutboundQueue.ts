@@ -2,6 +2,8 @@ import pool from '../../../db/pool';
 import { whatsappConfig } from '../config/whatsapp';
 import { normalizePhone } from '../gateway/whatsappGatewayClient';
 import { logger } from '../../../utils';
+import { PARENTS_EXAM_NOTIFY_KEY } from '../automations/parentsExamNotify/constants';
+import { selectOutboundClaim } from './selectOutboundClaim';
 
 export interface OutboundJobRow {
   id: number;
@@ -66,26 +68,71 @@ export class WhatsAppOutboundQueue {
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
-      const result = await client.query<OutboundJobRow>(
-        `SELECT id, service_id, session_slug, to_phone, body, media_url, tenant_id,
-                conversation_id, trigger_type, trigger_ref, metadata, status,
-                attempts, max_attempts, last_error, scheduled_at
-         FROM wa_outbound_jobs
-         WHERE status IN ('pending', 'failed')
-           AND scheduled_at <= NOW()
-           AND attempts < max_attempts
-         ORDER BY scheduled_at ASC, id ASC
+      const jobSql = `SELECT j.id, j.service_id, j.session_slug, j.to_phone, j.body, j.media_url, j.tenant_id,
+                j.conversation_id, j.trigger_type, j.trigger_ref, j.metadata, j.status,
+                j.attempts, j.max_attempts, j.last_error, j.scheduled_at, s.key AS service_key
+         FROM wa_outbound_jobs j
+         LEFT JOIN wa_services s ON s.id = j.service_id`;
+      const due = `j.status IN ('pending', 'failed')
+           AND j.scheduled_at <= NOW()
+           AND j.attempts < j.max_attempts`;
+      const nonPaced = await client.query<OutboundJobRow & { service_key: string | null }>(
+        `${jobSql}
+         WHERE ${due}
+           AND (s.key IS DISTINCT FROM $2)
+         ORDER BY j.scheduled_at ASC, j.id ASC
          LIMIT $1
-         FOR UPDATE SKIP LOCKED`,
-        [limit],
+         FOR UPDATE OF j SKIP LOCKED`,
+        [limit, PARENTS_EXAM_NOTIFY_KEY],
+      );
+      const paced = await client.query<OutboundJobRow & { service_key: string | null }>(
+        `${jobSql}
+         WHERE ${due}
+           AND s.key = $1
+           AND (
+             COALESCE(j.metadata->>'immediate', '') = 'true'
+             OR NOT EXISTS (
+               SELECT 1 FROM wa_outbound_jobs prev
+               WHERE prev.session_slug = j.session_slug
+                 AND prev.service_id = j.service_id
+                 AND (
+                   prev.status = 'processing'
+                   OR (
+                     prev.status = 'sent'
+                     AND prev.processed_at > NOW() - make_interval(
+                       secs => GREATEST(15, LEAST(300, COALESCE((s.config->>'interval_seconds')::int, 30)))
+                     )
+                   )
+                 )
+             )
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM wa_parent_exam_notifications n
+             JOIN wa_parent_exam_settings st ON st.exam_id = n.exam_id AND st.paused = TRUE
+             WHERE n.job_id = j.id
+           )
+         ORDER BY j.scheduled_at ASC, j.id ASC
+         LIMIT 500
+         FOR UPDATE OF j SKIP LOCKED`,
+        [PARENTS_EXAM_NOTIFY_KEY],
       );
 
-      if (!result.rowCount) {
+      const picked = selectOutboundClaim(
+        [...nonPaced.rows, ...paced.rows].map((row) => ({
+          ...row,
+          sessionSlug: row.session_slug,
+          serviceKey: row.service_key,
+          scheduledAt: new Date(row.scheduled_at).getTime(),
+        })),
+        { batchSize: limit, pacedServiceKey: PARENTS_EXAM_NOTIFY_KEY },
+      );
+
+      if (!picked.length) {
         await client.query('COMMIT');
         return [];
       }
 
-      const ids = result.rows.map((r) => r.id);
+      const ids = picked.map((r) => r.id);
       await client.query(
         `UPDATE wa_outbound_jobs
          SET status = 'processing', attempts = attempts + 1
@@ -94,7 +141,7 @@ export class WhatsAppOutboundQueue {
       );
       await client.query('COMMIT');
 
-      return result.rows.map((row) => ({
+      return picked.map((row) => ({
         ...row,
         metadata:
           typeof row.metadata === 'string' ? JSON.parse(row.metadata) : row.metadata || {},
@@ -113,6 +160,12 @@ export class WhatsAppOutboundQueue {
       `UPDATE wa_outbound_jobs
        SET status = 'sent', processed_at = NOW(), last_error = NULL
        WHERE id = $1`,
+      [jobId],
+    );
+    await pool.query(
+      `UPDATE wa_parent_exam_notifications
+       SET status = 'sent'
+       WHERE job_id = $1 AND status = 'scheduled'`,
       [jobId],
     );
   }
