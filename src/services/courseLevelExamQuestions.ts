@@ -40,9 +40,9 @@ export class CourseLevelExamQuestionsService {
    */
   private static async verifyExamOwnership(examId: number, teacherId: number): Promise<void> {
     const examRes = await pool.query(
-      `SELECT e.*, c.teacher_id 
+      `SELECT e.*, COALESCE(e.teacher_id, c.teacher_id) AS teacher_id
        FROM course_level_exams e
-       JOIN courses c ON e.course_id = c.id
+       LEFT JOIN courses c ON e.course_id = c.id
        WHERE e.id = $1`,
       [examId],
     );
@@ -65,10 +65,10 @@ export class CourseLevelExamQuestionsService {
     teacherId: number,
   ): Promise<number> {
     const questionRes = await pool.query(
-      `SELECT q.exam_id, c.teacher_id
+      `SELECT q.exam_id, COALESCE(e.teacher_id, c.teacher_id) AS teacher_id
        FROM course_level_exam_questions q
        JOIN course_level_exams e ON q.exam_id = e.id
-       JOIN courses c ON e.course_id = c.id
+       LEFT JOIN courses c ON e.course_id = c.id
        WHERE q.id = $1`,
       [questionId],
     );
@@ -118,7 +118,9 @@ export class CourseLevelExamQuestionsService {
       [
         input.examId,
         input.questionText,
-        input.questionImage || null,
+        typeof input.questionImage === 'string' && input.questionImage.trim()
+          ? input.questionImage.trim()
+          : null,
         input.optionA,
         input.optionB,
         input.optionC,
@@ -221,6 +223,8 @@ export class CourseLevelExamQuestionsService {
       optionC: string;
       optionD: string;
       correctAnswer: 'A' | 'B' | 'C' | 'D';
+      questionImage?: string | null;
+      question_image?: string | null;
     }>,
   ) {
     if (!questions.length) {
@@ -236,6 +240,11 @@ export class CourseLevelExamQuestionsService {
       const optionC = (q.optionC || '').trim();
       const optionD = (q.optionD || '').trim();
       const correctAnswer = (q.correctAnswer || '').toUpperCase() as 'A' | 'B' | 'C' | 'D';
+      const rawImage = (q as any).questionImage ?? (q as any).question_image ?? null;
+      const questionImage =
+        typeof rawImage === 'string' && rawImage.trim() && rawImage !== 'null'
+          ? rawImage.trim()
+          : null;
 
       if (!questionText || !optionA || !optionB || !optionC || !optionD) {
         throw new HttpError(400, 'كل سؤال يحتاج: questionText, optionA, optionB, optionC, optionD');
@@ -256,9 +265,19 @@ export class CourseLevelExamQuestionsService {
           option_d,
           correct_answer,
           created_by
-        ) VALUES ($1, 'TEXT', $2, NULL, $3, $4, $5, $6, $7, $8)
+        ) VALUES ($1, 'TEXT', $2, $3, $4, $5, $6, $7, $8, $9)
         RETURNING *`,
-        [examId, questionText, optionA, optionB, optionC, optionD, correctAnswer, requester.id],
+        [
+          examId,
+          questionText,
+          questionImage,
+          optionA,
+          optionB,
+          optionC,
+          optionD,
+          correctAnswer,
+          requester.id,
+        ],
       );
       created.push(result.rows[0]);
     }
@@ -393,14 +412,62 @@ export class CourseLevelExamQuestionsService {
   }
 
   /**
-   * Delete a question
+   * Delete a question from a course-level exam and regrade all past submitted attempts.
+   * Does not delete the source bank/library question.
+   * Caller must already have authorized access (ownership / course manager).
    */
+  static async deleteQuestionAndRegrade(questionId: number) {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      const qRes = await client.query<{ id: number; exam_id: number }>(
+        `SELECT id, exam_id FROM course_level_exam_questions WHERE id = $1 FOR UPDATE`,
+        [questionId],
+      );
+      if (!qRes.rowCount) {
+        throw new HttpError(404, 'Question not found');
+      }
+      const examId = Number(qRes.rows[0].exam_id);
+      const deletedQuestionId = Number(qRes.rows[0].id);
+
+      const del = await client.query(
+        `DELETE FROM course_level_exam_questions WHERE id = $1 RETURNING id`,
+        [deletedQuestionId],
+      );
+      if (!del.rowCount) {
+        throw new HttpError(404, 'Question not found');
+      }
+
+      // Commit delete first so CASCADE answer removal is visible to recalculate (uses pool)
+      await client.query('COMMIT');
+
+      const { CourseLevelExamsService } = await import('./courseLevelExams.js');
+      // Full recalc from remaining questions — equalizes pre/post-delete attempts + syncs points
+      const regrade =
+        await CourseLevelExamsService.recalculateResultsFromRemainingQuestions(examId);
+
+      return {
+        message: 'Question deleted successfully',
+        examId,
+        deletedQuestionId,
+        regrade,
+      };
+    } catch (err) {
+      try {
+        await client.query('ROLLBACK');
+      } catch {
+        // already committed or no active transaction
+      }
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
   static async deleteQuestion(requester: RequestUser, questionId: number) {
     await this.verifyQuestionOwnership(questionId, requester.id);
-
-    await pool.query('DELETE FROM course_level_exam_questions WHERE id = $1', [questionId]);
-
-    return { message: 'Question deleted successfully' };
+    return this.deleteQuestionAndRegrade(questionId);
   }
 
   /**
@@ -434,8 +501,9 @@ export class CourseLevelExamQuestionsService {
   }
 
   /**
-   * Set exactly two correct answers for a course-level exam question, then regrade
+   * Set one or two correct answers for a course-level exam question, then regrade
    * all submitted attempts that include this question.
+   * Accepts 1 letter (normal) or 2 distinct letters (either accepted as correct).
    */
   static async setDualCorrectAnswers(
     requester: RequestUser,
@@ -452,10 +520,10 @@ export class CourseLevelExamQuestionsService {
       ),
     ] as Array<'A' | 'B' | 'C' | 'D'>;
 
-    if (unique.length !== 2) {
+    if (unique.length < 1 || unique.length > 2) {
       throw new HttpError(
         400,
-        'correctAnswers must contain exactly two distinct letters from A, B, C, D',
+        'correctAnswers must contain 1 or 2 distinct letters from A, B, C, D',
       );
     }
 
@@ -464,7 +532,7 @@ export class CourseLevelExamQuestionsService {
        SET correct_answer = $1, correct_answer_2 = $2, updated_at = NOW()
        WHERE id = $3
        RETURNING *`,
-      [unique[0], unique[1], questionId],
+      [unique[0], unique[1] ?? null, questionId],
     );
 
     if (!result.rowCount) {
@@ -513,6 +581,10 @@ export class CourseLevelExamQuestionsService {
       throw new HttpError(404, 'Question not found');
     }
 
-    return result.rows[0];
+    const { TeacherReadingPassagesService } = await import('./teacherReadingPassages.js');
+    const [withPassage] = await TeacherReadingPassagesService.attachPassagesByTeacherQuestionIds(
+      result.rows,
+    );
+    return withPassage ?? result.rows[0];
   }
 }

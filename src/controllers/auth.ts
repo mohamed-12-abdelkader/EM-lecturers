@@ -204,6 +204,12 @@ router.post(
     }
 
     const user = userQuery.rows[0];
+    if (user.deleted_at) {
+      return res.status(403).json({
+        message: 'الحساب محذوف — تواصل مع المدرس لاستعادته من المحذوفات',
+        code: 'ACCOUNT_DELETED',
+      });
+    }
     if (user.role === 'teacher' && user.account_status && user.account_status !== 'active') {
       return res.status(403).json({
         message: 'Teacher account is not active',

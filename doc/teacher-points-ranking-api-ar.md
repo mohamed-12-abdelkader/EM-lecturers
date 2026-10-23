@@ -14,6 +14,13 @@
 | `PUT` | `/teacher/points/settings` | teacher / academy / admin | تحديث إعدادات النقاط |
 | `GET` | `/teacher/points/leaderboard` | teacher / academy / admin | ترتيب طلاب المدرس (فلترة + بحث + صفحات) |
 | `POST` | `/teacher/points/manual` | teacher / academy / admin | منح نقاط يدوية لطالب |
+| `DELETE` | `/teacher/points/transactions/:transactionId` | teacher / academy / admin | حذف نقاط يدوية منحها المدرس |
+| `POST` | `/teacher/points/reset` | teacher / academy / admin | تصفير النقاط مع حفظ موسم أرشيفي قابل للاسترجاع |
+| `POST` | `/teacher/points/reset-and-rebuild-last-exam` | teacher / academy / admin | حذف كل النقاط ثم منح بدء+درجة آخر امتحان فقط لكل صف |
+| `GET` | `/teacher/points/seasons` | teacher / academy / admin | قائمة مواسم النقاط المؤرشفة |
+| `GET` | `/teacher/points/seasons/:seasonId` | teacher / academy / admin | تفاصيل موسم + أرصدة الطلاب فيه |
+| `POST` | `/teacher/points/seasons/:seasonId/restore` | teacher / academy / admin | استرجاع موسم سابق ليصبح الرصيد الحالي |
+| `POST` | `/teacher/points/consolidate-legacy` | teacher / academy / admin | توحيد نقاط الامتحانات القديمة (أول محاولة فقط) |
 | `GET` | `/teacher/points/students/:studentId/transactions` | teacher / academy / admin | سجل معاملات طالب |
 | `GET` | `/student/points/summary` | student | نقاط الطالب + رتبته + المتبقي للمركز التالي |
 | `GET` | `/student/points/leaderboard` | student | أعلى 10 في صف الطالب |
@@ -35,10 +42,10 @@
 | القيمة | متى تُمنح | كيف تُحسب النقاط | قابل للتعطيل من إعدادات المدرس |
 |--------|-----------|------------------|--------------------------------|
 | `VIDEO_WATCH` | أول مشاهدة لفيديو معيّن | قيمة ثابتة من الإعدادات (افتراضي 5) | نعم `video_watch_*` |
-| `EXAM_START` | إنشاء محاولة امتحان جديدة | قيمة ثابتة (افتراضي 5) | نعم `exam_start_*` |
-| `ASSIGNMENT_START` | إنشاء محاولة واجب جديدة | قيمة ثابتة (افتراضي 3) | نعم `assignment_start_*` |
-| `EXAM_SCORE` | تسليم امتحان | `floor(obtained_grade)` مثال: 15/20 → **+15** | نعم `exam_score_enabled` |
-| `ASSIGNMENT_SCORE` | تسليم واجب | `floor(obtained_grade)` | نعم `assignment_score_enabled` |
+| `EXAM_START` | أول دخول لامتحان (مرة واحدة فقط) | قيمة ثابتة (افتراضي 5) | نعم `exam_start_*` |
+| `ASSIGNMENT_START` | أول دخول لواجب (مرة واحدة فقط) | قيمة ثابتة (افتراضي 3) | نعم `assignment_start_*` |
+| `EXAM_SCORE` | أول تسليم امتحان | `floor(obtained_grade)` مثال: 15/20 → **+15** | نعم `exam_score_enabled` |
+| `ASSIGNMENT_SCORE` | أول تسليم واجب | `floor(obtained_grade)` | نعم `assignment_score_enabled` |
 | `MANUAL_REWARD` | منح يدوي من المدرس | الرقم الذي يدخله المدرس | دائمًا مسموح للمدرس |
 
 أنواع محجوزة للتوسع المستقبلي في الـ DB (بدون hooks حاليًا):  
@@ -51,15 +58,18 @@
 | الحدث | مثال `reference_key` |
 |-------|----------------------|
 | مشاهدة فيديو | `VIDEO_WATCH:teacher:10:video:55:student:42` |
-| بدء امتحان | `EXAM_START:attempt:1205` |
-| نتيجة امتحان | `EXAM_SCORE:attempt:1205` |
-| بدء واجب | `ASSIGNMENT_START:attempt:1206` |
-| نتيجة واجب | `ASSIGNMENT_SCORE:attempt:1206` |
+| بدء امتحان محاضرة | `EXAM_START:teacher:10:lecture_exam:55:student:42` |
+| نتيجة امتحان محاضرة | `EXAM_SCORE:teacher:10:lecture_exam:55:student:42` |
+| بدء امتحان شامل | `EXAM_START:teacher:10:course_exam:12:student:42` |
+| نتيجة امتحان شامل | `EXAM_SCORE:teacher:10:course_exam:12:student:42` |
+| بدء واجب | `ASSIGNMENT_START:teacher:10:assignment:55:student:42` |
+| نتيجة واجب | `ASSIGNMENT_SCORE:teacher:10:assignment:55:student:42` |
 | يدوي | `MANUAL_REWARD:teacher:10:uuid:<uuid>` |
 
 - `INSERT ... ON CONFLICT (reference_key) DO NOTHING`
 - إعادة Refresh / إعادة استدعاء API / فتح النتيجة مرة أخرى → **لا تضاعف النقاط**
-- محاولة امتحان جديدة (attempt جديد) → مفتاح جديد → يمكن منح start/score لهذه المحاولة فقط
+- إعادة دخول نفس الامتحان (attempt جديد) → **نفس المفتاح** → لا نقاط بدء/درجة مرة ثانية
+- النقاط تُمنح مرة واحدة فقط لكل طالب لكل امتحان: بدء + درجة أول تسليم
 
 ### 1.4 حساب الترتيب (Tie)
 
@@ -251,7 +261,13 @@ Authorization: Bearer <TEACHER_TOKEN>
         "avatar": null,
         "gradeId": 1,
         "gradeName": "الصف الثالث الثانوي",
-        "points": 500
+        "points": 500,
+        "courseGroup": {
+          "id": 3,
+          "name": "مجموعة أ",
+          "gradeId": 1,
+          "status": "active"
+        }
       },
       {
         "rank": 2,
@@ -261,7 +277,8 @@ Authorization: Bearer <TEACHER_TOKEN>
         "avatar": "https://...",
         "gradeId": 1,
         "gradeName": "الصف الثالث الثانوي",
-        "points": 450
+        "points": 450,
+        "courseGroup": null
       }
     ]
   }
@@ -271,6 +288,7 @@ Authorization: Bearer <TEACHER_TOKEN>
 - الترتيب تنازلي حسب `points`.
 - الـ `rank` محسوب داخل كل `gradeId` (`PARTITION BY grade_id`).
 - يظهر فقط من لديهم صف في `student_point_balances` (حصلوا على نقاط مرة واحدة على الأقل).
+- `courseGroup`: مجموعة الكورس النشطة للطالب عند هذا المدرس (`null` إن لم يكن منضمًا).
 
 ---
 
@@ -330,6 +348,162 @@ Content-Type: application/json
 | `403` | `Student is not linked to this teacher` |
 
 > ملاحظة: كل منح يدوي ينشئ `reference_key` بـ UUID جديد → يمكن منح نقاط يدوية متعددة لنفس الطالب.
+
+### 3.4.1 حذف نقاط يدوية
+
+```http
+DELETE /api/teacher/points/transactions/:transactionId
+Authorization: Bearer <TEACHER_TOKEN>
+```
+
+- يحذف معاملة `MANUAL_REWARD` فقط (النقاط اللي منحها المدرس يدوياً).
+- يخصم نفس القيمة من رصيد الطالب (`GREATEST(0, total - points)`).
+- `:transactionId` من `POST /manual` أو من قائمة معاملات الطالب.
+
+**Response `200`**
+
+```json
+{
+  "success": true,
+  "message": "تم حذف النقاط الممنوحة بنجاح",
+  "data": {
+    "deleted": true,
+    "transactionId": 99,
+    "studentId": 42,
+    "pointsRemoved": 20,
+    "totalPoints": 350
+  }
+}
+```
+
+| Status | السبب |
+|--------|--------|
+| `404` | المعاملة غير موجودة |
+| `403` | المعاملة لمدرس آخر |
+| `409` | ليست `MANUAL_REWARD` (امتحان/فيديو…) |
+
+### 3.4.2 توحيد نقاط الامتحانات القديمة (أول محاولة فقط)
+
+للامتحانات اللي الطالب امتحنها **قبل** نظام «مرة واحدة لكل امتحان»، كانت النقاط تُمنح لكل محاولة. هذا الـ endpoint (ويُشغَّل أيضاً تلقائياً عند `migrate up`) يوحّد السجلات:
+
+- يبقي نقاط **أول محاولة** لكل طالب + امتحان (`EXAM_START` / `EXAM_SCORE` / الواجب)
+- يحذف نقاط المحاولات التالية ويخصمها من الرصيد
+- يحدّث `reference_key` للشكل الجديد حتى لا تُعاد المنح
+
+```http
+POST /api/teacher/points/consolidate-legacy
+Authorization: Bearer <TEACHER_TOKEN>
+Content-Type: application/json
+```
+
+```json
+{ "confirm": "CONSOLIDATE_EXAM_POINTS" }
+```
+
+**Response `200`**
+
+```json
+{
+  "success": true,
+  "message": "تم توحيد نقاط الامتحانات: احتساب أول محاولة فقط وإلغاء تكرار المحاولات التالية",
+  "data": {
+    "groupsProcessed": 12,
+    "transactionsDeleted": 18,
+    "transactionsUpdated": 12,
+    "pointsRemovedFromBalances": 45
+  }
+}
+```
+
+### 3.4.3 تصفير النقاط مع حفظ السجل (موسم)
+
+```http
+POST /api/teacher/points/reset
+Authorization: Bearer <TEACHER_TOKEN>
+Content-Type: application/json
+```
+
+```json
+{
+  "confirm": "RESET_ALL_POINTS",
+  "gradeId": 1,
+  "label": "ترم أول 2026",
+  "reason": "بداية ترم جديد"
+}
+```
+
+| الحقل | مطلوب؟ | الوصف |
+|-------|--------|--------|
+| `confirm` | نعم | يجب أن يكون بالضبط `"RESET_ALL_POINTS"` |
+| `gradeId` | لا | إن وُجد يصفّر صف واحد فقط؛ وإلا كل طلاب المدرس |
+| `label` | لا | اسم اختياري للموسم المؤرشف |
+| `reason` | لا | سبب التصفير |
+
+- قبل التصفير تُنسخ الأرصدة والمعاملات إلى أرشيف موسم (`teacher_points_seasons`).
+- ثم تُمسح الجداول الحية حتى يبدأ الطلاب من الصفر ويمكنهم جمع نقاط الامتحان/الفيديو من جديد.
+- يمكن لاحقًا استعراض الموسم أو استرجاعه.
+
+**Response `200`**
+
+```json
+{
+  "success": true,
+  "message": "تم حفظ سجل نقاط الطلاب وتصفيرها — يمكنهم البدء من جديد ويمكنك استرجاع السجل لاحقًا",
+  "data": {
+    "reset": true,
+    "teacherId": 10,
+    "gradeId": null,
+    "seasonId": 3,
+    "balancesCleared": 120,
+    "transactionsDeleted": 540,
+    "studentsCount": 120,
+    "totalPointsSum": 18500
+  }
+}
+```
+
+### 3.4.4 مواسم النقاط المؤرشفة
+
+```http
+GET /api/teacher/points/seasons?gradeId=1&limit=50
+Authorization: Bearer <TEACHER_TOKEN>
+```
+
+```http
+GET /api/teacher/points/seasons/3?includeBalances=true&balancesLimit=200
+Authorization: Bearer <TEACHER_TOKEN>
+```
+
+### 3.4.5 استرجاع موسم سابق
+
+```http
+POST /api/teacher/points/seasons/3/restore
+Authorization: Bearer <TEACHER_TOKEN>
+Content-Type: application/json
+```
+
+```json
+{ "confirm": "RESTORE_POINTS_SEASON" }
+```
+
+- إن وُجدت نقاط حالية تُحفظ تلقائيًا كموسم `pre_restore_backup` قبل الاستبدال.
+- ثم تُعاد أرصدة ومعاملات الموسم المطلوب إلى الجداول الحية.
+
+**Response `200`**
+
+```json
+{
+  "success": true,
+  "message": "تم استرجاع الموسم — ونُسخت النقاط الحالية احتياطيًا قبل الاستبدال",
+  "data": {
+    "restored": true,
+    "seasonId": 3,
+    "backupSeasonId": 4,
+    "balancesRestored": 120,
+    "transactionsRestored": 540
+  }
+}
+```
 
 ---
 

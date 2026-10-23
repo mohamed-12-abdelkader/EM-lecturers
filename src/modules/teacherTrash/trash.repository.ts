@@ -1,4 +1,6 @@
+import bcrypt from 'bcrypt';
 import pool from '../../db/pool';
+import { HttpError } from '../../utils';
 import type { RecordTrashSnapshotInput, TrashEntityType, TrashListItem } from './types';
 
 type TrashRow = {
@@ -190,6 +192,36 @@ export class TeacherTrashRepository {
        JOIN courses c ON c.id = cf.course_id
        WHERE c.teacher_id = $1 AND cf.deleted_at IS NOT NULL`,
     );
+
+    // طلاب المنصة (soft-delete على users.deleted_at) — الاستعادة تُبقي كل السجلات المرتبطة
+    const hasUsersDeletedAt = await pool.query(
+      `SELECT 1 FROM information_schema.columns
+       WHERE table_schema = 'public' AND table_name = 'users' AND column_name = 'deleted_at'
+       LIMIT 1`,
+    );
+    if ((hasUsersDeletedAt.rowCount ?? 0) > 0) {
+      addUnion(
+        'platform_student',
+        `SELECT
+           'platform_student'::text,
+           u.id,
+           COALESCE(u.name, 'طالب') AS title,
+           COALESCE(u.student_code, u.phone, u.email, '') AS subtitle,
+           u.deleted_at,
+           TRUE AS can_restore,
+           ARRAY[]::text[] AS restore_blockers,
+           'live'::text,
+           jsonb_build_object(
+             'phone', u.phone,
+             'student_code', u.student_code,
+             'tenant_id', u.tenant_id,
+             'account_status', u.account_status
+           ) AS metadata
+         FROM users u
+         JOIN tenants t ON t.id = u.tenant_id AND t.owner_user_id = $1 AND t.is_active = TRUE
+         WHERE u.role = 'student' AND u.deleted_at IS NOT NULL`,
+      );
+    }
 
     if (unions.length === 0) {
       return { rows: [], total: 0 };
@@ -515,6 +547,353 @@ export class TeacherTrashRepository {
     return result.rows[0]?.id ?? null;
   }
 
+  /** استعادة طالب منصة soft-deleted — كل البيانات المرتبطة تبقى كما هي */
+  static async restorePlatformStudentLive(id: number, teacherId: number): Promise<boolean> {
+    const result = await pool.query(
+      `UPDATE users u
+       SET deleted_at = NULL,
+           account_status = 'active'
+       FROM tenants t
+       WHERE u.id = $1
+         AND u.role = 'student'
+         AND u.deleted_at IS NOT NULL
+         AND u.tenant_id = t.id
+         AND t.owner_user_id = $2
+         AND t.is_active = TRUE
+       RETURNING u.id`,
+      [id, teacherId],
+    );
+    return (result.rowCount ?? 0) > 0;
+  }
+
+  /**
+   * استعادة حساب طالب منصة من snapshot (للحذوفات النهائية القديمة).
+   * يعيد إدراج صف users + الصف/المجموعة إن وُجدت في النسخة.
+   */
+  static async restorePlatformStudentFromSnapshot(
+    snapshot: Record<string, unknown>,
+    teacherId: number,
+    opts: { tenantId?: number | null; entityId?: number | null } = {},
+  ): Promise<number> {
+    const user =
+      snapshot.user && typeof snapshot.user === 'object'
+        ? (snapshot.user as Record<string, unknown>)
+        : snapshot;
+
+    const preferredId = Number(user.id ?? snapshot.id ?? opts.entityId);
+
+    // إن كان الحساب ما زال موجوداً ومحذوفاً soft — استعده مباشرة بكل بياناته
+    if (Number.isInteger(preferredId) && preferredId > 0) {
+      const existing = await pool.query<{
+        id: number;
+        deleted_at: Date | null;
+        tenant_id: number;
+      }>(
+        `SELECT u.id, u.deleted_at, u.tenant_id
+         FROM users u
+         JOIN tenants t ON t.id = u.tenant_id AND t.owner_user_id = $2 AND t.is_active = TRUE
+         WHERE u.id = $1 AND u.role = 'student'`,
+        [preferredId, teacherId],
+      );
+      if (existing.rowCount) {
+        const row = existing.rows[0];
+        if (row.deleted_at) {
+          const ok = await this.restorePlatformStudentLive(preferredId, teacherId);
+          if (!ok) {
+            throw new HttpError(409, 'تعذّرت استعادة الحساب المحذوف');
+          }
+          return preferredId;
+        }
+        throw new HttpError(409, 'حساب الطالب موجود بالفعل وغير محذوف');
+      }
+    }
+
+    let tenantId = Number(user.tenant_id ?? snapshot.tenant_id ?? opts.tenantId);
+    if (!Number.isInteger(tenantId) || tenantId <= 0) {
+      const tenantRes = await pool.query<{ id: number }>(
+        `SELECT id FROM tenants WHERE owner_user_id = $1 AND is_active = TRUE ORDER BY id LIMIT 1`,
+        [teacherId],
+      );
+      tenantId = Number(tenantRes.rows[0]?.id);
+    }
+    if (!Number.isInteger(tenantId) || tenantId <= 0) {
+      throw new HttpError(409, 'بيانات الاستعادة ناقصة: لا يمكن تحديد منصة المدرس (tenant_id)');
+    }
+
+    const owns = await pool.query(
+      `SELECT 1 FROM tenants WHERE id = $1 AND owner_user_id = $2 AND is_active = TRUE`,
+      [tenantId, teacherId],
+    );
+    if (!owns.rowCount) {
+      throw new HttpError(403, 'غير مصرح باستعادة طالب على هذه المنصة');
+    }
+
+    const name = String(user.name ?? snapshot.name ?? '').trim();
+    if (!name) {
+      throw new HttpError(409, 'بيانات الاستعادة ناقصة: اسم الطالب غير موجود في النسخة');
+    }
+
+    const phone =
+      user.phone != null && String(user.phone).trim()
+        ? String(user.phone).trim()
+        : null;
+    const parentPhone =
+      user.parent_phone != null && String(user.parent_phone).trim()
+        ? String(user.parent_phone).trim()
+        : null;
+    const email =
+      user.email != null && String(user.email).trim()
+        ? String(user.email).trim()
+        : null;
+    let studentCode =
+      user.student_code != null && String(user.student_code).trim()
+        ? String(user.student_code).replace(/\D/g, '')
+        : null;
+    if (studentCode === '') studentCode = null;
+
+    const conflictExcludeId =
+      Number.isInteger(preferredId) && preferredId > 0 ? preferredId : -1;
+
+    if (phone) {
+      const phoneTaken = await pool.query(
+        `SELECT id, name FROM users
+         WHERE phone = $1 AND tenant_id = $2 AND id <> $3
+           AND deleted_at IS NULL
+         LIMIT 1`,
+        [phone, tenantId, conflictExcludeId],
+      );
+      if (phoneTaken.rowCount) {
+        throw new HttpError(
+          409,
+          `رقم الهاتف مستخدم بالفعل لطالب آخر (#${phoneTaken.rows[0].id}) — غيّر رقم الهاتف عنده أو احذفه أولاً`,
+        );
+      }
+    }
+    if (studentCode) {
+      const codeTaken = await pool.query(
+        `SELECT id, name FROM users
+         WHERE student_code = $1 AND id <> $2 AND deleted_at IS NULL
+         LIMIT 1`,
+        [studentCode, conflictExcludeId],
+      );
+      if (codeTaken.rowCount) {
+        throw new HttpError(
+          409,
+          `كود الطالب ${studentCode} مستخدم بالفعل (#${codeTaken.rows[0].id})`,
+        );
+      }
+    }
+    if (email) {
+      const emailTaken = await pool.query(
+        `SELECT id FROM users
+         WHERE email = $1 AND tenant_id = $2 AND id <> $3 AND deleted_at IS NULL
+         LIMIT 1`,
+        [email, tenantId, conflictExcludeId],
+      );
+      if (emailTaken.rowCount) {
+        throw new HttpError(409, `البريد الإلكتروني مستخدم بالفعل (#${emailTaken.rows[0].id})`);
+      }
+    }
+
+    let passwordHash =
+      typeof user.password === 'string' && user.password.trim()
+        ? user.password.trim()
+        : null;
+    let mustChangePassword = Boolean(user.must_change_password ?? false);
+    if (!passwordHash) {
+      const temp = Math.random().toString(36).slice(-10) + 'A1';
+      passwordHash = await bcrypt.hash(temp, 10);
+      mustChangePassword = true;
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      let newId: number | null = null;
+      const canReuseId =
+        Number.isInteger(preferredId) &&
+        preferredId > 0 &&
+        !(await client.query(`SELECT 1 FROM users WHERE id = $1`, [preferredId])).rowCount;
+
+      if (canReuseId) {
+        const inserted = await client.query<{ id: number }>(
+          `INSERT INTO users (
+             id, name, phone, parent_phone, email, password, role, tenant_id,
+             student_code, must_change_password, managed_by_teacher_id,
+             account_status, avatar, created_at, deleted_at
+           ) VALUES (
+             $1, $2, $3, $4, $5, $6, 'student', $7,
+             $8, $9, $10, 'active', $11, COALESCE($12::timestamptz, NOW()), NULL
+           )
+           RETURNING id`,
+          [
+            preferredId,
+            name,
+            phone,
+            parentPhone,
+            email,
+            passwordHash,
+            tenantId,
+            studentCode,
+            mustChangePassword,
+            user.managed_by_teacher_id ?? teacherId,
+            user.avatar ?? null,
+            user.created_at ?? null,
+          ],
+        );
+        newId = inserted.rows[0]?.id ?? null;
+        await client.query(
+          `SELECT setval(
+             pg_get_serial_sequence('users', 'id'),
+             GREATEST((SELECT MAX(id) FROM users), 1)
+           )`,
+        );
+      } else {
+        const inserted = await client.query<{ id: number }>(
+          `INSERT INTO users (
+             name, phone, parent_phone, email, password, role, tenant_id,
+             student_code, must_change_password, managed_by_teacher_id,
+             account_status, avatar, created_at, deleted_at
+           ) VALUES (
+             $1, $2, $3, $4, $5, 'student', $6,
+             $7, $8, $9, 'active', $10, COALESCE($11::timestamptz, NOW()), NULL
+           )
+           RETURNING id`,
+          [
+            name,
+            phone,
+            parentPhone,
+            email,
+            passwordHash,
+            tenantId,
+            studentCode,
+            mustChangePassword,
+            user.managed_by_teacher_id ?? teacherId,
+            user.avatar ?? null,
+            user.created_at ?? null,
+          ],
+        );
+        newId = inserted.rows[0]?.id ?? null;
+      }
+
+      if (!newId) {
+        await client.query('ROLLBACK');
+        throw new HttpError(409, 'تعذّر إنشاء حساب الطالب من النسخة المحفوظة');
+      }
+
+      const nestedGrade =
+        snapshot.grade && typeof snapshot.grade === 'object'
+          ? (snapshot.grade as Record<string, unknown>).id
+          : undefined;
+      const gradeId = Number(snapshot.grade_id ?? user.grade_id ?? nestedGrade);
+      if (Number.isInteger(gradeId) && gradeId > 0) {
+        await client.query(
+          `INSERT INTO user_grades (user_id, grade_id) VALUES ($1, $2)
+           ON CONFLICT DO NOTHING`,
+          [newId, gradeId],
+        );
+      }
+
+      const nestedGroup =
+        snapshot.group && typeof snapshot.group === 'object'
+          ? (snapshot.group as Record<string, unknown>).id
+          : undefined;
+      const groupId = Number(snapshot.group_id ?? user.group_id ?? nestedGroup);
+      if (Number.isInteger(groupId) && groupId > 0) {
+        await client.query('SAVEPOINT restore_group_sp');
+        try {
+          const numRes = await client.query<{ next_num: string }>(
+            `SELECT COALESCE(MAX(number_in_group), 0) + 1 AS next_num
+             FROM group_students WHERE group_id = $1`,
+            [groupId],
+          );
+          await client.query(
+            `INSERT INTO group_students (group_id, student_id, number_in_group)
+             VALUES ($1, $2, $3)
+             ON CONFLICT (group_id, student_id) DO NOTHING`,
+            [groupId, newId, Number(numRes.rows[0]?.next_num ?? 1)],
+          );
+          await client.query('RELEASE SAVEPOINT restore_group_sp');
+        } catch {
+          await client.query('ROLLBACK TO SAVEPOINT restore_group_sp');
+        }
+      }
+
+      const nestedCourseGroup =
+        snapshot.course_group && typeof snapshot.course_group === 'object'
+          ? (snapshot.course_group as Record<string, unknown>).id
+          : undefined;
+      const courseGroupIdsRaw = snapshot.course_group_ids ?? user.course_group_ids;
+      const courseGroupIds = Array.isArray(courseGroupIdsRaw)
+        ? courseGroupIdsRaw.map((v) => Number(v)).filter((v) => Number.isInteger(v) && v > 0)
+        : Number.isInteger(
+              Number(snapshot.course_group_id ?? user.course_group_id ?? nestedCourseGroup),
+            ) &&
+            Number(snapshot.course_group_id ?? user.course_group_id ?? nestedCourseGroup) > 0
+          ? [Number(snapshot.course_group_id ?? user.course_group_id ?? nestedCourseGroup)]
+          : [];
+
+      for (const cgId of courseGroupIds) {
+        await client.query('SAVEPOINT restore_cg_sp');
+        try {
+          await client.query(
+            `INSERT INTO student_course_group_memberships (student_id, group_id, updated_at)
+             VALUES ($1, $2, NOW())
+             ON CONFLICT (student_id, group_id) DO NOTHING`,
+            [newId, cgId],
+          );
+          await client.query('RELEASE SAVEPOINT restore_cg_sp');
+        } catch {
+          await client.query('ROLLBACK TO SAVEPOINT restore_cg_sp');
+        }
+      }
+
+      // استعادة الاشتراكات في الكورسات إن وُجدت في النسخة
+      const enrollments = Array.isArray(snapshot.enrollments)
+        ? (snapshot.enrollments as Array<Record<string, unknown>>)
+        : [];
+      for (const en of enrollments) {
+        const courseId = Number(en.course_id);
+        if (!Number.isInteger(courseId) || courseId <= 0) continue;
+        await client.query('SAVEPOINT restore_enroll_sp');
+        try {
+          await client.query(
+            `INSERT INTO enrollments (user_id, course_id, created_at)
+             VALUES ($1, $2, COALESCE($3::timestamptz, NOW()))
+             ON CONFLICT DO NOTHING`,
+            [newId, courseId, en.created_at ?? null],
+          );
+          await client.query('RELEASE SAVEPOINT restore_enroll_sp');
+        } catch {
+          await client.query('ROLLBACK TO SAVEPOINT restore_enroll_sp');
+        }
+      }
+
+      await client.query('COMMIT');
+      return newId;
+    } catch (err) {
+      await client.query('ROLLBACK');
+      if (err instanceof HttpError) throw err;
+      const pg = err as { code?: string; message?: string };
+      if (pg.code === '42703' && pg.message?.includes('deleted_at')) {
+        throw new HttpError(
+          501,
+          'عمود soft-delete غير متوفر — شغّل migration 1779500000000_users_soft_delete_platform_students',
+        );
+      }
+      if (pg.code === '23505') {
+        throw new HttpError(
+          409,
+          'تعارض في بيانات الطالب (هاتف أو كود أو بريد مستخدم بالفعل)',
+        );
+      }
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
   static async restoreLectureFromSnapshot(
     snapshot: Record<string, unknown>,
     teacherId: number,
@@ -580,6 +959,7 @@ export class TeacherTrashRepository {
       'center_subscription',
       'teacher_file',
       'course_file',
+      'platform_student',
     ].includes(type);
   }
 }

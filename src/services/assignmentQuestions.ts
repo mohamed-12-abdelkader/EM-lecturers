@@ -380,21 +380,98 @@ export class AssignmentQuestionsService {
     }
   }
 
-  // تحديث الإجابة الصحيحة فقط
-  static async updateCorrectAnswer(questionId: number, correctAnswer: 'a' | 'b' | 'c' | 'd') {
-    const result = await pool.query(
-      `UPDATE assignment_questions 
-       SET correct_answer = $1, updated_at = NOW()
-       WHERE id = $2
-       RETURNING *`,
-      [correctAnswer, questionId],
+  /**
+   * تحديث الإجابة/الإجابات الصحيحة (1 أو 2 حروف من a–d).
+   * يقبل حرفاً واحداً أو مصفوفة من حرف أو حرفين مميزين.
+   */
+  static async updateCorrectAnswer(
+    questionId: number,
+    correctAnswer:
+      | 'a'
+      | 'b'
+      | 'c'
+      | 'd'
+      | Array<'a' | 'b' | 'c' | 'd' | string>,
+  ) {
+    const unique = [
+      ...new Set(
+        (Array.isArray(correctAnswer) ? correctAnswer : [correctAnswer])
+          .map((v) => String(v).trim().toLowerCase())
+          .filter((v) => ['a', 'b', 'c', 'd'].includes(v)),
+      ),
+    ] as Array<'a' | 'b' | 'c' | 'd'>;
+
+    if (unique.length < 1 || unique.length > 2) {
+      throw Object.assign(
+        new Error('correctAnswers must contain 1 or 2 distinct letters from a, b, c, d'),
+        { status: 400 },
+      );
+    }
+
+    const primary = unique[0];
+    const secondary = unique[1] ?? null;
+
+    // مزامنة correct_option_id(_2) من حروف الإجابات
+    const optionsResult = await pool.query(
+      `SELECT id, option_letter FROM assignment_question_options WHERE question_id = $1`,
+      [questionId],
     );
+    const byLetter = new Map(
+      optionsResult.rows.map((o: { id: number; option_letter: string }) => [
+        String(o.option_letter).toLowerCase(),
+        o.id,
+      ]),
+    );
+    const correctOptionId = byLetter.get(primary) ?? null;
+    const correctOptionId2 = secondary ? byLetter.get(secondary) ?? null : null;
+
+    let result;
+    try {
+      result = await pool.query(
+        `UPDATE assignment_questions
+         SET correct_answer = $1,
+             correct_answer_2 = $2,
+             correct_option_id = COALESCE($3, correct_option_id),
+             correct_option_id_2 = $4,
+             updated_at = NOW()
+         WHERE id = $5
+         RETURNING *`,
+        [primary, secondary, correctOptionId, correctOptionId2, questionId],
+      );
+    } catch (err: any) {
+      // أعمدة الإجابة الثانية قد تكون غير موجودة قبل تشغيل migration
+      if (
+        err?.message?.includes('correct_answer_2') ||
+        err?.message?.includes('correct_option_id_2')
+      ) {
+        if (unique.length > 1) {
+          throw Object.assign(
+            new Error(
+              'Second correct answer is not available. Run migration 1779300000000_dual_correct_answers_assignment_lecture.',
+            ),
+            { status: 501 },
+          );
+        }
+        result = await pool.query(
+          `UPDATE assignment_questions
+           SET correct_answer = $1,
+               correct_option_id = COALESCE($2, correct_option_id),
+               updated_at = NOW()
+           WHERE id = $3
+           RETURNING *`,
+          [primary, correctOptionId, questionId],
+        );
+      } else {
+        throw err;
+      }
+    }
 
     if (result.rows.length === 0) {
       return null;
     }
 
     const question = result.rows[0];
+    question.correct_answers = unique;
 
     // جلب الصور إذا كان السؤال من نوع صورة
     if (question.question_type === 'image') {
@@ -413,12 +490,102 @@ export class AssignmentQuestionsService {
     return question;
   }
 
-  // حذف سؤال
+  /**
+   * حذف سؤال من الواجب وإعادة احتساب كل التسليمات السابقة.
+   * لا يحذف السؤال من أي مصدر خارج الواجب.
+   */
   static async deleteQuestion(questionId: number) {
-    const result = await pool.query('DELETE FROM assignment_questions WHERE id = $1 RETURNING *', [
-      questionId,
-    ]);
-    return result.rows[0] || null;
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      const qRes = await client.query<{ id: number; assignment_id: number }>(
+        `SELECT id, assignment_id FROM assignment_questions WHERE id = $1 FOR UPDATE`,
+        [questionId],
+      );
+      if (!qRes.rowCount) {
+        await client.query('ROLLBACK');
+        return null;
+      }
+
+      const deletedQuestionId = Number(qRes.rows[0].id);
+      const assignmentId = Number(qRes.rows[0].assignment_id);
+
+      const result = await client.query(
+        `DELETE FROM assignment_questions WHERE id = $1 RETURNING *`,
+        [deletedQuestionId],
+      );
+
+      const remainingCountRes = await client.query<{ cnt: string }>(
+        `SELECT COUNT(*)::text AS cnt FROM assignment_questions WHERE assignment_id = $1`,
+        [assignmentId],
+      );
+      const remainingQuestionCount = Number(remainingCountRes.rows[0]?.cnt ?? 0);
+
+      const { recomputeAssignmentSubmissionAfterQuestionDelete } = await import(
+        './examQuestionDeleteRegrade.js'
+      );
+
+      const submissionsRes = await client.query(
+        `SELECT id, total_questions, correct_answers, wrong_answers, score
+         FROM assignment_submissions
+         WHERE assignment_id = $1`,
+        [assignmentId],
+      );
+
+      let submissionsUpdated = 0;
+      for (const sub of submissionsRes.rows) {
+        const answersRes = await client.query<{ is_correct: boolean }>(
+          `SELECT is_correct FROM assignment_submission_answers WHERE submission_id = $1`,
+          [sub.id],
+        );
+        const recomputed = recomputeAssignmentSubmissionAfterQuestionDelete({
+          remainingQuestionCount,
+          remainingAnswers: answersRes.rows.map((a) => ({ isCorrect: !!a.is_correct })),
+        });
+
+        if (
+          Number(sub.total_questions) !== recomputed.totalQuestions ||
+          Number(sub.correct_answers) !== recomputed.correctAnswers ||
+          Number(sub.wrong_answers) !== recomputed.wrongAnswers ||
+          Number(sub.score) !== recomputed.score
+        ) {
+          await client.query(
+            `UPDATE assignment_submissions
+             SET total_questions = $1,
+                 correct_answers = $2,
+                 wrong_answers = $3,
+                 score = $4
+             WHERE id = $5`,
+            [
+              recomputed.totalQuestions,
+              recomputed.correctAnswers,
+              recomputed.wrongAnswers,
+              recomputed.score,
+              sub.id,
+            ],
+          );
+          submissionsUpdated += 1;
+        }
+      }
+
+      await client.query('COMMIT');
+      const deleted = result.rows[0] || null;
+      if (deleted) {
+        (deleted as any).regrade = {
+          assignmentId,
+          deletedQuestionId,
+          submissionsUpdated,
+          remainingQuestionCount,
+        };
+      }
+      return deleted;
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
   }
 
   // التحقق من وجود الواجب

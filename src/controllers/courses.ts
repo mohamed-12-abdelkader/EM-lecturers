@@ -2520,14 +2520,27 @@ router.get(
       // Use explicit integer casting to ensure type matching
       console.log(`[GET /course-exam/:examId/questions] Fetching questions for exam ${examId} (type: ${typeof examId})`);
 
-      const questionsRes = await pool.query(
-        `SELECT id, type, question_text, question_image, option_a, option_b, option_c, option_d,
-                correct_answer, exam_id, teacher_question_id
-         FROM course_level_exam_questions
-         WHERE exam_id = $1::integer
-         ORDER BY id ASC`,
-        [examId],
-      );
+      let questionsRes: { rowCount: number | null; rows: any[] };
+      try {
+        questionsRes = await pool.query(
+          `SELECT id, type, question_text, question_image, option_a, option_b, option_c, option_d,
+                  correct_answer, exam_id, teacher_question_id, question_id_v2,
+                  passage_text, passage_title
+           FROM course_level_exam_questions
+           WHERE exam_id = $1::integer
+           ORDER BY id ASC`,
+          [examId],
+        );
+      } catch {
+        questionsRes = await pool.query(
+          `SELECT id, type, question_text, question_image, option_a, option_b, option_c, option_d,
+                  correct_answer, exam_id, teacher_question_id, question_id_v2
+           FROM course_level_exam_questions
+           WHERE exam_id = $1::integer
+           ORDER BY id ASC`,
+          [examId],
+        );
+      }
 
       console.log(`[GET /course-exam/:examId/questions] Found ${questionsRes.rowCount} questions for exam ${examId}`);
 
@@ -2587,6 +2600,63 @@ router.get(
     } catch (error: any) {
       console.error('Error fetching exam questions:', error);
       res.status(500).json({ message: 'Failed to fetch exam questions' });
+    }
+  }),
+);
+
+/**
+ * POST /api/course/course-exam/recalculate-all-stale-results
+ * إصلاح كل الامتحانات الشاملة التي ما زالت درجات طلابها على أساس أسئلة محذوفة
+ * (يجب تسجيله قبل مسار :examId)
+ */
+router.post(
+  '/course-exam/recalculate-all-stale-results',
+  authMiddleware(COURSE_CONTENT_ROLES),
+  asyncWrapper(async (req, res) => {
+    try {
+      const result =
+        await CourseLevelExamsService.backfillStaleResultsAfterQuestionDeletes();
+      res.json({
+        success: true,
+        message:
+          'تم فحص وتصحيح الامتحانات الشاملة ذات الدرجات القديمة غير المتكافئة',
+        data: result,
+      });
+    } catch (error: any) {
+      console.error('Error backfilling stale course exam results:', error);
+      res.status(500).json({ message: 'Failed to backfill stale exam results' });
+    }
+  }),
+);
+
+/**
+ * POST /api/course/course-exam/:examId/recalculate-results
+ * إعادة احتساب درجات كل الطلاب + النقاط من الأسئلة المتبقية
+ */
+router.post(
+  '/course-exam/:examId/recalculate-results',
+  authMiddleware(COURSE_CONTENT_ROLES),
+  asyncWrapper(async (req, res) => {
+    const examId = Number(req.params.examId);
+    if (Number.isNaN(examId)) {
+      return res.status(400).json({ message: 'Invalid exam id' });
+    }
+    try {
+      await CourseLevelExamsService.getExamById(examId, req.user!);
+      const result =
+        await CourseLevelExamsService.recalculateResultsFromRemainingQuestions(examId);
+      res.json({
+        success: true,
+        message:
+          'تم توحيد الدرجات: كل الطلاب على الأسئلة المتبقية فقط، وتم خصم درجات الأسئلة المحذوفة والنقاط الزائدة',
+        data: result,
+      });
+    } catch (error: any) {
+      if (error.status) {
+        return res.status(error.status).json({ message: error.message });
+      }
+      console.error('Error recalculating course exam results:', error);
+      res.status(500).json({ message: 'Failed to recalculate exam results' });
     }
   }),
 );
@@ -2723,8 +2793,15 @@ router.delete(
           [questionId, req.user!.id],
         );
         if (lectureExamCheck.rowCount) {
-          await pool.query('DELETE FROM exam_questions WHERE id = $1', [questionId]);
-          return res.json({ message: 'تم حذف السؤال بنجاح' });
+          const { ExamFlowService } = await import('../services/examFlow.js');
+          const regrade = await ExamFlowService.deleteExamQuestionAndRegradeSubmissions({
+            examId: Number(lectureExamCheck.rows[0].exam_id),
+            examQuestionId: questionId,
+          });
+          return res.json({
+            message: 'تم حذف السؤال بنجاح وإعادة احتساب نتائج الطلاب',
+            data: regrade,
+          });
         }
       }
 
@@ -2744,9 +2821,15 @@ router.delete(
 
       // حذف السؤال حسب نوعه
       if (question.exam_type === 'course_level') {
-        // حذف من course_level_exam_questions (بمعرّف الصف الفعلي)
-        await pool.query('DELETE FROM course_level_exam_questions WHERE id = $1', [idToDelete]);
-        return res.json({ message: 'تم حذف السؤال بنجاح' });
+        const { CourseLevelExamQuestionsService } = await import(
+          '../services/courseLevelExamQuestions.js'
+        );
+        const result =
+          await CourseLevelExamQuestionsService.deleteQuestionAndRegrade(idToDelete);
+        return res.json({
+          message: 'تم حذف السؤال بنجاح وإعادة احتساب نتائج الطلاب',
+          data: result,
+        });
       } else {
         // حذف من course_exam_questions
         const result = await ExamsService.deleteCourseExamQuestion(questionId);
@@ -3150,7 +3233,7 @@ router.patch(
   }),
 );
 
-// تحديد إجابتين صحيحتين لسؤال في الامتحان الشامل + إعادة تصحيح المحاولات السابقة
+// تحديد إجابة واحدة أو إجابتين صحيحتين لسؤال في الامتحان الشامل + إعادة تصحيح المحاولات السابقة
 router.patch(
   '/course-exam/question/:questionId/correct-answers',
   authMiddleware(COURSE_CONTENT_ROLES),
@@ -3164,16 +3247,20 @@ router.patch(
     const rawList =
       body.correctAnswers ??
       body.correct_answers ??
-      (body.correctAnswer != null && body.correctAnswer2 != null
-        ? [body.correctAnswer, body.correctAnswer2]
-        : body.correct_answer != null && body.correct_answer_2 != null
-          ? [body.correct_answer, body.correct_answer_2]
+      (body.correctAnswer != null
+        ? body.correctAnswer2 != null
+          ? [body.correctAnswer, body.correctAnswer2]
+          : [body.correctAnswer]
+        : body.correct_answer != null
+          ? body.correct_answer_2 != null
+            ? [body.correct_answer, body.correct_answer_2]
+            : [body.correct_answer]
           : null);
 
     if (!Array.isArray(rawList)) {
       return res.status(400).json({
         message:
-          'correctAnswers is required and must be an array of exactly two distinct letters (A–D)',
+          'correctAnswers is required and must be an array of 1 or 2 distinct letters (A–D)',
       });
     }
 
@@ -3183,8 +3270,12 @@ router.patch(
         questionId,
         rawList,
       );
+      const msg =
+        result.correctAnswers.length === 2
+          ? 'تم تحديث الإجابتين الصحيحتين وإعادة تصحيح المحاولات السابقة'
+          : 'تم تحديث الإجابة الصحيحة وإعادة تصحيح المحاولات السابقة';
       return res.json({
-        message: 'تم تحديث الإجابتين الصحيحتين وإعادة تصحيح المحاولات السابقة',
+        message: msg,
         question: result.question,
         correctAnswers: result.correctAnswers,
         regrade: result.regrade,

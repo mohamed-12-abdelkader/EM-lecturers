@@ -269,14 +269,16 @@ export class QuestionsManagementService {
       throw new Error('امتحان المحاضرة غير موجود');
     }
 
-    // جلب الأسئلة مع الاختيارات
-    const result = await pool.query(
-      `SELECT 
+    // جلب الأسئلة مع الاختيارات (+ روابط القطعة من المكتبة/البنك/snapshot)
+    const selectWithSnapshot = `SELECT 
         eq.id,
         eq.question_text as text,
         eq.grade,
         eq.image,
         eq.teacher_question_id,
+        eq.question_id_v2,
+        eq.passage_text,
+        eq.passage_title,
         q.id as question_id,
         q.text as question_text_from_questions,
         q.image as question_image_from_questions,
@@ -287,9 +289,32 @@ export class QuestionsManagementService {
        LEFT JOIN questions q ON eq.question_id = q.id
        LEFT JOIN question_choices qc ON q.id = qc.question_id
        WHERE eq.exam_id = $1
-       ORDER BY eq.id, qc.id`,
-      [examId],
-    );
+       ORDER BY eq.id, qc.id`;
+    const selectLegacy = `SELECT 
+        eq.id,
+        eq.question_text as text,
+        eq.grade,
+        eq.image,
+        eq.teacher_question_id,
+        eq.question_id_v2,
+        q.id as question_id,
+        q.text as question_text_from_questions,
+        q.image as question_image_from_questions,
+        qc.id as choice_id,
+        qc.text as choice_text,
+        qc.is_correct
+       FROM exam_questions eq
+       LEFT JOIN questions q ON eq.question_id = q.id
+       LEFT JOIN question_choices qc ON q.id = qc.question_id
+       WHERE eq.exam_id = $1
+       ORDER BY eq.id, qc.id`;
+
+    let result: { rowCount: number | null; rows: any[] };
+    try {
+      result = await pool.query(selectWithSnapshot, [examId]);
+    } catch {
+      result = await pool.query(selectLegacy, [examId]);
+    }
 
     if (!result.rowCount) {
       return [];
@@ -318,6 +343,9 @@ export class QuestionsManagementService {
           image: hasImage ? row.image || row.question_image_from_questions : null,
           grade: row.grade,
           teacher_question_id: row.teacher_question_id ?? null,
+          question_id_v2: row.question_id_v2 ?? null,
+          passage_text: row.passage_text ?? null,
+          passage_title: row.passage_title ?? null,
           choices: [],
         });
       }
@@ -603,10 +631,10 @@ export class QuestionsManagementService {
     return { message: 'تم تحديث الإجابة الصحيحة بنجاح' };
   }
 
-  // حذف سؤال من امتحان المحاضرة (يدعم الأسئلة المضافة من البنك V1 و V2)
+  // حذف سؤال من امتحان المحاضرة فقط (لا يحذف من البنك) + إعادة احتساب نتائج الطلاب
   static async deleteLectureExamQuestion(questionId: number) {
     const examQuestionRes = await pool.query(
-      `SELECT question_id, question_id_v2 FROM exam_questions WHERE id = $1`,
+      `SELECT id, exam_id FROM exam_questions WHERE id = $1`,
       [questionId],
     );
 
@@ -614,22 +642,17 @@ export class QuestionsManagementService {
       throw new Error('السؤال غير موجود');
     }
 
-    const actualQuestionId = examQuestionRes.rows[0].question_id;
+    const examId = Number(examQuestionRes.rows[0].exam_id);
+    const { ExamFlowService } = await import('./examFlow.js');
+    const regrade = await ExamFlowService.deleteExamQuestionAndRegradeSubmissions({
+      examId,
+      examQuestionId: questionId,
+    });
 
-    // إن كان السؤال مربوطاً بجدول questions (V1)، احذف الاختيارات والسؤال من الجدول
-    if (actualQuestionId) {
-      await pool.query(`DELETE FROM question_choices WHERE question_id = $1`, [actualQuestionId]);
-      await pool.query(`DELETE FROM questions WHERE id = $1`, [actualQuestionId]);
-    }
-
-    // حذف الصف من exam_questions (سواء السؤال من V1 أو V2 من البنك)
-    const result = await pool.query(`DELETE FROM exam_questions WHERE id = $1 RETURNING *`, [
-      questionId,
-    ]);
-    if (!result.rowCount) {
-      throw new Error('السؤال غير موجود');
-    }
-    return { message: 'تم حذف السؤال بنجاح' };
+    return {
+      message: 'تم حذف السؤال بنجاح وإعادة احتساب نتائج الطلاب',
+      ...regrade,
+    };
   }
 
   // إضافة سؤال جديد في امتحان المحاضرة مع صورة

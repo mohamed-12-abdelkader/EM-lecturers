@@ -42,14 +42,33 @@ export class AssignmentSubmissionsService {
         throw new Error('لقد قمت بتسليم هذا الواجب من قبل');
       }
 
-      // جلب جميع أسئلة الواجب مع الخيارات الصحيحة
-      const questionsResult = await client.query(
-        `SELECT q.id, q.correct_option_id, q.correct_answer 
-         FROM assignment_questions q 
-         WHERE q.assignment_id = $1 
-         ORDER BY q.order_index ASC, q.created_at ASC`,
-        [assignmentId],
-      );
+      // جلب جميع أسئلة الواجب مع الخيارات الصحيحة (إجابة واحدة أو اثنتين)
+      let questionsResult;
+      try {
+        questionsResult = await client.query(
+          `SELECT q.id, q.correct_option_id, q.correct_option_id_2,
+                  q.correct_answer, q.correct_answer_2
+           FROM assignment_questions q
+           WHERE q.assignment_id = $1
+           ORDER BY q.order_index ASC, q.created_at ASC`,
+          [assignmentId],
+        );
+      } catch (err: any) {
+        if (
+          err?.message?.includes('correct_answer_2') ||
+          err?.message?.includes('correct_option_id_2')
+        ) {
+          questionsResult = await client.query(
+            `SELECT q.id, q.correct_option_id, q.correct_answer
+             FROM assignment_questions q
+             WHERE q.assignment_id = $1
+             ORDER BY q.order_index ASC, q.created_at ASC`,
+            [assignmentId],
+          );
+        } else {
+          throw err;
+        }
+      }
 
       const questions = questionsResult.rows;
       const totalQuestions = questions.length;
@@ -90,6 +109,9 @@ export class AssignmentSubmissionsService {
         if (question.correct_option_id) {
           allOptionIds.add(question.correct_option_id);
         }
+        if (question.correct_option_id_2) {
+          allOptionIds.add(question.correct_option_id_2);
+        }
       }
 
       // جلب جميع الخيارات دفعة واحدة
@@ -126,7 +148,23 @@ export class AssignmentSubmissionsService {
           );
         }
 
-        const isCorrect = studentOptionId === question.correct_option_id;
+        const acceptedLetters = [
+          question.correct_answer,
+          question.correct_answer_2,
+        ]
+          .filter(Boolean)
+          .map((l: string) => String(l).toLowerCase());
+        const studentLetter = studentOption.option_letter
+          ? String(studentOption.option_letter).toLowerCase()
+          : null;
+
+        const isCorrect =
+          (question.correct_option_id != null &&
+            studentOptionId === question.correct_option_id) ||
+          (question.correct_option_id_2 != null &&
+            studentOptionId === question.correct_option_id_2) ||
+          (studentLetter != null && acceptedLetters.includes(studentLetter));
+
         const correctOption = question.correct_option_id
           ? optionsMap.get(question.correct_option_id)
           : null;
@@ -143,6 +181,7 @@ export class AssignmentSubmissionsService {
           student_answer: studentOption.option_letter || null,
           correct_option_id: question.correct_option_id,
           correct_answer: correctOption?.option_letter || question.correct_answer,
+          correct_answers: acceptedLetters,
           is_correct: isCorrect,
         });
       }

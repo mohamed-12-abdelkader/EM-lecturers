@@ -191,6 +191,20 @@ export class TeacherLibraryExamQuestionsService {
       examQuestionIds.push(examQuestionId);
       addedTeacherQuestionIds.push(q.id);
 
+      if (q.passage_id != null) {
+        try {
+          await db.query(
+            `UPDATE exam_questions eq
+             SET passage_text = p.content, passage_title = p.title
+             FROM teacher_question_passages p
+             WHERE eq.id = $1 AND p.id = $2`,
+            [examQuestionId, q.passage_id],
+          );
+        } catch {
+          // snapshot columns may be missing before migration
+        }
+      }
+
       if (q.question_type === 'choice' && choices.length > 0) {
         const limit = Math.min(choices.length, 4);
         for (let i = 0; i < limit; i++) {
@@ -307,7 +321,24 @@ export class TeacherLibraryExamQuestionsService {
         ],
       );
 
-      addedQuestions.push(insertRes.rows[0]);
+      const inserted = insertRes.rows[0];
+      if (q.passage_id != null && inserted?.id != null) {
+        try {
+          const snap = await db.query(
+            `UPDATE course_level_exam_questions cq
+             SET passage_text = p.content, passage_title = p.title
+             FROM teacher_question_passages p
+             WHERE cq.id = $1 AND p.id = $2
+             RETURNING cq.*`,
+            [inserted.id, q.passage_id],
+          );
+          addedQuestions.push(snap.rows[0] ?? inserted);
+        } catch {
+          addedQuestions.push(inserted);
+        }
+      } else {
+        addedQuestions.push(inserted);
+      }
       addedTeacherQuestionIds.push(q.id);
     }
 

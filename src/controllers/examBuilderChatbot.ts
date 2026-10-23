@@ -25,8 +25,17 @@ const ApproveSchema = z.object({
   title: z.string().min(1).max(255).optional(),
   type: z.string().optional(),
   duration: z.number().int().positive().nullable().optional(),
-  duration_minutes: z.number().int().positive().optional(),
+  duration_minutes: z.number().int().positive().nullable().optional(),
   total_grade: z.number().positive().optional(),
+  questions_count: z.number().int().positive().optional(),
+  question_display_mode: z.string().optional(),
+  answers_release_mode: z.string().optional(),
+  show_at: z.string().nullable().optional(),
+  hide_at: z.string().nullable().optional(),
+  available_from: z.string().nullable().optional(),
+  visibility_end_date: z.string().nullable().optional(),
+  show_answers_after_hours: z.number().int().nonnegative().nullable().optional(),
+  answers_visible_at: z.string().nullable().optional(),
 });
 
 const AdjustSchema = z.object({

@@ -100,7 +100,7 @@ d. الكبريت
 
 ---
 
-## 2. امتحان الكورس (Course-Level Exam)
+## 2. امتحان الكورس (Course-Level Exam) والامتحان العام (Public Exam)
 
 ### الطريقة الأولى: نفس الـ endpoint مع تمييز تلقائي
 
@@ -110,7 +110,12 @@ d. الكبريت
 | **URL** | `/api/exams/:examId/questions/from-bank` |
 | **Auth** | معلم |
 
-إذا كان `:examId` يخص امتحان كورس (course-level)، يتم التعامل معه كامتحان كورس.
+إذا كان `:examId` يخص امتحان كورس أو امتحانًا عامًا (`course_level_exams`)، يتم التعامل معه تلقائيًا دون الحاجة لـ `type` (أو أرسل `"type": "course-exam"` / `"public-exam"`).
+
+للامتحان العام مباشرة:
+
+`POST /api/public-exams/:examId/questions/from-bank`  
+ومن مكتبة المدرس: `POST /api/public-exams/:examId/questions/from-teacher-library`
 
 ### الطريقة الثانية: endpoint مخصّص لامتحان الكورس
 

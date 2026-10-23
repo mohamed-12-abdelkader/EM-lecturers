@@ -23,7 +23,6 @@ import {
 } from './examAccessPolicy';
 import { CourseAccessControl } from './courseAccessControl';
 import { CourseAccessService } from './courseAccess';
-import { TeacherPointsService } from './teacherPoints';
 import {
   choiceIdFromAnswerRow,
   collectLectureExamAnswersFromBody,
@@ -148,6 +147,8 @@ interface ExamQuestion {
   correct_answer_index?: number | null;
   /** تجاوز الإجابة الصحيحة في هذا الامتحان فقط (0=أ، 1=ب، 2=ج، 3=د) */
   correct_answer_index_override?: number | null;
+  /** تجاوز إجابة صحيحة ثانية اختيارية في هذا الامتحان فقط */
+  correct_answer_index_override_2?: number | null;
   /** false = مخفي من الامتحان (لا يظهر للطالب) */
   isVisible?: boolean;
   choices: {
@@ -156,6 +157,23 @@ interface ExamQuestion {
     image?: string | null;
     isCorrect: boolean;
   }[];
+}
+
+/** فهارس الإجابات الصحيحة الفعّالة (1 أو 2) من التجاوز أو البنك */
+function resolveEffectiveCorrectIndices(
+  override: number | null | undefined,
+  override2: number | null | undefined,
+  bankIndex: number | null | undefined,
+): number[] {
+  const fromOverride = [override, override2].filter(
+    (v): v is number => typeof v === 'number' && v >= 0 && v <= 3,
+  );
+  const unique = [...new Set(fromOverride)];
+  if (unique.length > 0) return unique;
+  if (typeof bankIndex === 'number' && bankIndex >= 0 && bankIndex <= 3) {
+    return [bankIndex];
+  }
+  return [];
 }
 
 function normalizeChoiceContent(
@@ -569,6 +587,19 @@ export class ExamFlowService {
       } catch {
         // الجدول قد يكون غير موجود قبل تشغيل migration 1700000007006
       }
+      // Snapshot نص القطعة من بنك الأسئلة
+      try {
+        await db.query(
+          `UPDATE exam_questions eq
+           SET passage_text = p.content, passage_title = p.title
+           FROM questions_v2 q
+           JOIN question_passages p ON p.id = q.passage_id
+           WHERE eq.id = $1 AND q.id = $2`,
+          [row.id, row.question_id_v2],
+        );
+      } catch {
+        // passage snapshot columns / question_passages may be missing
+      }
     }
 
     // 2. Identify remaining IDs that were NOT found in V2
@@ -818,6 +849,21 @@ export class ExamFlowService {
         const examQuestionId = examQuestionRes.rows[0].id as number;
         examQuestionIds.push(examQuestionId);
 
+        // Snapshot نص القطعة على صف الامتحان (لا يعتمد على عمود options القديم)
+        await client.query('SAVEPOINT sp_exam_passage_snapshot');
+        try {
+          await client.query(
+            `UPDATE exam_questions
+             SET passage_text = $1, passage_title = $2
+             WHERE id = $3`,
+            [passage.content, passage.title, examQuestionId],
+          );
+          await client.query('RELEASE SAVEPOINT sp_exam_passage_snapshot');
+        } catch {
+          await client.query('ROLLBACK TO SAVEPOINT sp_exam_passage_snapshot');
+          await client.query('RELEASE SAVEPOINT sp_exam_passage_snapshot');
+        }
+
         // مهم: أي خطأ داخل transaction يفسدها بالكامل، لذا نستخدم SAVEPOINT
         // لإبقاء إدراج snapshot اختياريًا بدون كسر العملية الأساسية.
         await client.query('SAVEPOINT sp_exam_question_options');
@@ -863,18 +909,343 @@ export class ExamFlowService {
       throw error;
     }
 
-    const result = await pool.query(
-      'DELETE FROM exam_questions WHERE id = $1 AND exam_id = $2',
-      [questionId, examId],
-    );
+    return this.deleteExamQuestionAndRegradeSubmissions({
+      examId,
+      examQuestionId: questionId,
+      exam,
+    });
+  }
 
-    if (result.rowCount === 0) {
-      const error: any = new Error('Question not found in this exam');
+  /**
+   * حذف سؤال من امتحان/واجب المحاضرة وإعادة احتساب كل التسليمات السابقة.
+   * لا يحذف السؤال من بنك الأسئلة أو مكتبة المدرّس.
+   */
+  static async deleteExamQuestionAndRegradeSubmissions(opts: {
+    examId: number;
+    examQuestionId: number;
+    exam?: any;
+  }): Promise<{
+    deleted: true;
+    examId: number;
+    deletedQuestionId: number;
+    examTotalGrade: number;
+    submissionsUpdated: number;
+    pointsSynced: number;
+  }> {
+    const {
+      recomputeLectureSubmissionAfterQuestionDelete,
+      sumRemainingQuestionGrades,
+    } = await import('./examQuestionDeleteRegrade.js');
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      const qRes = await client.query<{ id: number; exam_id: number; grade: number | null }>(
+        `SELECT id, exam_id, grade FROM exam_questions
+         WHERE id = $1 AND exam_id = $2
+         FOR UPDATE`,
+        [opts.examQuestionId, opts.examId],
+      );
+      if (!qRes.rowCount) {
+        const error: any = new Error('Question not found in this exam');
+        error.status = 404;
+        throw error;
+      }
+      const deletedQuestionId = Number(qRes.rows[0].id);
+      const deletedQuestionGrade = Number(qRes.rows[0].grade ?? 1) || 1;
+
+      await client.query(`DELETE FROM exam_questions WHERE id = $1 AND exam_id = $2`, [
+        deletedQuestionId,
+        opts.examId,
+      ]);
+
+      const remainingRes = await client.query<{ id: number; grade: number | null }>(
+        `SELECT id, grade FROM exam_questions WHERE exam_id = $1 ORDER BY id`,
+        [opts.examId],
+      );
+      const remainingQuestions = remainingRes.rows.map((r) => ({
+        id: Number(r.id),
+        grade: Number(r.grade ?? 1) || 1,
+      }));
+      const examTotalGrade = sumRemainingQuestionGrades(remainingQuestions);
+
+      try {
+        await client.query(
+          `UPDATE exams
+           SET total_grade = $1,
+               questions_count = $2
+           WHERE id = $3`,
+          [examTotalGrade, remainingQuestions.length, opts.examId],
+        );
+      } catch {
+        await client.query(`UPDATE exams SET total_grade = $1 WHERE id = $2`, [
+          examTotalGrade,
+          opts.examId,
+        ]);
+      }
+
+      let submissionsRes: { rows: any[] };
+      try {
+        submissionsRes = await client.query(
+          `SELECT id, student_id, total_grade, passed, status, submitted_at, selected_question_ids
+           FROM exam_submissions
+           WHERE exam_id = $1`,
+          [opts.examId],
+        );
+      } catch {
+        submissionsRes = await client.query(
+          `SELECT id, student_id, total_grade, passed, status, submitted_at
+           FROM exam_submissions
+           WHERE exam_id = $1`,
+          [opts.examId],
+        );
+      }
+
+      const exam = opts.exam ?? (await this.getExamWithCourse(opts.examId));
+      let submissionsUpdated = 0;
+      let pointsSynced = 0;
+
+      for (const sub of submissionsRes.rows) {
+        const submissionId = Number(sub.id);
+        const answersRes = await client.query<{
+          question_id: number;
+          is_correct: boolean;
+          grade: number | null;
+        }>(
+          `SELECT question_id, is_correct, grade FROM exam_answers WHERE submission_id = $1`,
+          [submissionId],
+        );
+
+        const recomputed = recomputeLectureSubmissionAfterQuestionDelete({
+          deletedQuestionId,
+          deletedQuestionGrade,
+          selectedQuestionIds: sub.selected_question_ids,
+          remainingQuestions,
+          remainingAnswers: answersRes.rows.map((a) => ({
+            questionId: Number(a.question_id),
+            isCorrect: !!a.is_correct,
+            grade: Number(a.grade ?? 0) || 0,
+          })),
+        });
+
+        const status = String(sub.status || '').toLowerCase();
+        const isInProgress = status === 'in_progress' || (sub.submitted_at == null && status !== 'submitted');
+
+        if (isInProgress && status === 'in_progress') {
+          if (recomputed.nextSelectedIds) {
+            try {
+              await client.query(
+                `UPDATE exam_submissions SET selected_question_ids = $1::int[] WHERE id = $2`,
+                [recomputed.nextSelectedIds, submissionId],
+              );
+            } catch {
+              // selected_question_ids may be missing on older schemas
+            }
+          }
+          continue;
+        }
+
+        const isSubmitted =
+          status === 'submitted' ||
+          status === 'completed' ||
+          sub.submitted_at != null;
+
+        if (!isSubmitted) continue;
+
+        const prevObtained = Number(sub.total_grade ?? 0);
+        if (
+          prevObtained !== recomputed.obtained ||
+          Boolean(sub.passed) !== recomputed.passed ||
+          recomputed.nextSelectedIds != null
+        ) {
+          try {
+            await client.query(
+              `UPDATE exam_submissions
+               SET total_grade = $1,
+                   passed = $2,
+                   selected_question_ids = CASE
+                     WHEN $3::boolean THEN $4::int[]
+                     ELSE selected_question_ids
+                   END
+               WHERE id = $5`,
+              [
+                recomputed.obtained,
+                recomputed.passed,
+                recomputed.nextSelectedIds != null,
+                recomputed.nextSelectedIds ?? [],
+                submissionId,
+              ],
+            );
+          } catch {
+            await client.query(
+              `UPDATE exam_submissions SET total_grade = $1, passed = $2 WHERE id = $3`,
+              [recomputed.obtained, recomputed.passed, submissionId],
+            );
+          }
+          submissionsUpdated += 1;
+        }
+
+        // نقاط الترتيب من آخر امتحان شامل فقط — امتحانات المحاضرات مستبعدة
+      }
+
+      await client.query('COMMIT');
+      return {
+        deleted: true,
+        examId: opts.examId,
+        deletedQuestionId,
+        examTotalGrade,
+        submissionsUpdated,
+        pointsSynced,
+      };
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * إعادة احتساب نتائج امتحان/واجب المحاضرة من الأسئلة المتبقية حاليًا
+   * (للامتحانات القديمة التي حُذفت أسئلتها قبل آلية الحذف الجديدة).
+   * يحدّث exams.total_grade ودرجات الطلاب ويزامِن النقاط.
+   */
+  static async recalculateResultsFromRemainingQuestions(
+    teacherId: number,
+    examId: number,
+  ): Promise<{
+    examId: number;
+    examTotalGrade: number;
+    remainingQuestions: number;
+    submissionsUpdated: number;
+    pointsSynced: number;
+  }> {
+    const exam = await this.getExamWithCourse(examId);
+    if (!exam) {
+      const error: any = new Error('Exam not found');
       error.status = 404;
       throw error;
     }
+    if (
+      !(await this.canUserManageCourse(teacherId, Number(exam.course_id))) &&
+      exam.teacher_id !== teacherId
+    ) {
+      const error: any = new Error('You do not own this exam');
+      error.status = 403;
+      throw error;
+    }
 
-    return true;
+    const {
+      recomputeLectureSubmissionFromRemainingQuestions,
+      sumRemainingQuestionGrades,
+    } = await import('./examQuestionDeleteRegrade.js');
+
+    const remainingRes = await pool.query<{ id: number; grade: number | null }>(
+      `SELECT id, grade FROM exam_questions WHERE exam_id = $1 ORDER BY id`,
+      [examId],
+    );
+    const remainingQuestions = remainingRes.rows.map((r) => ({
+      id: Number(r.id),
+      grade: Number(r.grade ?? 1) || 1,
+    }));
+    const examTotalGrade = sumRemainingQuestionGrades(remainingQuestions);
+
+    try {
+      await pool.query(
+        `UPDATE exams SET total_grade = $1, questions_count = $2 WHERE id = $3`,
+        [examTotalGrade, remainingQuestions.length, examId],
+      );
+    } catch {
+      await pool.query(`UPDATE exams SET total_grade = $1 WHERE id = $2`, [
+        examTotalGrade,
+        examId,
+      ]);
+    }
+
+    let submissionsRes: { rows: any[] };
+    try {
+      submissionsRes = await pool.query(
+        `SELECT id, student_id, total_grade, passed, status, submitted_at, selected_question_ids
+         FROM exam_submissions WHERE exam_id = $1`,
+        [examId],
+      );
+    } catch {
+      submissionsRes = await pool.query(
+        `SELECT id, student_id, total_grade, passed, status, submitted_at
+         FROM exam_submissions WHERE exam_id = $1`,
+        [examId],
+      );
+    }
+
+    let submissionsUpdated = 0;
+    let pointsSynced = 0;
+
+    for (const sub of submissionsRes.rows) {
+      const status = String(sub.status || '').toLowerCase();
+      const isSubmitted =
+        status === 'submitted' || status === 'completed' || sub.submitted_at != null;
+      if (!isSubmitted) continue;
+
+      const submissionId = Number(sub.id);
+      const answersRes = await pool.query<{
+        question_id: number;
+        is_correct: boolean;
+        grade: number | null;
+      }>(
+        `SELECT question_id, is_correct, grade FROM exam_answers WHERE submission_id = $1`,
+        [submissionId],
+      );
+
+      const recomputed = recomputeLectureSubmissionFromRemainingQuestions({
+        selectedQuestionIds: sub.selected_question_ids,
+        remainingQuestions,
+        remainingAnswers: answersRes.rows.map((a) => ({
+          questionId: Number(a.question_id),
+          isCorrect: !!a.is_correct,
+          grade: Number(a.grade ?? 0) || 0,
+        })),
+      });
+
+      const prevObtained = Number(sub.total_grade ?? 0);
+      if (prevObtained !== recomputed.obtained || Boolean(sub.passed) !== recomputed.passed) {
+        try {
+          await pool.query(
+            `UPDATE exam_submissions
+             SET total_grade = $1,
+                 passed = $2,
+                 selected_question_ids = CASE
+                   WHEN $3::boolean THEN $4::int[]
+                   ELSE selected_question_ids
+                 END
+             WHERE id = $5`,
+            [
+              recomputed.obtained,
+              recomputed.passed,
+              recomputed.nextSelectedIds != null,
+              recomputed.nextSelectedIds ?? [],
+              submissionId,
+            ],
+          );
+        } catch {
+          await pool.query(
+            `UPDATE exam_submissions SET total_grade = $1, passed = $2 WHERE id = $3`,
+            [recomputed.obtained, recomputed.passed, submissionId],
+          );
+        }
+        submissionsUpdated += 1;
+      }
+
+      // نقاط الترتيب من آخر امتحان شامل فقط — امتحانات المحاضرات مستبعدة
+    }
+
+    return {
+      examId,
+      examTotalGrade,
+      remainingQuestions: remainingQuestions.length,
+      submissionsUpdated,
+      pointsSynced,
+    };
   }
 
   /**
@@ -887,7 +1258,22 @@ export class ExamFlowService {
     examId: number,
     examQuestionId: number,
     correct_answer_index: number,
-  ): Promise<void> {
+  ): Promise<{ correctAnswers: number[] }> {
+    return this.setQuestionCorrectAnswers(teacherId, examId, examQuestionId, [
+      correct_answer_index,
+    ]);
+  }
+
+  /**
+   * تحديد إجابة واحدة أو إجابتين صحيحتين لسؤال في امتحان المحاضرة (تجاوز على مستوى الامتحان فقط).
+   * @param indices فهارس 0–3 (حرف أو حرفين مميزين)
+   */
+  static async setQuestionCorrectAnswers(
+    teacherId: number,
+    examId: number,
+    examQuestionId: number,
+    indices: number[],
+  ): Promise<{ correctAnswers: number[] }> {
     const exam = await this.getExamWithCourse(examId);
     if (!exam) {
       const error: any = new Error('Exam not found');
@@ -899,21 +1285,75 @@ export class ExamFlowService {
       error.status = 403;
       throw error;
     }
-    const index = Math.min(3, Math.max(0, correct_answer_index));
+
+    const unique = [
+      ...new Set(
+        (indices || [])
+          .map((v) => Number(v))
+          .filter((v) => Number.isInteger(v) && v >= 0 && v <= 3),
+      ),
+    ];
+    if (unique.length < 1 || unique.length > 2) {
+      const error: any = new Error(
+        'correctAnswers must contain 1 or 2 distinct indices (0–3) or letters (A–D)',
+      );
+      error.status = 400;
+      throw error;
+    }
+
+    const primary = unique[0]!;
+    const secondary = unique[1] ?? null;
+
     try {
       const result = await pool.query(
         `UPDATE exam_questions
-         SET correct_answer_index_override = $1
-         WHERE id = $2 AND exam_id = $3
+         SET correct_answer_index_override = $1,
+             correct_answer_index_override_2 = $2
+         WHERE id = $3 AND exam_id = $4
          RETURNING id`,
-        [index, examQuestionId, examId],
+        [primary, secondary, examQuestionId, examId],
       );
       if (result.rowCount === 0) {
         const error: any = new Error('Question not found in this exam');
         error.status = 404;
         throw error;
       }
+      return { correctAnswers: unique };
     } catch (err: any) {
+      if (err?.status) throw err;
+      if (err?.message?.includes('correct_answer_index_override_2')) {
+        if (unique.length > 1) {
+          const error: any = new Error(
+            'Second correct answer is not available. Run migration 1779300000000_dual_correct_answers_assignment_lecture.',
+          );
+          error.status = 501;
+          throw error;
+        }
+        try {
+          const result = await pool.query(
+            `UPDATE exam_questions
+             SET correct_answer_index_override = $1
+             WHERE id = $2 AND exam_id = $3
+             RETURNING id`,
+            [primary, examQuestionId, examId],
+          );
+          if (result.rowCount === 0) {
+            const error: any = new Error('Question not found in this exam');
+            error.status = 404;
+            throw error;
+          }
+          return { correctAnswers: [primary] };
+        } catch (err2: any) {
+          if (err2?.message?.includes('correct_answer_index_override')) {
+            const error: any = new Error(
+              'Correct answer override is not available. Run migration 1700000007003_add_exam_question_correct_answer_override.',
+            );
+            error.status = 501;
+            throw error;
+          }
+          throw err2;
+        }
+      }
       if (err?.message?.includes('correct_answer_index_override')) {
         const error: any = new Error(
           'Correct answer override is not available. Run migration 1700000007003_add_exam_question_correct_answer_override.',
@@ -1294,7 +1734,7 @@ export class ExamFlowService {
       );
 
       const attemptRow = insertResult.rows[0];
-      await this.maybeAwardStartPoints(exam, attemptRow, studentId);
+      // نقاط الترتيب من آخر امتحان شامل فقط — امتحانات المحاضرات مستبعدة
       return this.buildStudentAttemptPayload(exam, attemptRow, studentId, false);
     } catch (error: any) {
       if (error?.code === '23505') {
@@ -2204,13 +2644,7 @@ export class ExamFlowService {
     const updatedAttempt = updateRes.rows[0] || attempt;
 
     await this.persistAttemptAnswers(updatedAttempt.id, evaluation.questions);
-    await this.maybeAwardScorePoints(
-      exam,
-      updatedAttempt,
-      studentId,
-      evaluation.totalGrade,
-      evaluation.maxGrade,
-    );
+    // نقاط الترتيب من آخر امتحان شامل فقط — امتحانات المحاضرات مستبعدة
 
     const releaseDecision = this.shouldReleaseAnswers(exam, updatedAttempt, now);
     const wrongQuestions = releaseDecision.release
@@ -2382,6 +2816,39 @@ export class ExamFlowService {
         eq.image,
         eq.grade,
         eq.correct_answer_index_override,
+        eq.correct_answer_index_override_2,
+        eq.is_visible,
+        q2.passage_id,
+        q.text as bank_text,
+        ${legacyOptionsSelect}
+        q.image as bank_image,
+        qc.id as choice_id,
+        qc.text as choice_text,
+        qc.is_correct,
+        q2.question_text as bank_text_v2,
+        qm.media_url as bank_image_v2,
+        qo.id as choice_id_v2,
+        qo.text_content as choice_text_v2,
+        qo.image_url as choice_image_v2,
+        qo.option_index as choice_index_v2,
+        q2.correct_answer_index
+       FROM exam_questions eq
+       LEFT JOIN questions q ON eq.question_id = q.id
+       LEFT JOIN question_choices qc ON q.id = qc.question_id
+       LEFT JOIN questions_v2 q2 ON eq.question_id_v2 = q2.id
+       LEFT JOIN question_media qm ON q2.id = qm.question_id
+       LEFT JOIN question_options qo ON q2.id = qo.question_id
+       WHERE eq.exam_id = $1
+       ORDER BY eq.id, qc.id, qo.option_index`;
+
+    const queryWithOverrideSingle = `SELECT
+        eq.id as exam_question_id,
+        eq.question_id as bank_question_id,
+        eq.question_id_v2 as bank_question_id_v2,
+        eq.question_text,
+        eq.image,
+        eq.grade,
+        eq.correct_answer_index_override,
         eq.is_visible,
         q2.passage_id,
         q.text as bank_text,
@@ -2440,7 +2907,20 @@ export class ExamFlowService {
     try {
       res = await pool.query(queryWithOverride, [examId]);
     } catch (err: any) {
-      if (
+      if (err?.message?.includes('correct_answer_index_override_2')) {
+        try {
+          res = await pool.query(queryWithOverrideSingle, [examId]);
+        } catch (err2: any) {
+          if (
+            err2?.message?.includes('correct_answer_index_override') ||
+            err2?.message?.includes('is_visible')
+          ) {
+            res = await pool.query(queryWithoutOverride, [examId]);
+          } else {
+            throw err2;
+          }
+        }
+      } else if (
         err?.message?.includes('correct_answer_index_override') ||
         err?.message?.includes('is_visible')
       ) {
@@ -2451,6 +2931,8 @@ export class ExamFlowService {
     }
 
     const hasOverrideColumn = res.rows.length === 0 || res.rows[0].correct_answer_index_override !== undefined;
+    const hasOverride2Column =
+      res.rows.length === 0 || res.rows[0].correct_answer_index_override_2 !== undefined;
     const hasVisibleColumn = res.rows.length === 0 || res.rows[0].is_visible !== undefined;
     const skippedByVisibility = new Set<number>();
 
@@ -2475,6 +2957,10 @@ export class ExamFlowService {
           hasOverrideColumn && row.correct_answer_index_override != null
             ? Number(row.correct_answer_index_override)
             : null;
+        const override2 =
+          hasOverride2Column && row.correct_answer_index_override_2 != null
+            ? Number(row.correct_answer_index_override_2)
+            : null;
         const legacyPassageContent =
           row.bank_options_v1 &&
           typeof row.bank_options_v1 === 'object' &&
@@ -2497,6 +2983,8 @@ export class ExamFlowService {
           passage_id: row.passage_id ?? null,
           correct_answer_index: isV2 && row.correct_answer_index != null ? Number(row.correct_answer_index) : null,
           correct_answer_index_override: override != null && override >= 0 && override <= 3 ? override : null,
+          correct_answer_index_override_2:
+            override2 != null && override2 >= 0 && override2 <= 3 ? override2 : null,
           isVisible: hasVisibleColumn ? row.is_visible !== false : true,
           choices: [],
           passage:
@@ -2507,14 +2995,18 @@ export class ExamFlowService {
       }
 
       const question = map.get(row.exam_question_id)!;
-      const overrideIndex = question.correct_answer_index_override;
+      const overrideIndices = resolveEffectiveCorrectIndices(
+        question.correct_answer_index_override,
+        question.correct_answer_index_override_2,
+        null,
+      );
+      const hasAnyOverride = overrideIndices.length > 0;
 
       // Handle V1 Choice
       if (row.choice_id) {
-        const isCorrect =
-          overrideIndex != null
-            ? question.choices.length === overrideIndex
-            : !!row.is_correct;
+        const isCorrect = hasAnyOverride
+          ? overrideIndices.includes(question.choices.length)
+          : !!row.is_correct;
         question.choices.push({
           id: row.choice_id,
           text: row.choice_text,
@@ -2526,9 +3018,13 @@ export class ExamFlowService {
       if (row.choice_id_v2) {
         const bankCorrectIndex = row.correct_answer_index != null ? Number(row.correct_answer_index) : null;
         const choiceIndex = row.choice_index_v2 != null ? Number(row.choice_index_v2) : null;
-        const effectiveCorrect = overrideIndex ?? bankCorrectIndex;
+        const effectiveIndices = resolveEffectiveCorrectIndices(
+          question.correct_answer_index_override,
+          question.correct_answer_index_override_2,
+          bankCorrectIndex,
+        );
         const isCorrect =
-          effectiveCorrect !== null && choiceIndex !== null && choiceIndex === effectiveCorrect;
+          choiceIndex !== null && effectiveIndices.includes(choiceIndex);
         const { text: choiceText, image: choiceImage } = normalizeChoiceContent(
           row.choice_text_v2,
           row.choice_image_v2,
@@ -2569,8 +3065,11 @@ export class ExamFlowService {
         byExamQuestion.forEach((opts, examQuestionId) => {
           const question = map.get(examQuestionId);
           if (!question || opts.length === 0) return;
-          const effectiveCorrect =
-            question.correct_answer_index_override ?? question.correct_answer_index ?? null;
+          const effectiveIndices = resolveEffectiveCorrectIndices(
+            question.correct_answer_index_override,
+            question.correct_answer_index_override_2,
+            question.correct_answer_index,
+          );
           question.choices = opts
             .sort((a, b) => a.option_index - b.option_index)
             .map((o, i) => {
@@ -2579,7 +3078,7 @@ export class ExamFlowService {
                 id: -(examQuestionId * 10 + i + 1),
                 text,
                 image,
-                isCorrect: effectiveCorrect !== null && i === effectiveCorrect,
+                isCorrect: effectiveIndices.includes(i),
               };
             });
         });
@@ -2622,17 +3121,20 @@ export class ExamFlowService {
             }
           }
           if (choices.length === 0) continue;
-          const override = question.correct_answer_index_override;
           const bankCorrect =
             row.correct_answer_index != null ? Number(row.correct_answer_index) : null;
-          const effectiveCorrect = override ?? bankCorrect;
           if (question.correct_answer_index == null && bankCorrect != null) {
             question.correct_answer_index = bankCorrect;
           }
+          const effectiveIndices = resolveEffectiveCorrectIndices(
+            question.correct_answer_index_override,
+            question.correct_answer_index_override_2,
+            bankCorrect,
+          );
           question.choices = choices.slice(0, 4).map((text, i) => ({
             id: -(row.exam_question_id * 10 + i + 1),
             text,
-            isCorrect: effectiveCorrect !== null && i === effectiveCorrect,
+            isCorrect: effectiveIndices.includes(i),
           }));
         }
       } catch {
@@ -2646,22 +3148,19 @@ export class ExamFlowService {
       if (question.choices.length !== 0) return;
       // أي سؤال بدون خيارات (سواء صورة أو نص) نضيف له الخيارات الافتراضية إن وُجدت إجابة صحيحة، وإلا نضيفها لأي سؤال صورة
       const hasImage = !!question.image;
-      const correctIndex =
-        question.correct_answer_index_override != null
-          ? question.correct_answer_index_override
-          : question.correct_answer_index != null &&
-              question.correct_answer_index >= 0 &&
-              question.correct_answer_index <= 3
-            ? question.correct_answer_index
-            : null;
-      const shouldAddDefaults = hasImage || correctIndex !== null;
+      const correctIndices = resolveEffectiveCorrectIndices(
+        question.correct_answer_index_override,
+        question.correct_answer_index_override_2,
+        question.correct_answer_index,
+      );
+      const shouldAddDefaults = hasImage || correctIndices.length > 0;
       if (!shouldAddDefaults) return;
 
       defaultChoiceLabels.forEach((text, index) => {
         question.choices.push({
           id: -(index + 1), // IDs سالبة لتجنب التضارب مع خيارات حقيقية
           text,
-          isCorrect: correctIndex !== null ? index === correctIndex : false,
+          isCorrect: correctIndices.includes(index),
         });
       });
     });
@@ -2718,16 +3217,58 @@ export class ExamFlowService {
       }
     }
 
+    // Snapshot على exam_questions.passage_text (إن وُجدت الأعمدة)
+    const stillMissing = questions.filter((q) => !q.passage).map((q) => q.id);
+    const allExamIds = questions.map((q) => q.id);
+    if (allExamIds.length > 0) {
+      try {
+        const snapRes = await pool.query<{
+          id: number;
+          passage_text: string | null;
+          passage_title: string | null;
+        }>(
+          `SELECT id, passage_text, passage_title
+           FROM exam_questions
+           WHERE id = ANY($1::int[])
+             AND passage_text IS NOT NULL
+             AND TRIM(passage_text) <> ''`,
+          [allExamIds],
+        );
+        for (const row of snapRes.rows) {
+          const question = map.get(row.id);
+          if (!question) continue;
+          // Snapshot fills gaps; also prefer non-empty snapshot if linked passage missing
+          if (!question.passage && stillMissing.includes(row.id)) {
+            question.passage = {
+              id: question.passage_id ?? null,
+              title: row.passage_title,
+              content: row.passage_text as string,
+            };
+          } else if (!question.passage) {
+            question.passage = {
+              id: question.passage_id ?? null,
+              title: row.passage_title,
+              content: row.passage_text as string,
+            };
+          }
+        }
+      } catch {
+        // passage_text columns may be missing before migration
+      }
+    }
+
     return Array.from(map.values());
   }
 
   private static sanitizeOneQuestion(question: ExamQuestion, includeCorrect: boolean) {
+    const passageContent = question.passage?.content ?? null;
     const passage = question.passage
       ? {
           id: question.passage.id,
           title: question.passage.title ?? null,
           content: question.passage.content,
           text: question.passage.content,
+          passageText: question.passage.content,
         }
       : null;
     return {
@@ -2736,6 +3277,8 @@ export class ExamFlowService {
       text: question.text,
       image: question.image,
       grade: question.grade,
+      passageId: question.passage_id ?? question.passage?.id ?? null,
+      passageText: passageContent,
       passage,
       ...(question.isVisible !== undefined && includeCorrect ? { isVisible: question.isVisible } : {}),
       choices: question.choices.map((choice) => ({
@@ -2767,7 +3310,8 @@ export class ExamFlowService {
     questions.forEach((question) => {
       const selectedChoiceId = answerMap.get(question.id) ?? null;
       const selectedChoice = question.choices.find((c) => c.id === selectedChoiceId) || null;
-      const correctChoice = question.choices.find((c) => c.isCorrect) || null;
+      const correctChoices = question.choices.filter((c) => c.isCorrect);
+      const correctChoice = correctChoices[0] || null;
 
       const isCorrect = !!(selectedChoice && selectedChoice.isCorrect);
       if (isCorrect) {
@@ -3104,66 +3648,6 @@ export class ExamFlowService {
         wrong_questions_count: inProgress ? 0 : wrong.length,
       };
     });
-  }
-
-  private static async maybeAwardStartPoints(exam: any, attempt: any, studentId: number) {
-    try {
-      const ctx = await this.resolvePointsContext(exam);
-      if (!ctx) return;
-      const isAssignment = String(exam.type || '').toLowerCase() === 'assignment';
-      await TeacherPointsService.awardExamOrAssignmentStart({
-        studentId,
-        teacherId: ctx.teacherId,
-        courseId: ctx.courseId,
-        attemptId: Number(attempt.id),
-        examId: Number(exam.id),
-        isAssignment,
-        title: exam.title ?? null,
-      });
-    } catch (error) {
-      console.error('Error awarding exam start points:', error);
-    }
-  }
-
-  private static async maybeAwardScorePoints(
-    exam: any,
-    attempt: any,
-    studentId: number,
-    obtainedGrade: number,
-    maxGrade: number,
-  ) {
-    try {
-      const ctx = await this.resolvePointsContext(exam);
-      if (!ctx) return;
-      const isAssignment = String(exam.type || '').toLowerCase() === 'assignment';
-      await TeacherPointsService.awardExamOrAssignmentScore({
-        studentId,
-        teacherId: ctx.teacherId,
-        courseId: ctx.courseId,
-        attemptId: Number(attempt.id),
-        examId: Number(exam.id),
-        isAssignment,
-        obtainedGrade,
-        totalGrade: maxGrade,
-        title: exam.title ?? null,
-      });
-    } catch (error) {
-      console.error('Error awarding exam score points:', error);
-    }
-  }
-
-  private static async resolvePointsContext(
-    exam: any,
-  ): Promise<{ teacherId: number; courseId: number | null } | null> {
-    let courseId = exam.course_id != null ? Number(exam.course_id) : null;
-    if (!courseId && exam.lecture_id) {
-      const lec = await pool.query(`SELECT course_id FROM lectures WHERE id = $1`, [exam.lecture_id]);
-      courseId = lec.rowCount ? Number(lec.rows[0].course_id) : null;
-    }
-    if (!courseId) return null;
-    const teacherId = await TeacherPointsService.resolveTeacherIdForCourse(courseId);
-    if (!teacherId) return null;
-    return { teacherId, courseId };
   }
 
   private static mapExamRow(row: any, availabilityStatus?: string) {

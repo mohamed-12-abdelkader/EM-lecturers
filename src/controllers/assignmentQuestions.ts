@@ -154,11 +154,25 @@ const UpdateQuestionSchema = z.object({
   image_urls: z.array(z.string().url()).max(10).optional(),
 });
 
-const UpdateCorrectAnswerSchema = z.object({
-  correct_answer: z.enum(['a', 'b', 'c', 'd'], {
-    errorMap: () => ({ message: 'الإجابة الصحيحة يجب أن تكون a, b, c, أو d' }),
-  }),
+const letterEnum = z.enum(['a', 'b', 'c', 'd'], {
+  errorMap: () => ({ message: 'الإجابة الصحيحة يجب أن تكون a, b, c, أو d' }),
 });
+
+/** Body: { correct_answer: 'a' } أو { correctAnswers: ['a'] } أو { correctAnswers: ['a','c'] } */
+const UpdateCorrectAnswerSchema = z
+  .object({
+    correct_answer: letterEnum.optional(),
+    correct_answer_2: letterEnum.optional().nullable(),
+    correctAnswers: z.array(z.string()).optional(),
+    correct_answers: z.array(z.string()).optional(),
+  })
+  .refine(
+    (data) =>
+      data.correct_answer != null ||
+      (Array.isArray(data.correctAnswers) && data.correctAnswers.length > 0) ||
+      (Array.isArray(data.correct_answers) && data.correct_answers.length > 0),
+    { message: 'يجب إرسال correct_answer أو correctAnswers (1 أو 2 حروف)' },
+  );
 
 // 1. إضافة سؤال نصي
 router.post(
@@ -423,17 +437,44 @@ router.patch(
         });
       }
 
+      const body = parse.data;
+      const answersList =
+        body.correctAnswers ??
+        body.correct_answers ??
+        (body.correct_answer != null
+          ? body.correct_answer_2
+            ? [body.correct_answer, body.correct_answer_2]
+            : [body.correct_answer]
+          : []);
+
       const updatedQuestion = await AssignmentQuestionsService.updateCorrectAnswer(
         questionId,
-        parse.data.correct_answer,
+        answersList,
       );
+
+      const correctAnswers =
+        updatedQuestion?.correct_answers ??
+        [
+          updatedQuestion?.correct_answer,
+          updatedQuestion?.correct_answer_2,
+        ].filter(Boolean);
 
       res.json({
         success: true,
-        message: 'تم تحديث الإجابة الصحيحة بنجاح',
+        message:
+          correctAnswers.length === 2
+            ? 'تم تحديث الإجابتين الصحيحتين بنجاح'
+            : 'تم تحديث الإجابة الصحيحة بنجاح',
         question: updatedQuestion,
+        correctAnswers,
       });
     } catch (error: any) {
+      if (error?.status) {
+        return res.status(error.status).json({
+          error: error.message,
+          message: error.message,
+        });
+      }
       console.error('Error updating correct answer:', error);
       res.status(500).json({
         error: 'خطأ في تحديث الإجابة الصحيحة',

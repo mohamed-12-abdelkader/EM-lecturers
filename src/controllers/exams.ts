@@ -87,6 +87,64 @@ const parseRequiredPositiveNumber = (value: any, field: string): number => {
   return numericValue;
 };
 
+/** Extract a question image URL from OCR/frontend payloads (string, object, or question_images[]). */
+const resolveQuestionImageUrl = (source: any): string | null => {
+  if (source == null) return null;
+
+  if (typeof source === 'string') {
+    const trimmed = source.trim();
+    if (!trimmed || trimmed === 'null' || trimmed === 'undefined') return null;
+    return trimmed;
+  }
+
+  if (Array.isArray(source) && source.length > 0) {
+    return resolveQuestionImageUrl(source[0]);
+  }
+
+  if (typeof source === 'object') {
+    const direct =
+      source.image_url ??
+      source.imageUrl ??
+      source.url ??
+      source.secure_url ??
+      source.secureUrl ??
+      null;
+    if (typeof direct === 'string' && direct.trim()) {
+      return direct.trim();
+    }
+    if (source.question_images != null || source.questionImages != null) {
+      return resolveQuestionImageUrl(source.question_images ?? source.questionImages);
+    }
+  }
+
+  return null;
+};
+
+const resolveQuestionImageFromBody = (body: any): string | null => {
+  if (!body || typeof body !== 'object') return null;
+  return (
+    resolveQuestionImageUrl(pickBodyValue(body, 'questionImage', 'question_image')) ??
+    resolveQuestionImageUrl(pickBodyValue(body, 'question_images', 'questionImages')) ??
+    null
+  );
+};
+
+const serializeCourseLevelQuestionRow = (row: any) => {
+  if (!row || typeof row !== 'object') return row;
+  const questionImage = row.question_image ?? row.questionImage ?? null;
+  return {
+    ...row,
+    questionImage,
+    question_image: questionImage,
+    questionText: row.question_text ?? row.questionText,
+    optionA: row.option_a ?? row.optionA,
+    optionB: row.option_b ?? row.optionB,
+    optionC: row.option_c ?? row.optionC,
+    optionD: row.option_d ?? row.optionD,
+    correctAnswer: row.correct_answer ?? row.correctAnswer,
+  };
+};
+
 /** null / 0 / omitted-as-null = unlimited course-level timer */
 const parseOptionalDurationMinutes = (value: any, field: string): number | null => {
   if (value === undefined || value === null || value === '' || value === 'null' || value === 'unlimited') {
@@ -894,42 +952,44 @@ router.post(
       });
     }
 
-    const isCourseExam = body.type === 'course-exam';
-
-    if (isCourseExam) {
-      try {
-        await CourseLevelExamsService.getExamById(examId, req.user!);
-      } catch (err: any) {
-        if (err?.status === 404) {
-          return res.status(400).json({
-            message: 'Exam not found or is not a course-level exam. Use type "course-exam" only for course exams.',
-          });
-        }
-        if (err?.status === 403) {
-          return res.status(403).json({ message: err.message });
-        }
+    const requestedType = String(body.type || '').toLowerCase();
+    let courseLevelExam: any = null;
+    try {
+      courseLevelExam = await CourseLevelExamsService.getExamById(examId, req.user!);
+    } catch (err: any) {
+      if (err?.status === 403) {
+        return res.status(403).json({ message: err.message });
+      }
+      if (err?.status && err.status !== 404) {
         throw err;
       }
+    }
 
-      let result: { addedCount: number; addedQuestions: any[]; alreadyInExamIds?: number[] };
-      const client = await pool.connect();
-      try {
-        await client.query('BEGIN');
-        // eslint-disable-next-line @typescript-eslint/ban-ts-comment
-        // @ts-expect-error
-        result = await CourseLevelExamsService.addQuestionsFromBank(req.user!, examId, questionIds, client);
-        await client.query('COMMIT');
-      } catch (txErr) {
-        await client.query('ROLLBACK').catch(() => {});
-        throw txErr;
-      } finally {
-        client.release();
+    const isPublicExam = courseLevelExam && String(courseLevelExam.exam_scope || '') === 'public';
+    const isCourseExam =
+      requestedType === 'course-exam' ||
+      requestedType === 'public-exam' ||
+      (!!courseLevelExam && requestedType !== 'lecture-exam');
+
+    if (isCourseExam) {
+      if (!courseLevelExam) {
+        return res.status(400).json({
+          message:
+            'Exam not found or is not a course-level/public exam. Use type "course-exam" / "public-exam" only for those exams.',
+        });
       }
+
+      const result = (await CourseLevelExamsService.addQuestionsFromBank(
+        req.user!,
+        examId,
+        questionIds,
+      )) as { addedCount: number; addedQuestions: any[]; alreadyInExamIds?: number[] };
 
       const addedBankIds = (result.addedQuestions || []).map(
         (row: { question_id_v2?: number; question_id?: number }) => row.question_id_v2 ?? row.question_id,
       ).filter((id: number | undefined) => id != null);
       const skippedQuestions = result.alreadyInExamIds ?? [];
+      const examType = isPublicExam ? 'public-exam' : 'course-exam';
 
       if (skippedQuestions.length > 0 && addedBankIds.length > 0) {
         return res.status(200).json({
@@ -937,7 +997,7 @@ router.post(
           addedQuestions: addedBankIds,
           skippedQuestions,
           examId,
-          examType: 'course-exam',
+          examType,
         });
       }
       if (skippedQuestions.length > 0 && addedBankIds.length === 0) {
@@ -946,14 +1006,14 @@ router.post(
           addedQuestions: [],
           skippedQuestions,
           examId,
-          examType: 'course-exam',
+          examType,
         });
       }
       return res.status(200).json({
         message: 'Questions added successfully',
         addedQuestions: addedBankIds,
         examId,
-        examType: 'course-exam',
+        examType,
       });
     }
 
@@ -1173,9 +1233,33 @@ router.post(
       });
     }
 
-    const isCourseExam = req.body?.type === 'course-exam';
+    const requestedType = String(req.body?.type || '').toLowerCase();
+    let courseLevelExam: any = null;
+    try {
+      courseLevelExam = await CourseLevelExamsService.getExamById(examId, req.user!);
+    } catch (err: any) {
+      if (err?.status === 403) {
+        return res.status(403).json({ message: err.message });
+      }
+      if (err?.status && err.status !== 404) {
+        throw err;
+      }
+    }
+
+    const isPublicExam = courseLevelExam && String(courseLevelExam.exam_scope || '') === 'public';
+    const isCourseExam =
+      requestedType === 'course-exam' ||
+      requestedType === 'public-exam' ||
+      (!!courseLevelExam && requestedType !== 'lecture-exam');
 
     if (isCourseExam) {
+      if (!courseLevelExam) {
+        return res.status(400).json({
+          message:
+            'Exam not found or is not a course-level/public exam. Use type "course-exam" / "public-exam" only for those exams.',
+        });
+      }
+
       const client = await pool.connect();
       try {
         await client.query('BEGIN');
@@ -1195,7 +1279,7 @@ router.post(
                 ? 'Questions added successfully'
                 : 'All selected questions already exist in this exam',
           examId,
-          examType: 'course-exam',
+          examType: isPublicExam ? 'public-exam' : 'course-exam',
           addedCount: result.addedCount,
           addedTeacherQuestionIds: result.addedTeacherQuestionIds,
           skippedTeacherQuestionIds: result.skippedTeacherQuestionIds,
@@ -1373,7 +1457,7 @@ router.post(
       );
       return res.status(201).json({
         message: `تمت إضافة ${questions.length} سؤال`,
-        questions,
+        questions: questions.map(serializeCourseLevelQuestionRow),
         count: questions.length,
       });
     } catch (error: any) {
@@ -1399,14 +1483,26 @@ router.post(
 
     const body = req.body as any;
 
-    // إضافة مجموعة أسئلة من نص: { text: "..." } أو { questionText: "..." } — أي نص يحتوي a. و b. يُحلّل كمجموعة أسئلة (مع أو بدون سطر فاضي بين الأسئلة)
+    const hasStructuredOptions = [body.optionA, body.optionB, body.optionC, body.optionD].every(
+      (v) => v != null && String(v).trim() !== '',
+    );
+    const hasSingleQuestionShape =
+      hasStructuredOptions ||
+      body.type === 'TEXT' ||
+      resolveQuestionImageFromBody(body) != null ||
+      !!req.file;
+
+    // إضافة مجموعة أسئلة من نص — فقط عندما لا يكون الطلب سؤالًا فرديًا منظمًا (حتى لا نفقد questionImage)
     const bulkText =
       typeof body.text === 'string'
         ? body.text
-        : typeof body.questionText === 'string' && body.questionText.includes('a.') && body.questionText.includes('b.')
+        : !hasSingleQuestionShape &&
+            typeof body.questionText === 'string' &&
+            body.questionText.includes('a.') &&
+            body.questionText.includes('b.')
           ? body.questionText
           : null;
-    if (bulkText && bulkText.trim().length > 0) {
+    if (bulkText && bulkText.trim().length > 0 && !hasSingleQuestionShape) {
       const parsed = CourseLevelExamQuestionsService.parseBulkQuestionText(
         bulkText.trim(),
         Array.isArray(body.correctAnswers) ? body.correctAnswers as ('A' | 'B' | 'C' | 'D')[] : undefined,
@@ -1424,7 +1520,7 @@ router.post(
         );
         return res.status(201).json({
           message: `تمت إضافة ${questions.length} سؤال`,
-          questions,
+          questions: questions.map(serializeCourseLevelQuestionRow),
           count: questions.length,
         });
       } catch (error: any) {
@@ -1436,17 +1532,21 @@ router.post(
       }
     }
 
-    // إضافة مجموعة أسئلة: { questions: [ { questionText, optionA, optionB, optionC, optionD, correctAnswer }, ... ] }
+    // إضافة مجموعة أسئلة: { questions: [ { questionText, optionA, ..., questionImage? }, ... ] }
     if (Array.isArray(body.questions) && body.questions.length > 0) {
       try {
+        const normalized = body.questions.map((q: any) => ({
+          ...q,
+          questionImage: resolveQuestionImageFromBody(q) ?? resolveQuestionImageUrl(q?.questionImage),
+        }));
         const questions = await CourseLevelExamQuestionsService.createTextQuestionsBulk(
           req.user!,
           examId,
-          body.questions,
+          normalized,
         );
         return res.status(201).json({
           message: `تمت إضافة ${questions.length} سؤال`,
-          questions,
+          questions: questions.map(serializeCourseLevelQuestionRow),
           count: questions.length,
         });
       } catch (error: any) {
@@ -1484,6 +1584,9 @@ router.post(
         console.error('Error uploading image:', error);
         return res.status(500).json({ message: 'Failed to upload image' });
       }
+    } else {
+      // رابط صورة جاهز (مثلاً من استخراج OCR) — JSON أو FormData نصي
+      questionImage = resolveQuestionImageFromBody(body);
     }
 
     try {
@@ -1499,7 +1602,7 @@ router.post(
         createdBy: req.user!.id,
       });
 
-      res.status(201).json({ question });
+      res.status(201).json({ question: serializeCourseLevelQuestionRow(question) });
     } catch (error: any) {
       if (error.status) {
         return res.status(error.status).json({ message: error.message });
@@ -1523,8 +1626,15 @@ router.delete(
     }
 
     try {
-      await ExamFlowService.removeQuestionFromExam(req.user!.id, examId, questionId);
-      res.json({ message: 'Question removed successfully' });
+      const result = await ExamFlowService.removeQuestionFromExam(
+        req.user!.id,
+        examId,
+        questionId,
+      );
+      res.json({
+        message: 'Question removed successfully; student results recalculated',
+        data: result,
+      });
     } catch (error: any) {
       if (error.status) {
         return res.status(error.status).json({ message: error.message });
@@ -1535,28 +1645,119 @@ router.delete(
   }),
 );
 
-// PATCH /api/exams/:examId/questions/:questionId/correct-answer - Set correct answer for question in lecture exam (أسئلة من البنك - التعديل للامتحان فقط)
+/**
+ * POST /api/exams/:examId/recalculate-results
+ * إعادة احتساب درجات كل الطلاب + النقاط من الأسئلة المتبقية
+ * (مفيد للامتحانات القديمة التي حُذفت أسئلتها قبل آلية الحذف الجديدة)
+ */
+router.post(
+  '/:examId/recalculate-results',
+  authMiddleware(COURSE_CONTENT_ROLES),
+  asyncWrapper(async (req, res) => {
+    const examId = Number(req.params.examId);
+    if (Number.isNaN(examId)) {
+      return res.status(400).json({ message: 'Invalid exam id' });
+    }
+    try {
+      const result = await ExamFlowService.recalculateResultsFromRemainingQuestions(
+        req.user!.id,
+        examId,
+      );
+      res.json({
+        success: true,
+        message:
+          'تم إعادة احتساب درجات الطلاب والنقاط حسب الأسئلة المتبقية في الامتحان',
+        data: result,
+      });
+    } catch (error: any) {
+      if (error.status) {
+        return res.status(error.status).json({ message: error.message });
+      }
+      console.error('Error recalculating exam results:', error);
+      res.status(500).json({ message: 'Failed to recalculate exam results' });
+    }
+  }),
+);
+
+// PATCH /api/exams/:examId/questions/:questionId/correct-answer
+// تحديد إجابة واحدة أو إجابتين صحيحتين لسؤال في امتحان المحاضرة (تجاوز على مستوى الامتحان فقط)
+// Body examples:
+//   { correct_answer_index: 0 }
+//   { correctAnswers: ['A'] } أو { correctAnswers: ['A','C'] }
+//   { correct_answer_indices: [0, 2] }
 router.patch(
   '/:examId/questions/:questionId/correct-answer',
   authMiddleware(COURSE_CONTENT_ROLES),
   asyncWrapper(async (req, res) => {
     const examId = Number(req.params.examId);
     const questionId = Number(req.params.questionId);
-    const correct_answer_index = req.body.correct_answer_index ?? req.body.correctAnswerIndex;
 
     if (Number.isNaN(examId) || Number.isNaN(questionId)) {
       return res.status(400).json({ message: 'Invalid identifiers' });
     }
-    const index = typeof correct_answer_index === 'number' ? correct_answer_index : Number(correct_answer_index);
-    if (Number.isNaN(index) || index < 0 || index > 3) {
+
+    const body = req.body || {};
+    const letterToIndex = (v: unknown): number | null => {
+      if (typeof v === 'number' && Number.isInteger(v) && v >= 0 && v <= 3) return v;
+      const n = Number(v);
+      if (!Number.isNaN(n) && Number.isInteger(n) && n >= 0 && n <= 3) return n;
+      const map: Record<string, number> = { A: 0, B: 1, C: 2, D: 3 };
+      const key = String(v ?? '').trim().toUpperCase();
+      return key in map ? map[key]! : null;
+    };
+
+    let indices: number[] = [];
+    const rawList =
+      body.correctAnswers ??
+      body.correct_answers ??
+      body.correct_answer_indices ??
+      body.correctAnswerIndices;
+
+    if (Array.isArray(rawList)) {
+      indices = rawList
+        .map(letterToIndex)
+        .filter((v: number | null): v is number => v != null);
+    } else {
+      const single =
+        body.correct_answer_index ??
+        body.correctAnswerIndex ??
+        body.correctAnswer ??
+        body.correct_answer;
+      const second =
+        body.correct_answer_index_2 ??
+        body.correctAnswerIndex2 ??
+        body.correctAnswer2 ??
+        body.correct_answer_2;
+      const primary = letterToIndex(single);
+      if (primary != null) indices.push(primary);
+      const secondary = letterToIndex(second);
+      if (secondary != null) indices.push(secondary);
+    }
+
+    indices = [...new Set(indices)];
+    if (indices.length < 1 || indices.length > 2) {
       return res.status(400).json({
-        message: 'correct_answer_index is required and must be 0 (أ), 1 (ب), 2 (ج), or 3 (د)',
+        message:
+          'Provide 1 or 2 correct answers via correctAnswers (A–D) or correct_answer_index / correct_answer_indices (0–3)',
       });
     }
 
     try {
-      await ExamFlowService.setQuestionCorrectAnswer(req.user!.id, examId, questionId, index);
-      res.json({ message: 'Correct answer updated successfully' });
+      const result = await ExamFlowService.setQuestionCorrectAnswers(
+        req.user!.id,
+        examId,
+        questionId,
+        indices,
+      );
+      const indexToLetter = ['A', 'B', 'C', 'D'] as const;
+      res.json({
+        message:
+          result.correctAnswers.length === 2
+            ? 'تم تحديث الإجابتين الصحيحتين بنجاح'
+            : 'تم تحديث الإجابة الصحيحة بنجاح',
+        correctAnswers: result.correctAnswers.map((i) => indexToLetter[i]),
+        correctAnswerIndices: result.correctAnswers,
+      });
     } catch (error: any) {
       if (error.status) {
         return res.status(error.status).json({ message: error.message });
@@ -1678,7 +1879,7 @@ router.get(
 
     try {
       const questions = await CourseLevelExamQuestionsService.getExamQuestions(examId, req.user!);
-      res.json({ questions });
+      res.json({ questions: questions.map(serializeCourseLevelQuestionRow) });
     } catch (error: any) {
       if (error.status) {
         return res.status(error.status).json({ message: error.message });

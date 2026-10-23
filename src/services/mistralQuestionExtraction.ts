@@ -931,6 +931,266 @@ async function uploadQuestionImagesToCloudinary(
   return { questions: out, warnings };
 }
 
+const ARABIC_INDIC_DIGITS: Record<string, string> = {
+  '٠': '0',
+  '١': '1',
+  '٢': '2',
+  '٣': '3',
+  '٤': '4',
+  '٥': '5',
+  '٦': '6',
+  '٧': '7',
+  '٨': '8',
+  '٩': '9',
+};
+
+function toWesternDigits(value: string): string {
+  return String(value || '').replace(/[٠-٩]/g, (ch) => ARABIC_INDIC_DIGITS[ch] || ch);
+}
+
+type OcrNumberedBlock = {
+  num: number;
+  text: string;
+  matchStart: number;
+  textStart: number;
+};
+
+/** يفكك نص OCR إلى كتل مرقّمة (١) / 1) / ٢) …) */
+function parseOcrNumberedBlocks(documentText: string): OcrNumberedBlock[] {
+  const source = documentText || '';
+  const re =
+    /(?:^|\n)\s*(?:#{1,3}\s*)?(?:\*\*)?([0-9٠-٩]{1,3})(?:\*\*)?\s*[)）．.\-:]\s*/g;
+  const marks: Array<{ num: number; matchStart: number; textStart: number }> = [];
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(source)) !== null) {
+    const num = Number(toWesternDigits(match[1]));
+    if (!Number.isInteger(num) || num <= 0) continue;
+    marks.push({
+      num,
+      matchStart: match.index,
+      textStart: match.index + match[0].length,
+    });
+  }
+
+  return marks.map((mark, i) => {
+    const end = i + 1 < marks.length ? marks[i + 1].matchStart : source.length;
+    let text = source.slice(mark.textStart, end);
+    text = text.replace(/\nIMAGE_CONTEXT:[\s\S]*$/i, '').trim();
+    return { num: mark.num, text, matchStart: mark.matchStart, textStart: mark.textStart };
+  });
+}
+
+function stripMarkdownImages(text: string): string {
+  return text.replace(/!\[[^\]]*]\([^)]+\)/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+function extractMarkdownImageIds(text: string): string[] {
+  const ids: string[] = [];
+  const re = /!\[[^\]]*]\(([^)]+)\)/g;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(text)) !== null) {
+    const raw = (match[1] || '').trim();
+    if (!raw) continue;
+    const id = raw.split('/').pop() || raw;
+    if (id && !ids.includes(id)) ids.push(id);
+  }
+  return ids;
+}
+
+/** نص يبدو كسؤال مسحوب بالخطأ داخل options (مش اختيار). */
+function looksLikeLeakedQuestionStem(text: string): boolean {
+  const t = stripMarkdownImages(text || '').trim();
+  if (!t) return false;
+  if (/[؟?]\s*$/.test(t) && t.length > 35) return true;
+  if (t.length > 85 && /[؟?]/.test(t)) return true;
+  if (
+    /^(?:أي|ما(?!\s+المادة\b)|ماذا|من خلال|ادرس|ادرسى|اختر|حد[دّ]|فيما|في\s+الشكل|الشكل\s+المقابل)/u.test(
+      t,
+    ) &&
+    t.length > 45
+  ) {
+    return true;
+  }
+  if (/تتواجد في جدر|الأكثر تأثراً|تحول دون فقد|المادة التي تُرَسَب/u.test(t) && t.length > 40) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * عندما OCR يرقّم السؤال والاختيارات بأرقام متسلسلة (١ سؤال، ٢–٥ اختيارات):
+ * استخرج حتى 4 اختيارات نصية متتالية بعد رقم السؤال — بدون سحب سؤال لاحق.
+ */
+function extractOptionsFromFalseNumberedSlice(
+  slice: string,
+  stemSourceNumber?: string | number | null,
+): Array<{ label: string; text: string }> {
+  const blocks = parseOcrNumberedBlocks(slice);
+  if (blocks.length < 2) return [];
+
+  let stemIdx = 0;
+  const stemNum = Number(toWesternDigits(String(stemSourceNumber ?? '')));
+  if (Number.isInteger(stemNum) && stemNum > 0) {
+    const found = blocks.findIndex((b) => b.num === stemNum);
+    if (found >= 0) stemIdx = found;
+  }
+
+  const labels = ['أ', 'ب', 'ج', 'د'] as const;
+  const options: Array<{ label: string; text: string }> = [];
+  for (let i = stemIdx + 1; i < blocks.length && options.length < 4; i++) {
+    const expected = blocks[stemIdx].num + options.length + 1;
+    if (blocks[i].num !== expected) break;
+    const text = stripMarkdownImages(blocks[i].text);
+    if (!text) break;
+    // أي سطر يشبه سؤالًا — توقّف فورًا (لا تأخذه كاختيار)
+    if (looksLikeLeakedQuestionStem(text)) break;
+    options.push({ label: labels[options.length], text: text.slice(0, 400) });
+  }
+  return options;
+}
+
+/** تنظيف options: احذف أسئلة مسحوبة، ثبّت أ–د (4 كحد للأرابيك MCQ)، أزل التكرار. */
+function sanitizeMcqOptions(
+  question: MistralExtractedQuestion,
+  allQuestions: MistralExtractedQuestion[],
+): MistralExtractedQuestion {
+  const otherStems = allQuestions
+    .filter((q) => q.number !== question.number)
+    .flatMap((q) => [q.prompt_text || '', q.question_text || ''])
+    .map((s) => stripMarkdownImages(s).trim())
+    .filter((s) => s.length > 24);
+
+  const raw = [...(question.options || [])];
+  const cleaned: typeof raw = [];
+  const seenText = new Set<string>();
+
+  for (const opt of sortMcqOptions(raw)) {
+    const label = normalizeOptionLabel(opt.label);
+    if (label === 'هـ' || label === 'و') continue; // امتحانات العربي هنا غالبًا أ–د فقط
+
+    if (opt.image_id) {
+      cleaned.push({ ...opt, label: label || opt.label });
+      continue;
+    }
+
+    const text = (opt.text || '').trim();
+    if (!text) continue;
+    if (looksLikeLeakedQuestionStem(text)) continue;
+    if (otherStems.some((stem) => text === stem || (text.length > 30 && stem.includes(text)) || (stem.length > 30 && text.includes(stem.slice(0, 48))))) {
+      continue;
+    }
+    const key = text.replace(/\s+/g, ' ');
+    if (seenText.has(key)) continue;
+    seenText.add(key);
+    cleaned.push({ ...opt, label: label || opt.label, text });
+  }
+
+  const labels = ['أ', 'ب', 'ج', 'د'] as const;
+  const capped = cleaned.slice(0, 4).map((opt, i) => ({
+    ...opt,
+    label: labels[i] || normalizeOptionLabel(opt.label) || labels[i],
+  }));
+
+  return { ...question, options: capped };
+}
+
+function hydrateOptionImageUrls(questions: MistralExtractedQuestion[]): MistralExtractedQuestion[] {
+  return questions.map((q) => {
+    const urlById = new Map<string, string>();
+    for (const im of q.question_images || []) {
+      if (im.image_id && im.image_url) urlById.set(im.image_id, im.image_url);
+    }
+    return {
+      ...q,
+      options: (q.options || []).map((opt) => {
+        if (!opt.image_id) return opt;
+        const image_url = opt.image_url || urlById.get(opt.image_id);
+        return image_url ? { ...opt, image_url } : opt;
+      }),
+    };
+  });
+}
+
+function questionReferencesFigure(question: MistralExtractedQuestion): boolean {
+  const text = `${question.question_text || ''} ${question.prompt_text || ''} ${question.intro_text || ''}`;
+  return /الشكل|المقابل|الموضح|الرسوم|مخطط/u.test(text);
+}
+
+/** انقل question_figure من سؤال لا يذكر شكلًا إلى أقرب سؤال يذكر الشكل المقابل. */
+function relocateMisplacedFigures(questions: MistralExtractedQuestion[]): MistralExtractedQuestion[] {
+  const next = questions.map((q) => ({
+    ...q,
+    question_images: [...(q.question_images || [])],
+    options: [...(q.options || [])],
+  }));
+
+  for (let qi = 0; qi < next.length; qi++) {
+    const q = next[qi];
+    if (questionReferencesFigure(q)) continue;
+    const figures = (q.question_images || []).filter((im) => {
+      if ((q.options || []).some((o) => o.image_id === im.image_id)) return false;
+      const type = (im.image_type || '').toLowerCase();
+      return (
+        type === 'question_figure' ||
+        /فين|venn|مخطط/i.test(`${im.short_description || ''} ${im.summary || ''}`)
+      );
+    });
+    if (!figures.length) continue;
+
+    const targetIdx = next.findIndex(
+      (cand, idx) =>
+        idx !== qi &&
+        questionReferencesFigure(cand) &&
+        !(cand.question_images || []).some((im) => figures.some((f) => f.image_id === im.image_id)),
+    );
+    if (targetIdx < 0) continue;
+
+    const moveIds = new Set(figures.map((f) => f.image_id));
+    next[qi] = {
+      ...next[qi],
+      question_images: (next[qi].question_images || []).filter((im) => !moveIds.has(im.image_id)),
+    };
+    next[targetIdx] = {
+      ...next[targetIdx],
+      question_images: [...(next[targetIdx].question_images || []), ...figures],
+    };
+  }
+
+  return next;
+}
+
+function cleanQuestionTextFromOptionLeak(
+  questionText: string,
+  options: Array<{ text?: string | null }>,
+): string {
+  let text = (questionText || '').trim();
+  if (!text) return text;
+  text = text.replace(/\nIMAGE_CONTEXT:[\s\S]*$/i, '').trim();
+  text = text.replace(/(?:\n|^)\s*!\[[^\]]*]\([^)]+\)\s*/g, '\n').trim();
+
+  for (const opt of options) {
+    const optText = (opt.text || '').trim();
+    if (optText.length < 3) continue;
+    const escaped = optText.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    text = text.replace(new RegExp(`(?:\\n|^)\\s*[0-9٠-٩]{1,3}\\s*[)）．.\\-:]\\s*${escaped}\\s*`, 'g'), '\n');
+    text = text.replace(new RegExp(`(?:\\n|^)\\s*${escaped}\\s*(?=\\n|$)`, 'g'), '\n');
+  }
+
+  // أزل أسطر الاختيارات المرقّمة بعد سطر السؤال الأول
+  const lines = text.split(/\n/).map((l) => l.trim()).filter(Boolean);
+  if (lines.length > 1) {
+    const kept = [lines[0].replace(/^\s*[0-9٠-٩]{1,3}\s*[)）．.\-:]\s*/, '').trim() || lines[0]];
+    for (let i = 1; i < lines.length; i++) {
+      if (/^[0-9٠-٩]{1,3}\s*[)）．.\-:]/.test(lines[i])) continue;
+      if (/^[أابجدهـABCDE]\s*[)）．.\-:]/.test(lines[i])) continue;
+      kept.push(lines[i]);
+    }
+    text = kept.join('\n\n');
+  }
+
+  return text.replace(/\n{3,}/g, '\n\n').trim();
+}
+
 function extractArabicMcqOptionsFromSlice(slice: string): Array<{ label: string; text: string }> {
   const source = slice
     .replace(/[Ⓐⓐ🄐]/g, 'أ) ')
@@ -938,12 +1198,19 @@ function extractArabicMcqOptionsFromSlice(slice: string): Array<{ label: string;
     .replace(/[Ⓒⓒ🄒]/g, 'ج) ')
     .replace(/[Ⓓⓓ🄓]/g, 'د) ');
 
-  const labelRe = /(?:^|[\s\n])(?:\(|\[)?([أابجدهـ])(?:\)|\]|[)）.\-:])\s*/gu;
+  // يدعم: (أ) / أ) / أ. / أ: وأيضًا صفّين في شبكة 2×2 على سطر واحد أو سطرين
+  const labelRe =
+    /(?:^|[\s\n\r\t\|]| {2,})(?:\(|\[)?([أابجدهـABCDE])(?:\)|\]|[)）.\-:])\s*/gu;
   const marks: Array<{ label: string; matchStart: number; textStart: number }> = [];
   let match: RegExpExecArray | null;
   while ((match = labelRe.exec(source)) !== null) {
+    const raw = match[1];
+    const label =
+      LATIN_TO_AR_OPTION[raw] ||
+      LATIN_TO_AR_OPTION[raw.toLowerCase()] ||
+      normalizeOptionLabel(raw);
     marks.push({
-      label: normalizeOptionLabel(match[1]),
+      label,
       matchStart: match.index,
       textStart: match.index + match[0].length,
     });
@@ -953,17 +1220,45 @@ function extractArabicMcqOptionsFromSlice(slice: string): Array<{ label: string;
   for (let i = 0; i < marks.length; i++) {
     const end = i + 1 < marks.length ? marks[i + 1].matchStart : source.length;
     let text = source.slice(marks[i].textStart, end);
-    text = text.split(/\n\s*\d{1,3}\s*[)）．.\-:]/)[0];
-    text = text.replace(/\s+/g, ' ').trim();
-    if (!text) continue;
+    // لا تقطع عند سطر جديد داخل شبكة 2×2 — اقطع فقط عند رقم سؤال لاحق
+    text = text.split(/\n\s*\d{1,3}\s*[)）．.\-:]\s/)[0];
+    text = text.replace(/!\[[^\]]*]\([^)]+\)/g, ' ').replace(/\s+/g, ' ').trim();
+    // اختيار صوري بدون نص OCR — اعتبره موجودًا بنص فارغ ليُربط لاحقًا بالصورة
+    if (!text) {
+      if (!found.has(marks[i].label)) found.set(marks[i].label, '');
+      continue;
+    }
     if (text.length > 400) text = text.slice(0, 400).trim();
-    if (!found.has(marks[i].label)) found.set(marks[i].label, text);
+    const prev = found.get(marks[i].label);
+    if (!prev || text.length > prev.length) found.set(marks[i].label, text);
   }
 
-  const order = ['أ', 'ب', 'ج', 'د', 'هـ'];
+  const order = ['أ', 'ب', 'ج', 'د'];
   return order
     .filter((label) => found.has(label))
-    .map((label) => ({ label, text: found.get(label)! }));
+    .map((label) => ({ label, text: found.get(label)! }))
+    .filter((o) => !looksLikeLeakedQuestionStem(o.text));
+}
+
+function toArabicIndicDigits(value: string | number): string {
+  const map = ['٠', '١', '٢', '٣', '٤', '٥', '٦', '٧', '٨', '٩'];
+  return String(value).replace(/\d/g, (d) => map[Number(d)] || d);
+}
+
+function findNumberedBlockStart(documentText: string, sourceNo: string): number {
+  const western = toWesternDigits(sourceNo).trim();
+  const arabic = toArabicIndicDigits(western);
+  const variants = [...new Set([sourceNo.trim(), western, arabic].filter(Boolean))];
+  for (const variant of variants) {
+    const escaped = variant.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const startRe = new RegExp(
+      `(?:^|\\n)\\s*(?:#{1,3}\\s*)?(?:\\*\\*)?(?<![0-9٠-٩])${escaped}(?![0-9٠-٩])(?:\\*\\*)?\\s*[)）．.\\-:]*`,
+      'm',
+    );
+    const startMatch = documentText.match(startRe);
+    if (startMatch?.index != null) return startMatch.index;
+  }
+  return -1;
 }
 
 function findQuestionSlice(
@@ -972,32 +1267,23 @@ function findQuestionSlice(
   nextQuestion?: MistralExtractedQuestion,
 ): string | null {
   const sourceNo = (question.source_number || String(question.number)).trim();
-  const escaped = sourceNo.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const startRe = new RegExp(
-    `(?:^|\\n)\\s*(?:#{1,3}\\s*)?(?:\\*\\*)?(?<!\\d)${escaped}(?!\\d)(?:\\*\\*)?\\s*[)）．.\\-:]*`,
-    'm',
-  );
-  const startMatch = documentText.match(startRe);
-  let start = startMatch?.index ?? -1;
+  let start = findNumberedBlockStart(documentText, sourceNo);
 
   if (start < 0) {
-    const needle = (question.question_text || '').trim().slice(0, 32);
+    const needle = stripMarkdownImages((question.prompt_text || question.question_text || '').trim()).slice(
+      0,
+      40,
+    );
     if (needle.length >= 10) start = documentText.indexOf(needle);
   }
   if (start < 0) return null;
 
-  let end = Math.min(documentText.length, start + 1800);
+  let end = Math.min(documentText.length, start + 2200);
   if (nextQuestion) {
     const nextNo = (nextQuestion.source_number || String(nextQuestion.number)).trim();
-    const nextEscaped = nextNo.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const nextRe = new RegExp(
-      `(?:^|\\n)\\s*(?:#{1,3}\\s*)?(?:\\*\\*)?(?<!\\d)${nextEscaped}(?!\\d)(?:\\*\\*)?\\s*[)）．.\\-:]*`,
-      'm',
-    );
-    const rest = documentText.slice(start + 1);
-    const nextMatch = rest.match(nextRe);
-    if (nextMatch?.index != null) {
-      end = start + 1 + nextMatch.index;
+    const nextStart = findNumberedBlockStart(documentText.slice(start + 1), nextNo);
+    if (nextStart >= 0) {
+      end = start + 1 + nextStart;
     }
   }
 
@@ -1014,8 +1300,36 @@ function extractQuestionStemFromSlice(slice: string): string {
   return stem;
 }
 
+function mergeTextOptions(
+  current: Array<{ label: string; text?: string | null }>,
+  recovered: Array<{ label: string; text: string }>,
+): Array<{ label: string; text: string }> {
+  const byLabel = new Map<string, { label: string; text: string }>();
+  for (const opt of current) {
+    const label = normalizeOptionLabel(opt.label);
+    const text = (opt.text || '').trim();
+    if (label && text) byLabel.set(label, { label, text });
+  }
+  for (const opt of recovered) {
+    const label = normalizeOptionLabel(opt.label);
+    const text = (opt.text || '').trim();
+    if (!label || !text) continue;
+    const existing = byLabel.get(label);
+    // تجنّب تكرار نفس النص على أ وب بالخطأ من OCR
+    const duplicate = [...byLabel.values()].some(
+      (o) => o.label !== label && o.text === text && text.length > 12,
+    );
+    if (duplicate && existing) continue;
+    if (!existing || text.length > existing.text.length) {
+      byLabel.set(label, { label, text });
+    }
+  }
+  return sortMcqOptions([...byLabel.values()]);
+}
+
 /**
- * إذا رجّع النموذج اختيارين فقط أو أسقط نص الاقتباس — أكمل من مقطع OCR.
+ * إذا رجّع النموذج اختيارين فقط (مثل صف علوي من شبكة 2×2) أو أسقط نصًا — أكمل/ادمج من مقطع OCR.
+ * يدعم أيضًا خطأ OCR الشائع: ترقيم الاختيارات ٢)٣)٤)٥) بدل أ)ب)ج)د).
  */
 function repairSparseTextOptions(
   questions: MistralExtractedQuestion[],
@@ -1024,21 +1338,61 @@ function repairSparseTextOptions(
   return questions.map((question, index) => {
     if ((question.options || []).some((o) => o.image_id)) return question;
 
-    const slice = findQuestionSlice(documentText, question, questions[index + 1]);
+    const slice =
+      findQuestionSlice(documentText, question, questions[index + 1]) ||
+      question.question_text ||
+      '';
     if (!slice) return question;
 
     let next = question;
     const textOpts = (question.options || []).filter((o) => (o.text || '').trim());
-    if (textOpts.length < 4) {
-      const recovered = extractArabicMcqOptionsFromSlice(slice);
-      if (recovered.length > textOpts.length && recovered.length >= 3) {
-        next = { ...next, options: recovered };
+    const uniqueTexts = new Set(textOpts.map((o) => (o.text || '').trim()));
+    const needsRepair = textOpts.length < 4 || uniqueTexts.size < Math.min(3, textOpts.length);
+
+    if (needsRepair) {
+      const keepClean = (opts: Array<{ label: string; text: string }>) =>
+        opts.filter((o) => (o.text || '').trim() && !looksLikeLeakedQuestionStem(o.text));
+
+      const fromLetters = keepClean(extractArabicMcqOptionsFromSlice(slice));
+      const fromNumbers = keepClean(
+        extractOptionsFromFalseNumberedSlice(slice, question.source_number || question.number),
+      );
+      // لا تستخدم كامل المستند هنا — يلتقط أسئلة لاحقة كاختيارات بالخطأ
+
+      const currentClean = (question.options || []).filter(
+        (o) => (o.text || '').trim() && !looksLikeLeakedQuestionStem(o.text || ''),
+      );
+      let merged = mergeTextOptions(currentClean, fromLetters);
+      merged = mergeTextOptions(merged, fromNumbers);
+      merged = keepClean(merged).slice(0, 4);
+
+      if (merged.length > currentClean.length && merged.length >= 3) {
+        next = { ...next, options: merged };
+      } else if (currentClean.length >= 2 && currentClean.length < (question.options || []).length) {
+        // النموذج رجّع اختيارات ملوّثة — أبقِ النظيفة فقط
+        next = { ...next, options: currentClean.slice(0, 4) };
       }
+    }
+
+    const cleanedText = cleanQuestionTextFromOptionLeak(
+      next.question_text || '',
+      next.options || [],
+    );
+    if (cleanedText && cleanedText !== (next.question_text || '').trim()) {
+      next = {
+        ...next,
+        question_text: cleanedText,
+        prompt_text: next.prompt_text || cleanedText,
+      };
     }
 
     const recoveredStem = extractQuestionStemFromSlice(slice);
     const current = (next.question_text || '').trim();
-    if (hasUnderlineMarkup(current) || (next.underlined_phrases?.length ?? 0) > 0 || (next.display_blocks?.length ?? 0) > 1) {
+    if (
+      hasUnderlineMarkup(current) ||
+      (next.underlined_phrases?.length ?? 0) > 0 ||
+      (next.display_blocks?.length ?? 0) > 1
+    ) {
       return next;
     }
     const currentHead = current.slice(0, 20);
@@ -1050,10 +1404,203 @@ function repairSparseTextOptions(
         (currentHead && recoveredStem.includes(currentHead)) ||
         (recoveredHead && current.includes(recoveredHead)))
     ) {
-      next = { ...next, question_text: recoveredStem };
+      next = {
+        ...next,
+        question_text: cleanQuestionTextFromOptionLeak(recoveredStem, next.options || []),
+      };
     }
 
     return next;
+  });
+}
+
+function isChoiceOptionImage(image: {
+  image_type?: string | null;
+  short_description?: string | null;
+  summary?: string | null;
+}): boolean {
+  const type = (image.image_type || '').toLowerCase();
+  if (type === 'choice_option' || type.includes('choice')) return true;
+  const blob = `${image.short_description || ''} ${image.summary || ''}`.toLowerCase();
+  return /choice_option|answer choice|option thumbnail|اختيار|بديل\s*[أبجدهa-d]/i.test(blob);
+}
+
+function isLikelyImageChoicesQuestion(question: MistralExtractedQuestion): boolean {
+  const opts = question.options || [];
+  if (opts.some((o) => o.image_id)) return true;
+  const textOpts = opts.filter((o) => (o.text || '').trim());
+  // لا اختيارات نصية — جرّب ربط صور choice_option إن وُجدت في المقطع
+  if (textOpts.length === 0) return true;
+  // نص اختيار ضعيف جدًا مع بقاء أقل من 3 — غالبًا صف اختيارات مصوّرة
+  if (textOpts.length < 3) {
+    const avgLen =
+      textOpts.reduce((sum, o) => sum + (o.text || '').trim().length, 0) / textOpts.length;
+    if (avgLen <= 8) return true;
+  }
+  const stem = `${question.question_text || ''} ${question.prompt_text || ''}`;
+  if (
+    textOpts.length < 3 &&
+    /(?:الأشكال|الرسومات|الشكل\s+الموضح|أي\s+الأشكال|الخيارات\s+التالية\s+تمثل)/u.test(stem)
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function resolveOcrImageById(
+  ocrImages: InternalQuestionImage[],
+  imageId: string,
+): InternalQuestionImage | undefined {
+  const needle = imageId.trim();
+  if (!needle) return undefined;
+  return (
+    ocrImages.find((img) => img.image_id === needle) ||
+    ocrImages.find((img) => img.image_id.replace(/\.(jpeg|jpg|png|webp)$/i, '') === needle.replace(/\.(jpeg|jpg|png|webp)$/i, '')) ||
+    ocrImages.find((img) => needle.includes(img.image_id) || img.image_id.includes(needle))
+  );
+}
+
+/**
+ * يربط صور OCR / مراجع markdown باختيارات أ–د عندما تكون الاختيارات رسومات.
+ */
+function repairImageChoiceOptions(
+  questions: MistralExtractedQuestion[],
+  ocrImages: InternalQuestionImage[],
+  documentText: string,
+): MistralExtractedQuestion[] {
+  const usedImageIds = new Set<string>();
+  for (const q of questions) {
+    for (const o of q.options || []) {
+      if (o.image_id) usedImageIds.add(o.image_id);
+    }
+  }
+
+  const labels = ['أ', 'ب', 'ج', 'د'] as const;
+
+  return questions.map((question, index) => {
+    const textOpts = (question.options || []).filter((o) => (o.text || '').trim());
+    const existingImageOpts = (question.options || []).filter((o) => o.image_id);
+
+    if (existingImageOpts.length >= 4) {
+      return question;
+    }
+    // اختيارات نصية مكتملة (3+) بدون صور — اتركها
+    if (textOpts.length >= 3 && existingImageOpts.length === 0) {
+      return question;
+    }
+
+    const slice =
+      findQuestionSlice(documentText, question, questions[index + 1]) ||
+      question.question_text ||
+      '';
+    const markdownIds = extractMarkdownImageIds(`${slice}\n${question.question_text || ''}`);
+    const sliceImages = ocrImages.filter((img) => {
+      if (!img.image_id || usedImageIds.has(img.image_id)) return false;
+      if (slice && slice.includes(img.image_id)) return true;
+      return markdownIds.some(
+        (id) =>
+          id === img.image_id ||
+          id.replace(/\.(jpeg|jpg|png|webp)$/i, '') ===
+            img.image_id.replace(/\.(jpeg|jpg|png|webp)$/i, ''),
+      );
+    });
+
+    // صور مذكورة في markdown حتى لو ناقصة من ocrImages (نضيف مرجعًا؛ الرفع لاحقًا إن وُجد base64)
+    const markdownOnly = markdownIds
+      .filter((id) => !usedImageIds.has(id))
+      .filter((id) => !sliceImages.some((img) => img.image_id === id || id.includes(img.image_id)))
+      .map(
+        (id) =>
+          resolveOcrImageById(ocrImages, id) ||
+          ({
+            image_id: id,
+            page_index: null,
+            image_type: 'choice_option',
+          } as InternalQuestionImage),
+      );
+
+    let candidates = [...sliceImages, ...markdownOnly].filter(
+      (img, i, arr) => arr.findIndex((x) => x.image_id === img.image_id) === i,
+    );
+
+    const choiceTyped = candidates.filter(isChoiceOptionImage);
+    if (choiceTyped.length >= 2) {
+      candidates = choiceTyped;
+    } else {
+      const stemIds = new Set(
+        (question.question_images || [])
+          .filter((im) => (im.image_type || '').toLowerCase() === 'question_figure')
+          .map((im) => im.image_id),
+      );
+      candidates = candidates.filter((img) => !stemIds.has(img.image_id));
+    }
+
+    // سؤال نصي ناقص + عدة صور في المقطع = اختيارات مصوّرة (أو سؤال تالٍ اندمج)
+    const shouldBindImages =
+      isLikelyImageChoicesQuestion(question) ||
+      (textOpts.length < 3 && candidates.length >= 2) ||
+      (textOpts.length <= 2 && markdownIds.length >= 2);
+
+    if (!shouldBindImages || candidates.length < 2) {
+      return question;
+    }
+
+    const already = new Map(
+      existingImageOpts.map((o) => [normalizeOptionLabel(o.label), o.image_id!]),
+    );
+    const remaining = candidates.filter((img) => ![...already.values()].includes(img.image_id));
+    if (already.size + remaining.length < 2) {
+      return question;
+    }
+
+    const assigned: Array<{ label: string; text: string; image_id: string }> = [];
+    for (const label of labels) {
+      const existingId = already.get(label);
+      if (existingId) {
+        assigned.push({ label, text: '', image_id: existingId });
+        continue;
+      }
+      const nextImg = remaining.shift();
+      if (!nextImg) break;
+      assigned.push({ label, text: '', image_id: nextImg.image_id });
+      usedImageIds.add(nextImg.image_id);
+    }
+
+    if (assigned.length < 2) return question;
+    for (const opt of assigned) usedImageIds.add(opt.image_id);
+
+    const optionImageRefs = assigned.map((opt) => {
+      const ocrImage = resolveOcrImageById(ocrImages, opt.image_id);
+      return {
+        image_id: opt.image_id,
+        page_index: ocrImage?.page_index ?? null,
+        image_type: ocrImage?.image_type || 'choice_option',
+        short_description: ocrImage?.short_description,
+        summary: ocrImage?.summary,
+        educational_relevance: ocrImage?.educational_relevance,
+        image_base64: ocrImage?.image_base64,
+        image_url: ocrImage?.image_url,
+      };
+    });
+
+    const keptStemImages = (question.question_images || []).filter(
+      (im) => !assigned.some((o) => o.image_id === im.image_id),
+    );
+
+    // إن كانت هناك اختيارات نصية جيدة (3+) لا تستبدلها بالصور
+    if (textOpts.length >= 3) {
+      return {
+        ...question,
+        question_images: [...keptStemImages, ...optionImageRefs],
+      };
+    }
+
+    return {
+      ...question,
+      options: assigned,
+      question_images: [...keptStemImages, ...optionImageRefs],
+      question_text: cleanQuestionTextFromOptionLeak(question.question_text || '', assigned),
+    };
   });
 }
 
@@ -1142,6 +1689,49 @@ function normalizeExtractionPayload(raw: unknown): unknown {
   }
 
   return data;
+}
+
+/**
+ * Mistral/DeepSeek أحياناً ترجع question_images كمصفوفة strings (image_id)
+ * بدل objects — نحوّلها للشكل المتوقع قبل Zod.
+ */
+function normalizeLooseQuestionImages(raw: unknown): Array<Record<string, unknown>> {
+  if (!Array.isArray(raw)) return [];
+  const out: Array<Record<string, unknown>> = [];
+  for (const item of raw) {
+    if (typeof item === 'string') {
+      const image_id = item.trim();
+      if (image_id) out.push({ image_id });
+      continue;
+    }
+    if (!item || typeof item !== 'object') continue;
+    const o = item as Record<string, unknown>;
+    const image_id = String(o.image_id ?? o.id ?? o.imageId ?? '').trim();
+    if (!image_id) continue;
+    const pageRaw = o.page_index ?? o.pageIndex;
+    const page_index =
+      pageRaw == null || pageRaw === ''
+        ? null
+        : Number.isFinite(Number(pageRaw))
+          ? Number(pageRaw)
+          : null;
+    out.push({
+      ...o,
+      image_id,
+      page_index,
+      ...(typeof o.image_url === 'string'
+        ? { image_url: o.image_url }
+        : typeof o.imageUrl === 'string'
+          ? { image_url: o.imageUrl }
+          : {}),
+      ...(typeof o.image_type === 'string'
+        ? { image_type: o.image_type }
+        : typeof o.imageType === 'string'
+          ? { image_type: o.imageType }
+          : {}),
+    });
+  }
+  return out;
 }
 
 function normalizeLooseQuestion(
@@ -1253,54 +1843,6 @@ function normalizeLooseQuestion(
   };
 }
 
-type LooseQuestionImage = {
-  image_id: string;
-  page_index?: unknown;
-  image_url?: string;
-  image_type?: string;
-  short_description?: unknown;
-  summary?: unknown;
-  educational_relevance?: unknown;
-  [key: string]: unknown;
-};
-
-/** Coerce Chat quirks: ["img-0", {image_id:"img-1"}] → objects with image_id. */
-function normalizeLooseQuestionImages(raw: unknown): LooseQuestionImage[] {
-  if (!Array.isArray(raw)) return [];
-  const out: LooseQuestionImage[] = [];
-  for (const item of raw) {
-    if (typeof item === 'string') {
-      const imageId = item.trim();
-      if (imageId) out.push({ image_id: imageId });
-      continue;
-    }
-    if (!item || typeof item !== 'object') continue;
-    const img = item as Record<string, unknown>;
-    const imageId = String(img.image_id ?? img.imageId ?? img.id ?? '').trim();
-    if (!imageId) continue;
-    out.push({
-      ...img,
-      image_id: imageId,
-      ...(img.page_index !== undefined
-        ? { page_index: img.page_index }
-        : img.pageIndex !== undefined
-          ? { page_index: img.pageIndex }
-          : {}),
-      ...(typeof img.image_url === 'string'
-        ? { image_url: img.image_url }
-        : typeof img.imageUrl === 'string'
-          ? { image_url: img.imageUrl }
-          : {}),
-      ...(typeof img.image_type === 'string'
-        ? { image_type: img.image_type }
-        : typeof img.imageType === 'string'
-          ? { image_type: img.imageType }
-          : {}),
-    });
-  }
-  return out;
-}
-
 async function parseQuestionsWithChat(
   documentText: string,
   filename: string,
@@ -1315,9 +1857,16 @@ async function parseQuestionsWithChat(
   chatModel: string;
 }> {
   const { apiKey, apiBaseUrl } = getMistralConfig();
-  const chatModel = resolveChatModel(chatModelOverride);
+  let chatModel = resolveChatModel(chatModelOverride);
+  // DeepSeek نصّي فقط — لصفحات الصور (2×2 / اختيارات رسومية) نستخدم Mistral Vision تلقائيًا
+  if (pageImages.length > 0 && isDeepSeekChatModel(chatModel)) {
+    logger.warn(
+      { requested: chatModel, fallback: DEFAULT_MISTRAL_CHAT_MODEL, pages: pageImages.length },
+      'question extraction: DeepSeek is text-only; using Mistral vision for page images',
+    );
+    chatModel = DEFAULT_MISTRAL_CHAT_MODEL;
+  }
   const useDeepSeek = isDeepSeekChatModel(chatModel);
-  // DeepSeek chat is text-only; keep page images only for Mistral vision models.
   const hasPageImages = pageImages.length > 0 && !useDeepSeek;
   const mode = resolveExtractionMode(subject);
 
@@ -1460,9 +2009,14 @@ async function parseQuestionsWithChat(
   );
   const folded = foldSingletonPassages(expanded.passages, expanded.questions);
   const repairedQuestions = repairSparseTextOptions(folded.questions, documentText);
+  let sanitizedQuestions = repairedQuestions.map((q, _i, arr) => sanitizeMcqOptions(q, arr));
+  // بعد حذف الاختيارات الملوّثة: أعد المحاولة لاستكمال أ–د من الـ slice فقط
+  sanitizedQuestions = repairSparseTextOptions(sanitizedQuestions, documentText).map((q, _i, arr) =>
+    sanitizeMcqOptions(q, arr),
+  );
   return {
     passages: folded.passages,
-    questions: repairedQuestions,
+    questions: sanitizedQuestions,
     notes: validated.notes,
     chatModel: usedModel,
   };
@@ -1810,17 +2364,23 @@ export class MistralQuestionExtractionService {
     );
     const questionsWithPassages = fillMissingPassageIds(questions, passages);
     const attachedQuestions = opts.includeQuestionImages
-      ? attachOcrImages(
-          attachTablesByMarkdownProximity(questionsWithPassages, ocr, extractedImages),
+      ? repairImageChoiceOptions(
+          attachOcrImages(
+            attachTablesByMarkdownProximity(questionsWithPassages, ocr, extractedImages),
+            extractedImages,
+          ),
           extractedImages,
+          documentContext,
         )
       : questionsWithPassages.map((q) => ({ ...q, question_images: [] }));
 
-    let questionsWithImages = attachedQuestions;
+    let questionsWithImages = relocateMisplacedFigures(
+      attachedQuestions.map((q, _i, arr) => sanitizeMcqOptions(q, arr)),
+    );
     let imageUploadWarnings: string[] = [];
     if (opts.includeQuestionImages) {
-      const uploadResult = await uploadQuestionImagesToCloudinary(attachedQuestions);
-      questionsWithImages = uploadResult.questions;
+      const uploadResult = await uploadQuestionImagesToCloudinary(questionsWithImages);
+      questionsWithImages = hydrateOptionImageUrls(uploadResult.questions);
       imageUploadWarnings = uploadResult.warnings;
     }
 
@@ -1829,7 +2389,7 @@ export class MistralQuestionExtractionService {
       mime_type: ocr.mime_type,
       document_type: ocr.document_type,
       page_count: ocr.page_count,
-      question_count: questions.length,
+      question_count: questionsWithImages.length,
       ocr_model: ocr.model,
       chat_model: chatModel,
       infer_correct_answer: opts.inferCorrectAnswer,

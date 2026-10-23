@@ -4,6 +4,7 @@ import pool from '../db/pool';
 import { asyncWrapper, HttpError } from '../utils';
 import { TeacherActivityLogService } from '../services/teacherActivityLog';
 import { TeacherReadingPassagesService } from '../services/teacherReadingPassages';
+import { resolveOptionalPassageIdUpdate } from '../services/passageHelpers';
 
 export const router = Router();
 
@@ -506,10 +507,15 @@ router.put(
     } = req.body;
     const teacher_id = req.user!.id;
     const questionIdNum = Number(req.params.id);
-    const passageId = parseNullableNumber(req.body.passage_id, 'passage_id');
+    let passageIdUpdate: { present: false } | { present: true; value: number | null };
+    try {
+      passageIdUpdate = resolveOptionalPassageIdUpdate(req.body);
+    } catch {
+      throw new HttpError(400, 'passage_id غير صحيح');
+    }
 
     const check = await pool.query(
-      `SELECT q.id, q.lesson_id
+      `SELECT q.id, q.lesson_id, q.passage_id
        FROM teacher_questions q
        JOIN teacher_question_lessons l ON q.lesson_id = l.id
        WHERE q.id = $1 AND l.teacher_id = $2`,
@@ -517,8 +523,12 @@ router.put(
     );
     if (!check.rowCount) throw new HttpError(404, 'السؤال غير موجود');
 
-    if (passageId != null) {
-      const passage = await verifyPassageOwnership(passageId, teacher_id);
+    const nextPassageId = passageIdUpdate.present
+      ? passageIdUpdate.value
+      : (check.rows[0].passage_id as number | null);
+
+    if (nextPassageId != null) {
+      const passage = await verifyPassageOwnership(nextPassageId, teacher_id);
       if (!passage || passage.lesson_id !== Number(check.rows[0].lesson_id)) {
         throw new HttpError(404, 'القطعة غير موجودة داخل هذا الدرس');
       }
@@ -543,7 +553,7 @@ router.put(
         question_type,
         choices ? JSON.stringify(choices) : null,
         answer,
-        passageId,
+        nextPassageId,
         image_url || null,
         correct_answer_index ?? null,
         explanation || null,
@@ -559,7 +569,10 @@ router.put(
       entity_id: questionIdNum,
       description: `تعديل سؤال: ${question_text}`,
     });
-    res.json({ question: result.rows[0] });
+    const passageMap = await TeacherReadingPassagesService.loadPassageMapForQuestions(result.rows);
+    res.json({
+      question: TeacherReadingPassagesService.attachPassageToQuestion(result.rows[0], passageMap),
+    });
   }),
 );
 

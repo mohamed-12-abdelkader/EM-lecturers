@@ -87,6 +87,15 @@ export class TeacherTrashService {
       return this.restoreSnapshot(teacherId, id);
     }
 
+    // platform_student: جرّب soft-restore أولاً، ثم snapshot إن فشل (حذف نهائي قديم)
+    if (type === 'platform_student') {
+      const liveOk = await TeacherTrashRepository.restorePlatformStudentLive(id, teacherId);
+      if (liveOk) {
+        return { restored: true, type, id, entityId: id };
+      }
+      return this.restoreSnapshot(teacherId, id);
+    }
+
     if (TeacherTrashRepository.isKnownLiveType(type)) {
       const ok = await this.restoreLive(type, id, teacherId);
       if (!ok) {
@@ -116,6 +125,8 @@ export class TeacherTrashService {
         return TeacherTrashRepository.restoreTeacherFile(id, teacherId);
       case 'course_file':
         return TeacherTrashRepository.restoreCourseFile(id, teacherId);
+      case 'platform_student':
+        return TeacherTrashRepository.restorePlatformStudentLive(id, teacherId);
       default:
         return false;
     }
@@ -142,12 +153,25 @@ export class TeacherTrashService {
       case 'lecture':
         entityId = await TeacherTrashRepository.restoreLectureFromSnapshot(snapshot, teacherId);
         break;
+      case 'platform_student':
+        entityId = await TeacherTrashRepository.restorePlatformStudentFromSnapshot(
+          snapshot,
+          teacherId,
+          {
+            tenantId: row.tenant_id != null ? Number(row.tenant_id) : null,
+            entityId: row.entity_id != null ? Number(row.entity_id) : null,
+          },
+        );
+        break;
       default:
         throw new HttpError(400, `نوع الاستعادة غير مدعوم: ${row.entity_type}`);
     }
 
     if (!entityId) {
-      throw new HttpError(409, 'تعذّرت استعادة العنصر — قد يكون موجوداً بالفعل أو بياناته ناقصة');
+      throw new HttpError(
+        409,
+        'تعذّرت استعادة العنصر — قد يكون موجوداً بالفعل أو بياناته ناقصة',
+      );
     }
 
     await TeacherTrashRepository.markSnapshotRestored(snapshotId, teacherId);
