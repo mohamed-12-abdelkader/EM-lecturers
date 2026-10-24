@@ -16,6 +16,10 @@
 | `POST` | `/teacher/points/manual` | teacher / academy / admin | منح نقاط يدوية لطالب |
 | `DELETE` | `/teacher/points/transactions/:transactionId` | teacher / academy / admin | حذف نقاط يدوية منحها المدرس |
 | `POST` | `/teacher/points/reset` | teacher / academy / admin | تصفير النقاط مع حفظ موسم أرشيفي قابل للاسترجاع |
+| `GET` | `/teacher/points/grade-anchors` | teacher / academy / admin | امتحان بداية النقاط لكل صف |
+| `GET` | `/teacher/points/grade-anchors/:gradeId` | teacher / academy / admin | تفاصيل مرساة الصف + قائمة الامتحانات للاختيار |
+| `PUT` | `/teacher/points/grade-anchors/:gradeId` | teacher / academy / admin | تعيين امتحان بداية حساب النقاط للصف (بدون تصفير) |
+| `POST` | `/teacher/points/reset-and-start-from-exam` | teacher / academy / admin | تصفير صف + بدء النقاط من امتحان مختار وكل ما بعده |
 | `POST` | `/teacher/points/reset-and-rebuild-last-exam` | teacher / academy / admin | حذف كل النقاط ثم منح بدء+درجة آخر امتحان فقط لكل صف |
 | `GET` | `/teacher/points/seasons` | teacher / academy / admin | قائمة مواسم النقاط المؤرشفة |
 | `GET` | `/teacher/points/seasons/:seasonId` | teacher / academy / admin | تفاصيل موسم + أرصدة الطلاب فيه |
@@ -36,6 +40,7 @@
 - رصيد الطالب وترتيبه داخل زوج: **`teacher_id` + `grade_id`** (الصف الدراسي).
 - نقاط مدرس A في الصف 1 **لا تظهر** في ترتيب مدرس B أو صف 2.
 - `study_groups` تُستخدم فقط **لفلترة عرض** قائمة الترتيب عند المدرس، وليست scope للرصيد.
+- لكل صف يمكن للمدرس تعيين **امتحان بداية** (`teacher_grade_points_anchors`): يُحسب الامتحان المختار وكل امتحان شامل بعده حتى التصفير وبدء نافذة جديدة. بدون مرساة = آخر امتحان شامل فقط. امتحانات المحاضرات لا تدخل الترتيب.
 
 ### 1.2 أنواع الأحداث (`event_type`)
 
@@ -461,6 +466,79 @@ Content-Type: application/json
   }
 }
 ```
+
+### 3.4.3b امتحان بداية النقاط لكل صف (نافذة الترتيب)
+
+المدرس يختار لكل صف من أي امتحان شامل يبدأ حساب النقاط؛ يُحسب هذا الامتحان **وأي امتحان شامل بعده** حتى يصفّر ويبدأ من امتحان آخر. امتحانات المحاضرات لا تدخل الترتيب. بدون مرساة = السلوك القديم (آخر امتحان فقط).
+
+```http
+GET /api/teacher/points/grade-anchors
+Authorization: Bearer <TEACHER_TOKEN>
+```
+
+```http
+GET /api/teacher/points/grade-anchors/1
+Authorization: Bearer <TEACHER_TOKEN>
+```
+
+**Response `200` (تفاصيل صف)**
+
+```json
+{
+  "success": true,
+  "data": {
+    "gradeId": 1,
+    "anchor": {
+      "startExamId": 55,
+      "startExamTitle": "امتحان الوحدة 2",
+      "startExamCreatedAt": "2026-03-01T10:00:00.000Z"
+    },
+    "mode": "from_exam_onward",
+    "eligibleExamIds": [55, 60, 62],
+    "exams": [
+      { "id": 40, "title": "امتحان قديم", "createdAt": "...", "submittedAttempts": 12 },
+      { "id": 55, "title": "امتحان الوحدة 2", "createdAt": "...", "submittedAttempts": 30 }
+    ]
+  }
+}
+```
+
+```http
+PUT /api/teacher/points/grade-anchors/1
+Authorization: Bearer <TEACHER_TOKEN>
+Content-Type: application/json
+```
+
+```json
+{ "startExamId": 55 }
+```
+
+- يغيّر امتحان البداية فقط **بدون** تصفير تلقائي.
+
+```http
+POST /api/teacher/points/reset-and-start-from-exam
+Authorization: Bearer <TEACHER_TOKEN>
+Content-Type: application/json
+```
+
+```json
+{
+  "confirm": "RESET_AND_START_FROM_EXAM",
+  "gradeId": 1,
+  "startExamId": 55,
+  "label": "بداية من امتحان الوحدة 2",
+  "reason": "ترم جديد"
+}
+```
+
+| الحقل | مطلوب؟ | الوصف |
+|-------|--------|--------|
+| `confirm` | نعم | `"RESET_AND_START_FROM_EXAM"` |
+| `gradeId` | نعم | الصف |
+| `startExamId` | نعم | امتحان بداية النافذة |
+| `label` / `reason` | لا | لاسم الموسم المؤرشف |
+
+- يصفّر نقاط هذا الصف (أرشيف موسم) → يثبّت المرساة → يعيد بناء نقاط البدء+الدرجة لكل امتحان مؤهل من البداية فصاعدًا.
 
 ### 3.4.4 مواسم النقاط المؤرشفة
 

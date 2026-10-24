@@ -52,6 +52,18 @@ const ResetAndRebuildLastExamSchema = z.object({
   reason: z.string().trim().max(500).optional().nullable(),
 });
 
+const SetGradePointsAnchorSchema = z.object({
+  startExamId: z.coerce.number().int().positive(),
+});
+
+const ResetAndStartFromExamSchema = z.object({
+  confirm: z.literal('RESET_AND_START_FROM_EXAM'),
+  gradeId: z.coerce.number().int().positive(),
+  startExamId: z.coerce.number().int().positive(),
+  label: z.string().trim().max(200).optional().nullable(),
+  reason: z.string().trim().max(500).optional().nullable(),
+});
+
 const RestoreSeasonSchema = z.object({
   confirm: z.literal('RESTORE_POINTS_SEASON'),
 });
@@ -242,6 +254,129 @@ router.post(
           success: false,
           message: error.message,
         });
+      }
+      throw error;
+    }
+  }),
+);
+
+/** GET /api/teacher/points/grade-anchors — امتحان بداية النقاط لكل صف */
+router.get(
+  '/grade-anchors',
+  authMiddleware(['teacher', 'academy', 'admin']),
+  asyncWrapper(async (req, res) => {
+    const teacherId = resolveTeacherId(req);
+    const data = await TeacherPointsService.listGradePointsAnchors(teacherId);
+    res.json({ success: true, data });
+  }),
+);
+
+/** GET /api/teacher/points/grade-anchors/:gradeId — تفاصيل + قائمة الامتحانات للاختيار */
+router.get(
+  '/grade-anchors/:gradeId',
+  authMiddleware(['teacher', 'academy', 'admin']),
+  asyncWrapper(async (req, res) => {
+    const teacherId = resolveTeacherId(req);
+    const gradeId = Number(req.params.gradeId);
+    if (!Number.isFinite(gradeId) || gradeId <= 0) {
+      return res.status(400).json({ success: false, message: 'gradeId غير صالح' });
+    }
+    const anchor = await TeacherPointsService.getGradePointsAnchor(teacherId, gradeId);
+    const exams = await TeacherPointsService.listCourseExamsForGrade({ teacherId, gradeId });
+    const eligibleExamIds = await TeacherPointsService.listEligibleCourseExamIds(
+      teacherId,
+      gradeId,
+    );
+    res.json({
+      success: true,
+      data: {
+        gradeId,
+        anchor,
+        mode: anchor ? 'from_exam_onward' : 'last_exam_only',
+        eligibleExamIds,
+        exams,
+      },
+    });
+  }),
+);
+
+/**
+ * PUT /api/teacher/points/grade-anchors/:gradeId
+ * تعيين امتحان بداية حساب النقاط للصف (بدون تصفير تلقائي)
+ */
+router.put(
+  '/grade-anchors/:gradeId',
+  authMiddleware(['teacher', 'academy', 'admin']),
+  asyncWrapper(async (req, res) => {
+    const teacherId = resolveTeacherId(req);
+    const gradeId = Number(req.params.gradeId);
+    if (!Number.isFinite(gradeId) || gradeId <= 0) {
+      return res.status(400).json({ success: false, message: 'gradeId غير صالح' });
+    }
+    const parsed = SetGradePointsAnchorSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      return res.status(400).json({
+        success: false,
+        message: 'أرسل startExamId',
+        errors: parsed.error.errors,
+      });
+    }
+    try {
+      const data = await TeacherPointsService.setGradePointsAnchor({
+        teacherId,
+        gradeId,
+        startExamId: parsed.data.startExamId,
+      });
+      return res.json({
+        success: true,
+        message: 'تم تعيين امتحان بداية النقاط لهذا الصف',
+        data,
+      });
+    } catch (error) {
+      if (error instanceof HttpError) {
+        return res.status(error.status).json({ success: false, message: error.message });
+      }
+      throw error;
+    }
+  }),
+);
+
+/**
+ * POST /api/teacher/points/reset-and-start-from-exam
+ * تصفير نقاط الصف + تعيين امتحان البداية + إعادة بناء النقاط منه ومن كل ما بعده
+ */
+router.post(
+  '/reset-and-start-from-exam',
+  authMiddleware(['teacher', 'academy', 'admin']),
+  asyncWrapper(async (req, res) => {
+    const teacherId = resolveTeacherId(req);
+    const parsed = ResetAndStartFromExamSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      return res.status(400).json({
+        success: false,
+        message:
+          'للتأكيد أرسل confirm: "RESET_AND_START_FROM_EXAM" مع gradeId و startExamId',
+        errors: parsed.error.errors,
+      });
+    }
+    try {
+      const result = await TeacherPointsService.resetAndStartFromExam({
+        teacherId,
+        confirm: parsed.data.confirm,
+        gradeId: parsed.data.gradeId,
+        startExamId: parsed.data.startExamId,
+        label: parsed.data.label,
+        reason: parsed.data.reason,
+      });
+      return res.json({
+        success: true,
+        message:
+          'تم تصفير نقاط الصف وبدء حساب الترتيب من الامتحان المختار وجميع الامتحانات بعده',
+        data: result,
+      });
+    } catch (error) {
+      if (error instanceof HttpError) {
+        return res.status(error.status).json({ success: false, message: error.message });
       }
       throw error;
     }
