@@ -302,7 +302,8 @@ router.get(
 
 /**
  * PUT /api/teacher/points/grade-anchors/:gradeId
- * تعيين امتحان بداية حساب النقاط للصف (بدون تصفير تلقائي)
+ * تعيين امتحان بداية النقاط للصف + مزامنة الأرصدة فورًا
+ * (يمنح نقاط كل امتحان من البداية فصاعدًا، بدون تصفير الموسم/اليدوي/الفيديو)
  */
 router.put(
   '/grade-anchors/:gradeId',
@@ -326,10 +327,12 @@ router.put(
         teacherId,
         gradeId,
         startExamId: parsed.data.startExamId,
+        syncPoints: true,
       });
       return res.json({
         success: true,
-        message: 'تم تعيين امتحان بداية النقاط لهذا الصف',
+        message:
+          'تم تعيين امتحان البداية وإعادة احتساب نقاط الطلاب من هذا الامتحان وجميع الامتحانات بعده',
         data,
       });
     } catch (error) {

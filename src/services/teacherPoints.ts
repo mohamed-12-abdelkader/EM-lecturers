@@ -1334,6 +1334,7 @@ export class TeacherPointsService {
           teacherId: opts.teacherId,
           gradeId,
           startExamId: lastExam.id,
+          syncPoints: false,
         });
       } catch {
         // ignore if table missing mid-migrate
@@ -1652,11 +1653,18 @@ export class TeacherPointsService {
     teacherId: number;
     gradeId: number;
     startExamId: number;
+    /** بعد التعيين: امنح نقاط كل امتحان في النافذة وأزل خارجها (بدون تصفير الموسم) */
+    syncPoints?: boolean;
   }): Promise<{
     teacherId: number;
     gradeId: number;
     startExamId: number;
     startExamTitle: string | null;
+    synced?: boolean;
+    eligibleExamIds?: number[];
+    studentsAwarded?: number;
+    startAwards?: number;
+    scoreAwards?: number;
   }> {
     await this.assertTeacherOwnsGrade(opts.teacherId, opts.gradeId);
     const exams = await this.listCourseExamsForGrade({
@@ -1676,11 +1684,151 @@ export class TeacherPointsService {
       [opts.teacherId, opts.gradeId, exam.id],
     );
 
-    return {
+    const base = {
       teacherId: opts.teacherId,
       gradeId: opts.gradeId,
       startExamId: exam.id,
       startExamTitle: exam.title,
+    };
+
+    if (opts.syncPoints === false) {
+      return base;
+    }
+
+    const rebuilt = await this.rebuildEligibleCourseExamPointsForGrade({
+      teacherId: opts.teacherId,
+      gradeId: opts.gradeId,
+    });
+    return {
+      ...base,
+      synced: true,
+      eligibleExamIds: rebuilt.eligibleExamIds,
+      studentsAwarded: rebuilt.studentsAwarded,
+      startAwards: rebuilt.startAwards,
+      scoreAwards: rebuilt.scoreAwards,
+    };
+  }
+
+  /**
+   * إعادة احتساب نقاط الامتحانات الشاملة للصف حسب نافذة المرساة الحالية:
+   * يمنح بدء+درجة لكل امتحان مؤهل (idempotent)، ويحذف نقاط امتحان/واجب خارج النافذة،
+   * مع الإبقاء على اليدوي والفيديو.
+   */
+  static async rebuildEligibleCourseExamPointsForGrade(opts: {
+    teacherId: number;
+    gradeId: number;
+  }): Promise<{
+    eligibleExamIds: number[];
+    studentsAwarded: number;
+    startAwards: number;
+    scoreAwards: number;
+  }> {
+    const gradeId = Number(opts.gradeId);
+    const eligibleExamIds = await this.listEligibleCourseExamIds(opts.teacherId, gradeId);
+    let startAwards = 0;
+    let scoreAwards = 0;
+    const awardedStudents = new Set<number>();
+
+    for (const examId of eligibleExamIds) {
+      const examMeta = await pool.query<{
+        id: number;
+        title: string | null;
+        course_id: number | null;
+      }>(`SELECT id, title, course_id FROM course_level_exams WHERE id = $1`, [examId]);
+      if (!examMeta.rowCount) continue;
+      const exam = examMeta.rows[0];
+
+      const attemptsRes = await pool.query<{
+        id: number;
+        student_id: number;
+        obtained_grade: number | null;
+        total_grade: number | null;
+      }>(
+        `SELECT DISTINCT ON (a.student_id)
+           a.id, a.student_id, a.obtained_grade, a.total_grade
+         FROM course_level_exam_attempts a
+         WHERE a.exam_id = $1 AND a.status = 'submitted'
+         ORDER BY a.student_id, a.submitted_at DESC NULLS LAST, a.attempt_number DESC, a.id DESC`,
+        [examId],
+      );
+
+      for (const attempt of attemptsRes.rows) {
+        const studentId = Number(attempt.student_id);
+        const attemptId = Number(attempt.id);
+        const obtained = Math.max(0, Math.floor(Number(attempt.obtained_grade ?? 0)));
+        const total = Math.max(obtained, Math.floor(Number(attempt.total_grade ?? 0)));
+
+        const start = await this.awardExamOrAssignmentStart({
+          studentId,
+          teacherId: opts.teacherId,
+          courseId: exam.course_id,
+          attemptId,
+          examId,
+          isAssignment: false,
+          examKind: 'course',
+          title: exam.title,
+        });
+        if (start.awarded) startAwards += 1;
+
+        const score = await this.awardExamOrAssignmentScore({
+          studentId,
+          teacherId: opts.teacherId,
+          courseId: exam.course_id,
+          attemptId,
+          examId,
+          isAssignment: false,
+          examKind: 'course',
+          obtainedGrade: obtained,
+          totalGrade: total,
+          title: exam.title,
+        });
+        if (score.awarded) scoreAwards += 1;
+        if (start.awarded || score.awarded) awardedStudents.add(studentId);
+      }
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        `DELETE FROM point_transactions
+         WHERE teacher_id = $1
+           AND grade_id = $2
+           AND event_type IN (
+             'EXAM_START', 'EXAM_SCORE', 'ASSIGNMENT_START', 'ASSIGNMENT_SCORE'
+           )
+           AND NOT (
+             event_type IN ('EXAM_START', 'EXAM_SCORE')
+             AND reference_type = 'course_exam'
+             AND reference_id = ANY($3::int[])
+           )`,
+        [opts.teacherId, gradeId, eligibleExamIds.length ? eligibleExamIds : [-1]],
+      );
+      await client.query(
+        `DELETE FROM student_point_balances WHERE teacher_id = $1 AND grade_id = $2`,
+        [opts.teacherId, gradeId],
+      );
+      await client.query(
+        `INSERT INTO student_point_balances (student_id, teacher_id, grade_id, total_points)
+         SELECT student_id, teacher_id, grade_id, GREATEST(0, SUM(points)::int)
+         FROM point_transactions
+         WHERE teacher_id = $1 AND grade_id = $2
+         GROUP BY student_id, teacher_id, grade_id`,
+        [opts.teacherId, gradeId],
+      );
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+
+    return {
+      eligibleExamIds,
+      studentsAwarded: awardedStudents.size,
+      startAwards,
+      scoreAwards,
     };
   }
 
@@ -1778,6 +1926,7 @@ export class TeacherPointsService {
       teacherId: opts.teacherId,
       gradeId,
       startExamId: opts.startExamId,
+      syncPoints: false,
     });
 
     const reset = await this.resetAllStudentsPoints({
@@ -1788,109 +1937,10 @@ export class TeacherPointsService {
       reason: opts.reason ?? 'reset_and_start_from_exam',
     });
 
-    const eligibleExamIds = await this.listEligibleCourseExamIds(opts.teacherId, gradeId);
-    let studentsAwarded = 0;
-    let startAwards = 0;
-    let scoreAwards = 0;
-    const awardedStudents = new Set<number>();
-
-    for (const examId of eligibleExamIds) {
-      const examMeta = await pool.query<{
-        id: number;
-        title: string | null;
-        course_id: number | null;
-      }>(`SELECT id, title, course_id FROM course_level_exams WHERE id = $1`, [examId]);
-      if (!examMeta.rowCount) continue;
-      const exam = examMeta.rows[0];
-
-      const attemptsRes = await pool.query<{
-        id: number;
-        student_id: number;
-        obtained_grade: number | null;
-        total_grade: number | null;
-      }>(
-        `SELECT DISTINCT ON (a.student_id)
-           a.id, a.student_id, a.obtained_grade, a.total_grade
-         FROM course_level_exam_attempts a
-         WHERE a.exam_id = $1 AND a.status = 'submitted'
-         ORDER BY a.student_id, a.submitted_at DESC NULLS LAST, a.attempt_number DESC, a.id DESC`,
-        [examId],
-      );
-
-      for (const attempt of attemptsRes.rows) {
-        const studentId = Number(attempt.student_id);
-        const attemptId = Number(attempt.id);
-        const obtained = Math.max(0, Math.floor(Number(attempt.obtained_grade ?? 0)));
-        const total = Math.max(obtained, Math.floor(Number(attempt.total_grade ?? 0)));
-
-        const start = await this.awardExamOrAssignmentStart({
-          studentId,
-          teacherId: opts.teacherId,
-          courseId: exam.course_id,
-          attemptId,
-          examId,
-          isAssignment: false,
-          examKind: 'course',
-          title: exam.title,
-        });
-        if (start.awarded) startAwards += 1;
-
-        const score = await this.awardExamOrAssignmentScore({
-          studentId,
-          teacherId: opts.teacherId,
-          courseId: exam.course_id,
-          attemptId,
-          examId,
-          isAssignment: false,
-          examKind: 'course',
-          obtainedGrade: obtained,
-          totalGrade: total,
-          title: exam.title,
-        });
-        if (score.awarded) scoreAwards += 1;
-        if (start.awarded || score.awarded) awardedStudents.add(studentId);
-      }
-    }
-
-    studentsAwarded = awardedStudents.size;
-
-    // نظّف هذا الصف فقط — لا تلمس نقاط صفوف أخرى
-    const client = await pool.connect();
-    try {
-      await client.query('BEGIN');
-      await client.query(
-        `DELETE FROM point_transactions
-         WHERE teacher_id = $1
-           AND grade_id = $2
-           AND event_type IN (
-             'EXAM_START', 'EXAM_SCORE', 'ASSIGNMENT_START', 'ASSIGNMENT_SCORE'
-           )
-           AND NOT (
-             event_type IN ('EXAM_START', 'EXAM_SCORE')
-             AND reference_type = 'course_exam'
-             AND reference_id = ANY($3::int[])
-           )`,
-        [opts.teacherId, gradeId, eligibleExamIds.length ? eligibleExamIds : [-1]],
-      );
-      await client.query(
-        `DELETE FROM student_point_balances WHERE teacher_id = $1 AND grade_id = $2`,
-        [opts.teacherId, gradeId],
-      );
-      await client.query(
-        `INSERT INTO student_point_balances (student_id, teacher_id, grade_id, total_points)
-         SELECT student_id, teacher_id, grade_id, GREATEST(0, SUM(points)::int)
-         FROM point_transactions
-         WHERE teacher_id = $1 AND grade_id = $2
-         GROUP BY student_id, teacher_id, grade_id`,
-        [opts.teacherId, gradeId],
-      );
-      await client.query('COMMIT');
-    } catch (err) {
-      await client.query('ROLLBACK');
-      throw err;
-    } finally {
-      client.release();
-    }
+    const rebuilt = await this.rebuildEligibleCourseExamPointsForGrade({
+      teacherId: opts.teacherId,
+      gradeId,
+    });
 
     return {
       reset: true,
@@ -1900,10 +1950,10 @@ export class TeacherPointsService {
       seasonId: reset.seasonId,
       startExamId: anchor.startExamId,
       startExamTitle: anchor.startExamTitle,
-      eligibleExamIds,
-      studentsAwarded,
-      startAwards,
-      scoreAwards,
+      eligibleExamIds: rebuilt.eligibleExamIds,
+      studentsAwarded: rebuilt.studentsAwarded,
+      startAwards: rebuilt.startAwards,
+      scoreAwards: rebuilt.scoreAwards,
     };
   }
 
