@@ -22,6 +22,7 @@ function exam(partial: Partial<ExamState> = {}): ExamState {
     paused: false,
     absentSweptAt: null,
     courseTitle: 'فيزياء',
+    teacherId: 1,
     ...partial,
   };
 }
@@ -303,6 +304,7 @@ describe('parent exam notify engine', () => {
     const result = await testSend(store, 7, 1, 'passed');
     expect(store.jobs).toHaveLength(1);
     expect(result.jobId).toBe(store.jobs[0].id);
+    expect(store.jobs[0].sessionSlug).toBe('t1-01');
     expect(store.jobs[0].immediate).toBe(true);
     expect(store.jobs[0].scheduledAt.getTime()).toBe(store.now().getTime());
   });
@@ -311,6 +313,48 @@ describe('parent exam notify engine', () => {
     const store = openStore();
     store.failGetService = true;
     await expect(safeNotifyFinalized(store, 7, 1)).resolves.toBeUndefined();
+  });
+
+  it('does not enqueue when the teacher turns auto-send off', async () => {
+    const store = openStore();
+    store.teacherPrefs.set(1, {
+      auto_send: false,
+      notify_passed: true,
+      notify_failed: true,
+      notify_absent: true,
+      pass_percentage: 50,
+    });
+    expect(await notifyFinalizedAttempt(store, 7, 1)).toBe('ignored');
+    expect(store.jobs).toHaveLength(0);
+  });
+
+  it('does not enqueue a muted exam', async () => {
+    const store = openStore();
+    store.exams.get(7)!.enabled = false;
+    expect(await notifyFinalizedAttempt(store, 7, 1)).toBe('ignored');
+    expect(store.jobs).toHaveLength(0);
+  });
+
+  it('paces each teacher on their own number and cap', async () => {
+    const store = openStore();
+    store.service!.config.daily_cap = 1;
+    store.teacherPrefs.set(2, {
+      auto_send: true,
+      notify_passed: true,
+      notify_failed: true,
+      notify_absent: false,
+      pass_percentage: 50,
+    });
+    store.seedExam(
+      exam({ id: 8, teacherId: 2, title: 'امتحان تاني' }),
+      [student({ studentId: 9, studentName: 'كريم', parentPhone: '01009876543' })],
+    );
+    await notifyFinalizedAttempt(store, 7, 1);
+    await notifyFinalizedAttempt(store, 7, 2);
+    await notifyFinalizedAttempt(store, 8, 9);
+    expect(store.jobs.map((job) => job.sessionSlug).sort()).toEqual(['t1-01', 't2-01']);
+    expect(store.jobs.filter((job) => job.sessionSlug === 't1-01')).toHaveLength(1);
+    expect((await store.listExams(2)).map((row) => row.id)).toEqual([8]);
   });
 });
 

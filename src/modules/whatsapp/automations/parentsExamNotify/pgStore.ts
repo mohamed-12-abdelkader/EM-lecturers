@@ -5,7 +5,7 @@ import { HttpError } from '../../../../utils';
 import { WhatsAppOutboundQueue } from '../../queue/whatsappOutboundQueue';
 import { SessionPoolService } from '../../routing/sessionPool.service';
 import { PARENTS_EXAM_NOTIFY_KEY, PARENTS_EXAM_PACE_LOCK, type ExamCohort } from './constants';
-import { parseParentsExamConfig, type ParentsExamConfig } from './settings';
+import { parseParentsExamConfig, parseTeacherExamPrefs, type ParentsExamConfig, type TeacherExamPrefs } from './settings';
 import type {
   ExamState,
   NotificationState,
@@ -68,6 +68,7 @@ function mapExam(row: QueryResultRow): ExamState {
     paused: row.paused === true,
     absentSweptAt: row.absent_swept_at ? new Date(row.absent_swept_at) : null,
     courseTitle: row.course_title ? String(row.course_title) : null,
+    teacherId: Number(row.teacher_id || 0),
     scheduledCount: row.scheduled_count == null ? undefined : Number(row.scheduled_count),
     sentCount: row.sent_count == null ? undefined : Number(row.sent_count),
     skippedCount: row.skipped_count == null ? undefined : Number(row.skipped_count),
@@ -95,6 +96,7 @@ function mapNotification(row: QueryResultRow): NotificationState {
   return {
     id: Number(row.id),
     examId: Number(row.exam_id),
+    teacherId: Number(row.teacher_id || 0),
     studentId: Number(row.student_user_id),
     cohort: row.cohort as ExamCohort,
     parentPhone: row.parent_phone ? String(row.parent_phone) : null,
@@ -233,9 +235,54 @@ export class PgParentsExamStore implements ParentsExamStore {
     return row ? mapExam(row) : null;
   }
 
-  async listExams(limit: number): Promise<ExamState[]> {
-    const res = await query(`${EXAM_SELECT} ORDER BY e.id DESC LIMIT $1`, [limit]);
+  async listExams(teacherId?: number): Promise<ExamState[]> {
+    const res = teacherId
+      ? await query(
+          `${EXAM_SELECT} WHERE COALESCE(e.teacher_id, c.teacher_id) = $1 ORDER BY e.id DESC`,
+          [teacherId],
+        )
+      : await query(`${EXAM_SELECT} ORDER BY e.id DESC LIMIT 50`);
     return res.rows.map(mapExam);
+  }
+
+  async getTeacherPrefs(teacherId: number): Promise<TeacherExamPrefs> {
+    const res = await query(`SELECT * FROM wa_parent_exam_teacher_settings WHERE teacher_id = $1`, [
+      teacherId,
+    ]);
+    if (!res.rowCount) return parseTeacherExamPrefs(null);
+    const row = res.rows[0];
+    return parseTeacherExamPrefs({
+      auto_send: row.auto_send === true,
+      notify_passed: row.notify_passed === true,
+      notify_failed: row.notify_failed === true,
+      notify_absent: row.notify_absent === true,
+      pass_percentage: Number(row.pass_percentage),
+    });
+  }
+
+  async saveTeacherPrefs(teacherId: number, prefs: TeacherExamPrefs): Promise<TeacherExamPrefs> {
+    const parsed = parseTeacherExamPrefs(prefs);
+    await query(
+      `INSERT INTO wa_parent_exam_teacher_settings
+         (teacher_id, auto_send, notify_passed, notify_failed, notify_absent, pass_percentage)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       ON CONFLICT (teacher_id) DO UPDATE SET
+         auto_send = EXCLUDED.auto_send,
+         notify_passed = EXCLUDED.notify_passed,
+         notify_failed = EXCLUDED.notify_failed,
+         notify_absent = EXCLUDED.notify_absent,
+         pass_percentage = EXCLUDED.pass_percentage,
+         updated_at = NOW()`,
+      [
+        teacherId,
+        parsed.auto_send,
+        parsed.notify_passed,
+        parsed.notify_failed,
+        parsed.notify_absent,
+        parsed.pass_percentage,
+      ],
+    );
+    return parsed;
   }
 
   async setExamEnabled(examId: number, enabled: boolean): Promise<ExamState> {
@@ -278,6 +325,12 @@ export class PgParentsExamStore implements ParentsExamStore {
       `${EXAM_SELECT}
        WHERE st.absent_swept_at IS NULL
          AND COALESCE(st.enabled, TRUE) = TRUE
+         AND EXISTS (
+           SELECT 1 FROM wa_parent_exam_teacher_settings ts
+           WHERE ts.teacher_id = COALESCE(e.teacher_id, c.teacher_id)
+             AND ts.auto_send = TRUE
+             AND ts.notify_absent = TRUE
+         )
          AND (
            e.is_active = FALSE
            OR (e.visibility_end_date IS NOT NULL AND e.visibility_end_date <= $1)
@@ -330,6 +383,7 @@ export class PgParentsExamStore implements ParentsExamStore {
   }
 
   async insertNotification(row: {
+    teacherId: number;
     examId: number;
     studentId: number;
     cohort: ExamCohort;
@@ -342,12 +396,13 @@ export class PgParentsExamStore implements ParentsExamStore {
   }): Promise<NotificationState | null> {
     const res = await query(
       `INSERT INTO wa_parent_exam_notifications
-         (exam_id, student_user_id, cohort, parent_phone, body, status, skip_reason, ready_at, immediate)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+         (exam_id, teacher_id, student_user_id, cohort, parent_phone, body, status, skip_reason, ready_at, immediate)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
        ON CONFLICT (exam_id, student_user_id, cohort) DO NOTHING
        RETURNING *`,
       [
         row.examId,
+        row.teacherId,
         row.studentId,
         row.cohort,
         row.parentPhone,
@@ -386,28 +441,31 @@ export class PgParentsExamStore implements ParentsExamStore {
     await query(`UPDATE wa_parent_exam_notifications SET ready_at = $2 WHERE id = $1`, [id, readyAt]);
   }
 
-  async countPlacedOnDay(dayStart: Date, dayEnd: Date) {
+  async countPlacedOnDay(teacherId: number | null, dayStart: Date, dayEnd: Date) {
     const res = await query<{ n: number }>(
       `SELECT COUNT(*)::int AS n
        FROM wa_parent_exam_notifications
        WHERE status IN ('scheduled', 'sent')
-         AND scheduled_at >= $1 AND scheduled_at < $2`,
-      [dayStart, dayEnd],
+         AND scheduled_at >= $1 AND scheduled_at < $2
+         AND ($3::int IS NULL OR teacher_id = $3)`,
+      [dayStart, dayEnd, teacherId],
     );
     return Number(res.rows[0]?.n || 0);
   }
 
-  async lastSlot() {
+  async lastSlot(teacherId: number) {
     const res = await query<{ slot: Date | null }>(
       `SELECT MAX(scheduled_at) AS slot
        FROM wa_parent_exam_notifications
-       WHERE status IN ('scheduled', 'sent') AND scheduled_at IS NOT NULL`,
+       WHERE status IN ('scheduled', 'sent') AND scheduled_at IS NOT NULL
+         AND teacher_id = $1`,
+      [teacherId],
     );
     return res.rows[0]?.slot ? new Date(res.rows[0].slot) : null;
   }
 
-  async pickSession(phone: string | null) {
-    return SessionPoolService.pickSession(PARENTS_EXAM_NOTIFY_KEY, phone);
+  async pickSession(teacherId: number, phone: string | null) {
+    return SessionPoolService.pickSessionForTeacher('teacher_student_notify', teacherId, phone);
   }
 
   async enqueueJob(input: {

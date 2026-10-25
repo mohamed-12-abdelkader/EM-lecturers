@@ -1,5 +1,5 @@
 import type { ExamCohort } from './constants';
-import { DEFAULT_PARENTS_EXAM_CONFIG, type ParentsExamConfig } from './settings';
+import { DEFAULT_PARENTS_EXAM_CONFIG, DEFAULT_TEACHER_EXAM_PREFS, type ParentsExamConfig, type TeacherExamPrefs } from './settings';
 import type {
   EnqueueJobInput,
   ExamState,
@@ -32,18 +32,26 @@ export class MemoryParentsExamStore implements ParentsExamStore {
   students = new Map<number, StudentState[]>();
   notifications: NotificationState[] = [];
   jobs: MemoryJob[] = [];
+  teacherPrefs = new Map<number, TeacherExamPrefs>();
   failGetService = false;
   private seq = 1;
   private jobSeq = 1;
   private clock = new Date('2026-10-23T12:00:00.000Z');
 
-  constructor(config: ParentsExamConfig = { ...DEFAULT_PARENTS_EXAM_CONFIG, auto_send: true, notify_passed: true, notify_failed: true, notify_absent: true, jitter_seconds: 0, quiet_hours: { ...DEFAULT_PARENTS_EXAM_CONFIG.quiet_hours, enabled: false } }) {
+  constructor(config: ParentsExamConfig = { ...DEFAULT_PARENTS_EXAM_CONFIG, jitter_seconds: 0, quiet_hours: { ...DEFAULT_PARENTS_EXAM_CONFIG.quiet_hours, enabled: false } }) {
     this.service = {
       id: 1,
       isEnabled: true,
       config,
       readySessions: 1,
     };
+    this.teacherPrefs.set(1, {
+      ...DEFAULT_TEACHER_EXAM_PREFS,
+      auto_send: true,
+      notify_passed: true,
+      notify_failed: true,
+      notify_absent: true,
+    });
   }
 
   setNow(date: Date) {
@@ -75,11 +83,20 @@ export class MemoryParentsExamStore implements ParentsExamStore {
     return this.exams.get(examId) ?? null;
   }
 
-  async listExams(limit: number): Promise<ExamState[]> {
+  async listExams(teacherId?: number): Promise<ExamState[]> {
     return [...this.exams.values()]
+      .filter((exam) => teacherId == null || exam.teacherId === teacherId)
       .sort((a, b) => b.id - a.id)
-      .slice(0, limit)
       .map((exam) => this.withQueueCounts(exam));
+  }
+
+  async getTeacherPrefs(teacherId: number): Promise<TeacherExamPrefs> {
+    return this.teacherPrefs.get(teacherId) ?? { ...DEFAULT_TEACHER_EXAM_PREFS };
+  }
+
+  async saveTeacherPrefs(teacherId: number, prefs: TeacherExamPrefs): Promise<TeacherExamPrefs> {
+    this.teacherPrefs.set(teacherId, prefs);
+    return prefs;
   }
 
   async setExamEnabled(examId: number, enabled: boolean): Promise<ExamState> {
@@ -100,11 +117,15 @@ export class MemoryParentsExamStore implements ParentsExamStore {
   }
 
   async listClosedUnswept(now: Date): Promise<ExamState[]> {
-    return [...this.exams.values()].filter((exam) => {
-      if (!exam.enabled || exam.absentSweptAt) return false;
-      if (!exam.isActive) return true;
-      return exam.visibilityEnd != null && exam.visibilityEnd.getTime() <= now.getTime();
-    });
+    const out: ExamState[] = [];
+    for (const exam of this.exams.values()) {
+      if (!exam.enabled || exam.absentSweptAt) continue;
+      const prefs = await this.getTeacherPrefs(exam.teacherId);
+      if (!prefs.auto_send || !prefs.notify_absent) continue;
+      const closed = !exam.isActive || (exam.visibilityEnd != null && exam.visibilityEnd.getTime() <= now.getTime());
+      if (closed) out.push(exam);
+    }
+    return out;
   }
 
   async loadAudience(examId: number): Promise<StudentState[]> {
@@ -144,6 +165,7 @@ export class MemoryParentsExamStore implements ParentsExamStore {
   }
 
   async insertNotification(row: {
+    teacherId: number;
     examId: number;
     studentId: number;
     cohort: ExamCohort;
@@ -190,27 +212,29 @@ export class MemoryParentsExamStore implements ParentsExamStore {
     if (row) row.readyAt = readyAt;
   }
 
-  async countPlacedOnDay(dayStart: Date, dayEnd: Date) {
+  async countPlacedOnDay(teacherId: number | null, dayStart: Date, dayEnd: Date) {
     return this.notifications.filter((n) => {
+      if (teacherId != null && n.teacherId !== teacherId) return false;
       if (n.status !== 'scheduled' && n.status !== 'sent') return false;
       if (!n.scheduledAt) return false;
       return n.scheduledAt >= dayStart && n.scheduledAt < dayEnd;
     }).length;
   }
 
-  async lastSlot() {
+  async lastSlot(teacherId: number) {
     let max: Date | null = null;
     for (const n of this.notifications) {
+      if (n.teacherId !== teacherId) continue;
       if ((n.status !== 'scheduled' && n.status !== 'sent') || !n.scheduledAt) continue;
       if (!max || n.scheduledAt > max) max = n.scheduledAt;
     }
     return max;
   }
 
-  async pickSession() {
+  async pickSession(teacherId: number) {
     if (!this.service?.isEnabled) throw new Error('service disabled');
     if (!this.service.readySessions) throw new Error('no session');
-    return { sessionSlug: 'parents-01', serviceId: this.service.id };
+    return { sessionSlug: `t${teacherId}-01`, serviceId: 2 };
   }
 
   async enqueueJob(input: EnqueueJobInput) {

@@ -8,25 +8,31 @@ export interface QuietHoursConfig {
 export interface ParentsExamConfig {
   no_reply: true;
   language: 'ar-EG';
-  auto_send: boolean;
-  notify_passed: boolean;
-  notify_failed: boolean;
-  notify_absent: boolean;
-  pass_percentage: number;
   interval_seconds: number;
   jitter_seconds: number;
   daily_cap: number;
   quiet_hours: QuietHoursConfig;
 }
 
-export const DEFAULT_PARENTS_EXAM_CONFIG: ParentsExamConfig = {
-  no_reply: true,
-  language: 'ar-EG',
+export interface TeacherExamPrefs {
+  auto_send: boolean;
+  notify_passed: boolean;
+  notify_failed: boolean;
+  notify_absent: boolean;
+  pass_percentage: number;
+}
+
+export const DEFAULT_TEACHER_EXAM_PREFS: TeacherExamPrefs = {
   auto_send: false,
   notify_passed: false,
   notify_failed: false,
   notify_absent: false,
   pass_percentage: 50,
+};
+
+export const DEFAULT_PARENTS_EXAM_CONFIG: ParentsExamConfig = {
+  no_reply: true,
+  language: 'ar-EG',
   interval_seconds: 30,
   jitter_seconds: 10,
   daily_cap: 400,
@@ -70,11 +76,6 @@ export function parseParentsExamConfig(raw: unknown): ParentsExamConfig {
   return {
     no_reply: true,
     language: 'ar-EG',
-    auto_send: asBool(src.auto_send, DEFAULT_PARENTS_EXAM_CONFIG.auto_send),
-    notify_passed: asBool(src.notify_passed, DEFAULT_PARENTS_EXAM_CONFIG.notify_passed),
-    notify_failed: asBool(src.notify_failed, DEFAULT_PARENTS_EXAM_CONFIG.notify_failed),
-    notify_absent: asBool(src.notify_absent, DEFAULT_PARENTS_EXAM_CONFIG.notify_absent),
-    pass_percentage: clampInt(src.pass_percentage, 50, 0, 100),
     interval_seconds: clampInt(src.interval_seconds, 30, 15, 300),
     jitter_seconds: clampInt(src.jitter_seconds, 10, 0, 120),
     daily_cap: clampInt(src.daily_cap, 400, 1, 5000),
@@ -100,8 +101,19 @@ export function mergeParentsExamConfig(
   });
 }
 
-export function cohortEnabled(config: ParentsExamConfig, cohort: 'passed' | 'failed' | 'absent'): boolean {
-  if (cohort === 'passed') return config.notify_passed;
-  if (cohort === 'failed') return config.notify_failed;
-  return config.notify_absent;
+export function parseTeacherExamPrefs(raw: Partial<TeacherExamPrefs> | null | undefined): TeacherExamPrefs {
+  const src = raw ?? {};
+  return {
+    auto_send: asBool(src.auto_send, false),
+    notify_passed: asBool(src.notify_passed, false),
+    notify_failed: asBool(src.notify_failed, false),
+    notify_absent: asBool(src.notify_absent, false),
+    pass_percentage: clampInt(src.pass_percentage, 50, 0, 100),
+  };
+}
+
+export function cohortEnabled(prefs: TeacherExamPrefs, cohort: 'passed' | 'failed' | 'absent'): boolean {
+  if (cohort === 'passed') return prefs.notify_passed;
+  if (cohort === 'failed') return prefs.notify_failed;
+  return prefs.notify_absent;
 }

@@ -70,7 +70,8 @@ export class WhatsAppOutboundQueue {
       await client.query('BEGIN');
       const jobSql = `SELECT j.id, j.service_id, j.session_slug, j.to_phone, j.body, j.media_url, j.tenant_id,
                 j.conversation_id, j.trigger_type, j.trigger_ref, j.metadata, j.status,
-                j.attempts, j.max_attempts, j.last_error, j.scheduled_at, s.key AS service_key
+                j.attempts, j.max_attempts, j.last_error, j.scheduled_at,
+                CASE WHEN j.trigger_type LIKE 'parents_exam_%' THEN '${PARENTS_EXAM_NOTIFY_KEY}' ELSE s.key END AS service_key
          FROM wa_outbound_jobs j
          LEFT JOIN wa_services s ON s.id = j.service_id`;
       const due = `j.status IN ('pending', 'failed')
@@ -79,28 +80,30 @@ export class WhatsAppOutboundQueue {
       const nonPaced = await client.query<OutboundJobRow & { service_key: string | null }>(
         `${jobSql}
          WHERE ${due}
-           AND (s.key IS DISTINCT FROM $2)
+           AND (j.trigger_type IS NULL OR j.trigger_type NOT LIKE 'parents_exam_%')
          ORDER BY j.scheduled_at ASC, j.id ASC
          LIMIT $1
          FOR UPDATE OF j SKIP LOCKED`,
-        [limit, PARENTS_EXAM_NOTIFY_KEY],
+        [limit],
       );
       const paced = await client.query<OutboundJobRow & { service_key: string | null }>(
         `${jobSql}
          WHERE ${due}
-           AND s.key = $1
+           AND j.trigger_type LIKE 'parents_exam_%'
            AND (
              COALESCE(j.metadata->>'immediate', '') = 'true'
              OR NOT EXISTS (
-               SELECT 1 FROM wa_outbound_jobs prev
+               SELECT 1
+               FROM wa_outbound_jobs prev
+               JOIN wa_services pace ON pace.key = 'parents_exam_notify'
                WHERE prev.session_slug = j.session_slug
-                 AND prev.service_id = j.service_id
+                 AND prev.trigger_type LIKE 'parents_exam_%'
                  AND (
                    prev.status = 'processing'
                    OR (
                      prev.status = 'sent'
                      AND prev.processed_at > NOW() - make_interval(
-                       secs => GREATEST(15, LEAST(300, COALESCE((s.config->>'interval_seconds')::int, 30)))
+                       secs => GREATEST(15, LEAST(300, COALESCE((pace.config->>'interval_seconds')::int, 30)))
                      )
                    )
                  )
@@ -114,7 +117,6 @@ export class WhatsAppOutboundQueue {
          ORDER BY j.scheduled_at ASC, j.id ASC
          LIMIT 500
          FOR UPDATE OF j SKIP LOCKED`,
-        [PARENTS_EXAM_NOTIFY_KEY],
       );
 
       const picked = selectOutboundClaim(

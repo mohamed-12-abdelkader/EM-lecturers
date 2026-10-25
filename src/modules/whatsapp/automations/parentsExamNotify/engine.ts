@@ -37,6 +37,7 @@ async function recordStudent(
   if (!phone) {
     await store.insertNotification({
       examId: exam.id,
+      teacherId: exam.teacherId,
       studentId: student.studentId,
       cohort,
       parentPhone: null,
@@ -50,6 +51,7 @@ async function recordStudent(
   }
   const inserted = await store.insertNotification({
     examId: exam.id,
+    teacherId: exam.teacherId,
     studentId: student.studentId,
     cohort,
     parentPhone: phone,
@@ -66,62 +68,70 @@ export async function placePending(store: ParentsExamStore, now = store.now()): 
   return store.transaction(async () => {
     await store.lockPace();
     const service = await store.getService();
-    if (!service?.isEnabled) return 0;
-    const config = service.config;
+    const config = service?.config;
+    if (!config) return 0;
     const tz = config.quiet_hours.tz;
     const start = dayStart(now, tz);
     const end = new Date(start.getTime() + 24 * 60 * 60 * 1000);
-    let daily = await store.countPlacedOnDay(start, end);
-    let last = await store.lastSlot();
     const rows = await store.listUnqueued(now, 200);
-    let placed = 0;
-    let session: { sessionSlug: string; serviceId: number } | null = null;
-
+    const byTeacher = new Map<number, typeof rows>();
     for (const row of rows) {
       const exam = await store.getExam(row.examId);
       if (!exam || !exam.enabled || exam.paused) continue;
-      if (daily >= config.daily_cap) {
-        await store.defer(row.id, end);
-        continue;
-      }
-      const slot = nextScheduledAt({
-        now,
-        lastSlot: row.immediate ? null : last,
-        intervalSeconds: config.interval_seconds,
-        jitterSeconds: row.immediate ? 0 : config.jitter_seconds,
-        quietHours: config.quiet_hours,
-        dailyCount: daily,
-        dailyCap: config.daily_cap,
-        immediate: row.immediate,
-      });
-      if (!slot.ok) {
-        await store.defer(row.id, end);
-        continue;
-      }
-      if (!session) {
-        try {
-          session = await store.pickSession(row.parentPhone);
-        } catch {
-          break;
+      const bucket = byTeacher.get(exam.teacherId) ?? [];
+      bucket.push(row);
+      byTeacher.set(exam.teacherId, bucket);
+    }
+
+    let placed = 0;
+    for (const [teacherId, teacherRows] of byTeacher) {
+      let daily = await store.countPlacedOnDay(teacherId, start, end);
+      let last = await store.lastSlot(teacherId);
+      let session: { sessionSlug: string; serviceId: number } | null = null;
+      for (const row of teacherRows) {
+        if (daily >= config.daily_cap) {
+          await store.defer(row.id, end);
+          continue;
         }
+        const slot = nextScheduledAt({
+          now,
+          lastSlot: row.immediate ? null : last,
+          intervalSeconds: config.interval_seconds,
+          jitterSeconds: row.immediate ? 0 : config.jitter_seconds,
+          quietHours: config.quiet_hours,
+          dailyCount: daily,
+          dailyCap: config.daily_cap,
+          immediate: row.immediate,
+        });
+        if (!slot.ok) {
+          await store.defer(row.id, end);
+          continue;
+        }
+        if (!session) {
+          try {
+            session = await store.pickSession(teacherId, row.parentPhone);
+          } catch {
+            break;
+          }
+        }
+        const jobId = await store.enqueueJob({
+          sessionSlug: session.sessionSlug,
+          serviceId: session.serviceId,
+          to: row.parentPhone || '',
+          body: row.body,
+          scheduledAt: slot.at,
+          triggerType: row.immediate ? 'parents_exam_test' : `parents_exam_${row.cohort}`,
+          examId: row.examId,
+          studentId: row.studentId,
+          cohort: row.cohort,
+          notificationId: row.id,
+          immediate: row.immediate,
+        });
+        await store.attachJob(row.id, jobId, slot.at);
+        if (!row.immediate) last = slot.at;
+        daily += 1;
+        placed += 1;
       }
-      const jobId = await store.enqueueJob({
-        sessionSlug: session.sessionSlug,
-        serviceId: session.serviceId,
-        to: row.parentPhone || '',
-        body: row.body,
-        scheduledAt: slot.at,
-        triggerType: row.immediate ? 'parents_exam_test' : `parents_exam_${row.cohort}`,
-        examId: row.examId,
-        studentId: row.studentId,
-        cohort: row.cohort,
-        notificationId: row.id,
-        immediate: row.immediate,
-      });
-      await store.attachJob(row.id, jobId, slot.at);
-      if (!row.immediate) last = slot.at;
-      daily += 1;
-      placed += 1;
     }
     return placed;
   });
@@ -139,14 +149,16 @@ export async function notifyFinalizedAttempt(
   if (!exam) return 'ignored';
   const student = await store.getEligibleStudent(examId, studentId);
   if (!student) return 'ignored';
-  const cohort = standingOf(student, service.config.pass_percentage);
+  const prefs = exam.teacherId ? await store.getTeacherPrefs(exam.teacherId) : null;
+  const pass = prefs?.pass_percentage ?? 50;
+  const cohort = standingOf(student, pass);
   const existing = cohort === 'in_progress' ? null : await store.findNotification(examId, studentId, cohort);
   const ok = shouldAutoNotify({
-    serviceEnabled: service.isEnabled,
-    autoSend: service.config.auto_send,
+    serviceEnabled: true,
+    autoSend: Boolean(prefs?.auto_send),
     examEnabled: exam.enabled,
     cohort,
-    cohortEnabled: cohort === 'in_progress' ? false : cohortEnabled(service.config, cohort),
+    cohortEnabled: cohort === 'in_progress' || !prefs ? false : cohortEnabled(prefs, cohort),
     examClosed: isExamClosed(exam, now),
     alreadyRecorded: Boolean(existing),
   });
@@ -175,17 +187,15 @@ export async function sweepClosedExams(
   now = store.now(),
 ): Promise<{ exams: number; inserted: number }> {
   const service = await store.getService();
-  const exams =
-    service?.isEnabled && service.config.auto_send && service.config.notify_absent
-      ? await store.listClosedUnswept(now)
-      : [];
+  const exams = service ? await store.listClosedUnswept(now) : [];
   let inserted = 0;
-  if (service?.isEnabled && service.config.auto_send && service.config.notify_absent) {
+  if (service) {
     for (const exam of exams) {
+      const prefs = await store.getTeacherPrefs(exam.teacherId);
       const audience = await store.loadAudience(exam.id);
       let pending = false;
       for (const student of audience) {
-        const cohort = standingOf(student, service.config.pass_percentage);
+        const cohort = standingOf(student, prefs.pass_percentage);
         if (cohort !== 'absent') continue;
         const result = await recordStudent(store, exam, student, 'absent', now, false);
         if (result === 'inserted') inserted += 1;
@@ -196,7 +206,7 @@ export async function sweepClosedExams(
       if (!pending) await store.markAbsentSwept(exam.id, now);
     }
   }
-  if (service?.isEnabled) await placePending(store, now);
+  if (service) await placePending(store, now);
   return { exams: exams.length, inserted };
 }
 
@@ -208,12 +218,12 @@ export async function testSend(
 ): Promise<{ jobId: number | null; scheduledAt: Date | null; notificationId: number }> {
   const service = await store.getService();
   if (!service) throw new HttpError(404, 'خدمة إشعارات أولياء الأمور غير موجودة');
-  if (!service.isEnabled) throw new HttpError(400, 'فعّل الخدمة واربط رقم واتساب أولاً');
   const exam = await store.getExam(examId);
   if (!exam) throw new HttpError(404, 'الامتحان غير موجود');
+  const prefs = await store.getTeacherPrefs(exam.teacherId);
   const student = await store.getEligibleStudent(examId, studentId);
   if (!student) throw new HttpError(404, 'الطالب مش ضمن المستحقين للامتحان');
-  const actual = standingOf(student, service.config.pass_percentage);
+  const actual = standingOf(student, prefs.pass_percentage);
   if (actual === 'in_progress') throw new HttpError(400, 'الطالب لسه ما سلّمش الامتحان');
   if (actual !== cohort) throw new HttpError(400, 'حالة الطالب مختلفة عن الاختيار');
   const phone = canonicalParentPhone(student.parentPhone);
@@ -236,6 +246,7 @@ export async function testSend(
   } else if (!row) {
     row = await store.insertNotification({
       examId,
+      teacherId: exam.teacherId,
       studentId,
       cohort,
       parentPhone: phone,
@@ -263,12 +274,13 @@ export async function sendCohorts(
   flags: { passed?: boolean; failed?: boolean; absent?: boolean },
 ): Promise<{ inserted: number; skipped: number; duplicates: number }> {
   const service = await store.getService();
-  if (!service?.isEnabled) throw new HttpError(400, 'فعّل الخدمة واربط رقم واتساب أولاً');
+  if (!service) throw new HttpError(404, 'إعدادات الإرسال غير موجودة');
   if (!flags.passed && !flags.failed && !flags.absent) {
     throw new HttpError(400, 'اختار حالة واحدة على الأقل');
   }
   const exam = await store.getExam(examId);
   if (!exam) throw new HttpError(404, 'الامتحان غير موجود');
+  const prefs = await store.getTeacherPrefs(exam.teacherId);
   if (!exam.enabled) throw new HttpError(400, 'إشعارات الامتحان متوقفة');
   const now = store.now();
   const closed = isExamClosed(exam, now);
@@ -277,7 +289,7 @@ export async function sendCohorts(
   let skipped = 0;
   let duplicates = 0;
   for (const student of audience) {
-    const cohort = standingOf(student, service.config.pass_percentage);
+    const cohort = standingOf(student, prefs.pass_percentage);
     if (cohort === 'in_progress') continue;
     if (cohort === 'passed' && !flags.passed) continue;
     if (cohort === 'failed' && !flags.failed) continue;
@@ -292,10 +304,10 @@ export async function sendCohorts(
 }
 
 export async function previewExam(store: ParentsExamStore, examId: number) {
-  const service = await store.getService();
   const exam = await store.getExam(examId);
   if (!exam) throw new HttpError(404, 'الامتحان غير موجود');
-  const pass = service?.config.pass_percentage ?? 50;
+  const prefs = await store.getTeacherPrefs(exam.teacherId);
+  const pass = prefs.pass_percentage;
   const now = store.now();
   const audience = await store.loadAudience(examId);
   const notifications = await store.listNotifications(examId);
@@ -346,7 +358,7 @@ export async function getSettingsView(store: ParentsExamStore) {
   const start = dayStart(now, service.config.quiet_hours.tz);
   const end = new Date(start.getTime() + 24 * 60 * 60 * 1000);
   const sentToday = await store.sentOnDay(start, end);
-  const placedToday = await store.countPlacedOnDay(start, end);
+  const placedToday = await store.countPlacedOnDay(null, start, end);
   return {
     serviceId: service.id,
     isEnabled: service.isEnabled,
@@ -354,7 +366,7 @@ export async function getSettingsView(store: ParentsExamStore) {
     config: service.config,
     sentToday,
     placedToday,
-    capRemaining: Math.max(0, service.config.daily_cap - placedToday),
+    dailyCap: service.config.daily_cap,
     upcoming: await store.upcoming(15),
   };
 }
@@ -374,7 +386,6 @@ export function queueViewFromSettings(settings: Awaited<ReturnType<typeof getSet
   return {
     sentToday: settings.sentToday,
     placedToday: settings.placedToday,
-    capRemaining: settings.capRemaining,
     dailyCap: settings.config.daily_cap,
     upcoming: settings.upcoming,
   };

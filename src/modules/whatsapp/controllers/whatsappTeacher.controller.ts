@@ -5,6 +5,7 @@ import { authMiddleware } from '../../../middleware/authentication';
 import { validate } from '../../../middleware/validateReq';
 import { asyncWrapper, HttpError } from '../../../utils';
 import { TeacherWhatsAppService } from '../services/teacherWhatsApp.service';
+import { ParentsExamNotifyService } from '../automations/parentsExamNotify/service';
 
 export const whatsappTeacherRouter = Router();
 
@@ -161,5 +162,99 @@ whatsappTeacherRouter.post(
       req.body.student_ids,
     );
     res.json({ success: true, data });
+  }),
+);
+
+const TeacherParentPrefsBody = z.object({
+  auto_send: z.boolean(),
+  notify_passed: z.boolean(),
+  notify_failed: z.boolean(),
+  notify_absent: z.boolean(),
+  pass_percentage: z.number().min(0).max(100),
+});
+
+whatsappTeacherRouter.get(
+  '/parents-exam/settings',
+  asyncWrapper(async (req, res) => {
+    res.json({ success: true, data: await ParentsExamNotifyService.getTeacherPrefs(req.user!.id) });
+  }),
+);
+
+whatsappTeacherRouter.put(
+  '/parents-exam/settings',
+  validate(TeacherParentPrefsBody),
+  asyncWrapper(async (req, res) => {
+    const prefs = await ParentsExamNotifyService.saveTeacherPrefs(req.user!.id, req.body);
+    res.json({ success: true, data: prefs });
+  }),
+);
+
+whatsappTeacherRouter.get(
+  '/parents-exam/exams',
+  asyncWrapper(async (req, res) => {
+    const exams = await ParentsExamNotifyService.listExams(req.user!.id);
+    res.json({ success: true, data: { exams } });
+  }),
+);
+
+whatsappTeacherRouter.get(
+  '/parents-exam/exams/:examId/preview',
+  asyncWrapper(async (req, res) => {
+    const examId = Number(req.params.examId);
+    await ParentsExamNotifyService.assertOwned(req.user!.id, examId);
+    res.json({ success: true, data: await ParentsExamNotifyService.preview(examId) });
+  }),
+);
+
+whatsappTeacherRouter.put(
+  '/parents-exam/exams/:examId',
+  validate(z.object({ enabled: z.boolean() })),
+  asyncWrapper(async (req, res) => {
+    const examId = Number(req.params.examId);
+    await ParentsExamNotifyService.assertOwned(req.user!.id, examId);
+    res.json({ success: true, data: await ParentsExamNotifyService.setExamEnabled(examId, req.body.enabled) });
+  }),
+);
+
+whatsappTeacherRouter.post(
+  '/parents-exam/exams/:examId/test',
+  validate(
+    z.object({
+      studentId: z.number().int().positive(),
+      cohort: z.enum(['passed', 'failed', 'absent']),
+    }),
+  ),
+  asyncWrapper(async (req, res) => {
+    const examId = Number(req.params.examId);
+    await ParentsExamNotifyService.assertOwned(req.user!.id, examId);
+    const data = await ParentsExamNotifyService.testSend(examId, req.body.studentId, req.body.cohort);
+    res.status(202).json({ success: true, data });
+  }),
+);
+
+whatsappTeacherRouter.post(
+  '/parents-exam/exams/:examId/pause',
+  asyncWrapper(async (req, res) => {
+    const examId = Number(req.params.examId);
+    await ParentsExamNotifyService.assertOwned(req.user!.id, examId);
+    res.json({ success: true, data: await ParentsExamNotifyService.pause(examId) });
+  }),
+);
+
+whatsappTeacherRouter.post(
+  '/parents-exam/exams/:examId/resume',
+  asyncWrapper(async (req, res) => {
+    const examId = Number(req.params.examId);
+    await ParentsExamNotifyService.assertOwned(req.user!.id, examId);
+    res.json({ success: true, data: await ParentsExamNotifyService.resume(examId) });
+  }),
+);
+
+whatsappTeacherRouter.post(
+  '/parents-exam/exams/:examId/cancel-pending',
+  asyncWrapper(async (req, res) => {
+    const examId = Number(req.params.examId);
+    await ParentsExamNotifyService.assertOwned(req.user!.id, examId);
+    res.json({ success: true, data: await ParentsExamNotifyService.cancelPending(examId) });
   }),
 );

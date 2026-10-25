@@ -10,8 +10,9 @@ import {
   sweepClosedExams,
   testSend,
 } from './engine';
+import { HttpError } from '../../../../utils';
 import type { ExamCohort } from './constants';
-import type { ParentsExamConfig, QuietHoursConfig } from './settings';
+import type { ParentsExamConfig, QuietHoursConfig, TeacherExamPrefs } from './settings';
 
 export function onAttemptFinalized(examId: number, studentId: number): Promise<void> {
   return safeNotifyFinalized(pgParentsExamStore, examId, studentId);
@@ -26,7 +27,10 @@ export const ParentsExamNotifyService = {
   saveSettings: (patch: Partial<ParentsExamConfig> & { quiet_hours?: Partial<QuietHoursConfig> }) =>
     saveSettings(pgParentsExamStore, patch),
   queue: async () => queueViewFromSettings(await getSettingsView(pgParentsExamStore)),
-  listExams: (limit = 50) => pgParentsExamStore.listExams(limit),
+  listExams: (teacherId?: number) => pgParentsExamStore.listExams(teacherId),
+  getTeacherPrefs: (teacherId: number) => pgParentsExamStore.getTeacherPrefs(teacherId),
+  saveTeacherPrefs: (teacherId: number, prefs: TeacherExamPrefs) =>
+    pgParentsExamStore.saveTeacherPrefs(teacherId, prefs),
   setExamEnabled: (examId: number, enabled: boolean) =>
     pgParentsExamStore.setExamEnabled(examId, enabled),
   pause: (examId: number) => pgParentsExamStore.setExamPaused(examId, true),
@@ -41,4 +45,10 @@ export const ParentsExamNotifyService = {
   ) => sendCohorts(pgParentsExamStore, examId, flags),
   notifyFinalized: (examId: number, studentId: number) =>
     notifyFinalizedAttempt(pgParentsExamStore, examId, studentId),
+  async assertOwned(teacherId: number, examId: number) {
+    const exam = await pgParentsExamStore.getExam(examId);
+    if (!exam) throw new HttpError(404, 'الامتحان غير موجود');
+    if (exam.teacherId !== teacherId) throw new HttpError(403, 'هذا الامتحان ليس لك');
+    return exam;
+  },
 };

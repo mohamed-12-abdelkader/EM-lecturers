@@ -391,11 +391,6 @@ whatsappAdminRouter.post(
 );
 
 const ParentsExamSettingsBody = z.object({
-  auto_send: z.boolean().optional(),
-  notify_passed: z.boolean().optional(),
-  notify_failed: z.boolean().optional(),
-  notify_absent: z.boolean().optional(),
-  pass_percentage: z.number().min(0).max(100).optional(),
   interval_seconds: z.number().int().min(15).max(300).optional(),
   jitter_seconds: z.number().int().min(0).max(120).optional(),
   daily_cap: z.number().int().min(1).max(5000).optional(),

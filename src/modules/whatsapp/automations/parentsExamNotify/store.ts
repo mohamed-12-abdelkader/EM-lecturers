@@ -18,6 +18,7 @@ export interface ExamState {
   paused: boolean;
   absentSweptAt: Date | null;
   courseTitle: string | null;
+  teacherId: number;
   scheduledCount?: number;
   sentCount?: number;
   skippedCount?: number;
@@ -37,6 +38,7 @@ export type NotificationStatus = 'scheduled' | 'sent' | 'skipped' | 'cancelled';
 export interface NotificationState {
   id: number;
   examId: number;
+  teacherId: number;
   studentId: number;
   cohort: ExamCohort;
   parentPhone: string | null;
@@ -83,7 +85,12 @@ export interface ParentsExamStore {
   getService(): Promise<ServiceState | null>;
   saveConfig(config: ParentsExamConfig): Promise<ServiceState>;
   getExam(examId: number): Promise<ExamState | null>;
-  listExams(limit: number): Promise<ExamState[]>;
+  listExams(teacherId?: number): Promise<ExamState[]>;
+  getTeacherPrefs(teacherId: number): Promise<import('./settings').TeacherExamPrefs>;
+  saveTeacherPrefs(
+    teacherId: number,
+    prefs: import('./settings').TeacherExamPrefs,
+  ): Promise<import('./settings').TeacherExamPrefs>;
   setExamEnabled(examId: number, enabled: boolean): Promise<ExamState>;
   setExamPaused(examId: number, paused: boolean): Promise<ExamState>;
   markAbsentSwept(examId: number, at: Date): Promise<void>;
@@ -101,6 +108,7 @@ export interface ParentsExamStore {
     patch: { parentPhone: string; body: string; readyAt: Date; immediate: boolean },
   ): Promise<void>;
   insertNotification(row: {
+    teacherId: number;
     examId: number;
     studentId: number;
     cohort: ExamCohort;
@@ -114,9 +122,9 @@ export interface ParentsExamStore {
   listUnqueued(now: Date, limit: number): Promise<NotificationState[]>;
   attachJob(id: number, jobId: number, scheduledAt: Date): Promise<void>;
   defer(id: number, readyAt: Date): Promise<void>;
-  countPlacedOnDay(dayStart: Date, dayEnd: Date): Promise<number>;
-  lastSlot(): Promise<Date | null>;
-  pickSession(phone: string | null): Promise<{ sessionSlug: string; serviceId: number }>;
+  countPlacedOnDay(teacherId: number | null, dayStart: Date, dayEnd: Date): Promise<number>;
+  lastSlot(teacherId: number): Promise<Date | null>;
+  pickSession(teacherId: number, phone: string | null): Promise<{ sessionSlug: string; serviceId: number }>;
   enqueueJob(input: EnqueueJobInput): Promise<number>;
   cancelPending(examId: number): Promise<{ notifications: number }>;
   sentOnDay(dayStart: Date, dayEnd: Date): Promise<number>;
