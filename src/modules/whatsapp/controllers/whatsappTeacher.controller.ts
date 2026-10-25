@@ -171,6 +171,9 @@ const TeacherParentPrefsBody = z.object({
   notify_failed: z.boolean(),
   notify_absent: z.boolean(),
   pass_percentage: z.number().min(0).max(100),
+  template_passed: z.string().min(1).max(500),
+  template_failed: z.string().min(1).max(500),
+  template_absent: z.string().min(1).max(500),
 });
 
 whatsappTeacherRouter.get(

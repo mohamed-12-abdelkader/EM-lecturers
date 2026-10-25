@@ -1,3 +1,5 @@
+import { DEFAULT_PARENT_EXAM_TEMPLATES } from './templates';
+
 export interface QuietHoursConfig {
   enabled: boolean;
   start: string;
@@ -20,6 +22,9 @@ export interface TeacherExamPrefs {
   notify_failed: boolean;
   notify_absent: boolean;
   pass_percentage: number;
+  template_passed: string;
+  template_failed: string;
+  template_absent: string;
 }
 
 export const DEFAULT_TEACHER_EXAM_PREFS: TeacherExamPrefs = {
@@ -28,6 +33,9 @@ export const DEFAULT_TEACHER_EXAM_PREFS: TeacherExamPrefs = {
   notify_failed: false,
   notify_absent: false,
   pass_percentage: 50,
+  template_passed: DEFAULT_PARENT_EXAM_TEMPLATES.passed,
+  template_failed: DEFAULT_PARENT_EXAM_TEMPLATES.failed,
+  template_absent: DEFAULT_PARENT_EXAM_TEMPLATES.absent,
 };
 
 export const DEFAULT_PARENTS_EXAM_CONFIG: ParentsExamConfig = {
@@ -101,6 +109,13 @@ export function mergeParentsExamConfig(
   });
 }
 
+function templateText(value: unknown, fallback: string): string {
+  if (typeof value !== 'string') return fallback;
+  const text = value.trim();
+  if (!text || text.length > 500) return fallback;
+  return text;
+}
+
 export function parseTeacherExamPrefs(raw: Partial<TeacherExamPrefs> | null | undefined): TeacherExamPrefs {
   const src = raw ?? {};
   return {
@@ -109,7 +124,20 @@ export function parseTeacherExamPrefs(raw: Partial<TeacherExamPrefs> | null | un
     notify_failed: asBool(src.notify_failed, false),
     notify_absent: asBool(src.notify_absent, false),
     pass_percentage: clampInt(src.pass_percentage, 50, 0, 100),
+    template_passed: templateText(src.template_passed, DEFAULT_TEACHER_EXAM_PREFS.template_passed),
+    template_failed: templateText(src.template_failed, DEFAULT_TEACHER_EXAM_PREFS.template_failed),
+    template_absent: templateText(src.template_absent, DEFAULT_TEACHER_EXAM_PREFS.template_absent),
   };
+}
+
+export function templateForCohort(
+  prefs: Pick<TeacherExamPrefs, 'template_passed' | 'template_failed' | 'template_absent'> | null | undefined,
+  cohort: 'passed' | 'failed' | 'absent',
+): string {
+  if (!prefs) return DEFAULT_TEACHER_EXAM_PREFS[`template_${cohort}`];
+  if (cohort === 'passed') return prefs.template_passed;
+  if (cohort === 'failed') return prefs.template_failed;
+  return prefs.template_absent;
 }
 
 export function cohortEnabled(prefs: TeacherExamPrefs, cohort: 'passed' | 'failed' | 'absent'): boolean {

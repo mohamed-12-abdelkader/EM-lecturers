@@ -3,7 +3,7 @@ import { classifyStudent, isExamClosed, shouldAutoNotify, type StudentStanding }
 import type { ExamCohort } from './constants';
 import { canonicalParentPhone } from './phone';
 import { dayStart, nextScheduledAt } from './schedule';
-import { cohortEnabled, mergeParentsExamConfig, type ParentsExamConfig } from './settings';
+import { cohortEnabled, mergeParentsExamConfig, templateForCohort, type ParentsExamConfig } from './settings';
 import type { ExamState, ParentsExamStore, StudentState } from './store';
 import { renderParentExamMessage } from './templates';
 
@@ -23,6 +23,7 @@ async function recordStudent(
   cohort: ExamCohort,
   now: Date,
   immediate: boolean,
+  template?: string | null,
 ): Promise<'inserted' | 'skipped' | 'duplicate'> {
   const existing = await store.findNotification(exam.id, student.studentId, cohort);
   if (existing) return 'duplicate';
@@ -33,6 +34,7 @@ async function recordStudent(
     examTitle: exam.title,
     score: student.obtained,
     total: student.total,
+    template,
   });
   if (!phone) {
     await store.insertNotification({
@@ -163,7 +165,15 @@ export async function notifyFinalizedAttempt(
     alreadyRecorded: Boolean(existing),
   });
   if (!ok || cohort === 'in_progress') return 'ignored';
-  const recorded = await recordStudent(store, exam, student, cohort, now, false);
+  const recorded = await recordStudent(
+    store,
+    exam,
+    student,
+    cohort,
+    now,
+    false,
+    templateForCohort(prefs, cohort),
+  );
   if (recorded === 'skipped') return 'skipped';
   if (recorded === 'duplicate') return 'ignored';
   await placePending(store, now);
@@ -197,7 +207,15 @@ export async function sweepClosedExams(
       for (const student of audience) {
         const cohort = standingOf(student, prefs.pass_percentage);
         if (cohort !== 'absent') continue;
-        const result = await recordStudent(store, exam, student, 'absent', now, false);
+        const result = await recordStudent(
+          store,
+          exam,
+          student,
+          'absent',
+          now,
+          false,
+          templateForCohort(prefs, 'absent'),
+        );
         if (result === 'inserted') inserted += 1;
         if (result === 'duplicate') continue;
         const row = await store.findNotification(exam.id, student.studentId, 'absent');
@@ -235,6 +253,7 @@ export async function testSend(
     examTitle: exam.title,
     score: student.obtained,
     total: student.total,
+    template: templateForCohort(prefs, cohort),
   });
   let row = await store.findNotification(examId, studentId, cohort);
   if (row?.status === 'sent') throw new HttpError(409, 'الرسالة اتبعتت قبل كده');
@@ -294,7 +313,15 @@ export async function sendCohorts(
     if (cohort === 'passed' && !flags.passed) continue;
     if (cohort === 'failed' && !flags.failed) continue;
     if (cohort === 'absent' && (!flags.absent || !closed)) continue;
-    const result = await recordStudent(store, exam, student, cohort, now, false);
+    const result = await recordStudent(
+      store,
+      exam,
+      student,
+      cohort,
+      now,
+      false,
+      templateForCohort(prefs, cohort),
+    );
     if (result === 'inserted') inserted += 1;
     else if (result === 'skipped') skipped += 1;
     else duplicates += 1;

@@ -1,5 +1,5 @@
 import type { ExamCohort } from './constants';
-import { DEFAULT_PARENTS_EXAM_CONFIG, DEFAULT_TEACHER_EXAM_PREFS, type ParentsExamConfig, type TeacherExamPrefs } from './settings';
+import { DEFAULT_PARENTS_EXAM_CONFIG, DEFAULT_TEACHER_EXAM_PREFS, parseTeacherExamPrefs, type ParentsExamConfig, type TeacherExamPrefs } from './settings';
 import type {
   EnqueueJobInput,
   ExamState,
@@ -91,7 +91,7 @@ export class MemoryParentsExamStore implements ParentsExamStore {
   }
 
   async getTeacherPrefs(teacherId: number): Promise<TeacherExamPrefs> {
-    return this.teacherPrefs.get(teacherId) ?? { ...DEFAULT_TEACHER_EXAM_PREFS };
+    return parseTeacherExamPrefs(this.teacherPrefs.get(teacherId) ?? null);
   }
 
   async saveTeacherPrefs(teacherId: number, prefs: TeacherExamPrefs): Promise<TeacherExamPrefs> {

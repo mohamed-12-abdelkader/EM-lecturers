@@ -7,6 +7,7 @@ import type { ExamState, StudentState } from '../store';
 import { canonicalParentPhone } from '../phone';
 import { dayStart, nextScheduledAt, zonedParts, zonedTimeToUtc } from '../schedule';
 import { DEFAULT_PARENTS_EXAM_CONFIG } from '../settings';
+import { DEFAULT_TEACHER_EXAM_PREFS } from '../settings';
 import { renderParentExamMessage } from '../templates';
 import { onParentsExamInbound } from '../handler';
 import { selectOutboundClaim } from '../../../queue/selectOutboundClaim';
@@ -101,6 +102,16 @@ describe('parent exam templates and cohorts', () => {
         total: 10,
       }),
     ).toContain('ألف مبروك، نجح');
+    expect(
+      renderParentExamMessage({
+        cohort: 'passed',
+        studentName: 'أحمد',
+        examTitle: 'الشامل',
+        score: 8,
+        total: 10,
+        template: 'نتيجة {الاسم} في {الامتحان} هي {الدرجة} من {المجموع}',
+      }),
+    ).toBe('نتيجة أحمد في الشامل هي 8 من 10');
   });
 
   it('classifies submitted, in-progress, and never-started separately', () => {
@@ -248,6 +259,41 @@ describe('parent exam notify engine', () => {
     expect(store.jobs[0].scheduledAt.getTime()).toBeGreaterThan(store.now().getTime());
   });
 
+  it('queues the teacher message for passed, failed, and absent', async () => {
+    const store = openStore();
+    store.teacherPrefs.set(1, {
+      ...DEFAULT_TEACHER_EXAM_PREFS,
+      auto_send: true,
+      notify_passed: true,
+      notify_failed: true,
+      notify_absent: true,
+      template_passed: 'نجح {الاسم} في {الامتحان} بـ {الدرجة}/{المجموع}',
+      template_failed: 'رسب {الاسم} في {الامتحان} بـ {الدرجة}/{المجموع}',
+      template_absent: '{الاسم} ما دخلش {الامتحان}',
+    });
+    await notifyFinalizedAttempt(store, 7, 1);
+    await notifyFinalizedAttempt(store, 7, 2);
+    store.exams.get(7)!.isActive = false;
+    await sweepClosedExams(store);
+    expect(store.jobs.find((job) => job.studentId === 1)?.body).toBe(
+      'نجح أحمد في امتحان شامل بـ 8/10',
+    );
+    expect(store.jobs.find((job) => job.studentId === 2)?.body).toBe(
+      'رسب منى في امتحان شامل بـ 2/10',
+    );
+    expect(store.jobs.find((job) => job.studentId === 4)?.body).toBe('ليلى ما دخلش امتحان شامل');
+
+    const testStore = openStore();
+    testStore.teacherPrefs.set(1, {
+      ...DEFAULT_TEACHER_EXAM_PREFS,
+      template_passed: 'نجح {الاسم} في {الامتحان} بـ {الدرجة}/{المجموع}',
+    });
+    const test = await testSend(testStore, 7, 1, 'passed');
+    expect(testStore.jobs.find((job) => job.id === test.jobId)?.body).toBe(
+      'نجح أحمد في امتحان شامل بـ 8/10',
+    );
+  });
+
   it('does not enqueue an in-progress student', async () => {
     const store = openStore();
     expect(await notifyFinalizedAttempt(store, 7, 3)).toBe('ignored');
@@ -318,11 +364,11 @@ describe('parent exam notify engine', () => {
   it('does not enqueue when the teacher turns auto-send off', async () => {
     const store = openStore();
     store.teacherPrefs.set(1, {
+      ...DEFAULT_TEACHER_EXAM_PREFS,
       auto_send: false,
       notify_passed: true,
       notify_failed: true,
       notify_absent: true,
-      pass_percentage: 50,
     });
     expect(await notifyFinalizedAttempt(store, 7, 1)).toBe('ignored');
     expect(store.jobs).toHaveLength(0);
@@ -339,11 +385,10 @@ describe('parent exam notify engine', () => {
     const store = openStore();
     store.service!.config.daily_cap = 1;
     store.teacherPrefs.set(2, {
+      ...DEFAULT_TEACHER_EXAM_PREFS,
       auto_send: true,
       notify_passed: true,
-      notify_failed: true,
       notify_absent: false,
-      pass_percentage: 50,
     });
     store.seedExam(
       exam({ id: 8, teacherId: 2, title: 'امتحان تاني' }),

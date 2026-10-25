@@ -257,6 +257,9 @@ export class PgParentsExamStore implements ParentsExamStore {
       notify_failed: row.notify_failed === true,
       notify_absent: row.notify_absent === true,
       pass_percentage: Number(row.pass_percentage),
+      template_passed: row.template_passed,
+      template_failed: row.template_failed,
+      template_absent: row.template_absent,
     });
   }
 
@@ -264,14 +267,18 @@ export class PgParentsExamStore implements ParentsExamStore {
     const parsed = parseTeacherExamPrefs(prefs);
     await query(
       `INSERT INTO wa_parent_exam_teacher_settings
-         (teacher_id, auto_send, notify_passed, notify_failed, notify_absent, pass_percentage)
-       VALUES ($1, $2, $3, $4, $5, $6)
+         (teacher_id, auto_send, notify_passed, notify_failed, notify_absent, pass_percentage,
+          template_passed, template_failed, template_absent)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
        ON CONFLICT (teacher_id) DO UPDATE SET
          auto_send = EXCLUDED.auto_send,
          notify_passed = EXCLUDED.notify_passed,
          notify_failed = EXCLUDED.notify_failed,
          notify_absent = EXCLUDED.notify_absent,
          pass_percentage = EXCLUDED.pass_percentage,
+         template_passed = EXCLUDED.template_passed,
+         template_failed = EXCLUDED.template_failed,
+         template_absent = EXCLUDED.template_absent,
          updated_at = NOW()`,
       [
         teacherId,
@@ -280,6 +287,9 @@ export class PgParentsExamStore implements ParentsExamStore {
         parsed.notify_failed,
         parsed.notify_absent,
         parsed.pass_percentage,
+        parsed.template_passed,
+        parsed.template_failed,
+        parsed.template_absent,
       ],
     );
     return parsed;
