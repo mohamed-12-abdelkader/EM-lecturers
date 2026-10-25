@@ -1,5 +1,6 @@
 import pool from '../../../db/pool';
 import type { WaConversationStatus, WaServiceRow } from '../automations/types';
+import { PARENTS_EXAM_NOTIFY_KEY } from '../automations/parentsExamNotify/constants';
 import { HttpError } from '../../../utils';
 
 function parseJson(raw: unknown): Record<string, unknown> {
@@ -84,7 +85,9 @@ export class WhatsAppServiceAdmin {
          JOIN wa_sessions s ON s.slug = ps.session_slug
          WHERE ps.service_id = sv.id
        ) sc ON TRUE
+       WHERE sv.key <> $1
        ORDER BY sv.id ASC`,
+      [PARENTS_EXAM_NOTIFY_KEY],
     );
     return result.rows.map((r) => ({ ...r, config: parseJson(r.config) }));
   }
@@ -119,7 +122,9 @@ export class WhatsAppServiceAdmin {
        WHERE sv.id = $1`,
       [id],
     );
-    if (!svc.rowCount) throw new HttpError(404, 'الخدمة غير موجودة');
+    if (!svc.rowCount || svc.rows[0].key === PARENTS_EXAM_NOTIFY_KEY) {
+      throw new HttpError(404, 'الخدمة غير موجودة');
+    }
 
     const sessions = await pool.query(
       `SELECT
@@ -147,6 +152,10 @@ export class WhatsAppServiceAdmin {
       config?: Record<string, unknown>;
     },
   ): Promise<WaServiceRow> {
+    const current = await pool.query<{ key: string }>(`SELECT key FROM wa_services WHERE id = $1`, [id]);
+    if (!current.rowCount || current.rows[0].key === PARENTS_EXAM_NOTIFY_KEY) {
+      throw new HttpError(404, 'الخدمة غير موجودة');
+    }
     const result = await pool.query<WaServiceRow>(
       `UPDATE wa_services SET
          name = CASE WHEN $2::boolean THEN $3 ELSE name END,
@@ -173,11 +182,13 @@ export class WhatsAppServiceAdmin {
   }
 
   static async replacePool(serviceId: number, members: PoolMemberInput[]): Promise<void> {
-    const exists = await pool.query<{ id: number; config: unknown }>(
-      `SELECT id, config FROM wa_services WHERE id = $1`,
+    const exists = await pool.query<{ id: number; key: string; config: unknown }>(
+      `SELECT id, key, config FROM wa_services WHERE id = $1`,
       [serviceId],
     );
-    if (!exists.rowCount) throw new HttpError(404, 'الخدمة غير موجودة');
+    if (!exists.rowCount || exists.rows[0].key === PARENTS_EXAM_NOTIFY_KEY) {
+      throw new HttpError(404, 'الخدمة غير موجودة');
+    }
     const serviceConfig = parseJson(exists.rows[0].config);
     const isTeacherService = serviceConfig.owner === 'teacher';
 

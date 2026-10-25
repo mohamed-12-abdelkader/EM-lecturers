@@ -210,7 +210,14 @@ export class PgParentsExamStore implements ParentsExamStore {
        WHERE sv.key = $1`,
       [PARENTS_EXAM_NOTIFY_KEY],
     );
-    if (!res.rowCount) return null;
+    if (!res.rowCount) {
+      return {
+        id: 0,
+        isEnabled: false,
+        config: parseParentsExamConfig(null),
+        readySessions: 0,
+      };
+    }
     const row = res.rows[0];
     return {
       id: Number(row.id),
@@ -222,7 +229,7 @@ export class PgParentsExamStore implements ParentsExamStore {
 
   async saveConfig(config: ParentsExamConfig): Promise<ServiceState> {
     await query(
-      `UPDATE wa_services SET config = $2::jsonb, updated_at = NOW() WHERE key = $1`,
+      `UPDATE wa_services SET config = $2::jsonb, is_enabled = FALSE, updated_at = NOW() WHERE key = $1`,
       [PARENTS_EXAM_NOTIFY_KEY, JSON.stringify(config)],
     );
     const service = await this.getService();

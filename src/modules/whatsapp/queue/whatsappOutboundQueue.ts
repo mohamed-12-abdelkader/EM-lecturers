@@ -95,7 +95,6 @@ export class WhatsAppOutboundQueue {
              OR NOT EXISTS (
                SELECT 1
                FROM wa_outbound_jobs prev
-               JOIN wa_services pace ON pace.key = 'parents_exam_notify'
                WHERE prev.session_slug = j.session_slug
                  AND prev.trigger_type LIKE 'parents_exam_%'
                  AND (
@@ -103,7 +102,10 @@ export class WhatsAppOutboundQueue {
                    OR (
                      prev.status = 'sent'
                      AND prev.processed_at > NOW() - make_interval(
-                       secs => GREATEST(15, LEAST(300, COALESCE((pace.config->>'interval_seconds')::int, 30)))
+                       secs => GREATEST(15, LEAST(300, COALESCE(
+                         (SELECT (config->>'interval_seconds')::int FROM wa_services WHERE key = 'parents_exam_notify'),
+                         30
+                       )))
                      )
                    )
                  )
