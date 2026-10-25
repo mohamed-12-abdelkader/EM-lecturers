@@ -143,9 +143,6 @@ export class LectureActivationService {
       if (!row.is_active) {
         throw new HttpError(400, 'هذا الكود غير مفعّل');
       }
-      if (Number(row.max_uses) > 0 && Number(row.uses) >= Number(row.max_uses)) {
-        throw new HttpError(400, 'تم استنفاد عدد استخدامات هذا الكود');
-      }
 
       const courseAccess = await CourseAccessService.checkStudentAccess(studentId, row.course_id);
       if (!courseAccess.hasAccess) {
@@ -158,17 +155,25 @@ export class LectureActivationService {
       );
 
       const now = new Date();
-      if (existing.rowCount) {
-        const prev = existing.rows[0];
-        if (new Date(prev.expires_at).getTime() > now.getTime()) {
-          throw new HttpError(400, 'لديك تفعيل ساري لهذه المحاضرة بالفعل', {
-            code: 'ALREADY_ACTIVE',
-            activation: {
-              activated_at: prev.activated_at,
-              expires_at: prev.expires_at,
-            },
-          });
-        }
+      const prev = existing.rowCount ? existing.rows[0] : null;
+      if (prev && new Date(prev.expires_at).getTime() > now.getTime()) {
+        throw new HttpError(400, 'لديك تفعيل ساري لهذه المحاضرة بالفعل', {
+          code: 'ALREADY_ACTIVE',
+          activation: {
+            activated_at: prev.activated_at,
+            expires_at: prev.expires_at,
+          },
+        });
+      }
+
+      // تجديد بعد انتهاء المدة بنفس الكود لا يستهلك استخدامًا جديدًا
+      const renewingSameCode = prev != null && Number(prev.code_id) === Number(row.id);
+      if (
+        !renewingSameCode &&
+        Number(row.max_uses) > 0 &&
+        Number(row.uses) >= Number(row.max_uses)
+      ) {
+        throw new HttpError(400, 'تم استنفاد عدد استخدامات هذا الكود');
       }
 
       const durationHours = Number(row.duration_hours);
@@ -186,10 +191,12 @@ export class LectureActivationService {
         [row.lecture_id, row.course_id, studentId, row.id, now, expiresAt],
       );
 
-      await client.query(
-        `UPDATE lecture_activation_codes SET uses = uses + 1, updated_at = NOW() WHERE id = $1`,
-        [row.id],
-      );
+      if (!renewingSameCode) {
+        await client.query(
+          `UPDATE lecture_activation_codes SET uses = uses + 1, updated_at = NOW() WHERE id = $1`,
+          [row.id],
+        );
+      }
 
       await client.query('COMMIT');
 

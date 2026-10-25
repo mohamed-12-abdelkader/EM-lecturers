@@ -252,6 +252,69 @@ router.get(
   }),
 );
 
+router.post(
+  '/:examId/late-access',
+  authMiddleware(COURSE_CONTENT_ROLES),
+  asyncWrapper(async (req, res) => {
+    const examId = Number(req.params.examId);
+    const studentCode = pickBodyValue(req.body ?? {}, 'studentCode', 'student_code');
+    const studentIdRaw = pickBodyValue(req.body ?? {}, 'studentId', 'student_id');
+    const studentId = studentIdRaw == null || studentIdRaw === '' ? null : Number(studentIdRaw);
+    const extraRaw = pickBodyValue(req.body ?? {}, 'extraAttempts', 'extra_attempts');
+    const extraAttempts = extraRaw == null || extraRaw === '' ? 1 : Number(extraRaw);
+    const note = pickBodyValue(req.body ?? {}, 'note');
+    if (!Number.isInteger(examId) || examId <= 0) {
+      throw new HttpError(400, 'examId غير صالح');
+    }
+    if ((studentCode == null || String(studentCode).trim() === '') && !(Number(studentId) > 0)) {
+      throw new HttpError(400, 'كود الطالب مطلوب');
+    }
+    await assertPublicExam(examId, req.user!);
+    const data = await CourseLevelExamsService.grantLateAccess({
+      examId,
+      studentCode: studentCode == null ? null : String(studentCode),
+      studentId,
+      requester: req.user!,
+      extraAttempts,
+      note: note == null ? null : String(note),
+    });
+    res.json({
+      success: true,
+      message: 'تم السماح للطالب بمحاولة إضافية حتى بعد انتهاء وقت الامتحان',
+      data,
+    });
+  }),
+);
+
+router.get(
+  '/:examId/late-access',
+  authMiddleware(COURSE_CONTENT_ROLES),
+  asyncWrapper(async (req, res) => {
+    const examId = Number(req.params.examId);
+    if (!Number.isInteger(examId) || examId <= 0) throw new HttpError(400, 'examId غير صالح');
+    await assertPublicExam(examId, req.user!);
+    const data = await CourseLevelExamsService.listLateAccess(examId, req.user!);
+    res.json({ success: true, data });
+  }),
+);
+
+router.delete(
+  '/:examId/late-access/:studentCode',
+  authMiddleware(COURSE_CONTENT_ROLES),
+  asyncWrapper(async (req, res) => {
+    const examId = Number(req.params.examId);
+    const studentCode = String(req.params.studentCode || '').trim();
+    if (!Number.isInteger(examId) || examId <= 0 || !studentCode) {
+      throw new HttpError(400, 'examId وكود الطالب مطلوبان');
+    }
+    await assertPublicExam(examId, req.user!);
+    const data = await CourseLevelExamsService.revokeLateAccess(examId, req.user!, {
+      studentCode,
+    });
+    res.json({ success: true, message: 'تم إلغاء السماح', data });
+  }),
+);
+
 router.get(
   '/:examId',
   authMiddleware([...COURSE_CONTENT_ROLES, 'student']),

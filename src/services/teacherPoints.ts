@@ -2634,10 +2634,38 @@ export class TeacherPointsService {
     }
 
     const higherRes = await pool.query<{ cnt: string }>(
-      `SELECT COUNT(*)::text AS cnt
-       FROM student_point_balances
-       WHERE teacher_id = $1 AND grade_id = $2 AND total_points > $3`,
-      [opts.teacherId, opts.gradeId, totalPoints],
+      `WITH mine AS (
+         SELECT COALESCE(
+           (SELECT MAX(created_at) FROM point_transactions
+            WHERE student_id = $4 AND teacher_id = $1 AND grade_id = $2),
+           (SELECT updated_at FROM student_point_balances
+            WHERE student_id = $4 AND teacher_id = $1 AND grade_id = $2),
+           NOW()
+         ) AS reached_at
+       ),
+       others AS (
+         SELECT b.student_id, b.total_points,
+           COALESCE(
+             (SELECT MAX(t.created_at) FROM point_transactions t
+              WHERE t.student_id = b.student_id
+                AND t.teacher_id = b.teacher_id
+                AND t.grade_id = b.grade_id),
+             b.updated_at
+           ) AS reached_at
+         FROM student_point_balances b
+         WHERE b.teacher_id = $1 AND b.grade_id = $2 AND b.student_id <> $4
+       )
+       SELECT COUNT(*)::text AS cnt
+       FROM others, mine
+       WHERE others.total_points > $3
+          OR (
+            others.total_points = $3
+            AND (
+              others.reached_at < mine.reached_at
+              OR (others.reached_at = mine.reached_at AND others.student_id < $4)
+            )
+          )`,
+      [opts.teacherId, opts.gradeId, totalPoints, opts.studentId],
     );
     const rank = Number(higherRes.rows[0]?.cnt || 0) + 1;
 
@@ -2676,11 +2704,29 @@ export class TeacherPointsService {
          b.total_points,
          u.name AS student_name,
          u.avatar AS student_avatar,
-         RANK() OVER (ORDER BY b.total_points DESC, b.student_id ASC) AS rank
+         RANK() OVER (
+           ORDER BY b.total_points DESC,
+                    COALESCE(
+                      (SELECT MAX(t.created_at) FROM point_transactions t
+                       WHERE t.student_id = b.student_id
+                         AND t.teacher_id = b.teacher_id
+                         AND t.grade_id = b.grade_id),
+                      b.updated_at
+                    ) ASC,
+                    b.student_id ASC
+         ) AS rank
        FROM student_point_balances b
        JOIN users u ON u.id = b.student_id
        WHERE b.teacher_id = $1 AND b.grade_id = $2
-       ORDER BY b.total_points DESC, b.student_id ASC
+       ORDER BY b.total_points DESC,
+                COALESCE(
+                  (SELECT MAX(t.created_at) FROM point_transactions t
+                   WHERE t.student_id = b.student_id
+                     AND t.teacher_id = b.teacher_id
+                     AND t.grade_id = b.grade_id),
+                  b.updated_at
+                ) ASC,
+                b.student_id ASC
        LIMIT $3`,
       [opts.teacherId, opts.gradeId, limit],
     );
@@ -2777,7 +2823,18 @@ export class TeacherPointsService {
          cg.name AS course_group_name,
          cg.grade_id AS course_group_grade_id,
          cg.status AS course_group_status,
-         RANK() OVER (PARTITION BY b.grade_id ORDER BY b.total_points DESC, b.student_id ASC) AS rank
+         RANK() OVER (
+           PARTITION BY b.grade_id
+           ORDER BY b.total_points DESC,
+                    COALESCE(
+                      (SELECT MAX(t.created_at) FROM point_transactions t
+                       WHERE t.student_id = b.student_id
+                         AND t.teacher_id = b.teacher_id
+                         AND t.grade_id = b.grade_id),
+                      b.updated_at
+                    ) ASC,
+                    b.student_id ASC
+         ) AS rank
        FROM student_point_balances b
        JOIN users u ON u.id = b.student_id
        LEFT JOIN grades g ON g.id = b.grade_id
@@ -2793,7 +2850,15 @@ export class TeacherPointsService {
        ) cg_ref ON TRUE
        LEFT JOIN course_groups cg ON cg.id = cg_ref.group_id
        WHERE ${where}
-       ORDER BY b.total_points DESC, b.student_id ASC
+       ORDER BY b.total_points DESC,
+                COALESCE(
+                  (SELECT MAX(t.created_at) FROM point_transactions t
+                   WHERE t.student_id = b.student_id
+                     AND t.teacher_id = b.teacher_id
+                     AND t.grade_id = b.grade_id),
+                  b.updated_at
+                ) ASC,
+                b.student_id ASC
        LIMIT $${i++} OFFSET $${i}`,
       params,
     );

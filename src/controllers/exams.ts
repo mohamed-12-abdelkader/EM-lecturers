@@ -1915,6 +1915,90 @@ router.get(
   }),
 );
 
+// POST /api/exams/:examId/late-access — محاولة إضافية لطالب واحد بعد انتهاء الوقت
+router.post(
+  '/:examId/late-access',
+  authMiddleware(COURSE_CONTENT_ROLES),
+  asyncWrapper(async (req, res) => {
+    const examId = Number(req.params.examId);
+    const studentCode = pickBodyValue(req.body ?? {}, 'studentCode', 'student_code');
+    const studentIdRaw = pickBodyValue(req.body ?? {}, 'studentId', 'student_id');
+    const studentId = studentIdRaw == null || studentIdRaw === '' ? null : Number(studentIdRaw);
+    const extraRaw = pickBodyValue(req.body ?? {}, 'extraAttempts', 'extra_attempts');
+    const extraAttempts = extraRaw == null || extraRaw === '' ? 1 : Number(extraRaw);
+    const note = pickBodyValue(req.body ?? {}, 'note');
+    if (!Number.isInteger(examId) || examId <= 0) {
+      return res.status(400).json({ success: false, message: 'examId غير صالح' });
+    }
+    if ((studentCode == null || String(studentCode).trim() === '') && !(Number(studentId) > 0)) {
+      return res.status(400).json({ success: false, message: 'كود الطالب مطلوب' });
+    }
+    try {
+      const data = await CourseLevelExamsService.grantLateAccess({
+        examId,
+        studentCode: studentCode == null ? null : String(studentCode),
+        studentId,
+        requester: req.user!,
+        extraAttempts,
+        note: note == null ? null : String(note),
+      });
+      return res.json({
+        success: true,
+        message: 'تم السماح للطالب بمحاولة إضافية حتى بعد انتهاء وقت الامتحان',
+        data,
+      });
+    } catch (error: any) {
+      if (error.status) {
+        return res.status(error.status).json({ success: false, message: error.message });
+      }
+      throw error;
+    }
+  }),
+);
+
+router.get(
+  '/:examId/late-access',
+  authMiddleware(COURSE_CONTENT_ROLES),
+  asyncWrapper(async (req, res) => {
+    const examId = Number(req.params.examId);
+    if (!Number.isInteger(examId) || examId <= 0) {
+      return res.status(400).json({ success: false, message: 'examId غير صالح' });
+    }
+    try {
+      const data = await CourseLevelExamsService.listLateAccess(examId, req.user!);
+      return res.json({ success: true, data });
+    } catch (error: any) {
+      if (error.status) {
+        return res.status(error.status).json({ success: false, message: error.message });
+      }
+      throw error;
+    }
+  }),
+);
+
+router.delete(
+  '/:examId/late-access/:studentCode',
+  authMiddleware(COURSE_CONTENT_ROLES),
+  asyncWrapper(async (req, res) => {
+    const examId = Number(req.params.examId);
+    const studentCode = String(req.params.studentCode || '').trim();
+    if (!Number.isInteger(examId) || examId <= 0 || !studentCode) {
+      return res.status(400).json({ success: false, message: 'examId وكود الطالب مطلوبان' });
+    }
+    try {
+      const data = await CourseLevelExamsService.revokeLateAccess(examId, req.user!, {
+        studentCode,
+      });
+      return res.json({ success: true, message: 'تم إلغاء السماح', data });
+    } catch (error: any) {
+      if (error.status) {
+        return res.status(error.status).json({ success: false, message: error.message });
+      }
+      throw error;
+    }
+  }),
+);
+
 // POST /api/exams/:examId/start - Start exam attempt (student only)
 // Note: This route handles both lecture exams and course-level exams
 router.post(

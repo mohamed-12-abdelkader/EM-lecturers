@@ -38,6 +38,8 @@ export type LectureAccessResult = {
   group_ids?: number[];
   /** في وضع groups: هل فُتحت لأن الطالب ضمن المجموعة المحددة؟ */
   open_via_group?: boolean;
+  /** انتهت النافذة السابقة ويمكن إدخال كود لفتح المحاضرة من جديد */
+  can_reactivate?: boolean;
 };
 
 type LectureRow = {
@@ -194,8 +196,9 @@ export class LectureAccessService {
         ...byCode,
         group_ids: groupIds,
         open_via_group: false,
-        message:
-          byCode.status === 'requires_activation_code'
+        message: byCode.can_reactivate
+          ? 'انتهت مدة التفعيل — أدخل كودًا لفتح المحاضرة مرة أخرى'
+          : byCode.status === 'requires_activation_code'
             ? 'المحاضرة ظاهرة لك ومقفولة — أدخل كود التفعيل (مفتوحة بدون كود لمجموعات محددة فقط)'
             : byCode.message,
       };
@@ -238,10 +241,11 @@ export class LectureAccessService {
     if (remainingMs <= 0) {
       return {
         can_access: false,
-        status: 'activation_expired',
-        message: 'انتهت مدة تفعيل المحاضرة الخاصة بك',
+        status: 'requires_activation_code',
+        message: 'انتهت مدة التفعيل — يمكنك إدخال كود لفتح المحاضرة مرة أخرى',
         access_mode: mode,
         lecture_access_mode: mode,
+        can_reactivate: true,
         activation: {
           activated_at: activatedAt.toISOString(),
           expires_at: expiresAt.toISOString(),

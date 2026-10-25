@@ -61,7 +61,23 @@ const DEFAULT_SETTINGS: RegistrationSettings = {
 };
 
 function normalizeStudentCode(code: string): string {
-  return code.replace(/\D/g, '');
+  const arabic = '٠١٢٣٤٥٦٧٨٩';
+  const persian = '۰۱۲۳۴۵۶۷۸۹';
+  let out = '';
+  for (const ch of String(code ?? '')) {
+    const a = arabic.indexOf(ch);
+    if (a >= 0) {
+      out += String(a);
+      continue;
+    }
+    const p = persian.indexOf(ch);
+    if (p >= 0) {
+      out += String(p);
+      continue;
+    }
+    if (ch >= '0' && ch <= '9') out += ch;
+  }
+  return out;
 }
 
 export function normalizeStudentCodeInput(code: string): string {

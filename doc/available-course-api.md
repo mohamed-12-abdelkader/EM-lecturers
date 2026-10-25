@@ -148,9 +148,8 @@ PATCH /api/course/lecture/:lectureId
 | `open` | متاحة |
 | `locked` | مقفولة بسبب واجب/امتحان سابق |
 | `expired` | انتهت مدة `expires_at` |
-| `requires_activation_code` | يحتاج كود |
+| `requires_activation_code` | يحتاج كود — يشمل انتهاء المدة السابقة (`can_reactivate: true`) ويمكن إدخال كود من جديد |
 | `activated` | مفعّلة للطالب وضمن المدة |
-| `activation_expired` | انتهت مدة تفعيله |
 | `group_restricted` | المحاضرة لمجموعات محددة والطالب خارجها |
 | `not_enrolled` | غير مشترك |
 

@@ -36,6 +36,7 @@ import {
   type CourseExamLetter,
 } from './courseLevelExamAttemptPolicy';
 import { TeacherReadingPassagesService } from './teacherReadingPassages';
+import { normalizeStudentCodeInput } from './teacherManagedStudents';
 
 interface RequestUser {
   id: number;
@@ -1587,6 +1588,223 @@ export class CourseLevelExamsService {
     await CourseAccessControl.assertCanManageCourse(requester, Number(exam.course_id));
   }
 
+  private static async lateAccessRemainingMap(
+    examIds: number[],
+    studentId: number,
+  ): Promise<Map<number, number>> {
+    const map = new Map<number, number>();
+    if (!examIds.length) return map;
+    try {
+      const res = await pool.query<{ exam_id: number; remaining_attempts: number }>(
+        `SELECT exam_id, remaining_attempts
+         FROM course_level_exam_late_access
+         WHERE student_id = $1 AND exam_id = ANY($2::int[]) AND remaining_attempts > 0`,
+        [studentId, examIds],
+      );
+      for (const row of res.rows) {
+        map.set(Number(row.exam_id), Number(row.remaining_attempts));
+      }
+    } catch (err: any) {
+      if (err?.code !== '42P01') throw err;
+    }
+    return map;
+  }
+
+  private static async getLateAccessRemaining(examId: number, studentId: number): Promise<number> {
+    const map = await this.lateAccessRemainingMap([examId], studentId);
+    return map.get(examId) ?? 0;
+  }
+
+  /** إيجاد الطالب بكوده أو موبايله أو رقمه، بشرط أن يصل لهذا الامتحان. */
+  private static async resolveStudentForLateAccess(opts: {
+    exam: {
+      exam_scope?: string | null;
+      course_id?: number | null;
+      grade_id?: number | null;
+    };
+    studentId?: number | null;
+    studentCode?: string | null;
+  }): Promise<{ id: number; name: string | null; studentCode: string | null }> {
+    const rawCode = String(opts.studentCode ?? '').trim();
+    if (rawCode) {
+      const code = normalizeStudentCodeInput(rawCode);
+      if (!code) {
+        throw new HttpError(400, 'كود الطالب غير صالح');
+      }
+      const byCode = await pool.query<{
+        id: number;
+        name: string | null;
+        student_code: string | null;
+        role: string;
+      }>(
+        `SELECT id, name, role, student_code
+         FROM users
+         WHERE role = 'student'
+           AND (
+             regexp_replace(COALESCE(student_code, ''), '[^0-9]', '', 'g') = $1
+             OR ltrim(regexp_replace(COALESCE(phone, ''), '[^0-9]', '', 'g'), '0') = ltrim($1, '0')
+             OR id::text = $1
+           )
+         LIMIT 20`,
+        [code],
+      );
+      const allowed = [];
+      for (const row of byCode.rows) {
+        try {
+          await this.assertStudentCanAccessExam(opts.exam, Number(row.id));
+          allowed.push(row);
+        } catch {
+          // طالب موجود لكن غير مشترك في هذا الامتحان
+        }
+      }
+      if (allowed.length > 1) {
+        throw new HttpError(409, 'أكثر من طالب يطابق هذا الكود داخل الامتحان');
+      }
+      if (!allowed.length) {
+        throw new HttpError(
+          404,
+          'لا يوجد طالب مشترك في هذا الامتحان بهذا الكود. استخدم كود الطالب أو رقم الموبايل',
+        );
+      }
+      return {
+        id: Number(allowed[0].id),
+        name: allowed[0].name,
+        studentCode: allowed[0].student_code,
+      };
+    }
+
+    const studentId = Number(opts.studentId);
+    if (!Number.isInteger(studentId) || studentId <= 0) {
+      throw new HttpError(400, 'كود الطالب مطلوب');
+    }
+    const studentRes = await pool.query<{ id: number; name: string | null; role: string; student_code: string | null }>(
+      `SELECT id, name, role, student_code FROM users WHERE id = $1`,
+      [studentId],
+    );
+    if (!studentRes.rowCount || studentRes.rows[0].role !== 'student') {
+      throw new HttpError(404, 'الطالب غير موجود');
+    }
+    return {
+      id: Number(studentRes.rows[0].id),
+      name: studentRes.rows[0].name,
+      studentCode: studentRes.rows[0].student_code ?? null,
+    };
+  }
+
+  /**
+   * يسمح لطالب واحد بدخول امتحان شامل بعد انتهاء وقته،
+   * وحتى لو كان امتحنه — محاولة إضافية لهذا الطالب فقط.
+   * التحديد الأساسي بكود الطالب.
+   */
+  static async grantLateAccess(opts: {
+    examId: number;
+    studentId?: number | null;
+    studentCode?: string | null;
+    requester: RequestUser;
+    extraAttempts?: number;
+    note?: string | null;
+  }) {
+    const extraAttempts = Math.trunc(Number(opts.extraAttempts ?? 1));
+    if (!Number.isInteger(extraAttempts) || extraAttempts < 1 || extraAttempts > 10) {
+      throw new HttpError(400, 'extraAttempts يجب أن يكون بين 1 و 10');
+    }
+
+    const exam = await this.getExamById(opts.examId, opts.requester);
+    await this.assertCanManageExam(exam, opts.requester);
+
+    const student = await this.resolveStudentForLateAccess({
+      exam,
+      studentId: opts.studentId,
+      studentCode: opts.studentCode,
+    });
+    await this.assertStudentCanAccessExam(exam, student.id);
+
+    const note = opts.note?.trim() ? opts.note.trim().slice(0, 500) : null;
+    let row;
+    try {
+      const inserted = await pool.query(
+        `INSERT INTO course_level_exam_late_access
+           (exam_id, student_id, granted_by, remaining_attempts, note, updated_at)
+         VALUES ($1, $2, $3, $4, $5, NOW())
+         ON CONFLICT (exam_id, student_id)
+         DO UPDATE SET
+           remaining_attempts = course_level_exam_late_access.remaining_attempts + EXCLUDED.remaining_attempts,
+           granted_by = EXCLUDED.granted_by,
+           note = COALESCE(EXCLUDED.note, course_level_exam_late_access.note),
+           updated_at = NOW()
+         RETURNING *`,
+        [opts.examId, student.id, opts.requester.id, extraAttempts, note],
+      );
+      row = inserted.rows[0];
+    } catch (err: any) {
+      if (err?.code === '42P01') {
+        throw new HttpError(503, 'جدول السماح المتأخر غير جاهز — شغّل المايجريشن');
+      }
+      throw err;
+    }
+
+    return {
+      id: Number(row.id),
+      examId: Number(row.exam_id),
+      studentId: Number(row.student_id),
+      studentCode: student.studentCode,
+      studentName: student.name,
+      remainingAttempts: Number(row.remaining_attempts),
+      note: row.note ?? null,
+      grantedBy: Number(row.granted_by),
+      updatedAt: row.updated_at,
+    };
+  }
+
+  static async listLateAccess(examId: number, requester: RequestUser) {
+    const exam = await this.getExamById(examId, requester);
+    await this.assertCanManageExam(exam, requester);
+    const res = await pool.query(
+      `SELECT a.*, u.name AS student_name, u.student_code
+       FROM course_level_exam_late_access a
+       JOIN users u ON u.id = a.student_id
+       WHERE a.exam_id = $1
+       ORDER BY a.updated_at DESC`,
+      [examId],
+    );
+    return res.rows.map((row) => ({
+      id: Number(row.id),
+      examId: Number(row.exam_id),
+      studentId: Number(row.student_id),
+      studentCode: row.student_code ?? null,
+      studentName: row.student_name ?? null,
+      remainingAttempts: Number(row.remaining_attempts),
+      note: row.note ?? null,
+      grantedBy: Number(row.granted_by),
+      updatedAt: row.updated_at,
+    }));
+  }
+
+  static async revokeLateAccess(
+    examId: number,
+    requester: RequestUser,
+    target: { studentId?: number | null; studentCode?: string | null },
+  ) {
+    const exam = await this.getExamById(examId, requester);
+    await this.assertCanManageExam(exam, requester);
+    const student = await this.resolveStudentForLateAccess({ exam, ...target });
+    const res = await pool.query(
+      `DELETE FROM course_level_exam_late_access
+       WHERE exam_id = $1 AND student_id = $2
+       RETURNING id`,
+      [examId, student.id],
+    );
+    if (!res.rowCount) {
+      throw new HttpError(404, 'لا يوجد سماح متأخر لهذا الطالب');
+    }
+    return {
+      examId,
+      studentId: student.id,
+      studentCode: student.studentCode,
+      revoked: true,
+    };
+  }
+
   /**
    * Get visible exams for a student in a course
    */
@@ -1610,6 +1828,10 @@ export class CourseLevelExamsService {
 
     const listed = result.rows.filter((exam) =>
       shouldListExamForStudent(courseLevelExamAvailabilityInput(exam), now),
+    );
+    const lateAccessByExam = await this.lateAccessRemainingMap(
+      listed.map((exam) => Number(exam.id)),
+      studentId,
     );
 
     // Get attempt counts for each exam
@@ -1637,14 +1859,18 @@ export class CourseLevelExamsService {
           inProgressAttemptId != null &&
           Number.isInteger(inProgressAttemptId) &&
           inProgressAttemptId > 0;
-        const canAttemptNew =
-          exam.attempt_limit === null || attemptsCount < exam.attempt_limit;
-
+        const lateRemaining = lateAccessByExam.get(Number(exam.id)) ?? 0;
         const availability_status = getStudentExamAvailability(
           courseLevelExamAvailabilityInput(exam),
           now,
         );
-        const canStartNew = canStudentStartExam(courseLevelExamAvailabilityInput(exam), now);
+        const lateBypass =
+          lateRemaining > 0 &&
+          (availability_status === 'open' || availability_status === 'expired');
+        const canAttemptNew =
+          exam.attempt_limit === null || attemptsCount < exam.attempt_limit || lateBypass;
+        const canStartNew =
+          canStudentStartExam(courseLevelExamAvailabilityInput(exam), now) || lateBypass;
         const inProgressExpireAt = attemptsRes.rows[0]?.in_progress_expire_at ?? null;
 
         return {
@@ -1660,6 +1886,7 @@ export class CourseLevelExamsService {
           attempt_expires_at: hasInProgressAttempt ? inProgressExpireAt : null,
           remaining_seconds: hasInProgressAttempt ? remainingSeconds(inProgressExpireAt, now) : null,
           can_resume: hasInProgressAttempt && canResumeCourseAttempt(inProgressExpireAt, now),
+          late_access_remaining: lateRemaining,
           can_attempt:
             (hasInProgressAttempt && canResumeCourseAttempt(inProgressExpireAt, now)) ||
             (canAttemptNew && canStartNew),
@@ -1708,6 +1935,10 @@ export class CourseLevelExamsService {
     const listed = result.rows.filter((exam) =>
       shouldListExamForStudent(courseLevelExamAvailabilityInput(exam), now),
     );
+    const lateAccessByExam = await this.lateAccessRemainingMap(
+      listed.map((exam) => Number(exam.id)),
+      studentId,
+    );
 
     const examsWithAttempts = await Promise.all(
       listed.map(async (exam) => {
@@ -1733,14 +1964,18 @@ export class CourseLevelExamsService {
           inProgressAttemptId != null &&
           Number.isInteger(inProgressAttemptId) &&
           inProgressAttemptId > 0;
-        const canAttemptNew =
-          exam.attempt_limit === null || attemptsCount < exam.attempt_limit;
-
+        const lateRemaining = lateAccessByExam.get(Number(exam.id)) ?? 0;
         const availability_status = getStudentExamAvailability(
           courseLevelExamAvailabilityInput(exam),
           now,
         );
-        const canStartNew = canStudentStartExam(courseLevelExamAvailabilityInput(exam), now);
+        const lateBypass =
+          lateRemaining > 0 &&
+          (availability_status === 'open' || availability_status === 'expired');
+        const canAttemptNew =
+          exam.attempt_limit === null || attemptsCount < exam.attempt_limit || lateBypass;
+        const canStartNew =
+          canStudentStartExam(courseLevelExamAvailabilityInput(exam), now) || lateBypass;
         const inProgressExpireAt = attemptsRes.rows[0]?.in_progress_expire_at ?? null;
 
         return {
@@ -1757,6 +1992,7 @@ export class CourseLevelExamsService {
           attempt_expires_at: hasInProgressAttempt ? inProgressExpireAt : null,
           remaining_seconds: hasInProgressAttempt ? remainingSeconds(inProgressExpireAt, now) : null,
           can_resume: hasInProgressAttempt && canResumeCourseAttempt(inProgressExpireAt, now),
+          late_access_remaining: lateRemaining,
           can_attempt:
             (hasInProgressAttempt && canResumeCourseAttempt(inProgressExpireAt, now)) ||
             (canAttemptNew && canStartNew),
@@ -1831,19 +2067,12 @@ export class CourseLevelExamsService {
       }
     }
 
-    if (!canStudentStartExam(courseLevelExamAvailabilityInput(exam), new Date())) {
-      const status = getStudentExamAvailability(courseLevelExamAvailabilityInput(exam));
-      if (status === 'expired') {
-        throw new HttpError(403, 'This exam has ended. You can view it but cannot start a new attempt.');
-      }
-      if (status === 'upcoming') {
-        throw new HttpError(403, 'This exam is not open yet');
-      }
-      if (status === 'incomplete') {
-        throw new HttpError(403, 'This exam is not ready yet');
-      }
-      throw new HttpError(403, 'This exam is no longer available');
-    }
+    const now = new Date();
+    const availability = getStudentExamAvailability(
+      courseLevelExamAvailabilityInput(exam),
+      now,
+    );
+    const windowOpen = canStudentStartExam(courseLevelExamAvailabilityInput(exam), now);
 
     const attemptsRes = await pool.query(
       `SELECT COUNT(*) FILTER (WHERE status = 'submitted') as attempts_count,
@@ -1856,8 +2085,27 @@ export class CourseLevelExamsService {
 
     const attemptsCount = Number(attemptsRes.rows[0]?.attempts_count || 0);
     const hasCompletedAttempts = attemptsCount > 0;
+    const attemptsBlocked =
+      exam.attempt_limit !== null && attemptsCount >= exam.attempt_limit;
+    const lateRemaining = await this.getLateAccessRemaining(examId, studentId);
+    const lateBypass =
+      lateRemaining > 0 && (availability === 'open' || availability === 'expired');
+    const useLateAccess = lateBypass && (!windowOpen || attemptsBlocked);
 
-    if (exam.attempt_limit === 1 && hasCompletedAttempts) {
+    if (!windowOpen && !useLateAccess) {
+      if (availability === 'expired') {
+        throw new HttpError(403, 'This exam has ended. You can view it but cannot start a new attempt.');
+      }
+      if (availability === 'upcoming') {
+        throw new HttpError(403, 'This exam is not open yet');
+      }
+      if (availability === 'incomplete') {
+        throw new HttpError(403, 'This exam is not ready yet');
+      }
+      throw new HttpError(403, 'This exam is no longer available');
+    }
+
+    if (exam.attempt_limit === 1 && hasCompletedAttempts && !useLateAccess) {
       const lastAttemptRes = await pool.query(
         `SELECT * FROM course_level_exam_attempts
          WHERE exam_id = $1 AND student_id = $2 AND status = 'submitted'
@@ -1897,7 +2145,7 @@ export class CourseLevelExamsService {
       }
     }
 
-    if (exam.attempt_limit !== null && attemptsCount >= exam.attempt_limit) {
+    if (attemptsBlocked && !useLateAccess) {
       throw new HttpError(403, 'You have used all allowed attempts for this exam');
     }
 
@@ -1919,12 +2167,26 @@ export class CourseLevelExamsService {
     const attemptExpireAt = computeAttemptExpireAt({
       startedAt,
       durationMinutes: exam.duration_minutes,
-      visibilityEndDate: exam.visibility_end_date,
+      visibilityEndDate: useLateAccess && availability === 'expired' ? null : exam.visibility_end_date,
     });
 
     let attempt;
+    const client = await pool.connect();
     try {
-      const attemptResult = await pool.query(
+      await client.query('BEGIN');
+      if (useLateAccess) {
+        const consumed = await client.query(
+          `UPDATE course_level_exam_late_access
+           SET remaining_attempts = remaining_attempts - 1, updated_at = NOW()
+           WHERE exam_id = $1 AND student_id = $2 AND remaining_attempts > 0
+           RETURNING remaining_attempts`,
+          [examId, studentId],
+        );
+        if (!consumed.rowCount) {
+          throw new HttpError(403, 'لا توجد محاولة إضافية متاحة لهذا الامتحان');
+        }
+      }
+      const attemptResult = await client.query(
         `INSERT INTO course_level_exam_attempts (
           exam_id, student_id, attempt_number, status, started_at,
           selected_question_ids, attempt_expire_at
@@ -1933,7 +2195,9 @@ export class CourseLevelExamsService {
         [examId, studentId, nextAttemptNumber, startedAt, selectedQuestionIds, attemptExpireAt],
       );
       attempt = attemptResult.rows[0];
+      await client.query('COMMIT');
     } catch (error: any) {
+      await client.query('ROLLBACK');
       if (error?.code === '23505') {
         const existing = await pool.query(
           `SELECT * FROM course_level_exam_attempts
@@ -1946,6 +2210,8 @@ export class CourseLevelExamsService {
         }
       }
       throw error;
+    } finally {
+      client.release();
     }
 
     await this.maybeAwardCourseExamStartPoints(exam, attempt, studentId);
@@ -2598,7 +2864,8 @@ export class CourseLevelExamsService {
          a.selected_question_ids,
          u.name as student_name,
          u.email as student_email,
-         u.phone as student_phone
+         u.phone as student_phone,
+         u.student_code
        FROM course_level_exam_attempts a
        JOIN users u ON a.student_id = u.id
        WHERE a.exam_id = $1 AND a.status IN ('submitted', 'in_progress')
@@ -2698,6 +2965,8 @@ export class CourseLevelExamsService {
           studentEmail: a.student_email,
           phone: a.student_phone,
           studentPhone: a.student_phone,
+          student_code: a.student_code ?? null,
+          studentCode: a.student_code ?? null,
           attemptId: a.attempt_id,
           submission_id: a.attempt_id,
           attemptNumber: a.attempt_number,

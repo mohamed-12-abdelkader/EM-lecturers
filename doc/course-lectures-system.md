@@ -227,7 +227,7 @@ POST /api/course/lecture/activate-by-code
 { "code": "ABC12XYZ" }
 ```
 
-بعد التفعيل يحصل على نافذة زمنية حسب `duration_hours`. عند انتهائها: `activation_expired`.
+بعد التفعيل يحصل على نافذة زمنية حسب `duration_hours`. عند انتهائها يرجع `access_status: requires_activation_code` مع `can_reactivate: true`، ويقدر يدخل كود (نفس الكود أو كود جديد) فيفتح له نافذة جديدة.
 
 ---
 
@@ -265,9 +265,8 @@ GET /api/course/:courseId/details
 | `access_status` / `status` | المعنى |
 |----------------------------|--------|
 | `open` | متاحة |
-| `requires_activation_code` | محتاج كود (محاضرة مغلقة، أو groups وهو خارج المجموعة) |
+| `requires_activation_code` | محتاج كود، أو انتهت المدة السابقة ويمكن إدخال كود مرة أخرى (`can_reactivate: true`) |
 | `activated` | مفعّلة وبها وقت متبقٍ |
-| `activation_expired` | انتهت مدة التفعيل |
 | `group_restricted` | نادرًا — لم يعد يُستخدم لإخفاء محاضرات المجموعات |
 | `not_enrolled` | غير مشترك في الكورس |
 
@@ -362,7 +361,7 @@ PATCH /api/course/:courseId/access-settings
 5. لا تعتمد على إعداد كورس قديم `lecture_access_mode`.
 6. للطالب:
    - `open_via_group === true` → يدخل مباشرة
-   - `access_status === requires_activation_code` → زر «أدخل كود التفعيل»
+   - `access_status === requires_activation_code` → زر «أدخل كود التفعيل» (يشمل انتهاء المدة السابقة عندما `can_reactivate === true`)
 7. الحقل `lecture_access_mode` في ردود الطالب ما زال موجودًا للتوافق ويساوي `access_mode` الجديد.
 
 ---
