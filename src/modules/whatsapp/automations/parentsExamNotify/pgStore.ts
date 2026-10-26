@@ -608,6 +608,7 @@ export class PgParentsExamStore implements ParentsExamStore {
       summary: summary.rows.map((row) => ({ status: String(row.status), count: Number(row.n) })),
       jobs: jobs.rows.map((row) => ({ status: String(row.status), count: Number(row.n) })),
       nextAt: next.rows[0]?.at ? new Date(next.rows[0].at).toISOString() : null,
+      teachers: await this.teacherNumbers(),
       rows: rows.rows.map((row) => ({
         id: Number(row.id),
         status: String(row.status),
@@ -628,6 +629,59 @@ export class PgParentsExamStore implements ParentsExamStore {
             ? 'لا يوجد رقم واتساب جاهز على إشعارات الطلاب'
             : null,
         phoneTail: row.phone_tail ? String(row.phone_tail) : '',
+      })),
+    };
+  }
+
+  private async teacherNumbers() {
+    const numbers = await query(
+      `SELECT u.id AS teacher_id, u.name AS teacher_name,
+              s.slug, s.phone_number, s.status, s.is_enabled, s.last_error, s.last_ready_at,
+              sv.key AS service_key, sv.name AS service_name,
+              COALESCE(ps.is_enabled, FALSE) AS link_enabled
+       FROM wa_sessions s
+       JOIN users u ON u.id = s.teacher_id
+       LEFT JOIN wa_service_sessions ps ON ps.session_slug = s.slug
+       LEFT JOIN wa_services sv ON sv.id = ps.service_id
+       WHERE s.teacher_id IS NOT NULL
+       ORDER BY u.name ASC, s.slug ASC, sv.key ASC`,
+    );
+    const missing = await query(
+      `SELECT u.id AS teacher_id, u.name AS teacher_name
+       FROM users u
+       WHERE (
+         EXISTS (SELECT 1 FROM wa_parent_exam_teacher_settings p WHERE p.teacher_id = u.id)
+         OR EXISTS (
+           SELECT 1 FROM wa_parent_exam_notifications n
+           WHERE n.teacher_id = u.id AND n.status = 'scheduled'
+         )
+       )
+         AND NOT EXISTS (
+           SELECT 1
+           FROM wa_sessions s
+           JOIN wa_service_sessions ps ON ps.session_slug = s.slug AND ps.is_enabled
+           JOIN wa_services sv ON sv.id = ps.service_id AND sv.key = 'teacher_student_notify'
+           WHERE s.teacher_id = u.id AND s.status = 'ready' AND s.is_enabled
+         )
+       ORDER BY u.name ASC`,
+    );
+    return {
+      numbers: numbers.rows.map((row) => ({
+        teacherId: Number(row.teacher_id),
+        teacherName: String(row.teacher_name ?? ''),
+        slug: String(row.slug),
+        phone: row.phone_number ? String(row.phone_number) : '',
+        status: String(row.status ?? 'pending'),
+        enabled: row.is_enabled !== false,
+        linkEnabled: row.link_enabled === true,
+        serviceKey: row.service_key ? String(row.service_key) : '',
+        serviceName: row.service_name ? String(row.service_name) : '',
+        lastError: row.last_error ? String(row.last_error).slice(0, 160) : null,
+        lastReadyAt: row.last_ready_at ? new Date(row.last_ready_at).toISOString() : null,
+      })),
+      missing: missing.rows.map((row) => ({
+        teacherId: Number(row.teacher_id),
+        teacherName: String(row.teacher_name ?? ''),
       })),
     };
   }
