@@ -86,7 +86,7 @@ export function parseParentsExamConfig(raw: unknown): ParentsExamConfig {
     language: 'ar-EG',
     interval_seconds: clampInt(src.interval_seconds, 30, 15, 300),
     jitter_seconds: clampInt(src.jitter_seconds, 10, 0, 120),
-    daily_cap: clampInt(src.daily_cap, 400, 1, 5000),
+    daily_cap: src.daily_cap === 0 || src.daily_cap === '0' ? 0 : clampInt(src.daily_cap, 400, 1, 5000),
     quiet_hours: {
       enabled: asBool(quiet.enabled, true),
       start: hhmm(quiet.start, '23:00'),

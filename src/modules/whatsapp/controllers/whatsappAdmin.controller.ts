@@ -393,7 +393,7 @@ whatsappAdminRouter.post(
 const ParentsExamSettingsBody = z.object({
   interval_seconds: z.number().int().min(15).max(300).optional(),
   jitter_seconds: z.number().int().min(0).max(120).optional(),
-  daily_cap: z.number().int().min(1).max(5000).optional(),
+  daily_cap: z.number().int().min(0).max(5000).optional(),
   quiet_hours: z
     .object({
       enabled: z.boolean().optional(),

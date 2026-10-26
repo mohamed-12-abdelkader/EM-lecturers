@@ -243,6 +243,16 @@ describe('parent exam schedule', () => {
       dailyCap: 400,
     });
     expect(capped).toEqual({ ok: false, reason: 'capped' });
+    const unlimited = nextScheduledAt({
+      now,
+      lastSlot: null,
+      intervalSeconds: 30,
+      jitterSeconds: 0,
+      quietHours: quietOff,
+      dailyCount: 5000,
+      dailyCap: 0,
+    });
+    expect(unlimited.ok).toBe(true);
     expect(dayStart(now, 'Africa/Cairo').getTime()).toBeLessThanOrEqual(now.getTime());
   });
 });

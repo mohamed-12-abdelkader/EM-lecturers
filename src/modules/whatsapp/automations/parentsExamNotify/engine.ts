@@ -97,7 +97,7 @@ export async function placePending(
       let last = await store.lastSlot(teacherId);
       let session: { sessionSlug: string; serviceId: number } | null = null;
       for (const row of teacherRows) {
-        if (daily >= config.daily_cap) {
+        if (config.daily_cap > 0 && daily >= config.daily_cap) {
           await store.defer(row.id, end);
           continue;
         }

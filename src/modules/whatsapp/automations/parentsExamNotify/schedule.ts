@@ -102,7 +102,7 @@ export interface ScheduleInput {
 export type ScheduleResult = { ok: true; at: Date } | { ok: false; reason: 'capped' };
 
 export function nextScheduledAt(input: ScheduleInput): ScheduleResult {
-  if (input.dailyCount >= input.dailyCap) return { ok: false, reason: 'capped' };
+  if (input.dailyCap > 0 && input.dailyCount >= input.dailyCap) return { ok: false, reason: 'capped' };
   if (input.immediate) return { ok: true, at: new Date(input.now.getTime()) };
 
   const random = input.random ?? Math.random;
