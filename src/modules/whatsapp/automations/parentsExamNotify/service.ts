@@ -45,6 +45,12 @@ export const ParentsExamNotifyService = {
     flags: { passed?: boolean; failed?: boolean; absent?: boolean },
   ) => sendCohorts(pgParentsExamStore, examId, flags),
   sendMissing: (examId: number) => sendMissing(pgParentsExamStore, examId),
+  monitor: (input: { limit?: number; status?: string | null; q?: string | null }) =>
+    pgParentsExamStore.monitor({
+      limit: input.limit ?? 80,
+      status: input.status,
+      q: input.q,
+    }),
   notifyFinalized: (examId: number, studentId: number) =>
     notifyFinalizedAttempt(pgParentsExamStore, examId, studentId),
   async assertOwned(teacherId: number, examId: number) {

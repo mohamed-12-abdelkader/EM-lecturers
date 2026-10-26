@@ -546,6 +546,76 @@ export class PgParentsExamStore implements ParentsExamStore {
     return Number(res.rows[0]?.n || 0);
   }
 
+  async monitor(input: { limit: number; status?: string | null; q?: string | null }) {
+    const limit = Math.min(200, Math.max(1, input.limit || 80));
+    const status = input.status?.trim() || null;
+    const q = input.q?.trim() ? `%${input.q.trim()}%` : null;
+    const summary = await query(
+      `SELECT n.status, COUNT(*)::int AS n
+       FROM wa_parent_exam_notifications n
+       GROUP BY n.status`,
+    );
+    const jobs = await query(
+      `SELECT status, COUNT(*)::int AS n
+       FROM wa_outbound_jobs
+       WHERE trigger_type LIKE 'parents_exam_%'
+       GROUP BY status`,
+    );
+    const next = await query<{ at: Date | null }>(
+      `SELECT MIN(scheduled_at) AS at
+       FROM wa_outbound_jobs
+       WHERE trigger_type LIKE 'parents_exam_%' AND status = 'pending'`,
+    );
+    const rows = await query(
+      `SELECT n.id, n.status, n.cohort, n.scheduled_at, n.skip_reason,
+              e.id AS exam_id, e.title AS exam_title,
+              u.name AS student_name,
+              tu.id AS teacher_id, tu.name AS teacher_name,
+              j.status AS job_status, j.attempts, j.processed_at, j.last_error,
+              RIGHT(regexp_replace(COALESCE(n.parent_phone, ''), '[^0-9]', '', 'g'), 4) AS phone_tail
+       FROM wa_parent_exam_notifications n
+       JOIN course_level_exams e ON e.id = n.exam_id
+       JOIN users u ON u.id = n.student_user_id
+       LEFT JOIN users tu ON tu.id = n.teacher_id
+       LEFT JOIN wa_outbound_jobs j ON j.id = n.job_id
+       WHERE ($1::text IS NULL OR n.status = $1 OR j.status = $1)
+         AND (
+           $2::text IS NULL
+           OR tu.name ILIKE $2
+           OR e.title ILIKE $2
+           OR u.name ILIKE $2
+         )
+       ORDER BY
+         CASE WHEN n.status = 'scheduled' THEN 0 ELSE 1 END,
+         n.scheduled_at ASC NULLS LAST,
+         n.id DESC
+       LIMIT $3`,
+      [status, q, limit],
+    );
+    return {
+      summary: summary.rows.map((row) => ({ status: String(row.status), count: Number(row.n) })),
+      jobs: jobs.rows.map((row) => ({ status: String(row.status), count: Number(row.n) })),
+      nextAt: next.rows[0]?.at ? new Date(next.rows[0].at).toISOString() : null,
+      rows: rows.rows.map((row) => ({
+        id: Number(row.id),
+        status: String(row.status),
+        cohort: String(row.cohort),
+        scheduledAt: row.scheduled_at ? new Date(row.scheduled_at).toISOString() : null,
+        skipReason: row.skip_reason ? String(row.skip_reason) : null,
+        examId: Number(row.exam_id),
+        examTitle: String(row.exam_title ?? ''),
+        studentName: String(row.student_name ?? ''),
+        teacherId: row.teacher_id == null ? null : Number(row.teacher_id),
+        teacherName: row.teacher_name ? String(row.teacher_name) : '',
+        jobStatus: row.job_status ? String(row.job_status) : null,
+        attempts: Number(row.attempts || 0),
+        processedAt: row.processed_at ? new Date(row.processed_at).toISOString() : null,
+        error: row.last_error ? String(row.last_error).slice(0, 180) : null,
+        phoneTail: row.phone_tail ? String(row.phone_tail) : '',
+      })),
+    };
+  }
+
   async upcoming(limit: number): Promise<UpcomingSend[]> {
     const res = await query(
       `SELECT n.id, n.exam_id, e.title AS exam_title, n.student_user_id, u.name AS student_name,

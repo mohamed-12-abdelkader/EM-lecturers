@@ -422,6 +422,17 @@ whatsappAdminRouter.put(
 );
 
 whatsappAdminRouter.get(
+  '/parents-exam/monitor',
+  asyncWrapper(async (req, res) => {
+    const status = typeof req.query.status === 'string' ? req.query.status : null;
+    const q = typeof req.query.q === 'string' ? req.query.q : null;
+    const limit = Number(req.query.limit || 80);
+    const data = await ParentsExamNotifyService.monitor({ status, q, limit });
+    res.json({ success: true, data });
+  }),
+);
+
+whatsappAdminRouter.get(
   '/parents-exam/queue',
   asyncWrapper(async (_req, res) => {
     const data = await ParentsExamNotifyService.queue();
