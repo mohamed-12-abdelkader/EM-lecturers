@@ -66,7 +66,11 @@ async function recordStudent(
   return inserted ? 'inserted' : 'duplicate';
 }
 
-export async function placePending(store: ParentsExamStore, now = store.now()): Promise<number> {
+export async function placePending(
+  store: ParentsExamStore,
+  now = store.now(),
+  forceExamId?: number,
+): Promise<number> {
   return store.transaction(async () => {
     await store.lockPace();
     const service = await store.getService();
@@ -79,7 +83,9 @@ export async function placePending(store: ParentsExamStore, now = store.now()): 
     const byTeacher = new Map<number, typeof rows>();
     for (const row of rows) {
       const exam = await store.getExam(row.examId);
-      if (!exam || !exam.enabled || exam.paused) continue;
+      if (!exam) continue;
+      const forced = exam.id === forceExamId;
+      if (!forced && (!exam.enabled || exam.paused)) continue;
       const bucket = byTeacher.get(exam.teacherId) ?? [];
       bucket.push(row);
       byTeacher.set(exam.teacherId, bucket);
@@ -328,6 +334,86 @@ export async function sendCohorts(
   }
   await placePending(store, now);
   return { inserted, skipped, duplicates };
+}
+
+export async function sendMissing(
+  store: ParentsExamStore,
+  examId: number,
+): Promise<{ prepared: number; placed: number; alreadySent: number; skipped: number; notReady: number }> {
+  const exam = await store.getExam(examId);
+  if (!exam) throw new HttpError(404, 'الامتحان غير موجود');
+  const prefs = await store.getTeacherPrefs(exam.teacherId);
+  const now = store.now();
+  const closed = isExamClosed(exam, now);
+  const audience = await store.loadAudience(examId);
+  const notifications = await store.listNotifications(examId);
+  let prepared = 0;
+  let alreadySent = 0;
+  let skipped = 0;
+  let notReady = 0;
+
+  for (const student of audience) {
+    const cohort = standingOf(student, prefs.pass_percentage);
+    if (cohort === 'in_progress' || (cohort === 'absent' && !closed)) {
+      notReady += 1;
+      continue;
+    }
+    const received = notifications.some(
+      (row) => row.studentId === student.studentId && row.status === 'sent',
+    );
+    if (received) {
+      alreadySent += 1;
+      continue;
+    }
+    const row = notifications.find(
+      (item) => item.studentId === student.studentId && item.cohort === cohort,
+    );
+    if (row?.status === 'scheduled') {
+      prepared += 1;
+      continue;
+    }
+    if (row?.status === 'cancelled') {
+      const phone = canonicalParentPhone(student.parentPhone);
+      if (!phone) {
+        skipped += 1;
+        continue;
+      }
+      await store.reopenNotification(row.id, {
+        parentPhone: phone,
+        body: renderParentExamMessage({
+          cohort,
+          studentName: student.studentName,
+          examTitle: exam.title,
+          score: student.obtained,
+          total: student.total,
+          template: templateForCohort(prefs, cohort),
+        }),
+        readyAt: now,
+        immediate: false,
+      });
+      prepared += 1;
+      continue;
+    }
+    if (row?.status === 'skipped') {
+      skipped += 1;
+      continue;
+    }
+    const result = await recordStudent(
+      store,
+      exam,
+      student,
+      cohort,
+      now,
+      false,
+      templateForCohort(prefs, cohort),
+    );
+    if (result === 'inserted') prepared += 1;
+    else if (result === 'skipped') skipped += 1;
+    else alreadySent += 1;
+  }
+
+  const placed = await placePending(store, now, examId);
+  return { prepared, placed, alreadySent, skipped, notReady };
 }
 
 export async function previewExam(store: ParentsExamStore, examId: number) {

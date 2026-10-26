@@ -7,6 +7,7 @@ import {
   safeNotifyFinalized,
   saveSettings,
   sendCohorts,
+  sendMissing,
   sweepClosedExams,
   testSend,
 } from './engine';
@@ -43,6 +44,7 @@ export const ParentsExamNotifyService = {
     examId: number,
     flags: { passed?: boolean; failed?: boolean; absent?: boolean },
   ) => sendCohorts(pgParentsExamStore, examId, flags),
+  sendMissing: (examId: number) => sendMissing(pgParentsExamStore, examId),
   notifyFinalized: (examId: number, studentId: number) =>
     notifyFinalizedAttempt(pgParentsExamStore, examId, studentId),
   async assertOwned(teacherId: number, examId: number) {

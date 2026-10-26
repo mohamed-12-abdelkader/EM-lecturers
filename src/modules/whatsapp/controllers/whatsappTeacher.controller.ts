@@ -220,6 +220,16 @@ whatsappTeacherRouter.put(
 );
 
 whatsappTeacherRouter.post(
+  '/parents-exam/exams/:examId/send-missing',
+  asyncWrapper(async (req, res) => {
+    const examId = Number(req.params.examId);
+    await ParentsExamNotifyService.assertOwned(req.user!.id, examId);
+    const data = await ParentsExamNotifyService.sendMissing(examId);
+    res.status(202).json({ success: true, data });
+  }),
+);
+
+whatsappTeacherRouter.post(
   '/parents-exam/exams/:examId/test',
   validate(
     z.object({

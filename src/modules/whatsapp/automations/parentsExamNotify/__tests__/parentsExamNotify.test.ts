@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { classifyStudent, isExamClosed, shouldAutoNotify } from '../cohorts';
-import { safeNotifyFinalized, notifyFinalizedAttempt, sweepClosedExams, testSend } from '../engine';
+import { safeNotifyFinalized, notifyFinalizedAttempt, sweepClosedExams, testSend, sendMissing } from '../engine';
 import { MemoryParentsExamStore } from '../memoryStore';
 import type { ExamState, StudentState } from '../store';
 import { canonicalParentPhone } from '../phone';
@@ -379,6 +379,25 @@ describe('parent exam notify engine', () => {
     store.exams.get(7)!.enabled = false;
     expect(await notifyFinalizedAttempt(store, 7, 1)).toBe('ignored');
     expect(store.jobs).toHaveLength(0);
+  });
+
+  it('sends missing parent messages for a muted past exam and skips anyone already sent', async () => {
+    const store = openStore();
+    store.exams.get(7)!.enabled = false;
+    store.teacherPrefs.set(1, { ...DEFAULT_TEACHER_EXAM_PREFS, auto_send: false });
+    const first = await sendMissing(store, 7);
+    expect(first.placed).toBe(2);
+    expect(store.jobs.map((job) => job.studentId).sort()).toEqual([1, 2]);
+    store.notifications.find((row) => row.studentId === 1)!.status = 'sent';
+    const second = await sendMissing(store, 7);
+    expect(second.alreadySent).toBe(1);
+    expect(second.notReady).toBeGreaterThan(0);
+    expect(store.jobs.filter((job) => job.studentId === 1)).toHaveLength(1);
+    store.exams.get(7)!.isActive = false;
+    const afterClose = await sendMissing(store, 7);
+    expect(store.jobs.some((job) => job.studentId === 4)).toBe(true);
+    expect(store.jobs.some((job) => job.studentId === 5)).toBe(false);
+    expect(afterClose.placed).toBeGreaterThan(0);
   });
 
   it('paces each teacher on their own number and cap', async () => {
