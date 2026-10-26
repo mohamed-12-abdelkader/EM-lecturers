@@ -276,7 +276,19 @@ export class WhatsAppInboundService {
     isTeacherOwned: boolean;
   }): Promise<void> {
     // Teacher outbound channels: log inbound only; no platform chatbot auto-reply.
+    // Parent exam threads stay completely silent. A parent reply gets no notice.
     if (ctx.isTeacherOwned) {
+      const parentExamReply = await pool.query(
+        `SELECT 1
+         FROM wa_outbound_jobs
+         WHERE session_slug = $1
+           AND to_phone = $2
+           AND trigger_type LIKE 'parents_exam_%'
+         LIMIT 1`,
+        [ctx.sessionSlug, ctx.fromPhone],
+      );
+      if (parentExamReply.rowCount) return;
+
       if (ctx.conversation && !ctx.conversation.metadata?.outbound_only_notified) {
         await WhatsAppOutboundQueue.enqueue({
           sessionSlug: ctx.conversation.session_slug,
