@@ -578,7 +578,17 @@ export class PgParentsExamStore implements ParentsExamStore {
               u.name AS student_name,
               tu.id AS teacher_id, tu.name AS teacher_name,
               j.status AS job_status, j.attempts, j.processed_at, j.last_error,
-              RIGHT(regexp_replace(COALESCE(n.parent_phone, ''), '[^0-9]', '', 'g'), 4) AS phone_tail
+              RIGHT(regexp_replace(COALESCE(n.parent_phone, ''), '[^0-9]', '', 'g'), 4) AS phone_tail,
+              EXISTS (
+                SELECT 1
+                FROM wa_sessions s
+                JOIN wa_service_sessions ps ON ps.session_slug = s.slug
+                JOIN wa_services sv ON sv.id = ps.service_id AND sv.key = 'teacher_student_notify'
+                WHERE s.teacher_id = n.teacher_id
+                  AND s.status = 'ready'
+                  AND s.is_enabled
+                  AND ps.is_enabled
+              ) AS session_ready
        FROM wa_parent_exam_notifications n
        JOIN course_level_exams e ON e.id = n.exam_id
        JOIN users u ON u.id = n.student_user_id
@@ -612,7 +622,11 @@ export class PgParentsExamStore implements ParentsExamStore {
         jobStatus: row.job_status ? String(row.job_status) : null,
         attempts: Number(row.attempts || 0),
         processedAt: row.processed_at ? new Date(row.processed_at).toISOString() : null,
-        error: row.last_error ? String(row.last_error).slice(0, 180) : null,
+        error: row.last_error
+          ? String(row.last_error).slice(0, 180)
+          : row.session_ready === false && !row.job_id
+            ? 'لا يوجد رقم واتساب جاهز على إشعارات الطلاب'
+            : null,
         phoneTail: row.phone_tail ? String(row.phone_tail) : '',
       })),
     };
