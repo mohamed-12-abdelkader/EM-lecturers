@@ -427,7 +427,7 @@ whatsappAdminRouter.get(
     const status = typeof req.query.status === 'string' ? req.query.status : null;
     const q = typeof req.query.q === 'string' ? req.query.q : null;
     const cohort = typeof req.query.cohort === 'string' ? req.query.cohort : null;
-    const limit = Number(req.query.limit || 50);
+    const limit = Number(req.query.limit || 500);
     const page = Number(req.query.page || 1);
     const data = await ParentsExamNotifyService.monitor({ status, q, cohort, limit, page });
     res.json({ success: true, data });

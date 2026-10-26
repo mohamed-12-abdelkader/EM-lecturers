@@ -53,7 +53,7 @@ export const ParentsExamNotifyService = {
     cohort?: string | null;
   }) =>
     pgParentsExamStore.monitor({
-      limit: input.limit ?? 50,
+      limit: input.limit ?? 500,
       page: input.page ?? 1,
       status: input.status,
       q: input.q,

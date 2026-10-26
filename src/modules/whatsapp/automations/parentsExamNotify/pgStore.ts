@@ -559,7 +559,7 @@ export class PgParentsExamStore implements ParentsExamStore {
     q?: string | null;
     cohort?: string | null;
   }) {
-    const pageSize = Math.min(100, Math.max(1, input.limit || 50));
+    const pageSize = Math.min(500, Math.max(1, input.limit || 500));
     const status = input.status?.trim() || null;
     const q = input.q?.trim() ? `%${input.q.trim()}%` : null;
     const cohort = input.cohort?.trim() || null;
