@@ -553,11 +553,12 @@ export class PgParentsExamStore implements ParentsExamStore {
 
   async monitor(input: {
     limit: number;
+    page?: number;
     status?: string | null;
     q?: string | null;
     cohort?: string | null;
   }) {
-    const limit = Math.min(200, Math.max(1, input.limit || 80));
+    const pageSize = Math.min(100, Math.max(1, input.limit || 50));
     const status = input.status?.trim() || null;
     const q = input.q?.trim() ? `%${input.q.trim()}%` : null;
     const cohort = input.cohort?.trim() || null;
@@ -577,6 +578,23 @@ export class PgParentsExamStore implements ParentsExamStore {
        FROM wa_outbound_jobs
        WHERE trigger_type LIKE 'parents_exam_%' AND status = 'pending'`,
     );
+    const filteredFrom = `
+       FROM wa_parent_exam_notifications n
+       JOIN course_level_exams e ON e.id = n.exam_id
+       JOIN users u ON u.id = n.student_user_id
+       LEFT JOIN users tu ON tu.id = n.teacher_id
+       LEFT JOIN wa_outbound_jobs j ON j.id = n.job_id
+       WHERE ($1::text IS NULL OR n.status = $1 OR j.status = $1)
+         AND ($2::text IS NULL OR tu.name ILIKE $2 OR e.title ILIKE $2 OR u.name ILIKE $2)
+         AND ($3::text IS NULL OR n.cohort = $3)`;
+    const count = await query<{ n: number }>(
+      `SELECT COUNT(*)::int AS n ${filteredFrom}`,
+      [status, q, cohort],
+    );
+    const total = Number(count.rows[0]?.n || 0);
+    const totalPages = Math.max(1, Math.ceil(total / pageSize));
+    const page = Math.min(Math.max(1, Number(input.page) || 1), totalPages);
+    const offset = (page - 1) * pageSize;
     const rows = await query(
       `SELECT n.id, n.status, n.cohort, n.scheduled_at, n.skip_reason,
               e.id AS exam_id, e.title AS exam_title,
@@ -594,25 +612,22 @@ export class PgParentsExamStore implements ParentsExamStore {
                   AND s.is_enabled
                   AND ps.is_enabled
               ) AS session_ready
-       FROM wa_parent_exam_notifications n
-       JOIN course_level_exams e ON e.id = n.exam_id
-       JOIN users u ON u.id = n.student_user_id
-       LEFT JOIN users tu ON tu.id = n.teacher_id
-       LEFT JOIN wa_outbound_jobs j ON j.id = n.job_id
-       WHERE ($1::text IS NULL OR n.status = $1 OR j.status = $1)
-         AND ($2::text IS NULL OR tu.name ILIKE $2 OR e.title ILIKE $2 OR u.name ILIKE $2)
-         AND ($3::text IS NULL OR n.cohort = $3)
+       ${filteredFrom}
        ORDER BY
          CASE WHEN n.status = 'scheduled' THEN 0 ELSE 1 END,
          n.scheduled_at ASC NULLS LAST,
          n.id DESC
-       LIMIT $4`,
-      [status, q, cohort, limit],
+       LIMIT $4 OFFSET $5`,
+      [status, q, cohort, pageSize, offset],
     );
     return {
       summary: summary.rows.map((row) => ({ status: String(row.status), count: Number(row.n) })),
       jobs: jobs.rows.map((row) => ({ status: String(row.status), count: Number(row.n) })),
       nextAt: next.rows[0]?.at ? new Date(next.rows[0].at).toISOString() : null,
+      page,
+      pageSize,
+      total,
+      totalPages,
       teachers: await this.teacherNumbers(),
       rows: rows.rows.map((row) => ({
         id: Number(row.id),

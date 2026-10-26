@@ -47,12 +47,14 @@ export const ParentsExamNotifyService = {
   sendMissing: (examId: number) => sendMissing(pgParentsExamStore, examId),
   monitor: (input: {
     limit?: number;
+    page?: number;
     status?: string | null;
     q?: string | null;
     cohort?: string | null;
   }) =>
     pgParentsExamStore.monitor({
-      limit: input.limit ?? 80,
+      limit: input.limit ?? 50,
+      page: input.page ?? 1,
       status: input.status,
       q: input.q,
       cohort: input.cohort,
