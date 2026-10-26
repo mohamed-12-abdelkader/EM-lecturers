@@ -435,7 +435,7 @@ whatsappAdminRouter.get(
 );
 
 const ParentsExamQueueAction = z.object({
-  action: z.enum(['cancel', 'send_now']),
+  action: z.enum(['cancel', 'remove', 'send_now']),
   ids: z.array(z.number().int().positive()).max(500).optional(),
   allMatching: z.boolean().optional(),
   status: z.string().max(32).optional().nullable(),

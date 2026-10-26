@@ -411,6 +411,19 @@ describe('parent exam notify engine', () => {
     expect(afterClose.placed).toBeGreaterThan(0);
   });
 
+  it('schedules again after a scheduled parent message is removed', async () => {
+    const store = openStore();
+    await notifyFinalizedAttempt(store, 7, 1);
+    expect(store.notifications.filter((row) => row.studentId === 1)).toHaveLength(1);
+    store.notifications = store.notifications.filter((row) => row.studentId !== 1);
+    store.jobs = store.jobs.filter((job) => job.studentId !== 1);
+    const again = await sendMissing(store, 7);
+    expect(again.placed).toBeGreaterThan(0);
+    expect(
+      store.notifications.some((row) => row.studentId === 1 && row.status === 'scheduled'),
+    ).toBe(true);
+  });
+
   it('paces each teacher on their own number and cap', async () => {
     const store = openStore();
     store.service!.config.daily_cap = 1;

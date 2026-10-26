@@ -709,7 +709,7 @@ export class PgParentsExamStore implements ParentsExamStore {
   }
 
   async controlQueue(input: {
-    action: 'cancel' | 'send_now';
+    action: 'cancel' | 'remove' | 'send_now';
     ids?: number[];
     allMatching?: boolean;
     status?: string | null;
@@ -733,7 +733,7 @@ export class PgParentsExamStore implements ParentsExamStore {
          LEFT JOIN users tu ON tu.id = n.teacher_id
          LEFT JOIN wa_outbound_jobs j ON j.id = n.job_id
          WHERE n.status = 'scheduled'
-           AND (j.id IS NULL OR j.status IN ('pending', 'failed'))
+           AND (j.id IS NULL OR j.status IN ('pending', 'failed', 'dead'))
            AND (
              ($1::boolean = FALSE AND n.id = ANY($2::int[]))
              OR (
@@ -751,18 +751,17 @@ export class PgParentsExamStore implements ParentsExamStore {
         await client.query('COMMIT');
         return { affected: 0 };
       }
-      if (input.action === 'cancel') {
+      if (input.action === 'cancel' || input.action === 'remove') {
         if (jobIds.length) {
           await client.query(
             `UPDATE wa_outbound_jobs
-             SET status = 'dead', processed_at = NOW(), last_error = 'cancelled by admin'
+             SET status = 'dead', processed_at = NOW(), last_error = 'removed by admin'
              WHERE id = ANY($1::int[]) AND status IN ('pending', 'failed')`,
             [jobIds],
           );
         }
         await client.query(
-          `UPDATE wa_parent_exam_notifications
-           SET status = 'cancelled', job_id = NULL, scheduled_at = NULL
+          `DELETE FROM wa_parent_exam_notifications
            WHERE id = ANY($1::int[]) AND status = 'scheduled'`,
           [noteIds],
         );
@@ -771,7 +770,7 @@ export class PgParentsExamStore implements ParentsExamStore {
           await client.query(
             `UPDATE wa_outbound_jobs
              SET status = 'pending', scheduled_at = NOW(), last_error = NULL
-             WHERE id = ANY($1::int[]) AND status IN ('pending', 'failed')`,
+             WHERE id = ANY($1::int[]) AND status IN ('pending', 'failed', 'dead')`,
             [jobIds],
           );
         }

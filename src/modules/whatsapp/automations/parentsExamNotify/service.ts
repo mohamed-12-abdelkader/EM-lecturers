@@ -60,7 +60,7 @@ export const ParentsExamNotifyService = {
       cohort: input.cohort,
     }),
   controlQueue: (input: {
-    action: 'cancel' | 'send_now';
+    action: 'cancel' | 'remove' | 'send_now';
     ids?: number[];
     allMatching?: boolean;
     status?: string | null;
