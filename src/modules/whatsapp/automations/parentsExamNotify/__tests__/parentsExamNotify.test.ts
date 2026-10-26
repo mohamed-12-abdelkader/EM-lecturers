@@ -11,6 +11,7 @@ import { DEFAULT_TEACHER_EXAM_PREFS } from '../settings';
 import { renderParentExamMessage } from '../templates';
 import { onParentsExamInbound } from '../handler';
 import { selectOutboundClaim } from '../../../queue/selectOutboundClaim';
+import { decideOwnedSession } from '../parentExamSession';
 
 function exam(partial: Partial<ExamState> = {}): ExamState {
   return {
@@ -480,5 +481,47 @@ describe('parents exam pace gate and inbound', () => {
     });
     expect(result).toEqual({ handled: true });
     expect(result.reply).toBeUndefined();
+  });
+
+  it('keeps a parent exam message on that teacher’s own ready session', () => {
+    expect(
+      decideOwnedSession({
+        parentExam: true,
+        teacherId: 21,
+        jobSlug: 't21-01',
+        slugReady: true,
+        current: { sessionSlug: 't1290-01', serviceId: 2 },
+      }),
+    ).toEqual({ action: 'keep', slug: 't21-01' });
+
+    expect(
+      decideOwnedSession({
+        parentExam: true,
+        teacherId: 21,
+        jobSlug: 't21-01',
+        slugReady: false,
+        current: { sessionSlug: 't21-02', serviceId: 2 },
+      }),
+    ).toEqual({ action: 'move', slug: 't21-02', serviceId: 2 });
+
+    expect(
+      decideOwnedSession({
+        parentExam: true,
+        teacherId: 21,
+        jobSlug: 't21-01',
+        slugReady: false,
+        current: null,
+      }),
+    ).toEqual({ action: 'wait' });
+
+    expect(
+      decideOwnedSession({
+        parentExam: false,
+        teacherId: null,
+        jobSlug: 'support-01',
+        slugReady: false,
+        current: null,
+      }),
+    ).toEqual({ action: 'keep', slug: 'support-01' });
   });
 });

@@ -2,6 +2,7 @@ import axios from 'axios';
 import { whatsappConfig } from '../config/whatsapp';
 import { WhatsAppOutboundQueue } from '../queue/whatsappOutboundQueue';
 import { sendMessage, isWhatsAppConfigured } from '../gateway/whatsappGatewayClient';
+import { resolveParentExamSendSession } from '../automations/parentsExamNotify/parentExamSession';
 import { logger } from '../../../utils';
 
 let workerTimer: ReturnType<typeof setInterval> | null = null;
@@ -53,8 +54,13 @@ async function processBatch(): Promise<void> {
       jobs.map(async (job) => {
         const attempts = job.attempts + 1;
         try {
+          const resolved = await resolveParentExamSendSession(job);
+          if ('wait' in resolved) {
+            await WhatsAppOutboundQueue.parkUntilSession(job.id);
+            return;
+          }
           await sendMessage({
-            sessionId: job.session_slug,
+            sessionId: resolved.slug,
             to: job.to_phone,
             body: job.body || undefined,
             media: job.media_url ? { url: job.media_url } : undefined,

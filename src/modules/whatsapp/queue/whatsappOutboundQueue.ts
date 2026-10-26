@@ -2,7 +2,10 @@ import pool from '../../../db/pool';
 import { whatsappConfig } from '../config/whatsapp';
 import { normalizePhone } from '../gateway/whatsappGatewayClient';
 import { logger } from '../../../utils';
-import { PARENTS_EXAM_NOTIFY_KEY } from '../automations/parentsExamNotify/constants';
+import {
+  PARENT_EXAM_NO_SESSION,
+  PARENTS_EXAM_NOTIFY_KEY,
+} from '../automations/parentsExamNotify/constants';
 import { selectOutboundClaim } from './selectOutboundClaim';
 
 export interface OutboundJobRow {
@@ -171,6 +174,19 @@ export class WhatsAppOutboundQueue {
        SET status = 'sent'
        WHERE job_id = $1 AND status = 'scheduled'`,
       [jobId],
+    );
+  }
+
+  /** Teacher has no ready number. Keep the job and do not spend an attempt. */
+  static async parkUntilSession(jobId: number): Promise<void> {
+    await pool.query(
+      `UPDATE wa_outbound_jobs
+       SET status = 'pending',
+           attempts = GREATEST(attempts - 1, 0),
+           scheduled_at = NOW() + INTERVAL '3 minutes',
+           last_error = $2
+       WHERE id = $1`,
+      [jobId, PARENT_EXAM_NO_SESSION],
     );
   }
 

@@ -4,7 +4,12 @@ import pool from '../../../../db/pool';
 import { HttpError } from '../../../../utils';
 import { WhatsAppOutboundQueue } from '../../queue/whatsappOutboundQueue';
 import { SessionPoolService } from '../../routing/sessionPool.service';
-import { PARENTS_EXAM_NOTIFY_KEY, PARENTS_EXAM_PACE_LOCK, type ExamCohort } from './constants';
+import {
+  PARENT_EXAM_NO_SESSION,
+  PARENTS_EXAM_NOTIFY_KEY,
+  PARENTS_EXAM_PACE_LOCK,
+  type ExamCohort,
+} from './constants';
 import { parseParentsExamConfig, parseTeacherExamPrefs, type ParentsExamConfig, type TeacherExamPrefs } from './settings';
 import type {
   ExamState,
@@ -624,9 +629,11 @@ export class PgParentsExamStore implements ParentsExamStore {
         attempts: Number(row.attempts || 0),
         processedAt: row.processed_at ? new Date(row.processed_at).toISOString() : null,
         error: row.last_error
-          ? String(row.last_error).slice(0, 180)
+          ? String(row.last_error).includes('session not found')
+            ? PARENT_EXAM_NO_SESSION
+            : String(row.last_error).slice(0, 180)
           : row.session_ready === false && !row.job_id
-            ? 'لا يوجد رقم واتساب جاهز على إشعارات الطلاب'
+            ? PARENT_EXAM_NO_SESSION
             : null,
         phoneTail: row.phone_tail ? String(row.phone_tail) : '',
       })),
