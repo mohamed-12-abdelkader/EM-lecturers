@@ -426,8 +426,27 @@ whatsappAdminRouter.get(
   asyncWrapper(async (req, res) => {
     const status = typeof req.query.status === 'string' ? req.query.status : null;
     const q = typeof req.query.q === 'string' ? req.query.q : null;
+    const cohort = typeof req.query.cohort === 'string' ? req.query.cohort : null;
     const limit = Number(req.query.limit || 80);
-    const data = await ParentsExamNotifyService.monitor({ status, q, limit });
+    const data = await ParentsExamNotifyService.monitor({ status, q, cohort, limit });
+    res.json({ success: true, data });
+  }),
+);
+
+const ParentsExamQueueAction = z.object({
+  action: z.enum(['cancel', 'send_now']),
+  ids: z.array(z.number().int().positive()).max(500).optional(),
+  allMatching: z.boolean().optional(),
+  status: z.string().max(32).optional().nullable(),
+  q: z.string().max(120).optional().nullable(),
+  cohort: z.enum(['passed', 'failed', 'absent']).optional().nullable(),
+});
+
+whatsappAdminRouter.post(
+  '/parents-exam/monitor/actions',
+  validate(ParentsExamQueueAction),
+  asyncWrapper(async (req, res) => {
+    const data = await ParentsExamNotifyService.controlQueue(req.body);
     res.json({ success: true, data });
   }),
 );

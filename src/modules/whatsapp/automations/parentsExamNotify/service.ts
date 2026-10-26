@@ -45,12 +45,26 @@ export const ParentsExamNotifyService = {
     flags: { passed?: boolean; failed?: boolean; absent?: boolean },
   ) => sendCohorts(pgParentsExamStore, examId, flags),
   sendMissing: (examId: number) => sendMissing(pgParentsExamStore, examId),
-  monitor: (input: { limit?: number; status?: string | null; q?: string | null }) =>
+  monitor: (input: {
+    limit?: number;
+    status?: string | null;
+    q?: string | null;
+    cohort?: string | null;
+  }) =>
     pgParentsExamStore.monitor({
       limit: input.limit ?? 80,
       status: input.status,
       q: input.q,
+      cohort: input.cohort,
     }),
+  controlQueue: (input: {
+    action: 'cancel' | 'send_now';
+    ids?: number[];
+    allMatching?: boolean;
+    status?: string | null;
+    q?: string | null;
+    cohort?: string | null;
+  }) => pgParentsExamStore.controlQueue(input),
   notifyFinalized: (examId: number, studentId: number) =>
     notifyFinalizedAttempt(pgParentsExamStore, examId, studentId),
   async assertOwned(teacherId: number, examId: number) {

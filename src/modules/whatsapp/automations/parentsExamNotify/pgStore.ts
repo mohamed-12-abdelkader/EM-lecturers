@@ -546,10 +546,16 @@ export class PgParentsExamStore implements ParentsExamStore {
     return Number(res.rows[0]?.n || 0);
   }
 
-  async monitor(input: { limit: number; status?: string | null; q?: string | null }) {
+  async monitor(input: {
+    limit: number;
+    status?: string | null;
+    q?: string | null;
+    cohort?: string | null;
+  }) {
     const limit = Math.min(200, Math.max(1, input.limit || 80));
     const status = input.status?.trim() || null;
     const q = input.q?.trim() ? `%${input.q.trim()}%` : null;
+    const cohort = input.cohort?.trim() || null;
     const summary = await query(
       `SELECT n.status, COUNT(*)::int AS n
        FROM wa_parent_exam_notifications n
@@ -579,18 +585,14 @@ export class PgParentsExamStore implements ParentsExamStore {
        LEFT JOIN users tu ON tu.id = n.teacher_id
        LEFT JOIN wa_outbound_jobs j ON j.id = n.job_id
        WHERE ($1::text IS NULL OR n.status = $1 OR j.status = $1)
-         AND (
-           $2::text IS NULL
-           OR tu.name ILIKE $2
-           OR e.title ILIKE $2
-           OR u.name ILIKE $2
-         )
+         AND ($2::text IS NULL OR tu.name ILIKE $2 OR e.title ILIKE $2 OR u.name ILIKE $2)
+         AND ($3::text IS NULL OR n.cohort = $3)
        ORDER BY
          CASE WHEN n.status = 'scheduled' THEN 0 ELSE 1 END,
          n.scheduled_at ASC NULLS LAST,
          n.id DESC
-       LIMIT $3`,
-      [status, q, limit],
+       LIMIT $4`,
+      [status, q, cohort, limit],
     );
     return {
       summary: summary.rows.map((row) => ({ status: String(row.status), count: Number(row.n) })),
@@ -614,6 +616,90 @@ export class PgParentsExamStore implements ParentsExamStore {
         phoneTail: row.phone_tail ? String(row.phone_tail) : '',
       })),
     };
+  }
+
+  async controlQueue(input: {
+    action: 'cancel' | 'send_now';
+    ids?: number[];
+    allMatching?: boolean;
+    status?: string | null;
+    q?: string | null;
+    cohort?: string | null;
+  }): Promise<{ affected: number }> {
+    const ids = (input.ids || []).map(Number).filter((id) => Number.isInteger(id) && id > 0);
+    const allMatching = input.allMatching === true;
+    if (!allMatching && !ids.length) return { affected: 0 };
+    const status = input.status?.trim() || null;
+    const q = input.q?.trim() ? `%${input.q.trim()}%` : null;
+    const cohort = input.cohort?.trim() || null;
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const target = await client.query<{ id: number; job_id: number | null }>(
+        `SELECT n.id, n.job_id
+         FROM wa_parent_exam_notifications n
+         JOIN course_level_exams e ON e.id = n.exam_id
+         JOIN users u ON u.id = n.student_user_id
+         LEFT JOIN users tu ON tu.id = n.teacher_id
+         LEFT JOIN wa_outbound_jobs j ON j.id = n.job_id
+         WHERE n.status = 'scheduled'
+           AND (j.id IS NULL OR j.status IN ('pending', 'failed'))
+           AND (
+             ($1::boolean = FALSE AND n.id = ANY($2::int[]))
+             OR (
+               $1::boolean = TRUE
+               AND ($3::text IS NULL OR n.status = $3 OR j.status = $3)
+               AND ($4::text IS NULL OR tu.name ILIKE $4 OR e.title ILIKE $4 OR u.name ILIKE $4)
+               AND ($5::text IS NULL OR n.cohort = $5)
+             )
+           )`,
+        [allMatching, ids, status, q, cohort],
+      );
+      const noteIds = target.rows.map((row) => row.id);
+      const jobIds = target.rows.map((row) => row.job_id).filter((id): id is number => id != null);
+      if (!noteIds.length) {
+        await client.query('COMMIT');
+        return { affected: 0 };
+      }
+      if (input.action === 'cancel') {
+        if (jobIds.length) {
+          await client.query(
+            `UPDATE wa_outbound_jobs
+             SET status = 'dead', processed_at = NOW(), last_error = 'cancelled by admin'
+             WHERE id = ANY($1::int[]) AND status IN ('pending', 'failed')`,
+            [jobIds],
+          );
+        }
+        await client.query(
+          `UPDATE wa_parent_exam_notifications
+           SET status = 'cancelled', job_id = NULL, scheduled_at = NULL
+           WHERE id = ANY($1::int[]) AND status = 'scheduled'`,
+          [noteIds],
+        );
+      } else {
+        if (jobIds.length) {
+          await client.query(
+            `UPDATE wa_outbound_jobs
+             SET status = 'pending', scheduled_at = NOW(), last_error = NULL
+             WHERE id = ANY($1::int[]) AND status IN ('pending', 'failed')`,
+            [jobIds],
+          );
+        }
+        await client.query(
+          `UPDATE wa_parent_exam_notifications
+           SET scheduled_at = NOW(), ready_at = NOW(), immediate = TRUE
+           WHERE id = ANY($1::int[]) AND status = 'scheduled'`,
+          [noteIds],
+        );
+      }
+      await client.query('COMMIT');
+      return { affected: noteIds.length };
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
   }
 
   async upcoming(limit: number): Promise<UpcomingSend[]> {
