@@ -116,7 +116,8 @@ export class WhatsAppOutboundQueue {
            )
            AND NOT EXISTS (
              SELECT 1 FROM wa_parent_exam_notifications n
-             JOIN wa_parent_exam_settings st ON st.exam_id = n.exam_id AND st.paused = TRUE
+             JOIN wa_parent_exam_settings st ON st.exam_id = n.exam_id
+               AND (st.paused = TRUE OR st.enabled = FALSE)
              WHERE n.job_id = j.id
            )
          ORDER BY j.scheduled_at ASC, j.id ASC

@@ -102,6 +102,7 @@ export class MemoryParentsExamStore implements ParentsExamStore {
   async setExamEnabled(examId: number, enabled: boolean): Promise<ExamState> {
     const exam = this.requireExam(examId);
     exam.enabled = enabled;
+    if (!enabled) await this.cancelPending(examId);
     return exam;
   }
 

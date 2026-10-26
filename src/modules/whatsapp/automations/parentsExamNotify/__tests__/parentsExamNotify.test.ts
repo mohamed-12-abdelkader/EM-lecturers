@@ -392,6 +392,16 @@ describe('parent exam notify engine', () => {
     expect(store.jobs).toHaveLength(0);
   });
 
+  it('stops scheduled messages when the teacher mutes the exam', async () => {
+    const store = openStore();
+    expect(await notifyFinalizedAttempt(store, 7, 1)).toBe('enqueued');
+    expect(store.jobs[0]?.status).toBe('pending');
+    await store.setExamEnabled(7, false);
+    expect(store.notifications.find((row) => row.studentId === 1)?.status).toBe('cancelled');
+    expect(store.jobs[0]?.status).toBe('dead');
+    expect(store.notifications.some((row) => row.status === 'scheduled')).toBe(false);
+  });
+
   it('sends missing parent messages for a muted past exam and skips anyone already sent', async () => {
     const store = openStore();
     store.exams.get(7)!.enabled = false;

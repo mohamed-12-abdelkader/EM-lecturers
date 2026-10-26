@@ -315,6 +315,7 @@ export class PgParentsExamStore implements ParentsExamStore {
        ON CONFLICT (exam_id) DO UPDATE SET enabled = EXCLUDED.enabled, updated_at = NOW()`,
       [examId, enabled],
     );
+    if (!enabled) await this.cancelPending(examId);
     const exam = await this.getExam(examId);
     if (!exam) throw new HttpError(404, 'الامتحان غير موجود');
     return exam;
