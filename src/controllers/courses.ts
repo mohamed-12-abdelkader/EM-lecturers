@@ -3320,6 +3320,7 @@ router.get(
        FROM enrollments e
        JOIN users u ON e.user_id = u.id
        WHERE e.course_id = $1
+         AND u.deleted_at IS NULL
        ORDER BY e.enrolled_at DESC`,
       [courseId],
     );
@@ -4524,6 +4525,7 @@ router.get(
        FROM enrollments e
        JOIN users u ON e.user_id = u.id
        WHERE e.course_id = $1
+         AND u.deleted_at IS NULL
        ORDER BY e.enrolled_at DESC`,
       [courseId],
     );
@@ -4740,6 +4742,7 @@ router.get(
             SELECT id FROM exams WHERE lecture_id IN (SELECT id FROM lectures WHERE course_id = $1) AND type = 'exam'
           )
           WHERE e.course_id = $1
+            AND u.deleted_at IS NULL
           GROUP BY u.id, u.name, u.email, u.phone, u.parent_phone, e.enrolled_at
         )
         SELECT 
@@ -5496,25 +5499,26 @@ router.get(
           COUNT(DISTINCT l.id) as total_lectures,
           COUNT(DISTINCT lv.id) as total_videos,
           COUNT(DISTINCT le.id) as total_lecture_exams,
-          COUNT(DISTINCT e.user_id) as total_students,
+          COUNT(DISTINCT eu.id) as total_students,
           
           -- إحصائيات التقدم
-          COUNT(DISTINCT CASE WHEN lv_views.user_id IS NOT NULL THEN e.user_id END) as students_with_lecture_views,
-          COUNT(DISTINCT CASE WHEN vv.user_id IS NOT NULL THEN e.user_id END) as students_with_video_views,
-          COUNT(DISTINCT CASE WHEN les.student_id IS NOT NULL THEN e.user_id END) as students_with_lecture_exam_submissions,
+          COUNT(DISTINCT CASE WHEN lv_views.user_id IS NOT NULL THEN eu.id END) as students_with_lecture_views,
+          COUNT(DISTINCT CASE WHEN vv.user_id IS NOT NULL THEN eu.id END) as students_with_video_views,
+          COUNT(DISTINCT CASE WHEN les.student_id IS NOT NULL THEN eu.id END) as students_with_lecture_exam_submissions,
           
           -- متوسطات التقدم
-          ROUND(AVG(lecture_progress.lecture_completion_percentage), 2) as avg_lecture_completion,
-          ROUND(AVG(video_progress.video_completion_percentage), 2) as avg_video_completion,
-          ROUND(AVG(exam_progress.exam_completion_percentage), 2) as avg_exam_completion
+          ROUND(AVG(lecture_progress.lecture_completion_percentage) FILTER (WHERE eu.id IS NOT NULL), 2) as avg_lecture_completion,
+          ROUND(AVG(video_progress.video_completion_percentage) FILTER (WHERE eu.id IS NOT NULL), 2) as avg_video_completion,
+          ROUND(AVG(exam_progress.exam_completion_percentage) FILTER (WHERE eu.id IS NOT NULL), 2) as avg_exam_completion
         FROM courses c
         LEFT JOIN lectures l ON c.id = l.course_id
         LEFT JOIN lecture_videos lv ON l.id = lv.lecture_id
         LEFT JOIN exams le ON l.id = le.lecture_id AND le.type = 'exam'
         LEFT JOIN enrollments e ON c.id = e.course_id
-        LEFT JOIN lecture_views lv_views ON e.user_id = lv_views.user_id AND lv_views.lecture_id = l.id
-        LEFT JOIN video_views vv ON e.user_id = vv.user_id AND vv.course_id = c.id
-        LEFT JOIN exam_submissions les ON e.user_id = les.student_id AND les.exam_id = le.id
+        LEFT JOIN users eu ON eu.id = e.user_id AND eu.role = 'student' AND eu.deleted_at IS NULL
+        LEFT JOIN lecture_views lv_views ON eu.id = lv_views.user_id AND lv_views.lecture_id = l.id
+        LEFT JOIN video_views vv ON eu.id = vv.user_id AND vv.course_id = c.id
+        LEFT JOIN exam_submissions les ON eu.id = les.student_id AND les.exam_id = le.id
         LEFT JOIN LATERAL (
           SELECT 
             CASE 

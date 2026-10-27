@@ -229,7 +229,11 @@ export class LectureEngagementReportService {
     const params: unknown[] = [lectureId, courseId, teacherId];
     let p = 4;
 
-    const conditions: string[] = [`e.course_id = $2`, `u.role = 'student'`];
+    const conditions: string[] = [
+      `e.course_id = $2`,
+      `u.role = 'student'`,
+      `u.deleted_at IS NULL`,
+    ];
 
     if (isGroupsMode && caps.courseGroupsTable && lectureGroupIds.length > 0) {
       conditions.push(`EXISTS (

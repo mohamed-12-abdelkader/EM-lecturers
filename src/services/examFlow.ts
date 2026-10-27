@@ -2091,7 +2091,12 @@ export class ExamFlowService {
          u.email AS student_email
        FROM exam_submissions es
        JOIN users u ON es.student_id = u.id
+       JOIN exams ex ON ex.id = es.exam_id
+       LEFT JOIN lectures lec ON lec.id = ex.lecture_id
+       JOIN enrollments en ON en.user_id = es.student_id
+         AND en.course_id = COALESCE(ex.course_id, lec.course_id)
        WHERE es.exam_id = $1
+         AND u.deleted_at IS NULL
          AND COALESCE(es.status, 'submitted') IN ('submitted', 'late', 'expired')
        ORDER BY es.student_id, es.submitted_at DESC NULLS LAST, es.id DESC`,
       [exam.id],
@@ -2222,6 +2227,7 @@ export class ExamFlowService {
        FROM enrollments e
        JOIN users u ON u.id = e.user_id
        WHERE e.course_id = $1 AND u.role = 'student'
+         AND u.deleted_at IS NULL
        ORDER BY u.name ASC`,
       [exam.course_id],
     );
@@ -2375,7 +2381,13 @@ export class ExamFlowService {
            es.total_grade,
            es.passed
          FROM exam_submissions es
+         JOIN users u ON u.id = es.student_id AND u.deleted_at IS NULL
+         JOIN exams ex ON ex.id = es.exam_id
+         LEFT JOIN lectures lec ON lec.id = ex.lecture_id
+         JOIN enrollments en ON en.user_id = es.student_id
+           AND en.course_id = COALESCE(ex.course_id, lec.course_id)
          WHERE COALESCE(es.status, 'submitted') IN ('submitted', 'late', 'expired')
+           AND COALESCE(ex.course_id, lec.course_id) = $1
          ORDER BY es.exam_id, es.student_id, es.submitted_at DESC NULLS LAST, es.id DESC
        )
        SELECT
@@ -3522,7 +3534,11 @@ export class ExamFlowService {
               s.selected_question_ids, s.is_late,
               u.name, u.email, u.phone
        FROM exam_submissions s
-       JOIN users u ON s.student_id = u.id
+       JOIN users u ON s.student_id = u.id AND u.deleted_at IS NULL
+       JOIN exams ex ON ex.id = s.exam_id
+       LEFT JOIN lectures lec ON lec.id = ex.lecture_id
+       JOIN enrollments en ON en.user_id = s.student_id
+         AND en.course_id = COALESCE(ex.course_id, lec.course_id)
        WHERE s.exam_id = $1
          AND COALESCE(s.status, 'submitted') IN ('submitted', 'late', 'expired', 'in_progress')
        ORDER BY CASE WHEN COALESCE(s.status, 'submitted') = 'in_progress' THEN 0 ELSE 1 END,

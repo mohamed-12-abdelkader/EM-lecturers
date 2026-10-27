@@ -66,9 +66,10 @@ export async function getStudentCourseWatchPercentage(
 /** متوسط نسبة مشاهدة الكورس لكل الطلاب المسجلين */
 export async function getCourseAverageWatchPercentage(courseId: number): Promise<number> {
   const result = await pool.query<{ avg_watch: string }>(
-    `WITH enrolled AS (
+    `     WITH enrolled AS (
        SELECT e.user_id
        FROM enrollments e
+       JOIN users u ON u.id = e.user_id AND u.deleted_at IS NULL
        WHERE e.course_id = $1
      ),
      per_student AS (

@@ -47,9 +47,10 @@ export class DataAnalystReportsService {
   static async getTeacherCourses(teacherId: number) {
     const r = await pool.query<{ id: number; title: string; enrolled_students: string }>(
       `SELECT c.id, c.title,
-              COUNT(DISTINCT e.user_id)::text AS enrolled_students
+              COUNT(DISTINCT u.id)::text AS enrolled_students
        FROM courses c
        LEFT JOIN enrollments e ON e.course_id = c.id
+       LEFT JOIN users u ON u.id = e.user_id AND u.role = 'student' AND u.deleted_at IS NULL
        WHERE c.teacher_id = $1
        GROUP BY c.id, c.title
        ORDER BY c.created_at DESC`,
@@ -69,9 +70,10 @@ export class DataAnalystReportsService {
     const trimmed = (name || '').trim();
     if (!trimmed) return [];
     const result = await pool.query(
-      `SELECT c.id, c.title, COUNT(DISTINCT e.user_id)::text AS enrolled_students
+      `SELECT c.id, c.title, COUNT(DISTINCT u.id)::text AS enrolled_students
        FROM courses c
        LEFT JOIN enrollments e ON e.course_id = c.id
+       LEFT JOIN users u ON u.id = e.user_id AND u.role = 'student' AND u.deleted_at IS NULL
        WHERE c.teacher_id = $1 AND c.title ILIKE $2
        GROUP BY c.id, c.title
        ORDER BY c.title ASC
@@ -126,7 +128,7 @@ export class DataAnalystReportsService {
            FROM users u
            JOIN enrollments e ON e.user_id = u.id
            JOIN courses c ON c.id = e.course_id
-           WHERE c.teacher_id = $1 AND u.role = 'student'
+           WHERE c.teacher_id = $1 AND u.role = 'student' AND u.deleted_at IS NULL
          ),
          watch AS (
            SELECT e.user_id AS student_id,
@@ -139,6 +141,7 @@ export class DataAnalystReportsService {
                   )
                   END AS watch_percentage
            FROM enrollments e
+           JOIN users u ON u.id = e.user_id AND u.deleted_at IS NULL
            JOIN courses c ON c.id = e.course_id
            JOIN lectures l ON l.course_id = c.id
            LEFT JOIN lecture_views lv ON lv.lecture_id = l.id AND lv.user_id = e.user_id
@@ -153,12 +156,15 @@ export class DataAnalystReportsService {
            JOIN exams ex ON ex.id = es.exam_id
            JOIN lectures l ON l.id = ex.lecture_id
            JOIN courses c ON c.id = l.course_id
+           JOIN enrollments enr ON enr.user_id = es.student_id AND enr.course_id = c.id
+           JOIN users u ON u.id = es.student_id AND u.deleted_at IS NULL
            WHERE c.teacher_id = $1
            GROUP BY es.student_id
          ),
          course_counts AS (
            SELECT e.user_id AS student_id, COUNT(DISTINCT e.course_id)::int AS courses_count
            FROM enrollments e
+           JOIN users u ON u.id = e.user_id AND u.deleted_at IS NULL
            JOIN courses c ON c.id = e.course_id
            WHERE c.teacher_id = $1
            GROUP BY e.user_id
@@ -190,7 +196,7 @@ export class DataAnalystReportsService {
            FROM users u
            JOIN enrollments e ON e.user_id = u.id
            JOIN courses c ON c.id = e.course_id
-           WHERE c.teacher_id = $1 AND u.role = 'student'
+           WHERE c.teacher_id = $1 AND u.role = 'student' AND u.deleted_at IS NULL
          ),
          latest_activity AS (
            SELECT ts.id AS student_id, MAX(a.occurred_at) AS last_activity
@@ -210,6 +216,7 @@ export class DataAnalystReportsService {
                   )
                   END AS watch_percentage
            FROM enrollments e
+           JOIN users u ON u.id = e.user_id AND u.deleted_at IS NULL
            JOIN courses c ON c.id = e.course_id
            JOIN lectures l ON l.course_id = c.id
            LEFT JOIN lecture_views lv ON lv.lecture_id = l.id AND lv.user_id = e.user_id
@@ -224,6 +231,8 @@ export class DataAnalystReportsService {
            JOIN exams ex ON ex.id = es.exam_id
            JOIN lectures l ON l.id = ex.lecture_id
            JOIN courses c ON c.id = l.course_id
+           JOIN enrollments enr ON enr.user_id = es.student_id AND enr.course_id = c.id
+           JOIN users u ON u.id = es.student_id AND u.deleted_at IS NULL
            WHERE c.teacher_id = $1
            GROUP BY es.student_id
          )
@@ -263,7 +272,7 @@ export class DataAnalystReportsService {
            FROM users u
            JOIN enrollments e ON e.user_id = u.id
            JOIN courses c ON c.id = e.course_id
-           WHERE c.teacher_id = $1 AND u.role = 'student'
+           WHERE c.teacher_id = $1 AND u.role = 'student' AND u.deleted_at IS NULL
          )
          SELECT
            (SELECT COUNT(*)::text FROM teacher_students) AS total_students,
@@ -280,6 +289,7 @@ export class DataAnalystReportsService {
                       )
                       END AS watch_percentage
                FROM enrollments e
+               JOIN users u ON u.id = e.user_id AND u.deleted_at IS NULL
                JOIN courses c ON c.id = e.course_id
                JOIN lectures l ON l.course_id = c.id
                LEFT JOIN lecture_views lv ON lv.lecture_id = l.id AND lv.user_id = e.user_id
@@ -294,6 +304,8 @@ export class DataAnalystReportsService {
              JOIN exams ex ON ex.id = es.exam_id
              JOIN lectures l ON l.id = ex.lecture_id
              JOIN courses c ON c.id = l.course_id
+             JOIN enrollments enr ON enr.user_id = es.student_id AND enr.course_id = c.id
+             JOIN users u ON u.id = es.student_id AND u.deleted_at IS NULL
              WHERE c.teacher_id = $1
            ) AS average_exam`,
         [teacherId],

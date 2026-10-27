@@ -30,6 +30,7 @@ export class AnalyticsIntelligenceService {
          JOIN users u ON u.id = e.user_id
          WHERE e.course_id = $1
            AND u.role = 'student'
+           AND u.deleted_at IS NULL
            AND u.tenant_id = $2`,
         [courseId, scope.tenantId],
       ),
@@ -60,6 +61,7 @@ export class AnalyticsIntelligenceService {
              AND vv.updated_at BETWEEN $3 AND $4
            WHERE e.course_id = $1
              AND u.role = 'student'
+             AND u.deleted_at IS NULL
              AND u.tenant_id = $2
            GROUP BY e.user_id
          )
@@ -92,6 +94,7 @@ export class AnalyticsIntelligenceService {
              AND vv.updated_at BETWEEN $3 AND $4
            WHERE e.course_id = $1
              AND u.role = 'student'
+             AND u.deleted_at IS NULL
              AND u.tenant_id = $2
            GROUP BY e.user_id
          )
@@ -117,7 +120,7 @@ export class AnalyticsIntelligenceService {
            END::text AS avg_completion
          FROM lectures l
          JOIN enrollments e ON e.course_id = l.course_id
-         JOIN users u ON u.id = e.user_id AND u.role = 'student' AND u.tenant_id = $2
+         JOIN users u ON u.id = e.user_id AND u.role = 'student' AND u.deleted_at IS NULL AND u.tenant_id = $2
          LEFT JOIN lecture_views lv ON lv.lecture_id = l.id AND lv.user_id = e.user_id
            AND lv.viewed_at BETWEEN $3 AND $4
          LEFT JOIN video_views vv ON vv.lecture_id = l.id AND vv.user_id = e.user_id AND vv.course_id = l.course_id
@@ -156,6 +159,7 @@ export class AnalyticsIntelligenceService {
            AND vv2.updated_at BETWEEN $3 AND $4
          WHERE e.course_id = $1
            AND u.role = 'student'
+           AND u.deleted_at IS NULL
            AND u.tenant_id = $2
          GROUP BY u.id, u.name
          ORDER BY COALESCE(SUM(vv.watch_duration), 0) DESC,
@@ -531,6 +535,7 @@ export class AnalyticsIntelligenceService {
        LEFT JOIN watch w ON w.student_id = u.id
        LEFT JOIN exams e ON e.student_id = u.id
        WHERE u.role = 'student'
+         AND u.deleted_at IS NULL
          AND u.tenant_id = $1
        ORDER BY
          COALESCE(e.avg_exam_percentage, 0) DESC,
@@ -566,7 +571,7 @@ export class AnalyticsIntelligenceService {
          LEFT JOIN analytics_student_activity_logs a
            ON a.student_id = u.id
            AND a.tenant_id = $1
-         WHERE u.role = 'student' AND u.tenant_id = $1
+         WHERE u.role = 'student' AND u.deleted_at IS NULL AND u.tenant_id = $1
          GROUP BY u.id
        ),
        completion AS (
@@ -603,6 +608,7 @@ export class AnalyticsIntelligenceService {
          LEFT JOIN completion c ON c.student_id = u.id
          LEFT JOIN exams e ON e.student_id = u.id
          WHERE u.role = 'student'
+           AND u.deleted_at IS NULL
            AND u.tenant_id = $1
        )
        SELECT

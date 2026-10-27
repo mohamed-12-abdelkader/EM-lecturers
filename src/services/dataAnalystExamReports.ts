@@ -197,6 +197,7 @@ export class DataAnalystExamReportsService {
          LIMIT 1
        ) es ON TRUE
        WHERE en.course_id = $1
+         AND u.deleted_at IS NULL
        ORDER BY u.name ASC`,
       [exam.course_id, examId],
     );
@@ -341,6 +342,7 @@ export class DataAnalystExamReportsService {
          LIMIT 1
        ) att ON TRUE
        WHERE en.course_id = $1
+         AND u.deleted_at IS NULL
        ORDER BY u.name ASC`,
       [courseId, examId],
     );

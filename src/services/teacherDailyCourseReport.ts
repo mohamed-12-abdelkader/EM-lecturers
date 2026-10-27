@@ -194,6 +194,7 @@ export class TeacherDailyCourseReportService {
     // 2) Students stats: total, enrolled today, active (last 48h), inactive
     const totalEnrolledRes = await pool.query(
       `SELECT COUNT(*) as cnt FROM enrollments e
+       JOIN users u ON u.id = e.user_id AND u.deleted_at IS NULL
        WHERE e.course_id = $1
          AND (e.subscription_status IS NULL OR e.subscription_status = 'active')
          AND (e.expires_at IS NULL OR e.expires_at > NOW())
@@ -204,6 +205,7 @@ export class TeacherDailyCourseReportService {
 
     const enrolledTodayRes = await pool.query(
       `SELECT COUNT(*) as cnt FROM enrollments e
+       JOIN users u ON u.id = e.user_id AND u.deleted_at IS NULL
        WHERE e.course_id = $1
          AND e.enrolled_at >= CURRENT_DATE
          AND (e.subscription_status IS NULL OR e.subscription_status = 'active')
@@ -236,6 +238,7 @@ export class TeacherDailyCourseReportService {
 
     const enrolledUserIdsRes = await pool.query(
       `SELECT e.user_id FROM enrollments e
+       JOIN users u ON u.id = e.user_id AND u.deleted_at IS NULL
        WHERE e.course_id = $1
          AND (e.subscription_status IS NULL OR e.subscription_status = 'active')
          AND (e.expires_at IS NULL OR e.expires_at > NOW())
@@ -269,6 +272,7 @@ export class TeacherDailyCourseReportService {
         `SELECT COUNT(DISTINCT vv.user_id) as cnt
          FROM video_views vv
          JOIN enrollments e ON e.user_id = vv.user_id AND e.course_id = vv.course_id
+         JOIN users u ON u.id = vv.user_id AND u.deleted_at IS NULL
          WHERE vv.lecture_id = $1 AND vv.course_id = $2
            AND (e.subscription_status IS NULL OR e.subscription_status = 'active')
            AND (e.expires_at IS NULL OR e.expires_at > NOW())
@@ -313,6 +317,9 @@ export class TeacherDailyCourseReportService {
                   COUNT(*) FILTER (WHERE e.total_grade > 0 AND (es.total_grade::float / e.total_grade) > 0.85) as excellence
            FROM exam_submissions es
            JOIN exams e ON e.id = es.exam_id
+           JOIN lectures lec ON lec.id = e.lecture_id
+           JOIN users u ON u.id = es.student_id AND u.deleted_at IS NULL
+           JOIN enrollments enr ON enr.user_id = es.student_id AND enr.course_id = lec.course_id
            WHERE es.exam_id = $1 AND es.status IN ('submitted', 'late', 'expired')`,
           [examId],
         );
@@ -332,8 +339,11 @@ export class TeacherDailyCourseReportService {
           `SELECT COUNT(*) as total,
                   COUNT(*) FILTER (WHERE total_grade > 0 AND (obtained_grade::float / total_grade) >= 0.5) as passed,
                   COUNT(*) FILTER (WHERE total_grade > 0 AND (obtained_grade::float / total_grade) > 0.85) as excellence
-           FROM course_level_exam_attempts
-           WHERE exam_id = $1 AND status = 'submitted'`,
+           FROM course_level_exam_attempts a
+           JOIN users u ON u.id = a.student_id AND u.deleted_at IS NULL
+           JOIN course_level_exams ex ON ex.id = a.exam_id
+           JOIN enrollments enr ON enr.user_id = a.student_id AND enr.course_id = ex.course_id
+           WHERE a.exam_id = $1 AND a.status = 'submitted'`,
           [examId],
         );
         const total = parseInt(attRes.rows[0]?.total || '0', 10);
@@ -365,6 +375,8 @@ export class TeacherDailyCourseReportService {
        JOIN lectures l ON e.lecture_id = l.id
        JOIN exam_answers ea ON ea.question_id = eq.id
        JOIN exam_submissions es ON ea.submission_id = es.id AND es.exam_id = e.id
+       JOIN users u ON u.id = es.student_id AND u.deleted_at IS NULL
+       JOIN enrollments enr ON enr.user_id = es.student_id AND enr.course_id = l.course_id
        WHERE l.course_id = $1
          AND es.status IN ('submitted', 'late', 'expired')
        GROUP BY eq.id, eq.question_text, eq.image
@@ -396,6 +408,8 @@ export class TeacherDailyCourseReportService {
        JOIN course_level_exams e ON q.exam_id = e.id
        JOIN course_level_exam_answers a ON a.question_id = q.id
        JOIN course_level_exam_attempts att ON a.attempt_id = att.id AND att.exam_id = e.id
+       JOIN users u ON u.id = att.student_id AND u.deleted_at IS NULL
+       JOIN enrollments enr ON enr.user_id = att.student_id AND enr.course_id = e.course_id
        WHERE e.course_id = $1 AND att.status = 'submitted'
        GROUP BY q.id, q.question_text, q.question_image
        HAVING COUNT(*) > 0 AND (COUNT(*) FILTER (WHERE a.is_correct = false)::float / COUNT(*)) > 0.5`,

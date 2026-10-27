@@ -19,6 +19,7 @@ export class TeacherReportsService {
        JOIN enrollments e ON u.id = e.user_id
        JOIN courses c ON e.course_id = c.id
        WHERE c.teacher_id = $1 AND u.role = 'student'
+         AND u.deleted_at IS NULL
          AND (u.name ILIKE $2 OR u.email ILIKE $2)
        GROUP BY u.id, u.name, u.email, u.phone
        ORDER BY u.name ASC
@@ -73,6 +74,7 @@ export class TeacherReportsService {
        JOIN enrollments e ON u.id = e.user_id
        JOIN courses c ON e.course_id = c.id
        WHERE c.teacher_id = $1 AND u.role = 'student'
+         AND u.deleted_at IS NULL
        GROUP BY u.id, u.name, u.email, u.phone
        ORDER BY u.name ASC`,
       [teacherId],
@@ -90,7 +92,9 @@ export class TeacherReportsService {
       `SELECT DISTINCT e.course_id, c.title as course_title
        FROM enrollments e
        JOIN courses c ON e.course_id = c.id
-       WHERE c.teacher_id = $1 AND e.user_id = $2`,
+       JOIN users u ON u.id = e.user_id
+       WHERE c.teacher_id = $1 AND e.user_id = $2
+         AND u.deleted_at IS NULL`,
       [teacherId, studentId],
     );
 

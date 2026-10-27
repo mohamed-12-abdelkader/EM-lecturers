@@ -2869,10 +2869,22 @@ export class CourseLevelExamsService {
        FROM course_level_exam_attempts a
        JOIN users u ON a.student_id = u.id
        WHERE a.exam_id = $1 AND a.status IN ('submitted', 'in_progress')
+         AND u.deleted_at IS NULL
+         AND (
+           $3::int IS NULL
+           OR EXISTS (
+             SELECT 1 FROM enrollments en
+             WHERE en.user_id = a.student_id AND en.course_id = $3
+           )
+         )
          AND ($2::int IS NULL OR ${membershipSql})
        ORDER BY CASE WHEN a.status = 'in_progress' THEN 0 ELSE 1 END,
          a.submitted_at DESC NULLS LAST, a.started_at DESC`,
-      [examId, groupParam],
+      [
+        examId,
+        groupParam,
+        this.isPublicExam(exam) || exam.course_id == null ? null : Number(exam.course_id),
+      ],
     );
 
     const attempts = attemptsRes.rows;
@@ -3298,6 +3310,7 @@ export class CourseLevelExamsService {
            FROM enrollments e
            JOIN users u ON u.id = e.user_id
            WHERE e.course_id = $1 AND u.role = 'student'
+             AND u.deleted_at IS NULL
              AND ($2::int IS NULL OR ${membershipForUser})
            ORDER BY u.name ASC`,
           [exam.course_id, groupParam],
@@ -4235,8 +4248,17 @@ export class CourseLevelExamsService {
          u.email,
          u.phone
        FROM course_level_exam_attempts a
-       JOIN users u ON a.student_id = u.id
+       JOIN users u ON a.student_id = u.id AND u.deleted_at IS NULL
+       JOIN course_level_exams ex ON ex.id = a.exam_id
        WHERE a.exam_id = $1 AND a.status IN ('submitted', 'in_progress')
+         AND (
+           COALESCE(ex.exam_scope, 'course') = 'public'
+           OR ex.course_id IS NULL
+           OR EXISTS (
+             SELECT 1 FROM enrollments en
+             WHERE en.user_id = a.student_id AND en.course_id = ex.course_id
+           )
+         )
        ORDER BY CASE WHEN a.status = 'in_progress' THEN 0 ELSE 1 END,
          a.submitted_at DESC NULLS LAST, a.started_at DESC`,
       [examId],
