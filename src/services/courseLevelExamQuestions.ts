@@ -361,6 +361,15 @@ export class CourseLevelExamQuestionsService {
   }
 
   /**
+   * Remove a question from a known exam and regrade submitted attempts.
+   * Does not delete the source bank question. Caller must already own the exam.
+   */
+  static async deleteQuestionOnExam(examId: number, questionId: number) {
+    await this.assertQuestionOnExam(examId, questionId);
+    return this.deleteQuestionAndRegrade(questionId);
+  }
+
+  /**
    * Update a question
    */
   static async updateQuestion(

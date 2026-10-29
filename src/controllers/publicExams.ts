@@ -705,6 +705,31 @@ router.post(
   }),
 );
 
+/**
+ * DELETE /api/public-exams/:examId/questions/:questionId
+ * حذف السؤال من الامتحان العام فقط. سؤال البنك الأصلي يبقى، والمحاولات المسلّمة تتعاد درجاتها.
+ */
+router.delete(
+  '/:examId/questions/:questionId',
+  authMiddleware(COURSE_CONTENT_ROLES),
+  asyncWrapper(async (req, res) => {
+    const examId = Number(req.params.examId);
+    const questionId = Number(req.params.questionId);
+    if (!Number.isInteger(examId) || examId <= 0 || !Number.isInteger(questionId) || questionId <= 0) {
+      throw new HttpError(400, 'معرّف الامتحان أو السؤال غير صالح');
+    }
+    await assertPublicExam(examId, req.user!);
+    const result = await CourseLevelExamQuestionsService.deleteQuestionOnExam(examId, questionId);
+    res.json({
+      success: true,
+      message: 'تم حذف السؤال من الامتحان',
+      examId: result.examId,
+      deletedQuestionId: result.deletedQuestionId,
+      regrade: result.regrade,
+    });
+  }),
+);
+
 /** إضافة أسئلة من بنك الأسئلة للامتحان العام */
 router.post(
   '/:examId/questions/from-bank',
