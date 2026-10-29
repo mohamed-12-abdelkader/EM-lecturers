@@ -1,7 +1,10 @@
 import { Router } from 'express';
+import fs from 'fs';
+import path from 'path';
+import multer from 'multer';
 import { authMiddleware } from '../middleware/authentication';
 import { COURSE_CONTENT_ROLES } from '../services/courseAccessControl';
-import { asyncWrapper, HttpError } from '../utils';
+import { asyncWrapper, HttpError, uploadToCloudinary } from '../utils';
 import pool from '../db/pool';
 import { CourseLevelExamsService } from '../services/courseLevelExams';
 import { CourseLevelExamQuestionsService } from '../services/courseLevelExamQuestions';
@@ -15,6 +18,68 @@ import {
 import { normalizeQuestionDisplayMode } from '../services/examQuestionSelection';
 
 export const router = Router();
+
+const questionImageUpload = multer({
+  storage: multer.diskStorage({
+    destination: (_req, _file, cb) => {
+      const uploadDir = 'uploads';
+      if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
+      cb(null, uploadDir);
+    },
+    filename: (_req, file, cb) => {
+      const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
+      cb(null, 'public-exam-question-' + uniqueSuffix + path.extname(file.originalname));
+    },
+  }),
+  limits: { fileSize: 10 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    const allowed = /jpeg|jpg|png|gif|webp/;
+    if (allowed.test(path.extname(file.originalname).toLowerCase()) && allowed.test(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(new Error('Only image files are allowed'));
+    }
+  },
+}).fields([
+  { name: 'questionImage', maxCount: 1 },
+  { name: 'question_image', maxCount: 1 },
+  { name: 'image', maxCount: 1 },
+]);
+
+function firstUploadedImage(req: { files?: unknown }): Express.Multer.File | undefined {
+  const files = req.files as Record<string, Express.Multer.File[]> | undefined;
+  return files?.questionImage?.[0] || files?.question_image?.[0] || files?.image?.[0];
+}
+
+function mapPublicExamQuestion(row: any) {
+  const questionImage = row.question_image ?? row.questionImage ?? null;
+  return {
+    ...row,
+    questionImage,
+    question_image: questionImage,
+    questionText: row.question_text,
+    optionA: row.option_a,
+    optionB: row.option_b,
+    optionC: row.option_c,
+    optionD: row.option_d,
+    correctAnswer: row.correct_answer,
+    correctAnswer2: row.correct_answer_2 ?? null,
+  };
+}
+
+function optionalTrimmed(value: unknown): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  return String(value).trim();
+}
+
+function imageValueFromBody(body: Record<string, unknown>): string | null | undefined {
+  const raw = body.questionImage ?? body.question_image;
+  if (raw === undefined) return undefined;
+  if (raw === null || raw === 'null' || raw === '') return null;
+  const text = String(raw).trim();
+  if (!text || text === 'undefined') return undefined;
+  return text;
+}
 
 function parseTeacherLibraryBody(body: Record<string, unknown>) {
   const questionIds = Array.isArray(body.questionIds)
@@ -508,6 +573,134 @@ router.get(
         optionD: row.option_d,
         correctAnswer: row.correct_answer,
       })),
+    });
+  }),
+);
+
+/**
+ * PUT /api/public-exams/:examId/questions/:questionId
+ * تعديل نص السؤال أو الاختيارات أو الإجابة. الصورة اختيارية: ملف أو رابط.
+ */
+router.put(
+  '/:examId/questions/:questionId',
+  authMiddleware(COURSE_CONTENT_ROLES),
+  questionImageUpload,
+  asyncWrapper(async (req, res) => {
+    const examId = Number(req.params.examId);
+    const questionId = Number(req.params.questionId);
+    if (!Number.isInteger(examId) || examId <= 0 || !Number.isInteger(questionId) || questionId <= 0) {
+      throw new HttpError(400, 'معرّف الامتحان أو السؤال غير صالح');
+    }
+    await assertPublicExam(examId, req.user!);
+
+    const body = (req.body || {}) as Record<string, unknown>;
+    const updateData: {
+      questionText?: string;
+      questionImage?: string | null;
+      optionA?: string;
+      optionB?: string;
+      optionC?: string;
+      optionD?: string;
+    } = {};
+
+    const questionText = optionalTrimmed(body.questionText ?? body.question_text);
+    if (questionText !== undefined) updateData.questionText = questionText;
+    const optionA = optionalTrimmed(body.optionA ?? body.option_a);
+    const optionB = optionalTrimmed(body.optionB ?? body.option_b);
+    const optionC = optionalTrimmed(body.optionC ?? body.option_c);
+    const optionD = optionalTrimmed(body.optionD ?? body.option_d);
+    if (optionA !== undefined) updateData.optionA = optionA;
+    if (optionB !== undefined) updateData.optionB = optionB;
+    if (optionC !== undefined) updateData.optionC = optionC;
+    if (optionD !== undefined) updateData.optionD = optionD;
+
+    const file = firstUploadedImage(req);
+    if (file) {
+      const uploaded = await uploadToCloudinary(file.path);
+      updateData.questionImage = uploaded.secure_url;
+    } else {
+      const imageFromBody = imageValueFromBody(body);
+      if (imageFromBody !== undefined) updateData.questionImage = imageFromBody;
+    }
+
+    const rawAnswers =
+      body.correctAnswers ??
+      body.correct_answers ??
+      (body.correctAnswer != null || body.correct_answer != null
+        ? [
+            body.correctAnswer ?? body.correct_answer,
+            body.correctAnswer2 ?? body.correct_answer_2,
+          ].filter((v) => v != null && String(v).trim() !== '')
+        : null);
+
+    const hasContentUpdate = Object.keys(updateData).length > 0;
+    const hasAnswerUpdate = Array.isArray(rawAnswers);
+    if (!hasContentUpdate && !hasAnswerUpdate) {
+      throw new HttpError(400, 'أرسل حقلًا واحدًا على الأقل لتعديل السؤال');
+    }
+
+    let question = hasContentUpdate
+      ? await CourseLevelExamQuestionsService.updateQuestionOnExam(examId, questionId, updateData)
+      : null;
+    let regrade: unknown;
+    let correctAnswers: string[] | undefined;
+    if (hasAnswerUpdate) {
+      const written = await CourseLevelExamQuestionsService.setCorrectAnswersOnExam(
+        examId,
+        questionId,
+        rawAnswers as Array<'A' | 'B' | 'C' | 'D'>,
+      );
+      question = written.question;
+      regrade = written.regrade;
+      correctAnswers = written.correctAnswers;
+    }
+
+    res.json({
+      success: true,
+      message: 'تم تعديل السؤال',
+      question: mapPublicExamQuestion(question),
+      ...(correctAnswers ? { correctAnswers } : {}),
+      ...(regrade ? { regrade } : {}),
+    });
+  }),
+);
+
+/**
+ * POST /api/public-exams/:examId/questions/:questionId/image
+ * إضافة أو استبدال صورة السؤال. ملف (questionImage أو image) أو رابط questionImage.
+ */
+router.post(
+  '/:examId/questions/:questionId/image',
+  authMiddleware(COURSE_CONTENT_ROLES),
+  questionImageUpload,
+  asyncWrapper(async (req, res) => {
+    const examId = Number(req.params.examId);
+    const questionId = Number(req.params.questionId);
+    if (!Number.isInteger(examId) || examId <= 0 || !Number.isInteger(questionId) || questionId <= 0) {
+      throw new HttpError(400, 'معرّف الامتحان أو السؤال غير صالح');
+    }
+    await assertPublicExam(examId, req.user!);
+
+    const body = (req.body || {}) as Record<string, unknown>;
+    const file = firstUploadedImage(req);
+    let questionImage: string | null | undefined;
+    if (file) {
+      const uploaded = await uploadToCloudinary(file.path);
+      questionImage = uploaded.secure_url;
+    } else {
+      questionImage = imageValueFromBody(body);
+    }
+    if (!questionImage) {
+      throw new HttpError(400, 'أرسل ملف الصورة أو رابط questionImage');
+    }
+
+    const question = await CourseLevelExamQuestionsService.updateQuestionOnExam(examId, questionId, {
+      questionImage,
+    });
+    res.json({
+      success: true,
+      message: 'تمت إضافة صورة السؤال',
+      question: mapPublicExamQuestion(question),
     });
   }),
 );

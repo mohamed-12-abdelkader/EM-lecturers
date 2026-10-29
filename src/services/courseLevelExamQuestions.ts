@@ -324,6 +324,42 @@ export class CourseLevelExamQuestionsService {
     return insertedQuestions;
   }
 
+  private static async assertQuestionOnExam(examId: number, questionId: number) {
+    const res = await pool.query(
+      `SELECT exam_id FROM course_level_exam_questions WHERE id = $1`,
+      [questionId],
+    );
+    if (!res.rowCount || Number(res.rows[0].exam_id) !== examId) {
+      throw new HttpError(404, 'السؤال غير موجود في هذا الامتحان');
+    }
+  }
+
+  /**
+   * Update a question that already belongs to a known exam.
+   * Caller must have authorized access to that exam.
+   */
+  static async updateQuestionOnExam(
+    examId: number,
+    questionId: number,
+    input: UpdateQuestionInput,
+  ) {
+    await this.assertQuestionOnExam(examId, questionId);
+    return this.patchQuestion(questionId, input);
+  }
+
+  /**
+   * Set 1 or 2 correct answers on a question in a known exam, then regrade.
+   * Caller must have authorized access to that exam.
+   */
+  static async setCorrectAnswersOnExam(
+    examId: number,
+    questionId: number,
+    correctAnswers: Array<'A' | 'B' | 'C' | 'D'>,
+  ) {
+    await this.assertQuestionOnExam(examId, questionId);
+    return this.writeCorrectAnswers(questionId, correctAnswers);
+  }
+
   /**
    * Update a question
    */
@@ -333,7 +369,10 @@ export class CourseLevelExamQuestionsService {
     input: UpdateQuestionInput,
   ) {
     await this.verifyQuestionOwnership(questionId, requester.id);
+    return this.patchQuestion(questionId, input);
+  }
 
+  private static async patchQuestion(questionId: number, input: UpdateQuestionInput) {
     // Get current question
     const currentRes = await pool.query(`SELECT * FROM course_level_exam_questions WHERE id = $1`, [
       questionId,
@@ -511,7 +550,13 @@ export class CourseLevelExamQuestionsService {
     correctAnswers: Array<'A' | 'B' | 'C' | 'D'>,
   ) {
     await this.verifyQuestionOwnership(questionId, requester.id);
+    return this.writeCorrectAnswers(questionId, correctAnswers);
+  }
 
+  private static async writeCorrectAnswers(
+    questionId: number,
+    correctAnswers: Array<'A' | 'B' | 'C' | 'D'>,
+  ) {
     const unique = [
       ...new Set(
         (correctAnswers || [])
