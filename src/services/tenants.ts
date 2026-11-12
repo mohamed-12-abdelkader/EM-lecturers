@@ -9,6 +9,15 @@ import { SeoHooks } from './seo/hooks';
 import { TenantSitemapService } from './seo/sitemap';
 import { seoCacheDeletePrefix } from './seo/cache';
 
+const TENANT_LANDING_LAYOUTS = new Set(['bento', 'editorial', 'nocturne', 'horizon']);
+
+/** يحفظ تصميم اللاندينج المختار عند الإنشاء أو التعديل، ويرفض قيمة غير معروفة. */
+function withValidLandingLayout<T extends Record<string, unknown>>(page: T): T {
+  if (page.layout == null || page.layout === '') return page;
+  const raw = String(page.layout).trim().toLowerCase();
+  return { ...page, layout: TENANT_LANDING_LAYOUTS.has(raw) ? raw : 'bento' };
+}
+
 function buildArchivedSubdomain(tenantId: number, currentSubdomain: string): string {
   const base = String(currentSubdomain).replace(/^deleted-\d+-/, '');
   const prefix = `deleted-${tenantId}-`;
@@ -384,7 +393,7 @@ export class TenantService {
     await client.query(
       `INSERT INTO tenant_landing_pages (tenant_id, page) VALUES ($1, $2::JSONB)
        ON CONFLICT (tenant_id) DO UPDATE SET page = EXCLUDED.page, updated_at = NOW()`,
-      [created.id, JSON.stringify(input.landing ?? {})],
+      [created.id, JSON.stringify(withValidLandingLayout({ ...(input.landing ?? {}) }))],
     );
 
     if (input.owner?.email && input.owner?.password && input.owner?.name) {
@@ -809,7 +818,7 @@ export class TenantService {
         await client.query(
           `INSERT INTO tenant_landing_pages (tenant_id, page) VALUES ($1, $2::JSONB)
            ON CONFLICT (tenant_id) DO UPDATE SET page = EXCLUDED.page, updated_at = NOW()`,
-          [id, JSON.stringify(landingPayload)],
+          [id, JSON.stringify(withValidLandingLayout(landingPayload as Record<string, unknown>))],
         );
       }
 
