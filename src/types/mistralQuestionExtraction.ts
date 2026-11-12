@@ -219,6 +219,8 @@ export type MistralQuestionExtractionResult = {
     infer_correct_answer: boolean;
   subject?: string;
   extraction_mode?: 'ARABIC_HIGH_ACCURACY_MODE' | 'STANDARD_EXTRACTION_MODE';
+  /** وضع المحتوى المطلوب من العميل: auto | general | reading_passage */
+  extraction_content_mode?: 'auto' | 'general' | 'reading_passage';
   content_type?: 'reading_passage' | 'general';
   passages: MistralExtractedPassage[];
   extracted_images: MistralQuestionImage[];
@@ -243,4 +245,9 @@ export type MistralQuestionExtractionOptions = {
   endPage?: number;
   /** اسم المادة — يفعّل ARABIC_HIGH_ACCURACY_MODE للغة العربية */
   subject?: string | null;
+  /**
+   * auto | general | reading_passage
+   * لا يغيّر مسار الاستخراج العادي عند auto/undefined
+   */
+  contentMode?: 'auto' | 'general' | 'reading_passage' | null;
 };

@@ -23,6 +23,7 @@ import {
 } from './examAccessPolicy';
 import { CourseAccessControl } from './courseAccessControl';
 import { CourseAccessService } from './courseAccess';
+import { EssayReviewService, type EssayDraft } from './essayReview';
 import {
   choiceIdFromAnswerRow,
   collectLectureExamAnswersFromBody,
@@ -100,6 +101,7 @@ interface SubmitAttemptParams {
   examId: number;
   studentId: number;
   answers: AnswerPayload[];
+  essayDrafts?: EssayDraft[];
   attemptId?: number;
   allowAutoStart?: boolean;
 }
@@ -115,15 +117,33 @@ interface SubmitAttemptResult {
   releaseReason?: string;
   timedOut?: boolean;
   autosaved?: boolean;
+  essayQuestions?: unknown[];
+  essayNotice?: string | null;
 }
 
 interface WrongQuestion {
   questionId: number;
   questionText: string | null;
   questionImage: string | null;
-  correctChoice: { id: number | null; text: string | null } | null;
-  yourChoice: { id: number | null; text: string | null } | null;
+  type?: string | null;
+  correctChoice?: { id: number | null; text: string | null } | null;
+  yourChoice?: { id: number | null; text: string | null } | null;
+  yourAnswer?: string | null;
+  yourAnswerText?: string | null;
+  yourAnswerImages?: string[];
+  correctAnswer?: string | null;
+  correctAnswers?: string[];
+  correctAnswerText?: string | null;
+  correctAnswerImage?: string | null;
   unanswered?: boolean;
+  score?: number;
+  maxScore?: number;
+  gradingStatus?: string;
+  teacherNote?: string | null;
+  optionA?: string | null;
+  optionB?: string | null;
+  optionC?: string | null;
+  optionD?: string | null;
 }
 
 interface AttemptAnswersDetail {
@@ -151,6 +171,7 @@ interface ExamQuestion {
   correct_answer_index_override_2?: number | null;
   /** false = مخفي من الامتحان (لا يظهر للطالب) */
   isVisible?: boolean;
+  kind?: 'essay' | 'mcq';
   choices: {
     id: number;
     text: string;
@@ -195,6 +216,7 @@ interface QuestionEvaluation extends WrongQuestion {
   isCorrect: boolean;
   selectedChoiceId: number | null;
   correctChoiceId: number | null;
+  isEssay?: boolean;
 }
 
 interface QuestionReportStudent {
@@ -1773,6 +1795,7 @@ export class ExamFlowService {
     studentId: number,
     answers: LectureExamAnswer[],
     attemptId?: number,
+    essayDrafts: EssayDraft[] = [],
   ) {
     const exam = await this.getExamWithCourse(examId);
     if (!exam) {
@@ -1808,6 +1831,7 @@ export class ExamFlowService {
     if (isAttemptExpired(attempt.attempt_expire_at)) {
       const result = await this.finalizeInProgressAttempt(exam, attempt, studentId, answers, {
         timedOut: true,
+        essayDrafts,
       });
       return { ...result, autosaved: false };
     }
@@ -1816,6 +1840,10 @@ export class ExamFlowService {
     const allowed = new Set(questionBank.map((q) => Number(q.id)));
     const valid = answers.filter((a) => allowed.has(a.questionId));
     await this.upsertAttemptAnswers(attempt.id, valid);
+    const essayIds = questionBank.filter((q) => q.kind === 'essay').map((q) => q.id);
+    if (essayIds.length) {
+      await EssayReviewService.persistLectureDrafts(attempt.id, essayIds, essayDrafts);
+    }
     await pool.query(
       `UPDATE exam_submissions SET last_autosave_at = NOW() WHERE id = $1 AND status = 'in_progress'`,
       [attempt.id],
@@ -1836,6 +1864,7 @@ export class ExamFlowService {
     examId,
     studentId,
     answers,
+    essayDrafts,
     attemptId,
     allowAutoStart = false,
   }: SubmitAttemptParams): Promise<SubmitAttemptResult> {
@@ -1880,7 +1909,10 @@ export class ExamFlowService {
     }
 
     const timedOut = isAttemptExpired(attempt.attempt_expire_at);
-    return this.finalizeInProgressAttempt(exam, attempt, studentId, answers || [], { timedOut });
+    return this.finalizeInProgressAttempt(exam, attempt, studentId, answers || [], {
+      timedOut,
+      essayDrafts,
+    });
   }
 
   static async getAttemptDetails(examId: number, attemptId: number, user: RequestUser) {
@@ -2617,7 +2649,7 @@ export class ExamFlowService {
     attempt: any,
     studentId: number,
     submitted: AnswerPayload[],
-    options: { timedOut?: boolean } = {},
+    options: { timedOut?: boolean; essayDrafts?: EssayDraft[] } = {},
   ): Promise<SubmitAttemptResult> {
     const questionBank = await this.loadStudentAttemptQuestions(exam, attempt, studentId);
     if (!questionBank.length) {
@@ -2655,13 +2687,36 @@ export class ExamFlowService {
     );
     const updatedAttempt = updateRes.rows[0] || attempt;
 
-    await this.persistAttemptAnswers(updatedAttempt.id, evaluation.questions);
+    await this.persistAttemptAnswers(
+      updatedAttempt.id,
+      evaluation.questions,
+      questionBank.filter((q) => q.kind === 'essay').map((q) => q.id),
+    );
+    const essayIds = questionBank.filter((q) => q.kind === 'essay').map((q) => q.id);
+    if (essayIds.length) {
+      await EssayReviewService.persistLectureDrafts(
+        updatedAttempt.id,
+        essayIds,
+        options.essayDrafts || [],
+      );
+      await EssayReviewService.gradeLectureSubmission(updatedAttempt.id);
+    }
+    const finalTotals = essayIds.length
+      ? await EssayReviewService.recomputeLectureSubmission(updatedAttempt.id)
+      : { obtained: evaluation.totalGrade, max: evaluation.maxGrade };
+    const refreshedRes = await pool.query(`SELECT * FROM exam_submissions WHERE id = $1`, [
+      updatedAttempt.id,
+    ]);
+    const finalAttempt = refreshedRes.rows[0] || updatedAttempt;
+    const essaySummary = essayIds.length
+      ? await EssayReviewService.summarizeLectureEssays(updatedAttempt.id)
+      : { essayQuestions: [], essayNotice: null };
     // نقاط الترتيب من آخر امتحان شامل فقط — امتحانات المحاضرات مستبعدة
 
-    const releaseDecision = this.shouldReleaseAnswers(exam, updatedAttempt, now);
-    const wrongQuestions = releaseDecision.release
+    const releaseDecision = this.shouldReleaseAnswers(exam, finalAttempt, now);
+    const mcqWrong = releaseDecision.release
       ? evaluation.questions
-          .filter((q) => !q.isCorrect)
+          .filter((q) => !q.isCorrect && !q.isEssay)
           .map((q) => ({
             questionId: q.questionId,
             questionText: q.questionText,
@@ -2671,19 +2726,25 @@ export class ExamFlowService {
             unanswered: q.selectedChoiceId == null,
           }))
       : [];
+    const essayWrong = releaseDecision.release
+      ? await EssayReviewService.listIncorrectLectureEssays(updatedAttempt.id)
+      : [];
+    const wrongQuestions = [...mcqWrong, ...essayWrong];
 
     return {
-      attemptId: updatedAttempt.id,
+      attemptId: finalAttempt.id,
       status: 'submitted',
-      totalGrade: evaluation.totalGrade,
-      maxGrade: evaluation.maxGrade,
-      passed: evaluation.passed,
+      totalGrade: finalTotals.obtained,
+      maxGrade: finalTotals.max,
+      passed: finalTotals.obtained >= Math.ceil(finalTotals.max / 2),
       wrongQuestions,
       released: releaseDecision.release,
       // eslint-disable-next-line @typescript-eslint/ban-ts-comment
       // @ts-expect-error
       releaseReason: releaseDecision.reason,
       timedOut,
+      essayQuestions: essaySummary.essayQuestions,
+      essayNotice: essaySummary.essayNotice,
     };
   }
 
@@ -2691,7 +2752,12 @@ export class ExamFlowService {
     const now = new Date();
     const releaseDecision = this.shouldReleaseAnswers(exam, attempt, now);
     const answers = releaseDecision.release ? await this.getAttemptAnswers(attempt.id) : [];
-    const wrongQuestions = releaseDecision.release ? mapWrongQuestionsFromAnswers(answers) : [];
+    const mcqWrong = releaseDecision.release ? mapWrongQuestionsFromAnswers(answers) : [];
+    const essayWrong = releaseDecision.release
+      ? await EssayReviewService.listIncorrectLectureEssays(attempt.id)
+      : [];
+    const wrongQuestions = [...mcqWrong, ...essayWrong];
+    const essaySummary = await EssayReviewService.summarizeLectureEssays(attempt.id);
     return {
       attemptId: attempt.id,
       status: attempt.status === 'late' ? 'late' : 'submitted',
@@ -2703,6 +2769,8 @@ export class ExamFlowService {
       releaseReason: releaseDecision.release ? releaseDecision.reason : undefined,
       timedOut: Boolean(attempt.timed_out),
       autosaved: false,
+      essayQuestions: essaySummary.essayQuestions,
+      essayNotice: essaySummary.essayNotice,
     };
   }
 
@@ -3269,7 +3337,20 @@ export class ExamFlowService {
       }
     }
 
-    return Array.from(map.values());
+    const loadedQuestions = Array.from(map.values());
+    try {
+      const meta = await pool.query(
+        `SELECT id FROM exam_questions WHERE exam_id = $1 AND question_kind = 'essay'`,
+        [examId],
+      );
+      const essayIds = new Set(meta.rows.map((row) => Number(row.id)));
+      for (const question of loadedQuestions) {
+        if (essayIds.has(question.id)) question.kind = 'essay';
+      }
+    } catch {
+      // question_kind is added by the essay migration
+    }
+    return loadedQuestions;
   }
 
   private static sanitizeOneQuestion(question: ExamQuestion, includeCorrect: boolean) {
@@ -3289,11 +3370,12 @@ export class ExamFlowService {
       text: question.text,
       image: question.image,
       grade: question.grade,
+      type: question.kind === 'essay' ? 'ESSAY' : undefined,
       passageId: question.passage_id ?? question.passage?.id ?? null,
       passageText: passageContent,
       passage,
       ...(question.isVisible !== undefined && includeCorrect ? { isVisible: question.isVisible } : {}),
-      choices: question.choices.map((choice) => ({
+      choices: question.kind === 'essay' ? [] : question.choices.map((choice) => ({
         id: choice.id,
         text: choice.text,
         ...(choice.image ? { image: choice.image } : {}),
@@ -3320,6 +3402,22 @@ export class ExamFlowService {
     const evaluatedQuestions: QuestionEvaluation[] = [];
 
     questions.forEach((question) => {
+      if (question.kind === 'essay') {
+        maxGrade += question.grade || 1;
+        evaluatedQuestions.push({
+          questionId: question.id,
+          questionText: question.text,
+          questionImage: question.image,
+          grade: question.grade || 1,
+          isCorrect: false,
+          isEssay: true,
+          correctChoiceId: null,
+          selectedChoiceId: null,
+          correctChoice: null,
+          yourChoice: { id: null, text: null },
+        });
+        return;
+      }
       const selectedChoiceId = answerMap.get(question.id) ?? null;
       const selectedChoice = question.choices.find((c) => c.id === selectedChoiceId) || null;
       const correctChoices = question.choices.filter((c) => c.isCorrect);
@@ -3351,12 +3449,21 @@ export class ExamFlowService {
     return { totalGrade, maxGrade, passed, questions: evaluatedQuestions };
   }
 
-  private static async persistAttemptAnswers(attemptId: number, questions: QuestionEvaluation[]) {
-    await pool.query('DELETE FROM exam_answers WHERE submission_id = $1', [attemptId]);
+  private static async persistAttemptAnswers(
+    attemptId: number,
+    questions: QuestionEvaluation[],
+    essayIds: number[] = [],
+  ) {
+    await pool.query(
+      `DELETE FROM exam_answers
+       WHERE submission_id = $1 AND NOT (question_id = ANY($2::int[]))`,
+      [attemptId, essayIds],
+    );
 
+    const mcqQuestions = questions.filter((question) => !question.isEssay && !essayIds.includes(question.questionId));
     const values: any[] = [];
     const placeholders: string[] = [];
-    questions.forEach((question, idx) => {
+    mcqQuestions.forEach((question, idx) => {
       const base = idx * 6;
       placeholders.push(
         `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6})`,
@@ -3434,39 +3541,78 @@ export class ExamFlowService {
   }
 
   private static async getAttemptAnswers(attemptId: number): Promise<AttemptAnswersDetail[]> {
-    const res = await pool.query(
-      `SELECT 
-        ea.question_id as exam_question_id,
-        eq.question_text,
-        eq.image,
-        q.text as bank_text,
-        q.image as bank_image,
-        q2.question_text as bank_text_v2,
-        qm.media_url as bank_image_v2,
-        ea.selected_choice_id,
-        ea.is_correct,
-        selected_choice.text as selected_choice_text,
-        selected_opt.text_content as selected_choice_text_v2,
-        correct_choice.id as correct_choice_id,
-        correct_choice.text as correct_choice_text,
-        correct_opt.id as correct_choice_id_v2,
-        correct_opt.text_content as correct_choice_text_v2
-       FROM exam_answers ea
-       JOIN exam_questions eq ON ea.question_id = eq.id
-       LEFT JOIN questions q ON eq.question_id = q.id
-       LEFT JOIN question_choices selected_choice ON selected_choice.id = ea.selected_choice_id
-       LEFT JOIN question_choices correct_choice 
-         ON correct_choice.question_id = eq.question_id AND correct_choice.is_correct = true
-       LEFT JOIN questions_v2 q2 ON eq.question_id_v2 = q2.id
-       LEFT JOIN question_media qm ON q2.id = qm.question_id
-       LEFT JOIN question_options selected_opt ON selected_opt.id = ea.selected_choice_id
-       LEFT JOIN question_options correct_opt
-         ON correct_opt.question_id = q2.id
-        AND correct_opt.option_index = q2.correct_answer_index
-       WHERE ea.submission_id = $1
-       ORDER BY ea.question_id`,
-      [attemptId],
-    );
+    let res;
+    try {
+      res = await pool.query(
+        `SELECT 
+          ea.question_id as exam_question_id,
+          eq.question_text,
+          eq.image,
+          COALESCE(eq.question_kind, 'mcq') AS question_kind,
+          q.text as bank_text,
+          q.image as bank_image,
+          q2.question_text as bank_text_v2,
+          qm.media_url as bank_image_v2,
+          ea.selected_choice_id,
+          ea.is_correct,
+          selected_choice.text as selected_choice_text,
+          selected_opt.text_content as selected_choice_text_v2,
+          correct_choice.id as correct_choice_id,
+          correct_choice.text as correct_choice_text,
+          correct_opt.id as correct_choice_id_v2,
+          correct_opt.text_content as correct_choice_text_v2
+         FROM exam_answers ea
+         JOIN exam_questions eq ON ea.question_id = eq.id
+         LEFT JOIN questions q ON eq.question_id = q.id
+         LEFT JOIN question_choices selected_choice ON selected_choice.id = ea.selected_choice_id
+         LEFT JOIN question_choices correct_choice 
+           ON correct_choice.question_id = eq.question_id AND correct_choice.is_correct = true
+         LEFT JOIN questions_v2 q2 ON eq.question_id_v2 = q2.id
+         LEFT JOIN question_media qm ON q2.id = qm.question_id
+         LEFT JOIN question_options selected_opt ON selected_opt.id = ea.selected_choice_id
+         LEFT JOIN question_options correct_opt
+           ON correct_opt.question_id = q2.id
+          AND correct_opt.option_index = q2.correct_answer_index
+         WHERE ea.submission_id = $1
+           AND COALESCE(eq.question_kind, 'mcq') <> 'essay'
+         ORDER BY ea.question_id`,
+        [attemptId],
+      );
+    } catch {
+      res = await pool.query(
+        `SELECT 
+          ea.question_id as exam_question_id,
+          eq.question_text,
+          eq.image,
+          q.text as bank_text,
+          q.image as bank_image,
+          q2.question_text as bank_text_v2,
+          qm.media_url as bank_image_v2,
+          ea.selected_choice_id,
+          ea.is_correct,
+          selected_choice.text as selected_choice_text,
+          selected_opt.text_content as selected_choice_text_v2,
+          correct_choice.id as correct_choice_id,
+          correct_choice.text as correct_choice_text,
+          correct_opt.id as correct_choice_id_v2,
+          correct_opt.text_content as correct_choice_text_v2
+         FROM exam_answers ea
+         JOIN exam_questions eq ON ea.question_id = eq.id
+         LEFT JOIN questions q ON eq.question_id = q.id
+         LEFT JOIN question_choices selected_choice ON selected_choice.id = ea.selected_choice_id
+         LEFT JOIN question_choices correct_choice 
+           ON correct_choice.question_id = eq.question_id AND correct_choice.is_correct = true
+         LEFT JOIN questions_v2 q2 ON eq.question_id_v2 = q2.id
+         LEFT JOIN question_media qm ON q2.id = qm.question_id
+         LEFT JOIN question_options selected_opt ON selected_opt.id = ea.selected_choice_id
+         LEFT JOIN question_options correct_opt
+           ON correct_opt.question_id = q2.id
+          AND correct_opt.option_index = q2.correct_answer_index
+         WHERE ea.submission_id = $1
+         ORDER BY ea.question_id`,
+        [attemptId],
+      );
+    }
 
     return res.rows.map((row) => {
       const selectedText = row.selected_choice_text || row.selected_choice_text_v2 || null;

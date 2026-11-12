@@ -75,6 +75,7 @@ import { router as generalCourseGroupsRouter } from './controllers/generalCourse
 import { router as generalCourseGroupMeetingRouter } from './controllers/generalCourseGroupMeeting';
 import { router as generalCourseLecturesRouter } from './controllers/generalCourseLectures';
 import essayExamRouter from './controllers/essayExam';
+import { router as essayQuestionsRouter } from './controllers/essayQuestions';
 import { router as lessonQuestionsRouter } from './controllers/lessonQuestions';
 import { router as lessonPdfQuestionsRouter } from './controllers/lessonPdfQuestions';
 import { router as examsRouter } from './controllers/exams';
@@ -223,6 +224,7 @@ router.use('/general-courses', generalCourseGroupMeetingRouter);
 router.use('/general-courses', generalCoursesRouter);
 router.use('/general-course-lectures', generalCourseLecturesRouter);
 router.use('/essay-exams', essayExamRouter);
+router.use('/essay-questions', essayQuestionsRouter);
 router.use('/', lessonMcqQuestionsRouter);
 router.use('/lesson-questions', lessonQuestionsRouter);
 router.use('/lesson-pdf-questions', lessonPdfQuestionsRouter);

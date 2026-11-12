@@ -2,7 +2,11 @@ export type CourseExamLetter = 'A' | 'B' | 'C' | 'D';
 
 export type CourseExamAnswer = {
   questionId: number;
-  selectedAnswer: CourseExamLetter;
+  selectedAnswer?: CourseExamLetter | null;
+  essay?: boolean;
+  answerText?: string | null;
+  answerImages?: string[];
+  ocrText?: string | null;
 };
 
 const LETTERS: CourseExamLetter[] = ['A', 'B', 'C', 'D'];
@@ -29,23 +33,76 @@ function toDate(value: Date | string | null | undefined): Date | null {
   return Number.isNaN(parsed.getTime()) ? null : parsed;
 }
 
+export type CourseExamTimingMode = 'relative' | 'fixed' | null | undefined;
+
+/**
+ * Server deadline for an attempt.
+ * - fixed: always the shared schedule end (visibilityEndDate).
+ * - relative: startedAt + duration only (window gates start, not remaining time).
+ * - legacy/null: earlier of duration end and visibilityEndDate (existing behavior).
+ */
 export function computeAttemptExpireAt(input: {
   startedAt: Date | string;
   durationMinutes?: number | null;
   visibilityEndDate?: Date | string | null;
+  timingMode?: CourseExamTimingMode;
 }): Date | null {
-  const startedAt = toDate(input.startedAt);
-  if (!startedAt) return toDate(input.visibilityEndDate);
+  const mode = input.timingMode === 'fixed' || input.timingMode === 'relative' ? input.timingMode : null;
+  const windowEnd = toDate(input.visibilityEndDate);
 
-  const candidates: Date[] = [];
+  if (mode === 'fixed') {
+    return windowEnd;
+  }
+
+  const startedAt = toDate(input.startedAt);
   const duration = normalizeDurationMinutes(input.durationMinutes);
+
+  if (mode === 'relative') {
+    if (!startedAt || duration == null) return null;
+    return new Date(startedAt.getTime() + duration * 60_000);
+  }
+
+  // Legacy: keep previous min(duration, visibility_end) behavior for old exams.
+  if (!startedAt) return windowEnd;
+  const candidates: Date[] = [];
   if (duration != null) {
     candidates.push(new Date(startedAt.getTime() + duration * 60_000));
   }
-  const windowEnd = toDate(input.visibilityEndDate);
   if (windowEnd) candidates.push(windowEnd);
   if (candidates.length === 0) return null;
   return new Date(Math.min(...candidates.map((d) => d.getTime())));
+}
+
+export function normalizeTimingMode(value: unknown): 'relative' | 'fixed' | null {
+  const raw = String(value ?? '')
+    .trim()
+    .toLowerCase();
+  if (raw === 'fixed') return 'fixed';
+  if (raw === 'relative') return 'relative';
+  return null;
+}
+
+export function validateFixedExamSchedule(input: {
+  timingMode?: CourseExamTimingMode;
+  availableFrom?: Date | string | null;
+  visibilityEndDate?: Date | string | null;
+}): { ok: true } | { ok: false; message: string } {
+  const mode =
+    input.timingMode === 'fixed' || input.timingMode === 'relative' ? input.timingMode : null;
+  if (mode !== 'fixed') return { ok: true };
+
+  const start = toDate(input.availableFrom);
+  const end = toDate(input.visibilityEndDate);
+  if (!start) {
+    return { ok: false, message: 'موعد بداية الامتحان مطلوب عند اختيار الموعد الثابت' };
+  }
+  if (!end) {
+    return { ok: false, message: 'موعد نهاية الامتحان مطلوب عند اختيار الموعد الثابت' };
+  }
+  if (end.getTime() <= start.getTime()) {
+    return { ok: false, message: 'موعد نهاية الامتحان يجب أن يكون بعد موعد البداية' };
+  }
+  return { ok: true };
 }
 
 export function remainingSeconds(
@@ -92,6 +149,23 @@ export function parseCourseExamAnswerItem(raw: unknown): CourseExamAnswer | null
   const answer = raw as Record<string, unknown>;
   const questionId = Number(answer.questionId ?? answer.question_id ?? answer.id);
   if (!Number.isInteger(questionId) || questionId <= 0) return null;
+
+  const imageValues = answer.answerImages ?? answer.answer_images;
+  const answerImages = Array.isArray(imageValues)
+    ? imageValues.map((item) => String(item || '').trim()).filter(Boolean)
+    : [];
+  const answerTextRaw = answer.answerText ?? answer.answer_text;
+  const ocrTextRaw = answer.ocrText ?? answer.ocr_text;
+  if (answer.essay === true || answer.essay === 'true') {
+    return {
+      questionId,
+      essay: true,
+      selectedAnswer: null,
+      answerText: answerTextRaw == null ? null : String(answerTextRaw),
+      answerImages,
+      ocrText: ocrTextRaw == null ? null : String(ocrTextRaw),
+    };
+  }
 
   let selected: unknown =
     answer.selectedAnswer ??

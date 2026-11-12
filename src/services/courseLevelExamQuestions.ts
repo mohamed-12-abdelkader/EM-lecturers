@@ -16,6 +16,9 @@ interface CreateTextQuestionInput {
   correctAnswer: 'A' | 'B' | 'C' | 'D';
   questionImage?: string | null;
   createdBy: number;
+  /** لقطة نص القطعة المرتبطة بالسؤال (اختياري) */
+  passageText?: string | null;
+  passageTitle?: string | null;
 }
 
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
@@ -101,6 +104,15 @@ export class CourseLevelExamQuestionsService {
       throw new HttpError(400, 'correctAnswer must be one of A, B, C, or D');
     }
 
+    const passageText =
+      typeof input.passageText === 'string' && input.passageText.trim()
+        ? input.passageText.trim()
+        : null;
+    const passageTitle =
+      typeof input.passageTitle === 'string' && input.passageTitle.trim()
+        ? input.passageTitle.trim()
+        : null;
+
     const result = await pool.query(
       `INSERT INTO course_level_exam_questions (
         exam_id,
@@ -112,8 +124,10 @@ export class CourseLevelExamQuestionsService {
         option_c,
         option_d,
         correct_answer,
+        passage_text,
+        passage_title,
         created_by
-      ) VALUES ($1, 'TEXT', $2, $3, $4, $5, $6, $7, $8, $9)
+      ) VALUES ($1, 'TEXT', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
       RETURNING *`,
       [
         input.examId,
@@ -126,6 +140,8 @@ export class CourseLevelExamQuestionsService {
         input.optionC,
         input.optionD,
         input.correctAnswer,
+        passageText,
+        passageTitle,
         input.createdBy,
       ],
     );
@@ -225,6 +241,10 @@ export class CourseLevelExamQuestionsService {
       correctAnswer: 'A' | 'B' | 'C' | 'D';
       questionImage?: string | null;
       question_image?: string | null;
+      passageText?: string | null;
+      passage_text?: string | null;
+      passageTitle?: string | null;
+      passage_title?: string | null;
     }>,
   ) {
     if (!questions.length) {
@@ -245,6 +265,14 @@ export class CourseLevelExamQuestionsService {
         typeof rawImage === 'string' && rawImage.trim() && rawImage !== 'null'
           ? rawImage.trim()
           : null;
+      const rawPassage =
+        (q as any).passageText ?? (q as any).passage_text ?? null;
+      const passageText =
+        typeof rawPassage === 'string' && rawPassage.trim() ? rawPassage.trim() : null;
+      const rawTitle =
+        (q as any).passageTitle ?? (q as any).passage_title ?? null;
+      const passageTitle =
+        typeof rawTitle === 'string' && rawTitle.trim() ? rawTitle.trim() : null;
 
       if (!questionText || !optionA || !optionB || !optionC || !optionD) {
         throw new HttpError(400, 'كل سؤال يحتاج: questionText, optionA, optionB, optionC, optionD');
@@ -264,8 +292,10 @@ export class CourseLevelExamQuestionsService {
           option_c,
           option_d,
           correct_answer,
+          passage_text,
+          passage_title,
           created_by
-        ) VALUES ($1, 'TEXT', $2, $3, $4, $5, $6, $7, $8, $9)
+        ) VALUES ($1, 'TEXT', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
         RETURNING *`,
         [
           examId,
@@ -276,6 +306,8 @@ export class CourseLevelExamQuestionsService {
           optionC,
           optionD,
           correctAnswer,
+          passageText,
+          passageTitle,
           requester.id,
         ],
       );

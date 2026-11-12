@@ -29,14 +29,18 @@ import {
   mergeSavedAndSubmittedAnswers,
   normalizeCorrectAnswers,
   normalizeDurationMinutes,
+  normalizeTimingMode,
   parseCourseExamAnswerItem,
   remainingSeconds,
+  validateFixedExamSchedule,
   type CourseCorrectByQuestionId,
   type CourseExamAnswer,
   type CourseExamLetter,
 } from './courseLevelExamAttemptPolicy';
+import { CourseGroupAccessService } from './courseGroupAccess';
 import { TeacherReadingPassagesService } from './teacherReadingPassages';
 import { normalizeStudentCodeInput } from './teacherManagedStudents';
+import { EssayReviewService } from './essayReview';
 
 interface RequestUser {
   id: number;
@@ -61,6 +65,10 @@ interface CreateCourseLevelExamInput {
   questionDisplayMode?: string | null;
   isActive: boolean;
   attemptLimit?: number | null;
+  /** null = legacy min(duration, end); relative = duration from start; fixed = shared end */
+  timingMode?: 'relative' | 'fixed' | null;
+  audienceType?: 'all' | 'groups';
+  groupIds?: number[];
 }
 
 interface UpdateCourseLevelExamInput {
@@ -79,6 +87,9 @@ interface UpdateCourseLevelExamInput {
   questionDisplayMode?: string | null;
   isActive?: boolean;
   attemptLimit?: number | null;
+  timingMode?: 'relative' | 'fixed' | null;
+  audienceType?: 'all' | 'groups';
+  groupIds?: number[];
 }
 
 export class CourseLevelExamsService {
@@ -148,6 +159,24 @@ export class CourseLevelExamsService {
       scheduledDate: input.answersVisibleAt,
     });
 
+    const timingMode = normalizeTimingMode(input.timingMode);
+    const scheduleCheck = validateFixedExamSchedule({
+      timingMode,
+      availableFrom: input.availableFrom ?? null,
+      visibilityEndDate: input.visibilityEndDate,
+    });
+    if (!scheduleCheck.ok) {
+      throw new HttpError(400, scheduleCheck.message);
+    }
+    if (timingMode === 'relative' && normalizeDurationMinutes(input.durationMinutes) == null) {
+      throw new HttpError(400, 'يجب تحديد مدة الامتحان بالدقائق عند اختيار نظام المدة النسبية');
+    }
+
+    const audienceType = input.audienceType === 'groups' ? 'groups' : 'all';
+    if (audienceType === 'groups' && examScope !== 'course') {
+      throw new HttpError(400, 'تقييد المجموعات متاح فقط لامتحانات الكورس');
+    }
+
     const result = await pool.query(
       `INSERT INTO course_level_exams (
         course_id,
@@ -167,9 +196,11 @@ export class CourseLevelExamsService {
         attempt_limit,
         question_display_mode,
         answers_release_mode,
-        show_answers_after_hours
+        show_answers_after_hours,
+        timing_mode,
+        audience_type
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
       RETURNING *`,
       [
         courseId,
@@ -190,10 +221,29 @@ export class CourseLevelExamsService {
         resolvedDisplayMode,
         resolvedReleaseMode,
         releaseFlags.showAnswersAfterHours,
+        timingMode,
+        audienceType,
       ],
     );
 
-    return result.rows[0];
+    const exam = result.rows[0];
+    if (audienceType === 'groups' && teacherId) {
+      await CourseGroupAccessService.setExamAudience(
+        Number(exam.id),
+        teacherId,
+        'groups',
+        Array.isArray(input.groupIds) ? input.groupIds : [],
+      );
+      exam.audience_type = 'groups';
+      exam.group_ids = await CourseGroupAccessService.getExamGroupIds(Number(exam.id));
+    } else {
+      exam.audience_type = 'all';
+      exam.group_ids = [];
+    }
+    exam.timing_mode = timingMode;
+    exam.timingMode = timingMode;
+
+    return exam;
   }
 
   static async getExamsByCourse(courseId: number, requester: RequestUser) {
@@ -221,14 +271,20 @@ export class CourseLevelExamsService {
       [courseId],
     );
 
-    return result.rows.map((row) => ({
-      ...row,
-      configuredQuestionsCount: row.questions_count,
-      actualQuestionsCount: row.actual_questions_count,
-      duration_unlimited: isDurationUnlimited(row.duration_minutes),
-      durationUnlimited: isDurationUnlimited(row.duration_minutes),
-      availability_status: getStudentExamAvailability(courseLevelExamAvailabilityInput(row)),
-    }));
+    const mapped = await Promise.all(
+      result.rows.map(async (row) => {
+        const enriched = await this.enrichExamAudienceFields(row);
+        return {
+          ...enriched,
+          configuredQuestionsCount: row.questions_count,
+          actualQuestionsCount: row.actual_questions_count,
+          duration_unlimited: isDurationUnlimited(row.duration_minutes),
+          durationUnlimited: isDurationUnlimited(row.duration_minutes),
+          availability_status: getStudentExamAvailability(courseLevelExamAvailabilityInput(row)),
+        };
+      }),
+    );
+    return mapped;
   }
 
   static async getExamsByTeacher(
@@ -355,6 +411,10 @@ export class CourseLevelExamsService {
       answersVisibleAt: row.answers_visible_at,
       isActive: row.is_active,
       attemptLimit: row.attempt_limit,
+      timingMode: row.timing_mode ?? null,
+      timing_mode: row.timing_mode ?? null,
+      audienceType: row.audience_type || 'all',
+      audience_type: row.audience_type || 'all',
       submissionsCount: row.submissions_count,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
@@ -385,7 +445,7 @@ export class CourseLevelExamsService {
       throw new HttpError(403, 'You are not allowed to view this exam');
     }
 
-    return exam;
+    return this.enrichExamAudienceFields(exam);
   }
 
   static async updateExam(
@@ -454,6 +514,31 @@ export class CourseLevelExamsService {
       input.attemptLimit <= 0
     ) {
       throw new HttpError(400, 'attemptLimit must be greater than 0 if provided');
+    }
+
+    const nextTimingMode =
+      input.timingMode !== undefined
+        ? normalizeTimingMode(input.timingMode)
+        : normalizeTimingMode(exam.timing_mode);
+    const nextAvailableFrom =
+      input.availableFrom !== undefined ? input.availableFrom : exam.available_from;
+    const nextVisibilityEnd =
+      input.visibilityEndDate !== undefined ? input.visibilityEndDate : exam.visibility_end_date;
+    const nextDuration =
+      input.durationMinutes !== undefined
+        ? normalizeDurationMinutes(input.durationMinutes)
+        : normalizeDurationMinutes(exam.duration_minutes);
+
+    const scheduleCheck = validateFixedExamSchedule({
+      timingMode: nextTimingMode,
+      availableFrom: nextAvailableFrom,
+      visibilityEndDate: nextVisibilityEnd,
+    });
+    if (!scheduleCheck.ok) {
+      throw new HttpError(400, scheduleCheck.message);
+    }
+    if (nextTimingMode === 'relative' && nextDuration == null) {
+      throw new HttpError(400, 'يجب تحديد مدة الامتحان بالدقائق عند اختيار نظام المدة النسبية');
     }
 
     // Build update query dynamically
@@ -531,23 +616,76 @@ export class CourseLevelExamsService {
       updates.push(`attempt_limit = $${paramIndex++}`);
       values.push(input.attemptLimit);
     }
-
-    if (updates.length === 0) {
-      // No updates provided, return current exam
-      return exam;
+    if (input.timingMode !== undefined) {
+      updates.push(`timing_mode = $${paramIndex++}`);
+      values.push(normalizeTimingMode(input.timingMode));
     }
 
-    // Always update updated_at
-    updates.push(`updated_at = NOW()`);
-    values.push(examId);
+    const audienceRequested =
+      input.audienceType !== undefined || input.groupIds !== undefined;
 
-    const query = `UPDATE course_level_exams 
-                   SET ${updates.join(', ')} 
-                   WHERE id = $${paramIndex} 
-                   RETURNING *`;
+    let updatedExam = exam;
+    if (updates.length > 0) {
+      // Do not rewrite in-progress attempt_expire_at when settings change.
+      updates.push(`updated_at = NOW()`);
+      values.push(examId);
 
-    const result = await pool.query(query, values);
-    return result.rows[0];
+      const query = `UPDATE course_level_exams 
+                     SET ${updates.join(', ')} 
+                     WHERE id = $${paramIndex} 
+                     RETURNING *`;
+
+      const result = await pool.query(query, values);
+      updatedExam = result.rows[0];
+    } else if (!audienceRequested) {
+      return await this.enrichExamAudienceFields(exam);
+    }
+
+    if (audienceRequested) {
+      if (String(exam.exam_scope || 'course') === 'public') {
+        throw new HttpError(400, 'تقييد المجموعات متاح فقط لامتحانات الكورس');
+      }
+      const teacherId = Number(exam.teacher_id);
+      const audienceType =
+        input.audienceType !== undefined
+          ? input.audienceType === 'groups'
+            ? 'groups'
+            : 'all'
+          : Array.isArray(input.groupIds) && input.groupIds.length > 0
+            ? 'groups'
+            : 'all';
+      const audience = await CourseGroupAccessService.setExamAudience(
+        examId,
+        teacherId,
+        audienceType,
+        Array.isArray(input.groupIds) ? input.groupIds : [],
+      );
+      updatedExam = {
+        ...updatedExam,
+        audience_type: audience.audience_type,
+        group_ids: audience.group_ids,
+      };
+    } else {
+      updatedExam = await this.enrichExamAudienceFields(updatedExam);
+    }
+
+    return updatedExam;
+  }
+
+  private static async enrichExamAudienceFields<T extends Record<string, any>>(exam: T) {
+    const examId = Number(exam.id);
+    const groupIds = Number.isInteger(examId) && examId > 0
+      ? await CourseGroupAccessService.getExamGroupIds(examId)
+      : [];
+    return {
+      ...exam,
+      timing_mode: exam.timing_mode ?? null,
+      timingMode: exam.timing_mode ?? null,
+      audience_type: exam.audience_type || 'all',
+      audienceType: exam.audience_type || 'all',
+      group_ids: groupIds,
+      groupIds,
+    };
   }
 
   static async deleteExam(examId: number, requester: RequestUser) {
@@ -662,6 +800,24 @@ export class CourseLevelExamsService {
       .filter((row): row is CourseExamAnswer => row != null);
   }
 
+  private static async loadSavedEssayDrafts(attemptId: number): Promise<CourseExamAnswer[]> {
+    const res = await pool.query(
+      `SELECT a.question_id, a.answer_text, a.answer_images, a.ocr_text
+       FROM course_level_exam_answers a
+       JOIN course_level_exam_questions q ON q.id = a.question_id
+       WHERE a.attempt_id = $1 AND q.type = 'ESSAY'`,
+      [attemptId],
+    );
+    return res.rows.map((row) => ({
+      questionId: Number(row.question_id),
+      essay: true,
+      selectedAnswer: null,
+      answerText: row.answer_text,
+      answerImages: Array.isArray(row.answer_images) ? row.answer_images : [],
+      ocrText: row.ocr_text,
+    }));
+  }
+
   private static buildCorrectByQuestionId(questions: any[]): CourseCorrectByQuestionId {
     const correctByQuestionId: CourseCorrectByQuestionId = {};
     for (const q of questions) {
@@ -728,10 +884,11 @@ export class CourseLevelExamsService {
 
   private static async upsertAttemptAnswers(
     attemptId: number,
-    answers: Array<{ questionId: number; selectedAnswer?: CourseExamLetter | null }>,
+    answers: Array<{ questionId: number; selectedAnswer?: CourseExamLetter | null; essay?: boolean }>,
     correctByQuestionId?: CourseCorrectByQuestionId,
   ) {
     for (const answer of answers) {
+      if (answer.essay) continue;
       const selected = answer.selectedAnswer
         ? String(answer.selectedAnswer).trim().toUpperCase()
         : '';
@@ -789,7 +946,11 @@ export class CourseLevelExamsService {
     const questions = (await this.loadAttemptQuestions(exam, attempt, studentId)).map((q) =>
       this.mapCourseQuestionForStudent(q),
     );
-    const savedAnswers = await this.loadSavedAnswersForStudent(attempt.id);
+    const savedAnswers = [
+      ...(await this.loadSavedAnswersForStudent(attempt.id)),
+      ...(await this.loadSavedEssayDrafts(attempt.id)),
+    ];
+    const timingMode = normalizeTimingMode(exam.timing_mode);
     return {
       attemptId: attempt.id,
       examId: exam.id,
@@ -800,6 +961,13 @@ export class CourseLevelExamsService {
       startedAt: attempt.started_at,
       attemptExpiresAt: attempt.attempt_expire_at ?? null,
       remainingSeconds: remainingSeconds(attempt.attempt_expire_at),
+      timingMode,
+      timing_mode: timingMode,
+      scheduleStartAt: exam.available_from ?? null,
+      scheduleEndAt: exam.visibility_end_date ?? null,
+      schedule_start_at: exam.available_from ?? null,
+      schedule_end_at: exam.visibility_end_date ?? null,
+      serverNow: new Date().toISOString(),
       resumed,
       questions,
       savedAnswers,
@@ -819,11 +987,14 @@ export class CourseLevelExamsService {
     const merged = mergeSavedAndSubmittedAnswers(saved, submitted).filter((a) =>
       allowed.has(a.questionId),
     );
-    const correctByQuestionId = this.buildCorrectByQuestionId(questions);
+    const essayQuestions = questions.filter((q) => String(q.type || '').toUpperCase() === 'ESSAY');
+    const essayIds = new Set(essayQuestions.map((q) => Number(q.id)));
+    const objectiveQuestions = questions.filter((q) => !essayIds.has(Number(q.id)));
+    const correctByQuestionId = this.buildCorrectByQuestionId(objectiveQuestions);
     const graded = gradeCourseAttemptAnswers({
-      questionIds: questions.map((q) => Number(q.id)),
+      questionIds: objectiveQuestions.map((q) => Number(q.id)),
       correctByQuestionId,
-      answers: merged,
+      answers: merged.filter((answer) => !essayIds.has(answer.questionId)),
     });
 
     await this.upsertAttemptAnswers(
@@ -834,6 +1005,12 @@ export class CourseLevelExamsService {
       })),
       correctByQuestionId,
     );
+    await EssayReviewService.persistCourseDrafts(
+      attempt.id,
+      essayQuestions.map((q) => ({ id: Number(q.id) })),
+      submitted.filter((answer) => answer.essay || essayIds.has(answer.questionId)),
+    );
+    const totals = await EssayReviewService.recomputeCourseAttempt(attempt.id);
 
     const finalized = await pool.query(
       `UPDATE course_level_exam_attempts
@@ -843,7 +1020,7 @@ export class CourseLevelExamsService {
            obtained_grade = $2,
            timed_out = $3
        WHERE id = $4 AND status = 'in_progress'`,
-      [graded.maxGrade, graded.obtained, !!options.timedOut, attempt.id],
+      [totals.max, totals.obtained, !!options.timedOut, attempt.id],
     );
     if ((finalized.rowCount ?? 0) > 0) {
       try {
@@ -867,11 +1044,24 @@ export class CourseLevelExamsService {
       now,
     );
     const showAnswers = releaseDecision.release;
-    const wrongQuestions = showAnswers
+
+    if (essayQuestions.length) {
+      await EssayReviewService.gradeCourseAttempt(attempt.id);
+    }
+    const finalTotals = essayQuestions.length
+      ? await EssayReviewService.recomputeCourseAttempt(attempt.id)
+      : totals;
+    const refreshed = await pool.query(`SELECT * FROM course_level_exam_attempts WHERE id = $1`, [
+      attempt.id,
+    ]);
+    const finalAttempt = refreshed.rows[0] || stored;
+
+    const mcqWrong = showAnswers
       ? graded.results
           .filter((r) => !r.isCorrect)
           .map((r) => {
             const question = questions.find((q) => q.id === r.questionId);
+            if (String(question?.type || '').toUpperCase() === 'ESSAY') return null;
             return {
               questionId: r.questionId,
               questionText: question?.question_text,
@@ -887,29 +1077,39 @@ export class CourseLevelExamsService {
               optionD: question?.option_d,
             };
           })
+          .filter((row): row is NonNullable<typeof row> => row != null)
       : [];
+    const essayWrong = showAnswers
+      ? await EssayReviewService.listIncorrectCourseEssays(attempt.id)
+      : [];
+    const wrongQuestions = [...mcqWrong, ...essayWrong];
 
     await this.maybeAwardCourseExamScorePoints(
       exam,
-      stored,
+      finalAttempt,
       studentId,
-      graded.obtained,
-      graded.maxGrade,
+      finalTotals.obtained,
+      finalTotals.max,
     );
+    const essaySummary = essayQuestions.length
+      ? await EssayReviewService.summarizeCourseEssays(attempt.id)
+      : { essayQuestions: [], essayNotice: null };
 
     return {
-      attemptId: stored.id,
-      totalGrade: graded.obtained,
-      maxGrade: graded.maxGrade,
+      attemptId: finalAttempt.id,
+      totalGrade: finalTotals.obtained,
+      maxGrade: finalTotals.max,
       correctCount: graded.correctCount,
-      wrongCount: graded.maxGrade - graded.correctCount,
-      timedOut: !!stored.timed_out || !!options.timedOut,
+      wrongCount: wrongQuestions.length,
+      timedOut: !!finalAttempt.timed_out || !!options.timedOut,
       showAnswers,
       releaseReason: releaseDecision.release ? releaseDecision.reason : '',
       answersVisibleAt: exam.answers_visible_at,
       wrongQuestions,
-      startedAt: stored.started_at,
-      submittedAt: stored.submitted_at ?? now.toISOString(),
+      essayQuestions: essaySummary.essayQuestions,
+      essayNotice: essaySummary.essayNotice,
+      startedAt: finalAttempt.started_at,
+      submittedAt: finalAttempt.submitted_at ?? now.toISOString(),
     };
   }
 
@@ -975,6 +1175,37 @@ export class CourseLevelExamsService {
     }
   }
 
+  static async syncStoredCourseAttemptPoints(
+    attemptId: number,
+    obtainedGrade: number,
+    totalGrade: number,
+  ) {
+    const res = await pool.query(
+      `SELECT a.id, a.student_id, e.id AS exam_id, e.title, e.course_id,
+              COALESCE(e.teacher_id, c.teacher_id) AS teacher_id
+       FROM course_level_exam_attempts a
+       JOIN course_level_exams e ON e.id = a.exam_id
+       LEFT JOIN courses c ON c.id = e.course_id
+       WHERE a.id = $1`,
+      [attemptId],
+    );
+    if (!res.rowCount) return null;
+    const row = res.rows[0];
+    return this.maybeAwardCourseExamScorePoints(
+      {
+        id: row.exam_id,
+        course_id: row.course_id,
+        teacher_id: row.teacher_id,
+        title: row.title,
+      },
+      { id: attemptId },
+      Number(row.student_id),
+      obtainedGrade,
+      totalGrade,
+      { syncExisting: true },
+    );
+  }
+
   /**
    * After a question row is deleted (answers already CASCADE-removed):
    * recompute every submitted attempt from remaining answers/questions and sync points.
@@ -1005,11 +1236,16 @@ export class CourseLevelExamsService {
     }
     const exam = examRes.rows[0];
 
-    const remainingRes = await db.query<{ id: number }>(
-      `SELECT id FROM course_level_exam_questions WHERE exam_id = $1 ORDER BY id`,
+    const remainingRes = await db.query<{ id: number; type: string | null; points: string | null }>(
+      `SELECT id, type, points FROM course_level_exam_questions WHERE exam_id = $1 ORDER BY id`,
       [opts.examId],
     );
-    const remainingExamQuestionIds = remainingRes.rows.map((r) => Number(r.id));
+    const questionWeights = remainingRes.rows.map((r) => ({
+      questionId: Number(r.id),
+      essay: String(r.type || '').toUpperCase() === 'ESSAY',
+      points: r.points == null ? 1 : Number(r.points),
+    }));
+    const remainingExamQuestionIds = questionWeights.map((r) => r.questionId);
 
     // Keep questions_count from exceeding the bank size after deletes
     if (
@@ -1049,17 +1285,23 @@ export class CourseLevelExamsService {
       const selected = attempt.selected_question_ids;
 
       // Always strip deleted id from in-progress / submitted selected sets
-      const answersRes = await db.query<{ question_id: number; is_correct: boolean }>(
-        `SELECT question_id, is_correct FROM course_level_exam_answers WHERE attempt_id = $1`,
+      const answersRes = await db.query<{
+        question_id: number;
+        is_correct: boolean;
+        final_score: string | null;
+      }>(
+        `SELECT question_id, is_correct, final_score FROM course_level_exam_answers WHERE attempt_id = $1`,
         [attemptId],
       );
       const recomputed = recomputeCourseAttemptAfterQuestionDelete({
         deletedQuestionId: opts.deletedQuestionId,
         selectedQuestionIds: selected,
         remainingExamQuestionIds,
+        questionWeights,
         remainingAnswers: answersRes.rows.map((a) => ({
           questionId: Number(a.question_id),
           isCorrect: !!a.is_correct,
+          finalScore: a.final_score == null ? null : Number(a.final_score),
         })),
       });
 
@@ -1163,11 +1405,16 @@ export class CourseLevelExamsService {
     }
     const exam = examRes.rows[0];
 
-    const remainingRes = await pool.query<{ id: number }>(
-      `SELECT id FROM course_level_exam_questions WHERE exam_id = $1 ORDER BY id`,
+    const remainingRes = await pool.query<{ id: number; type: string | null; points: string | null }>(
+      `SELECT id, type, points FROM course_level_exam_questions WHERE exam_id = $1 ORDER BY id`,
       [examId],
     );
-    const remainingExamQuestionIds = remainingRes.rows.map((r) => Number(r.id));
+    const questionWeights = remainingRes.rows.map((r) => ({
+      questionId: Number(r.id),
+      essay: String(r.type || '').toUpperCase() === 'ESSAY',
+      points: r.points == null ? 1 : Number(r.points),
+    }));
+    const remainingExamQuestionIds = questionWeights.map((r) => r.questionId);
     const remainingSet = new Set(remainingExamQuestionIds);
 
     if (
@@ -1204,8 +1451,12 @@ export class CourseLevelExamsService {
 
     for (const attempt of attemptsRes.rows) {
       const attemptId = Number(attempt.id);
-      const answersRes = await pool.query<{ question_id: number; is_correct: boolean }>(
-        `SELECT question_id, is_correct FROM course_level_exam_answers WHERE attempt_id = $1`,
+      const answersRes = await pool.query<{
+        question_id: number;
+        is_correct: boolean;
+        final_score: string | null;
+      }>(
+        `SELECT question_id, is_correct, final_score FROM course_level_exam_answers WHERE attempt_id = $1`,
         [attemptId],
       );
 
@@ -1238,7 +1489,9 @@ export class CourseLevelExamsService {
         remainingAnswers: liveAnswers.map((a) => ({
           questionId: Number(a.question_id),
           isCorrect: !!a.is_correct,
+          finalScore: a.final_score == null ? null : Number(a.final_score),
         })),
+        questionWeights,
       });
 
       // Always persist cleaned selected ids for full-exam fairness
@@ -1317,17 +1570,22 @@ export class CourseLevelExamsService {
        FROM course_level_exam_attempts a
        WHERE a.status = 'submitted'
          AND (
-           a.total_grade > (
-             SELECT COUNT(*)::int FROM course_level_exam_questions q WHERE q.exam_id = a.exam_id
+           a.total_grade IS DISTINCT FROM (
+             SELECT COALESCE(SUM(CASE WHEN q.type = 'ESSAY' THEN COALESCE(q.points, 1) ELSE 1 END), 0)
+             FROM course_level_exam_questions q
+             WHERE q.exam_id = a.exam_id
            )
            OR a.obtained_grade IS DISTINCT FROM (
-             SELECT COALESCE(SUM(CASE WHEN ans.is_correct THEN 1 ELSE 0 END), 0)::int
+             SELECT COALESCE(SUM(
+               CASE
+                 WHEN q.type = 'ESSAY' THEN COALESCE(ans.final_score, 0)
+                 WHEN ans.is_correct THEN 1
+                 ELSE 0
+               END
+             ), 0)
              FROM course_level_exam_answers ans
-             WHERE ans.attempt_id = a.id
-               AND EXISTS (
-                 SELECT 1 FROM course_level_exam_questions q
-                 WHERE q.id = ans.question_id AND q.exam_id = a.exam_id
-               )
+             JOIN course_level_exam_questions q ON q.id = ans.question_id
+             WHERE ans.attempt_id = a.id AND q.exam_id = a.exam_id
            )
          )`,
     );
@@ -1413,9 +1671,16 @@ export class CourseLevelExamsService {
       // Recalculate attempt score from all answers that belong to this attempt's question set
       const attemptId = Number(row.attempt_id);
       const scoreRes = await pool.query(
-        `SELECT COALESCE(SUM(CASE WHEN is_correct THEN 1 ELSE 0 END), 0)::int AS obtained
-         FROM course_level_exam_answers
-         WHERE attempt_id = $1`,
+        `SELECT COALESCE(SUM(
+            CASE
+              WHEN q.type = 'ESSAY' THEN COALESCE(a.final_score, 0)
+              WHEN a.is_correct THEN 1
+              ELSE 0
+            END
+          ), 0) AS obtained
+         FROM course_level_exam_answers a
+         JOIN course_level_exam_questions q ON q.id = a.question_id
+         WHERE a.attempt_id = $1`,
         [attemptId],
       );
       const newObtained = Number(scoreRes.rows[0]?.obtained ?? 0);
@@ -1542,12 +1807,15 @@ export class CourseLevelExamsService {
     }
   }
 
-  /** Course enrollment OR matching user_grades for public exams */
+  /** Course enrollment, or public exams of the student's own platform teacher and grade */
   static async assertStudentCanAccessExam(
     exam: {
+      id?: number | null;
       exam_scope?: string | null;
       course_id?: number | null;
       grade_id?: number | null;
+      teacher_id?: number | null;
+      audience_type?: string | null;
     },
     studentId: number,
   ) {
@@ -1563,6 +1831,20 @@ export class CourseLevelExamsService {
       if (!gradeRes.rowCount) {
         throw new HttpError(403, 'هذا الامتحان غير مخصص لصفك الدراسي');
       }
+
+      let examTeacherId = exam.teacher_id != null ? Number(exam.teacher_id) : null;
+      if ((!examTeacherId || examTeacherId <= 0) && exam.id != null) {
+        const teacherRes = await pool.query<{ teacher_id: number | null }>(
+          `SELECT teacher_id FROM course_level_exams WHERE id = $1`,
+          [exam.id],
+        );
+        examTeacherId =
+          teacherRes.rows[0]?.teacher_id != null ? Number(teacherRes.rows[0].teacher_id) : null;
+      }
+      const platformTeacherIds = await this.platformTeacherIdsForStudent(studentId);
+      if (!examTeacherId || !platformTeacherIds.includes(examTeacherId)) {
+        throw new HttpError(403, 'هذا الامتحان غير متاح على منصة مدرسك');
+      }
       return;
     }
 
@@ -1571,6 +1853,25 @@ export class CourseLevelExamsService {
       throw new HttpError(403, 'You are not enrolled in this course');
     }
     await this.assertStudentCanAccessCourse(courseId, studentId);
+
+    let audienceExam = exam;
+    if (exam.audience_type == null && exam.id != null) {
+      const audRes = await pool.query(
+        `SELECT id, audience_type, teacher_id, course_id FROM course_level_exams WHERE id = $1`,
+        [exam.id],
+      );
+      if (audRes.rowCount) {
+        audienceExam = { ...exam, ...audRes.rows[0] };
+      }
+    }
+
+    const groupCheck = await CourseGroupAccessService.checkStudentExamGroupAccess(
+      audienceExam,
+      studentId,
+    );
+    if (!groupCheck.allowed) {
+      throw new HttpError(403, groupCheck.message || 'الامتحان غير متاح لمجموعتك');
+    }
   }
 
   private static async assertCanManageExam(
@@ -1826,9 +2127,25 @@ export class CourseLevelExamsService {
       [courseId],
     );
 
-    const listed = result.rows.filter((exam) =>
+    const visibilityListed = result.rows.filter((exam) =>
       shouldListExamForStudent(courseLevelExamAvailabilityInput(exam), now),
     );
+    const teacherId =
+      visibilityListed[0]?.teacher_id != null
+        ? Number(visibilityListed[0].teacher_id)
+        : await CourseGroupAccessService.resolveCourseTeacherId(courseId);
+    const allowedExamIds = teacherId
+      ? await CourseGroupAccessService.filterExamIdsAllowedForStudent(
+          visibilityListed.map((exam) => ({
+            id: Number(exam.id),
+            audience_type: exam.audience_type,
+            teacher_id: exam.teacher_id ?? teacherId,
+          })),
+          studentId,
+          teacherId,
+        )
+      : new Set(visibilityListed.map((exam) => Number(exam.id)));
+    const listed = visibilityListed.filter((exam) => allowedExamIds.has(Number(exam.id)));
     const lateAccessByExam = await this.lateAccessRemainingMap(
       listed.map((exam) => Number(exam.id)),
       studentId,
@@ -1878,7 +2195,13 @@ export class CourseLevelExamsService {
           configuredQuestionsCount: exam.questions_count,
           actualQuestionsCount: exam.actual_questions_count,
           duration_unlimited: isDurationUnlimited(exam.duration_minutes),
+          timing_mode: exam.timing_mode ?? null,
+          timingMode: exam.timing_mode ?? null,
+          audience_type: exam.audience_type || 'all',
+          audienceType: exam.audience_type || 'all',
           availability_status,
+          schedule_start_at: exam.available_from ?? null,
+          schedule_end_at: exam.visibility_end_date ?? null,
           attempts_count: attemptsCount,
           last_attempt_number: lastAttemptNumber,
           has_in_progress_attempt: hasInProgressAttempt,
@@ -1902,7 +2225,38 @@ export class CourseLevelExamsService {
   }
 
   /**
-   * Published public exams matching the student's grades (no course enrollment required).
+   * مدرسو منصة الطالب: من أنشأ الحساب، مالك التينانت، أو مدرس على نفس المنصة.
+   * امتحان عام لمدرس آخر لا يظهر لهذا الطالب.
+   */
+  private static async platformTeacherIdsForStudent(studentId: number): Promise<number[]> {
+    const res = await pool.query<{ teacher_id: number }>(
+      `SELECT DISTINCT teacher_id
+       FROM (
+         SELECT u.managed_by_teacher_id AS teacher_id
+         FROM users u
+         WHERE u.id = $1 AND u.managed_by_teacher_id IS NOT NULL
+         UNION
+         SELECT t.owner_user_id
+         FROM users u
+         JOIN tenants t ON t.id = u.tenant_id AND t.is_active = TRUE
+         WHERE u.id = $1 AND t.owner_user_id IS NOT NULL
+         UNION
+         SELECT teacher.id
+         FROM users u
+         JOIN users teacher
+           ON teacher.tenant_id = u.tenant_id
+          AND teacher.role IN ('teacher', 'academy')
+          AND teacher.deleted_at IS NULL
+         WHERE u.id = $1 AND u.tenant_id IS NOT NULL
+       ) teachers
+       WHERE teacher_id IS NOT NULL`,
+      [studentId],
+    );
+    return res.rows.map((row) => Number(row.teacher_id)).filter((id) => id > 0);
+  }
+
+  /**
+   * Published public exams for the student's grades on their own teacher's platform.
    */
   static async getVisiblePublicExamsForStudent(studentId: number) {
     const gradesRes = await pool.query(
@@ -1917,6 +2271,11 @@ export class CourseLevelExamsService {
       return [];
     }
 
+    const platformTeacherIds = await this.platformTeacherIdsForStudent(studentId);
+    if (!platformTeacherIds.length) {
+      return [];
+    }
+
     const now = new Date();
     const result = await pool.query(
       `SELECT e.*,
@@ -1926,10 +2285,11 @@ export class CourseLevelExamsService {
        JOIN grades g ON g.id = e.grade_id
        WHERE e.exam_scope = 'public'
          AND e.grade_id = ANY($1::int[])
+         AND e.teacher_id = ANY($2::int[])
          AND e.is_active = TRUE
          AND e.is_visible_to_students = TRUE
        ORDER BY e.created_at DESC`,
-      [gradeIds],
+      [gradeIds, platformTeacherIds],
     );
 
     const listed = result.rows.filter((exam) =>
@@ -2164,10 +2524,13 @@ export class CourseLevelExamsService {
     );
 
     const startedAt = new Date();
+    const timingMode = normalizeTimingMode(exam.timing_mode);
     const attemptExpireAt = computeAttemptExpireAt({
       startedAt,
       durationMinutes: exam.duration_minutes,
-      visibilityEndDate: useLateAccess && availability === 'expired' ? null : exam.visibility_end_date,
+      visibilityEndDate:
+        useLateAccess && availability === 'expired' ? null : exam.visibility_end_date,
+      timingMode,
     });
 
     let attempt;
@@ -2219,15 +2582,17 @@ export class CourseLevelExamsService {
   }
 
   private static mapCourseQuestionForStudent(q: any) {
+    const essay = String(q.type || '').toUpperCase() === 'ESSAY';
     return {
       id: q.id,
       type: q.type,
       questionText: q.question_text,
       questionImage: q.question_image,
-      optionA: q.option_a,
-      optionB: q.option_b,
-      optionC: q.option_c,
-      optionD: q.option_d,
+      optionA: essay ? null : q.option_a,
+      optionB: essay ? null : q.option_b,
+      optionC: essay ? null : q.option_c,
+      optionD: essay ? null : q.option_d,
+      points: essay ? Number(q.points ?? 1) : undefined,
       passageId: q.passageId ?? null,
       passageText: q.passageText ?? null,
       passage: q.passage ?? null,
@@ -2363,21 +2728,33 @@ export class CourseLevelExamsService {
       questionsRes = await pool.query(
         `SELECT id, type, question_text, question_image, option_a, option_b, option_c, option_d,
                 correct_answer, correct_answer_2, teacher_question_id, question_id_v2,
-                passage_text, passage_title
+                passage_text, passage_title, model_answer, model_answer_image, points
          FROM course_level_exam_questions
          WHERE exam_id = $1
          ORDER BY created_at ASC, id ASC`,
         [attempt.exam_id],
       );
     } catch {
-      questionsRes = await pool.query(
-        `SELECT id, type, question_text, question_image, option_a, option_b, option_c, option_d,
-                correct_answer, correct_answer_2, teacher_question_id, question_id_v2
-         FROM course_level_exam_questions
-         WHERE exam_id = $1
-         ORDER BY created_at ASC, id ASC`,
-        [attempt.exam_id],
-      );
+      try {
+        questionsRes = await pool.query(
+          `SELECT id, type, question_text, question_image, option_a, option_b, option_c, option_d,
+                  correct_answer, correct_answer_2, teacher_question_id, question_id_v2,
+                  model_answer, model_answer_image, points
+           FROM course_level_exam_questions
+           WHERE exam_id = $1
+           ORDER BY created_at ASC, id ASC`,
+          [attempt.exam_id],
+        );
+      } catch {
+        questionsRes = await pool.query(
+          `SELECT id, type, question_text, question_image, option_a, option_b, option_c, option_d,
+                  correct_answer, correct_answer_2, teacher_question_id, question_id_v2
+           FROM course_level_exam_questions
+           WHERE exam_id = $1
+           ORDER BY created_at ASC, id ASC`,
+          [attempt.exam_id],
+        );
+      }
     }
     const questionsWithPassages =
       await TeacherReadingPassagesService.attachPassagesByTeacherQuestionIds(questionsRes.rows);
@@ -2388,19 +2765,27 @@ export class CourseLevelExamsService {
       questionsWithPassages.map((q) => Number(q.id)),
     );
     const answersRes = await pool.query(
-      `SELECT question_id, selected_answer, is_correct
+      `SELECT question_id, selected_answer, is_correct, answer_text, answer_images, ocr_text,
+              grading_status, final_score, teacher_note
        FROM course_level_exam_answers
        WHERE attempt_id = $1`,
       [attemptId],
+    ).catch(async () =>
+      pool.query(
+        `SELECT question_id, selected_answer, is_correct
+         FROM course_level_exam_answers
+         WHERE attempt_id = $1`,
+        [attemptId],
+      ),
     );
     const answersByQuestion = new Map(
       answersRes.rows.map((row) => [Number(row.question_id), row]),
     );
 
-    return questionIds
+    const mcqWrong = questionIds
       .map((questionId) => {
         const question = questionsById.get(questionId);
-        if (!question) return null;
+        if (!question || String(question.type || '').toUpperCase() === 'ESSAY') return null;
         const answer = answersByQuestion.get(questionId);
         const selected = answer?.selected_answer
           ? String(answer.selected_answer).trim().toUpperCase()
@@ -2410,6 +2795,8 @@ export class CourseLevelExamsService {
         return this.mapCourseWrongQuestion(question, answer);
       })
       .filter((row): row is NonNullable<typeof row> => row != null);
+    const essayWrong = await EssayReviewService.listIncorrectCourseEssays(attemptId);
+    return [...mcqWrong, ...essayWrong];
   }
 
   private static mapAttemptSummary(attempt: any) {
@@ -2445,6 +2832,7 @@ export class CourseLevelExamsService {
       releaseReason: releaseDecision.release ? releaseDecision.reason : '',
       answersVisibleAt: exam.answers_visible_at,
       wrongQuestions: showAnswers ? await this.fetchWrongQuestionsForAttempt(attempt.id) : [],
+      ...(await EssayReviewService.summarizeCourseEssays(attempt.id)),
       startedAt: attempt.started_at,
       submittedAt: attempt.submitted_at,
     };
@@ -2497,6 +2885,12 @@ export class CourseLevelExamsService {
     const allowed = new Set(questions.map((q) => Number(q.id)));
     const valid = answers.filter((a) => allowed.has(a.questionId));
     await this.upsertAttemptAnswers(resolvedId, valid);
+    const essayQuestions = questions.filter((q) => String(q.type || '').toUpperCase() === 'ESSAY');
+    await EssayReviewService.persistCourseDrafts(
+      resolvedId,
+      essayQuestions.map((q) => ({ id: Number(q.id) })),
+      valid.filter((answer) => answer.essay),
+    );
     await pool.query(
       `UPDATE course_level_exam_attempts SET last_autosave_at = NOW() WHERE id = $1`,
       [resolvedId],
@@ -2520,7 +2914,7 @@ export class CourseLevelExamsService {
     examId: number,
     studentId: number,
     attemptId: number,
-    answers: { questionId: number; selectedAnswer: 'A' | 'B' | 'C' | 'D' }[],
+    answers: CourseExamAnswer[],
   ) {
     const expired = await this.expireOverdueAttemptIfNeeded(examId, studentId);
     if (expired && expired.attemptId === attemptId) {
@@ -2633,6 +3027,7 @@ export class CourseLevelExamsService {
         message: this.pendingReleaseMessage(release),
         attempt: attemptSummary,
         wrongQuestions: [],
+        ...(await EssayReviewService.summarizeCourseEssays(attempt.id)),
       };
     }
 
@@ -2654,6 +3049,7 @@ export class CourseLevelExamsService {
       showAnswersAfterHours: release.showAnswersAfterHours,
       attempt: attemptSummary,
       wrongQuestions,
+      ...(await EssayReviewService.summarizeCourseEssays(attempt.id)),
     };
   }
 
@@ -2670,7 +3066,7 @@ export class CourseLevelExamsService {
         answersReleaseMode: report.answersReleaseMode,
         examEndAt: report.examEndAt,
         answersVisibleAt: report.answersVisibleAt,
-        message: report.message,
+        message: report.essayNotice || ('message' in report ? report.message : null),
         attemptId: report.attempt.attemptId,
         totalGrade: report.attempt.totalGrade,
         maxGrade: report.attempt.maxGrade,

@@ -1,11 +1,74 @@
 import { MAX_MCQ_OPTIONS, MIN_MCQ_OPTIONS } from '../types/mistralQuestionExtraction';
 
+/** نوع المحتوى المطلوب استخراجه — مستقل عن وضع دقة العربية */
+export type ExtractionContentMode = 'auto' | 'general' | 'reading_passage';
+
 export type QuestionExtractionPromptOptions = {
   inferCorrectAnswer: boolean;
   hasPageImages?: boolean;
   /** اسم المادة — يحدد ARABIC_HIGH_ACCURACY_MODE مقابل STANDARD_EXTRACTION_MODE */
   subject?: string | null;
+  /**
+   * auto = السلوك الحالي (اكتشاف تلقائي)
+   * general = أسئلة مستقلة فقط بدون passages
+   * reading_passage = إجبار وضع قطعة + أسئلة مرتبطة
+   */
+  contentMode?: ExtractionContentMode | null;
 };
+
+export function normalizeExtractionContentMode(value: unknown): ExtractionContentMode {
+  const raw = String(value ?? '')
+    .trim()
+    .toLowerCase()
+    .replace(/-/g, '_');
+  if (
+    raw === 'reading_passage' ||
+    raw === 'passage' ||
+    raw === 'passages' ||
+    raw === 'قطعة' ||
+    raw === 'قطع'
+  ) {
+    return 'reading_passage';
+  }
+  if (raw === 'general' || raw === 'normal' || raw === 'questions' || raw === 'عادي') {
+    return 'general';
+  }
+  return 'auto';
+}
+
+function contentModeBlock(contentMode: ExtractionContentMode): string {
+  if (contentMode === 'reading_passage') {
+    return `## وضع المحتوى: READING_PASSAGE (إجباري)
+
+هذا المستند قطعة قراءة / فهم مقروء وأسئلة تابعة لها.
+
+إلزامي:
+1) استخرج نص القطعة كاملاً حرفياً في passages[] — لا تلخّص ولا تعد صياغة ولا تحذف فقرة.
+2) القطعة قد تمتد على أكثر من صفحة أو عمود — اجمعها بترتيب المصدر.
+3) إن وُجدت عدة قطع: passages[] متعددة (p1, p2, …) واربط كل سؤال بـ passage_id الصحيح فقط.
+4) كل سؤال تابع يضع passage_id للقطعة التي يعتمد عليها — لا تتركه null لأسئلة القطعة.
+5) لا تخلط نص القطعة مع نص السؤال أو الاختيارات.
+6) لا تعتبر عنواناً مثل «اقرأ ثم أجب» سؤالاً.
+7) content_type = "reading_passage".
+8) الأسئلة المستقلة تماماً (إن وُجدت بجانب القطع) تبقى passage_id = null.
+9) إن كان النص غير واضح: انسخ الظاهر كما هو وعلّق في notes — ممنوع اختراع كلمات.`;
+  }
+
+  if (contentMode === 'general') {
+    return `## وضع المحتوى: GENERAL (أسئلة عادية فقط)
+
+لا تستخرج قطعاً:
+- passages = [] دائماً.
+- content_type = "general".
+- أي تمهيد/اقتباس قصير لسؤال واحد → stimulus_text داخل السؤال و passage_id = null.
+- لا تستخدم passages[] حتى لو ظهر نص طويل مشترك — ضعه كـ stimulus لنفس السؤال إن لزم.`;
+  }
+
+  return `## وضع المحتوى: AUTO (اكتشاف تلقائي)
+
+اكتشف قطعة القراءة إن وُجدت كما في قواعد «قطعة القراءة» أدناه.
+إن لم توجد: passages = [] و content_type = "general".`;
+}
 
 export type ExtractionMode = 'ARABIC_HIGH_ACCURACY_MODE' | 'STANDARD_EXTRACTION_MODE';
 
@@ -108,10 +171,12 @@ export function buildQuestionExtractionPrompt(
 ): string {
   const subject = opts.subject?.trim() || 'غير محددة';
   const mode = resolveExtractionMode(opts.subject);
+  const contentMode = normalizeExtractionContentMode(opts.contentMode);
   const modeBlock =
     mode === 'ARABIC_HIGH_ACCURACY_MODE'
       ? arabicHighAccuracyBlock()
       : standardExtractionBlock(subject);
+  const contentBlock = contentModeBlock(contentMode);
 
   const answerRules = opts.inferCorrectAnswer
     ? `## الإجابة الصحيحة
@@ -141,10 +206,13 @@ export function buildQuestionExtractionPrompt(
 الملف: "${filename}"
 المادة (subject): "${subject}"
 وضع الاستخراج: ${mode}
+وضع المحتوى: ${contentMode}
 
 سيتم إرسال صور (إن وُجدت) + نص OCR مساعد. مهمتك استخراج الأسئلة بدقة عالية جدًا مع الحفاظ على بنية السؤال الأصلية.
 
 ${modeBlock}
+
+${contentBlock}
 
 ${visionPriority}
 
@@ -208,16 +276,39 @@ OCR كثيرًا يحوّل أوسمة الاختيارات العربية أ/ب
 إن وُجدت أ) ب) ج) د) (أو A B C D) فلا تعتبرها أسئلة مستقلة — ضعها داخل options لنفس السؤال.
 استخرج **كل** الاختيارات الظاهرة (غالبًا 4 في العربي). لا تكتفِ بصفين ظاهريين فقط.
 
-### تخطيطات شائعة يجب دعمها كلها
-1) عمودي: كل اختيار في سطر.
-2) أفقي: الأربعة في صف واحد.
-3) شبكة 2×2 (شائع جدًا في العربي RTL):
-   - الصف العلوي: أ (يمين) | ب (يسار)
-   - الصف السفلي: ج (يمين) | د (يسار)
-   - **لا تستخرج أ وب فقط وتترك ج ود** — ابحث تحت الصف الأول عن ج ود دائمًا.
-4) عمودان: أ فوق ج، وب فوق د — استخرج الأربعة ورتّبها أ→ب→ج→د.
+### ترتيب الاختيارات (إلزامي — 3 تخطيطات فقط)
 
-رتّب options دائمًا أ→ب→ج→د حتى لو OCR أو القراءة البصرية رتّبت الأعمدة/الصفوف بشكل مختلف.
+القانون الثابت: options[] النهائية دائماً بالترتيب أ ثم ب ثم ج ثم د.
+اربط كل نص بالحرف المكتوب بجانبه في الصورة — ممنوع تبديل القيم بين الحروف.
+
+1) **صف واحد** (أفقي): تظهر أ ب ج د على نفس السطر (من اليمين لليسار في العربي).
+   options = [أ, ب, ج, د] بنفس نصوصها الظاهرة بجانب كل حرف.
+
+2) **تحت بعض** (عمودي): كل اختيار في سطر:
+   أ
+   ب
+   ج
+   د
+   options = [أ, ب, ج, د] من الأعلى للأسفل.
+
+3) **صفّان × عمودان** (شبكة 2×2 — الأشهر في الكيمياء):
+   أ     ب
+   ج     د
+   حيث أ أعلى اليمين، ب أعلى اليسار، ج أسفل اليمين، د أسفل اليسار.
+   مثال:
+   أ=15.39 g | ب=25.65 g
+   ج=41.04 g | د=66.69 g
+   ⇒
+   [
+     {"label":"أ","text":"15.39 g"},
+     {"label":"ب","text":"25.65 g"},
+     {"label":"ج","text":"41.04 g"},
+     {"label":"د","text":"66.69 g"}
+   ]
+   ممنوع: قراءة الصف يسار→يمين ثم ملء أ←أول قيمة (هذا يبدّل أ مع ب وج مع د).
+   ممنوع: قراءة عمود ثم عمود بدون احترام الحرف المكتوب.
+
+قبل إخراج JSON: راجع داخلياً أن نص كل label يطابق ما بجوار نفس الحرف في الصورة.
 نص الاختيار قد يحتوي حرف «أ» (مثل «مرفوع بالألف») — لا تقطع عنده كبداية اختيار جديد إلا إذا كان وسم اختيار واضحًا مثل (أ) أو أ).
 
 ### اختيارات رسومية / صور (image choices)

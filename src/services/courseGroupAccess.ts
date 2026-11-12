@@ -345,6 +345,187 @@ export class CourseGroupAccessService {
     return unique;
   }
 
+  // ─── Course-level exam targeting ───────────────────────────
+
+  static async getExamGroupIds(examId: number): Promise<number[]> {
+    const r = await pool.query<{ group_id: number }>(
+      `SELECT group_id FROM course_level_exam_groups WHERE exam_id = $1`,
+      [examId],
+    );
+    return r.rows.map((row) => row.group_id);
+  }
+
+  static async setExamAudience(
+    examId: number,
+    teacherId: number,
+    audienceType: LectureAccessType,
+    groupIds: number[],
+  ): Promise<{ audience_type: LectureAccessType; group_ids: number[] }> {
+    const examRes = await pool.query<{
+      id: number;
+      teacher_id: number | null;
+      course_teacher_id: number | null;
+    }>(
+      `SELECT e.id,
+              e.teacher_id,
+              c.teacher_id AS course_teacher_id
+       FROM course_level_exams e
+       LEFT JOIN courses c ON c.id = e.course_id
+       WHERE e.id = $1`,
+      [examId],
+    );
+    if (!examRes.rowCount) {
+      throw new HttpError(404, 'الامتحان غير موجود');
+    }
+    const ownerId = Number(examRes.rows[0].teacher_id ?? examRes.rows[0].course_teacher_id);
+    if (ownerId !== teacherId) {
+      throw new HttpError(403, 'ليس لديك صلاحية تعديل جمهور هذا الامتحان');
+    }
+
+    let nextType: LectureAccessType = audienceType === 'groups' ? 'groups' : 'all';
+    let nextGroups: number[] = [];
+    if (nextType === 'groups') {
+      await this.updateTeacherSettings(teacherId, { course_group_access_enabled: true });
+      nextGroups = await this.validateGroupIdsForTeacher(groupIds, teacherId);
+      if (!nextGroups.length) {
+        throw new HttpError(400, 'يجب اختيار مجموعة واحدة على الأقل عندما يكون الامتحان لمجموعات محددة');
+      }
+    }
+
+    await pool.query('BEGIN');
+    try {
+      await pool.query(
+        `UPDATE course_level_exams SET audience_type = $1, updated_at = NOW() WHERE id = $2`,
+        [nextType, examId],
+      );
+      await pool.query(`DELETE FROM course_level_exam_groups WHERE exam_id = $1`, [examId]);
+      for (const gid of nextGroups) {
+        await pool.query(
+          `INSERT INTO course_level_exam_groups (exam_id, group_id) VALUES ($1, $2)
+           ON CONFLICT DO NOTHING`,
+          [examId, gid],
+        );
+      }
+      await pool.query('COMMIT');
+    } catch (e) {
+      await pool.query('ROLLBACK');
+      throw e;
+    }
+
+    return { audience_type: nextType, group_ids: nextGroups };
+  }
+
+  /** Enforce audience_type=groups on course exams (independent of teacher toggle). */
+  static async checkStudentExamGroupAccess(
+    exam: {
+      id?: number | null;
+      audience_type?: string | null;
+      teacher_id?: number | null;
+      course_id?: number | null;
+    },
+    studentId: number,
+  ): Promise<GroupAccessCheck> {
+    const audienceType = String(exam.audience_type || 'all').toLowerCase() === 'groups' ? 'groups' : 'all';
+    if (audienceType !== 'groups') {
+      return {
+        allowed: true,
+        message: 'الامتحان متاح لجميع طلاب الكورس',
+        status: 'open',
+        access_type: 'all',
+      };
+    }
+
+    const examId = Number(exam.id);
+    if (!Number.isInteger(examId) || examId <= 0) {
+      return {
+        allowed: false,
+        message: 'الامتحان غير متاح لمجموعتك',
+        status: 'group_restricted',
+        access_type: 'groups',
+      };
+    }
+
+    let teacherId = exam.teacher_id != null ? Number(exam.teacher_id) : null;
+    if ((!teacherId || teacherId <= 0) && exam.course_id != null) {
+      teacherId = await this.resolveCourseTeacherId(Number(exam.course_id));
+    }
+    if (!teacherId) {
+      return {
+        allowed: false,
+        message: 'الامتحان غير متاح لمجموعتك',
+        status: 'group_restricted',
+        access_type: 'groups',
+      };
+    }
+
+    const groupIds = await this.getExamGroupIds(examId);
+    if (!groupIds.length) {
+      return {
+        allowed: false,
+        message: 'الامتحان غير متاح لمجموعتك',
+        status: 'group_restricted',
+        access_type: 'groups',
+      };
+    }
+
+    const membership = await this.getStudentMembershipForTeacher(studentId, teacherId);
+    if (!membership) {
+      return {
+        allowed: false,
+        message: 'الامتحان متاح لمجموعات محددة فقط — أنت غير مرتبط بمجموعة',
+        status: 'group_restricted',
+        access_type: 'groups',
+      };
+    }
+
+    if (!groupIds.includes(Number(membership.group_id))) {
+      return {
+        allowed: false,
+        message: 'الامتحان غير متاح لمجموعتك',
+        status: 'group_restricted',
+        access_type: 'groups',
+      };
+    }
+
+    return {
+      allowed: true,
+      message: 'الامتحان متاح لمجموعتك',
+      status: 'open',
+      access_type: 'groups',
+    };
+  }
+
+  static async filterExamIdsAllowedForStudent(
+    exams: Array<{ id: number; audience_type?: string | null; teacher_id?: number | null }>,
+    studentId: number,
+    teacherId: number,
+  ): Promise<Set<number>> {
+    const restricted = exams.filter(
+      (e) => String(e.audience_type || 'all').toLowerCase() === 'groups',
+    );
+    const allowed = new Set(
+      exams
+        .filter((e) => String(e.audience_type || 'all').toLowerCase() !== 'groups')
+        .map((e) => Number(e.id)),
+    );
+    if (!restricted.length) return allowed;
+
+    const membership = await this.getStudentMembershipForTeacher(studentId, teacherId);
+    if (!membership) return allowed;
+
+    const examIds = restricted.map((e) => Number(e.id));
+    const r = await pool.query<{ exam_id: number }>(
+      `SELECT DISTINCT exam_id
+       FROM course_level_exam_groups
+       WHERE exam_id = ANY($1::int[]) AND group_id = $2`,
+      [examIds, membership.group_id],
+    );
+    for (const row of r.rows) {
+      allowed.add(Number(row.exam_id));
+    }
+    return allowed;
+  }
+
   // ─── Lecture targeting ────────────────────────────────────
 
   static async getLectureGroupIds(lectureId: number): Promise<number[]> {

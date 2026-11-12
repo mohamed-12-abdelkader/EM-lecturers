@@ -13,6 +13,7 @@ import {
   MistralQuestionExtractionSchema,
   parseQuestionExtractionImportPayload,
 } from '../types/mistralQuestionExtraction';
+import { normalizeExtractionContentMode } from '../prompts/mistralQuestionExtraction.prompt';
 
 export const router = Router();
 
@@ -166,12 +167,21 @@ function parseExtractionOptions(req: Request) {
   const subject =
     typeof subjectRaw === 'string' && subjectRaw.trim() ? subjectRaw.trim() : undefined;
 
+  const contentMode = normalizeExtractionContentMode(
+    req.body.extraction_content_mode ??
+      req.body.content_mode ??
+      req.body.contentMode ??
+      req.query.extraction_content_mode ??
+      req.query.content_mode,
+  );
+
   return {
     inferCorrectAnswer,
     includeQuestionImages,
     startPage: parseOptionalInt(req.body.start_page ?? req.query.start_page),
     endPage: parseOptionalInt(req.body.end_page ?? req.query.end_page),
     subject,
+    contentMode,
   };
 }
 
@@ -251,6 +261,7 @@ router.post(
         startPage: options.startPage,
         endPage: options.endPage,
         subject: options.subject,
+        contentMode: options.contentMode,
       });
       return res.json({ success: true, data });
     } catch (error) {

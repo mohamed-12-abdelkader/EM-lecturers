@@ -21,6 +21,31 @@ import pool from '../db/pool';
 import { TeacherLibraryExamQuestionsService } from '../services/teacherLibraryExamQuestions';
 import { normalizeQuestionDisplayMode } from '../services/examQuestionSelection';
 import { parseLectureDurationInput } from '../services/lectureExamAttemptPolicy';
+import { normalizeTimingMode } from '../services/courseLevelExamAttemptPolicy';
+import { extractEssayAnswerDrafts } from '../services/essayReview';
+
+function parseAudienceTypeInput(value: unknown): 'all' | 'groups' | undefined {
+  if (value === undefined || value === null || value === '') return undefined;
+  const raw = String(value).trim().toLowerCase();
+  if (raw === 'groups') return 'groups';
+  if (raw === 'all') return 'all';
+  throw new HttpError(400, 'audienceType must be "all" or "groups"');
+}
+
+function parseGroupIdsInput(value: unknown): number[] | undefined {
+  if (value === undefined) return undefined;
+  if (value === null || value === '') return [];
+  const list = Array.isArray(value)
+    ? value
+    : String(value)
+        .split(',')
+        .map((part) => part.trim())
+        .filter(Boolean);
+  const ids = list
+    .map((item) => Number(item))
+    .filter((id) => Number.isInteger(id) && id > 0);
+  return [...new Set(ids)];
+}
 
 export const router = Router();
 
@@ -287,6 +312,26 @@ router.post(
         }
       }
 
+      const timingModeRaw = pickBodyValue(req.body, 'timingMode', 'timing_mode');
+      const timingMode =
+        timingModeRaw === undefined || timingModeRaw === null || timingModeRaw === ''
+          ? null
+          : normalizeTimingMode(timingModeRaw);
+      if (
+        timingModeRaw !== undefined &&
+        timingModeRaw !== null &&
+        timingModeRaw !== '' &&
+        timingMode == null &&
+        String(timingModeRaw).trim().toLowerCase() !== 'null' &&
+        String(timingModeRaw).trim().toLowerCase() !== 'legacy'
+      ) {
+        throw new HttpError(400, 'timingMode must be "relative", "fixed", or null');
+      }
+      const audienceType = parseAudienceTypeInput(
+        pickBodyValue(req.body, 'audienceType', 'audience_type'),
+      );
+      const groupIds = parseGroupIdsInput(pickBodyValue(req.body, 'groupIds', 'group_ids'));
+
       const exam = await CourseLevelExamsService.createExam(req.user!, {
         title: titleInput,
         courseId,
@@ -302,6 +347,9 @@ router.post(
         isActive,
         attemptLimit,
         questionDisplayMode: normalizeQuestionDisplayMode(questionDisplayMode),
+        timingMode,
+        audienceType: audienceType ?? 'all',
+        groupIds: groupIds ?? [],
       });
 
       // إرسال إشعار مباشر للطلاب المشتركين في الكورس
@@ -887,6 +935,28 @@ router.patch(
           throw new HttpError(400, 'attemptLimit must be a positive integer or null');
         }
       }
+    }
+
+    if (req.body.timingMode !== undefined || req.body.timing_mode !== undefined) {
+      const timingModeRaw = pickBodyValue(req.body, 'timingMode', 'timing_mode');
+      if (timingModeRaw === null || timingModeRaw === '' || timingModeRaw === 'null' || timingModeRaw === 'legacy') {
+        updateData.timingMode = null;
+      } else {
+        const timingMode = normalizeTimingMode(timingModeRaw);
+        if (timingMode == null) {
+          throw new HttpError(400, 'timingMode must be "relative", "fixed", or null');
+        }
+        updateData.timingMode = timingMode;
+      }
+    }
+
+    if (req.body.audienceType !== undefined || req.body.audience_type !== undefined) {
+      updateData.audienceType = parseAudienceTypeInput(
+        pickBodyValue(req.body, 'audienceType', 'audience_type'),
+      );
+    }
+    if (req.body.groupIds !== undefined || req.body.group_ids !== undefined) {
+      updateData.groupIds = parseGroupIdsInput(pickBodyValue(req.body, 'groupIds', 'group_ids'));
     }
 
     try {
@@ -1589,6 +1659,15 @@ router.post(
       questionImage = resolveQuestionImageFromBody(body);
     }
 
+    const passageTextRaw = pickBodyValue(body, 'passageText', 'passage_text');
+    const passageTitleRaw = pickBodyValue(body, 'passageTitle', 'passage_title');
+    const passageText =
+      typeof passageTextRaw === 'string' && passageTextRaw.trim() ? passageTextRaw.trim() : null;
+    const passageTitle =
+      typeof passageTitleRaw === 'string' && passageTitleRaw.trim()
+        ? passageTitleRaw.trim()
+        : null;
+
     try {
       const question = await CourseLevelExamQuestionsService.createTextQuestion(req.user!, {
         examId,
@@ -1600,6 +1679,8 @@ router.post(
         correctAnswer: correctAnswer as 'A' | 'B' | 'C' | 'D',
         questionImage,
         createdBy: req.user!.id,
+        passageText,
+        passageTitle,
       });
 
       res.status(201).json({ question: serializeCourseLevelQuestionRow(question) });
@@ -2056,6 +2137,7 @@ router.post(
           req.user!.id,
           answers,
           req.body.attemptId ?? req.body.attempt_id,
+          extractEssayAnswerDrafts(req.body),
         );
         return res.json(result);
       }
@@ -2173,6 +2255,7 @@ router.post(
           examId,
           studentId: req.user!.id,
           answers: normalizedAnswers,
+          essayDrafts: extractEssayAnswerDrafts(req.body),
           attemptId: req.body.attemptId ?? req.body.attempt_id,
           allowAutoStart: false,
         });

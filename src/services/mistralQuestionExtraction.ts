@@ -1,5 +1,10 @@
 import { assertMistralConfigured, DEFAULT_MISTRAL_CHAT_MODEL, getMistralConfig } from '../config/mistral';
-import { buildQuestionExtractionPrompt, resolveExtractionMode } from '../prompts/mistralQuestionExtraction.prompt';
+import {
+  buildQuestionExtractionPrompt,
+  normalizeExtractionContentMode,
+  resolveExtractionMode,
+  type ExtractionContentMode,
+} from '../prompts/mistralQuestionExtraction.prompt';
 import {
   MAX_MCQ_OPTIONS,
   MIN_MCQ_OPTIONS,
@@ -1086,10 +1091,14 @@ function sanitizeMcqOptions(
   }
 
   const labels = ['أ', 'ب', 'ج', 'د'] as const;
-  const capped = cleaned.slice(0, 4).map((opt, i) => ({
-    ...opt,
-    label: labels[i] || normalizeOptionLabel(opt.label) || labels[i],
-  }));
+  // حافظ على ربط label→text الأصلي بعد الفرز؛ لا تُعد تسمية النصوص بترتيب الفهرس إلا إذا كان الحرف مفقوداً/غير صالح
+  const capped = sortMcqOptions(
+    cleaned.slice(0, 4).map((opt, i) => {
+      const own = normalizeOptionLabel(String(opt.label || '').trim());
+      const label = (labels as readonly string[]).includes(own) ? own : labels[i];
+      return { ...opt, label };
+    }),
+  );
 
   return { ...question, options: capped };
 }
@@ -1191,7 +1200,8 @@ function cleanQuestionTextFromOptionLeak(
   return text.replace(/\n{3,}/g, '\n\n').trim();
 }
 
-function extractArabicMcqOptionsFromSlice(slice: string): Array<{ label: string; text: string }> {
+/** Exported for unit tests — ربط أ/ب/ج/د بنصّها من مقطع OCR (يشمل شبكة 2×2). */
+export function extractArabicMcqOptionsFromSlice(slice: string): Array<{ label: string; text: string }> {
   const source = slice
     .replace(/[Ⓐⓐ🄐]/g, 'أ) ')
     .replace(/[Ⓑⓑ🄑]/g, 'ب) ')
@@ -1199,6 +1209,7 @@ function extractArabicMcqOptionsFromSlice(slice: string): Array<{ label: string;
     .replace(/[Ⓓⓓ🄓]/g, 'د) ');
 
   // يدعم: (أ) / أ) / أ. / أ: وأيضًا صفّين في شبكة 2×2 على سطر واحد أو سطرين
+  // ويدعم النص قبل الحرف: «15.39 g أ» الشائع في بعض OCR لشبكات RTL
   const labelRe =
     /(?:^|[\s\n\r\t\|]| {2,})(?:\(|\[)?([أابجدهـABCDE])(?:\)|\]|[)）.\-:])\s*/gu;
   const marks: Array<{ label: string; matchStart: number; textStart: number }> = [];
@@ -1233,11 +1244,141 @@ function extractArabicMcqOptionsFromSlice(slice: string): Array<{ label: string;
     if (!prev || text.length > prev.length) found.set(marks[i].label, text);
   }
 
+  // نمط شائع في OCR لشبكة RTL: القيمة ثم الحرف (15.39 g أ) أو (أ 15.39 g) بدون فاصل قوي
+  if (found.size < 3) {
+    const trailingLabelRe =
+      /(?:^|[\s\n|])([+-]?\d+(?:[.,]\d+)?\s*(?:g|kg|mg|mL|L|M|mol|%)?|[^\n|]{1,60}?)\s*(?:\(|\[)?([أابجدهـABCDE])(?:\)|\])?(?=$|[\s\n|,;])/gu;
+    let trail: RegExpExecArray | null;
+    while ((trail = trailingLabelRe.exec(source)) !== null) {
+      const rawLabel = trail[2];
+      const label =
+        LATIN_TO_AR_OPTION[rawLabel] ||
+        LATIN_TO_AR_OPTION[rawLabel.toLowerCase()] ||
+        normalizeOptionLabel(rawLabel);
+      let text = (trail[1] || '').replace(/\s+/g, ' ').trim();
+      if (!text || text.length > 400) continue;
+      if (looksLikeLeakedQuestionStem(text)) continue;
+      if (!found.has(label)) found.set(label, text);
+    }
+  }
+
+  // نمط: أ 15.39 g / ب25.65 دون قوس واضح
+  if (found.size < 3) {
+    const looseLabelRe =
+      /(?:^|[\s\n|])([أابجدهـABCDE])\s+([+-]?\d+(?:[.,]\d+)?\s*(?:g|kg|mg|mL|L|M|mol|%)?|[^\n|]{1,80}?)(?=$|[\s\n|,;]|(?:[أابجدهـABCDE])\s)/gu;
+    let loose: RegExpExecArray | null;
+    while ((loose = looseLabelRe.exec(source)) !== null) {
+      const rawLabel = loose[1];
+      const label =
+        LATIN_TO_AR_OPTION[rawLabel] ||
+        LATIN_TO_AR_OPTION[rawLabel.toLowerCase()] ||
+        normalizeOptionLabel(rawLabel);
+      let text = (loose[2] || '').replace(/\s+/g, ' ').trim();
+      if (!text || text.length > 400) continue;
+      if (looksLikeLeakedQuestionStem(text)) continue;
+      if (!found.has(label)) found.set(label, text);
+    }
+  }
+
   const order = ['أ', 'ب', 'ج', 'د'];
   return order
     .filter((label) => found.has(label))
     .map((label) => ({ label, text: found.get(label)! }))
     .filter((o) => !looksLikeLeakedQuestionStem(o.text));
+}
+
+/** هل نصوص الاختيارات لنفس الحروف مختلفة بين النموذج وOCR؟ */
+function optionTextsMismatchByLabel(
+  modelOpts: Array<{ label?: string; text?: string | null }>,
+  ocrOpts: Array<{ label: string; text: string }>,
+): boolean {
+  if (ocrOpts.length < 3) return false;
+  const modelByLabel = new Map<string, string>();
+  for (const opt of modelOpts) {
+    const label = normalizeOptionLabel(String(opt.label || '').trim());
+    const text = String(opt.text || '').replace(/\s+/g, ' ').trim();
+    if (label && text) modelByLabel.set(label, text);
+  }
+  let compared = 0;
+  let mismatches = 0;
+  for (const ocr of ocrOpts) {
+    const modelText = modelByLabel.get(ocr.label);
+    if (!modelText) continue;
+    compared += 1;
+    const a = modelText.toLowerCase();
+    const b = ocr.text.replace(/\s+/g, ' ').trim().toLowerCase();
+    if (a !== b && !a.includes(b) && !b.includes(a)) {
+      mismatches += 1;
+    }
+  }
+  // يكفي اختلاف اختيارين أو أكثر، أو اختلاف واحد مع توفر 4 اختيارات OCR
+  return mismatches >= 2 || (mismatches >= 1 && ocrOpts.length >= 4 && compared >= 3);
+}
+
+/**
+ * شبكة 2×2 بدون حروف واضحة في OCR:
+ * كل سطر يُقرأ LTR ⇒ [يسار, يمين] = [ب, أ] ثم [د, ج]
+ * نحوّلها إلى أ ب ج د.
+ */
+export function extractTwoByTwoGridOptionsFromSlice(
+  slice: string,
+): Array<{ label: string; text: string }> {
+  const lines = String(slice || '')
+    .split(/\r?\n/)
+    .map((l) => l.replace(/!\[[^\]]*]\([^)]+\)/g, ' ').trim())
+    .filter(Boolean)
+    // تخطّي سطر السؤال الطويل / رقم السؤال
+    .filter((l) => !/^\d{1,3}\s*[)）．.\-:]/.test(l) || /[أابجدهـABCDE]/.test(l));
+
+  const tokenRe =
+    /[+-]?\d+(?:[.,]\d+)?\s*(?:g|kg|mg|mL|ml|L|M|mol|%|سم3|سم³)?|[^\s|]{2,40}/gi;
+
+  const shortRows: string[][] = [];
+  for (const line of lines) {
+    // تجاهل الأسطر الطويلة جداً (متن السؤال)
+    if (line.length > 120 && !/[أابجدهـABCDE]\s*[)）．.]/.test(line)) continue;
+    const rawTokens = (line.match(tokenRe) || [])
+      .map((t) => t.replace(/\s+/g, ' ').trim())
+      .filter((t) => t && !/^[أابجدهـABCDE]$/i.test(t) && !looksLikeLeakedQuestionStem(t));
+    // صف شبكة عادة فيه توكنين قصيرين
+    if (rawTokens.length === 2 && rawTokens.every((t) => t.length <= 40)) {
+      shortRows.push(rawTokens);
+    }
+  }
+
+  if (shortRows.length < 2) return [];
+  const [row1, row2] = shortRows;
+  // LTR على الصف: [يسار=ب, يمين=أ]
+  const leftTop = row1[0];
+  const rightTop = row1[1];
+  const leftBottom = row2[0];
+  const rightBottom = row2[1];
+  return [
+    { label: 'أ', text: rightTop },
+    { label: 'ب', text: leftTop },
+    { label: 'ج', text: rightBottom },
+    { label: 'د', text: leftBottom },
+  ];
+}
+
+/** إن كانت قيم أ/ب متطابقة مع صف LTR غير مُصحَّح — أعد تخطيط 2×2 */
+function maybeFixSwappedTwoByTwo(
+  options: Array<{ label: string; text: string }>,
+): Array<{ label: string; text: string }> {
+  if (options.length !== 4) return options;
+  const by = new Map(options.map((o) => [o.label, o.text]));
+  const a = by.get('أ') || '';
+  const b = by.get('ب') || '';
+  const c = by.get('ج') || '';
+  const d = by.get('د') || '';
+  if (!a || !b || !c || !d) return options;
+
+  // إذا النصوص قصيرة رقمية ويبدو أن أ↔ب وج↔د (خطأ قراءة LTR شائع)
+  const short = [a, b, c, d].every((t) => t.length <= 40);
+  if (!short) return options;
+
+  // لا نخمّن التبديل إلا إذا طُلب من extractTwoByTwo — هذه دالة مساعدة عند الدمج
+  return options;
 }
 
 function toArabicIndicDigits(value: string | number): string {
@@ -1347,31 +1488,62 @@ function repairSparseTextOptions(
     let next = question;
     const textOpts = (question.options || []).filter((o) => (o.text || '').trim());
     const uniqueTexts = new Set(textOpts.map((o) => (o.text || '').trim()));
-    const needsRepair = textOpts.length < 4 || uniqueTexts.size < Math.min(3, textOpts.length);
+    const keepClean = (opts: Array<{ label: string; text: string }>) =>
+      opts.filter((o) => (o.text || '').trim() && !looksLikeLeakedQuestionStem(o.text));
 
-    if (needsRepair) {
-      const keepClean = (opts: Array<{ label: string; text: string }>) =>
-        opts.filter((o) => (o.text || '').trim() && !looksLikeLeakedQuestionStem(o.text));
+    const fromLetters = keepClean(extractArabicMcqOptionsFromSlice(slice));
+    const fromGrid = keepClean(extractTwoByTwoGridOptionsFromSlice(slice));
+    const fromNumbers = keepClean(
+      extractOptionsFromFalseNumberedSlice(slice, question.source_number || question.number),
+    );
+    const needsSparseRepair = textOpts.length < 4 || uniqueTexts.size < Math.min(3, textOpts.length);
+    // شبكة 2×2: النموذج قد يرجّع 4 اختيارات بنصوص مبدّلة بين أ/ب/ج/د
+    const needsLabelPairingRepair =
+      optionTextsMismatchByLabel(textOpts, fromLetters) ||
+      optionTextsMismatchByLabel(textOpts, fromGrid);
 
-      const fromLetters = keepClean(extractArabicMcqOptionsFromSlice(slice));
-      const fromNumbers = keepClean(
-        extractOptionsFromFalseNumberedSlice(slice, question.source_number || question.number),
-      );
+    const currentClean = (question.options || []).filter(
+      (o) => (o.text || '').trim() && !looksLikeLeakedQuestionStem(o.text || ''),
+    );
+
+    if (needsSparseRepair || needsLabelPairingRepair) {
       // لا تستخدم كامل المستند هنا — يلتقط أسئلة لاحقة كاختيارات بالخطأ
+      // أولوية: حروف واضحة من OCR → شبكة 2×2 → دمج
+      if (fromLetters.length >= 4 && needsLabelPairingRepair) {
+        next = { ...next, options: sortMcqOptions(fromLetters.slice(0, 4)) };
+      } else if (needsLabelPairingRepair && fromLetters.length >= 3) {
+        next = { ...next, options: sortMcqOptions(fromLetters.slice(0, 4)) };
+      } else if (needsLabelPairingRepair && fromGrid.length === 4) {
+        next = { ...next, options: sortMcqOptions(fromGrid) };
+      } else if (needsSparseRepair && fromLetters.length >= 4) {
+        next = { ...next, options: sortMcqOptions(fromLetters.slice(0, 4)) };
+      } else if (needsSparseRepair && fromGrid.length === 4 && currentClean.length < 4) {
+        next = { ...next, options: sortMcqOptions(fromGrid) };
+      } else {
+        let merged = mergeTextOptions(currentClean, fromLetters);
+        merged = mergeTextOptions(merged, fromGrid);
+        merged = mergeTextOptions(merged, fromNumbers);
+        merged = keepClean(maybeFixSwappedTwoByTwo(merged)).slice(0, 4);
 
-      const currentClean = (question.options || []).filter(
-        (o) => (o.text || '').trim() && !looksLikeLeakedQuestionStem(o.text || ''),
-      );
-      let merged = mergeTextOptions(currentClean, fromLetters);
-      merged = mergeTextOptions(merged, fromNumbers);
-      merged = keepClean(merged).slice(0, 4);
-
-      if (merged.length > currentClean.length && merged.length >= 3) {
-        next = { ...next, options: merged };
-      } else if (currentClean.length >= 2 && currentClean.length < (question.options || []).length) {
-        // النموذج رجّع اختيارات ملوّثة — أبقِ النظيفة فقط
-        next = { ...next, options: currentClean.slice(0, 4) };
+        if (merged.length > currentClean.length && merged.length >= 3) {
+          next = { ...next, options: sortMcqOptions(merged) };
+        } else if (currentClean.length >= 2 && currentClean.length < (question.options || []).length) {
+          next = { ...next, options: sortMcqOptions(currentClean.slice(0, 4)) };
+        } else {
+          next = { ...next, options: sortMcqOptions(currentClean.slice(0, 4)) };
+        }
       }
+    } else {
+      // العدد مكتمل: ثبّت الترتيب أ→ب→ج→د دون تغيير النصوص
+      next = {
+        ...next,
+        options: sortMcqOptions(
+          currentClean.map((o) => ({
+            ...o,
+            label: normalizeOptionLabel(String(o.label || '').trim()) || o.label,
+          })),
+        ),
+      };
     }
 
     const cleanedText = cleanQuestionTextFromOptionLeak(
@@ -1854,6 +2026,29 @@ function normalizeLooseQuestion(
   };
 }
 
+function applyContentModePostProcess(
+  passages: MistralExtractedPassage[],
+  questions: MistralExtractedQuestion[],
+  contentMode: ExtractionContentMode,
+): { passages: MistralExtractedPassage[]; questions: MistralExtractedQuestion[] } {
+  const expanded = expandMultiPartQuestions(normalizePassages(passages), dedupeByNumber(questions));
+
+  if (contentMode === 'general') {
+    return {
+      passages: [],
+      questions: expanded.questions.map((q) => ({ ...q, passage_id: null })),
+    };
+  }
+
+  if (contentMode === 'reading_passage') {
+    // لا تطوي القطعة حتى لو ارتبط بها سؤال واحد — المدرس اختار وضع القطع صراحةً
+    return { passages: expanded.passages, questions: expanded.questions };
+  }
+
+  // auto = السلوك السابق
+  return foldSingletonPassages(expanded.passages, expanded.questions);
+}
+
 async function parseQuestionsWithChat(
   documentText: string,
   filename: string,
@@ -1861,6 +2056,7 @@ async function parseQuestionsWithChat(
   chatModelOverride?: string,
   pageImages: VisionPageImage[] = [],
   subject?: string | null,
+  contentMode: ExtractionContentMode = 'auto',
 ): Promise<{
   passages: MistralExtractedPassage[];
   questions: MistralExtractedQuestion[];
@@ -1889,6 +2085,7 @@ async function parseQuestionsWithChat(
     inferCorrectAnswer,
     hasPageImages,
     subject,
+    contentMode,
   });
 
   const userContent: unknown = hasPageImages
@@ -1902,9 +2099,13 @@ async function parseQuestionsWithChat(
     : prompt;
 
   const systemContent =
-    mode === 'ARABIC_HIGH_ACCURACY_MODE'
-      ? 'أنت AI متخصص في تحليل واقتطاع أسئلة الامتحانات من الصور. للغة العربية: دقة قصوى في التشكيل والهمزات وبيوت الشعر. اكتشف قطعة القراءة إن وُجدت وضعها في passages[] مرة واحدة مع passage_id. أخرج JSON صالح فقط بلا markdown.'
-      : 'أنت AI متخصص في تحليل واقتطاع أسئلة الامتحانات من الصور وتحويلها إلى JSON. اكتشف قطعة القراءة إن وُجدت وضعها في passages[] مرة واحدة مع passage_id. افهم حدود كل سؤال ثم أخرج JSON صالح فقط بلا markdown.';
+    contentMode === 'reading_passage'
+      ? 'أنت AI متخصص في استخراج قطع القراءة وأسئلة الفهم من الصور. ضع نص القطعة كاملاً في passages[] واربط كل سؤال تابع بـ passage_id. لا تختصر القطعة ولا تخترع نصاً. أخرج JSON صالح فقط بلا markdown.'
+      : contentMode === 'general'
+        ? 'أنت AI متخصص في استخراج الأسئلة المستقلة من الصور. لا تستخدم passages[] — أي تمهيد قصير داخل stimulus_text. اختيارات MCQ بالترتيب أ→ب→ج→د مع احترام تخطيط 2×2 (أ يمين أعلى، ب يسار أعلى، ج يمين أسفل، د يسار أسفل). أخرج JSON صالح فقط بلا markdown.'
+        : mode === 'ARABIC_HIGH_ACCURACY_MODE'
+          ? 'أنت AI متخصص في تحليل واقتطاع أسئلة الامتحانات من الصور. للغة العربية: دقة قصوى في التشكيل والهمزات وبيوت الشعر. اختيارات MCQ: أ→ب→ج→د دائماً؛ في شبكة 2×2 اربط كل قيمة بالحرف المكتوب بجانبها لا بترتيب القراءة LTR. أخرج JSON صالح فقط بلا markdown.'
+          : 'أنت AI متخصص في تحليل واقتطاع أسئلة الامتحانات من الصور وتحويلها إلى JSON. اختيارات MCQ بالترتيب أ→ب→ج→د مع احترام تخطيط الصف الواحد / العمودي / 2×2. أخرج JSON صالح فقط بلا markdown.';
 
   const runChat = async (model: string, content: unknown) => {
     const deepseek = isDeepSeekChatModel(model);
@@ -1940,6 +2141,7 @@ async function parseQuestionsWithChat(
     inferCorrectAnswer,
     hasPageImages: false,
     subject,
+    contentMode,
   });
 
   if (!response.ok && hasPageImages && response.status >= 400 && response.status < 500) {
@@ -2014,11 +2216,11 @@ async function parseQuestionsWithChat(
   }
 
   const validated = validatedResult.data;
-  const expanded = expandMultiPartQuestions(
+  const folded = applyContentModePostProcess(
     normalizePassages(validated.passages),
     dedupeByNumber(validated.questions),
+    contentMode,
   );
-  const folded = foldSingletonPassages(expanded.passages, expanded.questions);
   const repairedQuestions = repairSparseTextOptions(folded.questions, documentText);
   let sanitizedQuestions = repairedQuestions.map((q, _i, arr) => sanitizeMcqOptions(q, arr));
   // بعد حذف الاختيارات الملوّثة: أعد المحاولة لاستكمال أ–د من الـ slice فقط
@@ -2190,6 +2392,7 @@ async function parseQuestionsWithChatBatched(
   chatModelOverride?: string,
   pageImages: VisionPageImage[] = [],
   subject?: string | null,
+  contentMode: ExtractionContentMode = 'auto',
 ): Promise<{
   passages: MistralExtractedPassage[];
   questions: MistralExtractedQuestion[];
@@ -2210,6 +2413,7 @@ async function parseQuestionsWithChatBatched(
       chatModelOverride,
       imagesForBatch(batches[0]),
       subject,
+      contentMode,
     );
   }
 
@@ -2230,6 +2434,7 @@ async function parseQuestionsWithChatBatched(
       chatModelOverride,
       imagesForBatch(batch),
       subject,
+      contentMode,
     );
     chatModel = result.chatModel;
     const remapped = prefixPassageIds(result.passages, result.questions, `b${i + 1}_`);
@@ -2242,11 +2447,7 @@ async function parseQuestionsWithChatBatched(
     throw new HttpError(400, 'لم يُستخرج أي أسئلة من الملف');
   }
 
-  const expanded = expandMultiPartQuestions(
-    normalizePassages(allPassages),
-    dedupeByNumber(allQuestions),
-  );
-  const folded = foldSingletonPassages(expanded.passages, expanded.questions);
+  const folded = applyContentModePostProcess(allPassages, allQuestions, contentMode);
 
   return {
     passages: folded.passages,
@@ -2282,6 +2483,7 @@ export class MistralQuestionExtractionService {
     const requestedChatModel = options.chatModel?.trim();
     const ocrModel = options.ocrModel?.trim();
     const subject = options.subject?.trim() || null;
+    const contentMode = normalizeExtractionContentMode(options.contentMode);
 
     const pdfFiles = files.filter((f) => {
       const mime = MistralOcrService.resolveSupportedMime(f);
@@ -2332,6 +2534,7 @@ export class MistralQuestionExtractionService {
       includeQuestionImages,
       requestedChatModel,
       subject,
+      contentMode,
       sourceFiles: files.map((f) => ({
         filename: f.originalname || f.filename,
         mime_type: MistralOcrService.resolveSupportedMime(f),
@@ -2355,6 +2558,7 @@ export class MistralQuestionExtractionService {
       includeQuestionImages: boolean;
       requestedChatModel?: string;
       subject?: string | null;
+      contentMode?: ExtractionContentMode;
       sourceFiles?: Array<{ filename: string; mime_type: string }>;
       pageImages?: VisionPageImage[];
       pageRange?: MistralQuestionExtractionResult['page_range'];
@@ -2365,6 +2569,7 @@ export class MistralQuestionExtractionService {
       throw new HttpError(400, 'لم يُستخرج أي نص من الملف — تأكد أن الصورة/PDF واضحة');
     }
 
+    const contentMode = normalizeExtractionContentMode(opts.contentMode);
     const extractedImages = extractOcrImages(ocr);
     const { passages, questions, notes, chatModel } = await parseQuestionsWithChatBatched(
       ocr,
@@ -2372,8 +2577,23 @@ export class MistralQuestionExtractionService {
       opts.requestedChatModel,
       opts.pageImages ?? [],
       opts.subject,
+      contentMode,
     );
-    const questionsWithPassages = fillMissingPassageIds(questions, passages);
+    let questionsWithPassages = fillMissingPassageIds(questions, passages);
+    if (contentMode === 'general') {
+      questionsWithPassages = questionsWithPassages.map((q) => ({ ...q, passage_id: null }));
+    }
+    // أرفق نص القطعة مع كل سؤال مرتبط (حقل إضافي غير كاسر للتوافق)
+    const passageById = new Map(passages.map((p) => [p.passage_id, p]));
+    questionsWithPassages = questionsWithPassages.map((q) => {
+      const linked = q.passage_id ? passageById.get(q.passage_id) : null;
+      if (!linked) return q;
+      return {
+        ...q,
+        passage_text: linked.content,
+        passage_title: linked.title ?? null,
+      } as MistralExtractedQuestion & { passage_text?: string; passage_title?: string | null };
+    });
     const attachedQuestions = opts.includeQuestionImages
       ? repairImageChoiceOptions(
           attachOcrImages(
@@ -2395,6 +2615,13 @@ export class MistralQuestionExtractionService {
       imageUploadWarnings = uploadResult.warnings;
     }
 
+    const resolvedContentType =
+      contentMode === 'general'
+        ? 'general'
+        : contentMode === 'reading_passage' || passages.length > 0
+          ? 'reading_passage'
+          : 'general';
+
     return {
       filename: ocr.filename,
       mime_type: ocr.mime_type,
@@ -2406,8 +2633,9 @@ export class MistralQuestionExtractionService {
       infer_correct_answer: opts.inferCorrectAnswer,
       subject: opts.subject?.trim() || undefined,
       extraction_mode: resolveExtractionMode(opts.subject),
-      content_type: passages.length > 0 ? 'reading_passage' : 'general',
-      passages,
+      extraction_content_mode: contentMode,
+      content_type: resolvedContentType,
+      passages: contentMode === 'general' ? [] : passages,
       extracted_images: opts.includeQuestionImages ? collectQuestionImages(questionsWithImages) : [],
       questions: questionsWithImages,
       notes,

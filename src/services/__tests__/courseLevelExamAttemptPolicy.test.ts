@@ -57,6 +57,26 @@ describe('computeAttemptExpireAt', () => {
       computeAttemptExpireAt({ startedAt, durationMinutes: 0, visibilityEndDate: null }),
     ).toBeNull();
   });
+
+  it('fixed mode always uses the shared schedule end, ignoring duration', () => {
+    const expire = computeAttemptExpireAt({
+      startedAt: '2026-09-02T11:00:00Z',
+      durationMinutes: 180,
+      visibilityEndDate: '2026-09-02T13:00:00Z',
+      timingMode: 'fixed',
+    });
+    expect(expire?.toISOString()).toBe('2026-09-02T13:00:00.000Z');
+  });
+
+  it('relative mode gives full duration even when an earlier visibility_end exists', () => {
+    const expire = computeAttemptExpireAt({
+      startedAt,
+      durationMinutes: 120,
+      visibilityEndDate: '2026-09-02T10:30:00Z',
+      timingMode: 'relative',
+    });
+    expect(expire?.toISOString()).toBe('2026-09-02T12:00:00.000Z');
+  });
 });
 
 describe('remainingSeconds / expiry', () => {

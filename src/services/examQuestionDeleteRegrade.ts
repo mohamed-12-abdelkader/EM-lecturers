@@ -10,7 +10,12 @@ export type CourseAttemptRegradeInput = {
   selectedQuestionIds: unknown;
   remainingExamQuestionIds: number[];
   /** Remaining answer rows after CASCADE delete */
-  remainingAnswers: Array<{ questionId: number; isCorrect: boolean }>;
+  remainingAnswers: Array<{
+    questionId: number;
+    isCorrect: boolean;
+    finalScore?: number | null;
+  }>;
+  questionWeights?: Array<{ questionId: number; essay?: boolean; points?: number | null }>;
 };
 
 export type CourseAttemptRegradeResult = {
@@ -20,6 +25,30 @@ export type CourseAttemptRegradeResult = {
   /** True when the deleted question was part of this attempt's question set */
   affected: boolean;
 };
+
+function scoreWithQuestionWeights(input: {
+  questionIds: number[];
+  remainingAnswers: Array<{ questionId: number; isCorrect: boolean; finalScore?: number | null }>;
+  questionWeights?: Array<{ questionId: number; essay?: boolean; points?: number | null }>;
+}): { obtained: number; total: number } | null {
+  if (!input.questionWeights?.length) return null;
+  const weights = new Map(input.questionWeights.map((row) => [row.questionId, row]));
+  const answers = new Map(input.remainingAnswers.map((row) => [row.questionId, row]));
+  let obtained = 0;
+  let total = 0;
+  for (const questionId of input.questionIds) {
+    const weight = weights.get(questionId);
+    const answer = answers.get(questionId);
+    if (weight?.essay) {
+      total += Number(weight.points ?? 0);
+      obtained += Number(answer?.finalScore ?? 0);
+    } else {
+      total += 1;
+      if (answer?.isCorrect) obtained += 1;
+    }
+  }
+  return { obtained, total: Math.max(0, total) };
+}
 
 export function recomputeCourseAttemptAfterQuestionDelete(
   input: CourseAttemptRegradeInput,
@@ -38,6 +67,16 @@ export function recomputeCourseAttemptAfterQuestionDelete(
   } else {
     // Full-exam attempt: every question removal changes the exam max total
     affected = true;
+  }
+
+  const scopedIds = nextSelectedIds ?? [...remainingSet];
+  const weighted = scoreWithQuestionWeights({
+    questionIds: scopedIds,
+    remainingAnswers: input.remainingAnswers,
+    questionWeights: input.questionWeights,
+  });
+  if (weighted) {
+    return { ...weighted, nextSelectedIds, affected };
   }
 
   const scopedAnswers = nextSelectedIds
@@ -62,13 +101,28 @@ export function recomputeCourseAttemptAfterQuestionDelete(
 export function recomputeCourseAttemptFromRemainingQuestions(input: {
   selectedQuestionIds: unknown;
   remainingExamQuestionIds: number[];
-  remainingAnswers: Array<{ questionId: number; isCorrect: boolean }>;
+  remainingAnswers: Array<{
+    questionId: number;
+    isCorrect: boolean;
+    finalScore?: number | null;
+  }>;
+  questionWeights?: Array<{ questionId: number; essay?: boolean; points?: number | null }>;
 }): Omit<CourseAttemptRegradeResult, 'affected'> {
   const remainingSet = new Set(input.remainingExamQuestionIds);
   const selected = parseSelectedQuestionIds(input.selectedQuestionIds);
   const nextSelectedIds = selected
     ? selected.filter((id) => remainingSet.has(id))
     : null;
+
+  const scopedIds = nextSelectedIds ?? [...remainingSet];
+  const weighted = scoreWithQuestionWeights({
+    questionIds: scopedIds,
+    remainingAnswers: input.remainingAnswers,
+    questionWeights: input.questionWeights,
+  });
+  if (weighted) {
+    return { ...weighted, nextSelectedIds };
+  }
 
   const scopedAnswers = nextSelectedIds
     ? input.remainingAnswers.filter((a) => nextSelectedIds.includes(a.questionId))
