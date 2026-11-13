@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest';
 
-import { orderItemsByIds, selectAttemptQuestions } from '../examAccessPolicy';
+import {
+  orderItemsByIds,
+  resolveAttemptQuestionIds,
+  selectAttemptQuestions,
+} from '../examAccessPolicy';
 import {
   computeSelectionSeed,
   needsAttemptBeforeQuestions,
@@ -16,6 +20,33 @@ describe('examAccessPolicy question selection helpers', () => {
 
   it('does not exceed the available bank size', () => {
     expect(selectAttemptQuestions([1, 2], 10, 'ordered')).toEqual([1, 2]);
+  });
+
+  it('expands a short stored selection when the exam bank grows', () => {
+    const bank = Array.from({ length: 50 }, (_, i) => i + 1);
+    const stored = bank.slice(0, 43);
+    const resolved = resolveAttemptQuestionIds({
+      bankQuestionIds: bank,
+      storedIds: stored,
+      questionsCount: 50,
+      mode: 'ordered',
+      seed: 'exam:student:1',
+    });
+    expect(resolved.expanded).toBe(true);
+    expect(resolved.questionIds).toHaveLength(50);
+    expect(resolved.questionIds.slice(0, 43)).toEqual(stored);
+    expect(resolved.questionIds.slice(43)).toEqual([44, 45, 46, 47, 48, 49, 50]);
+  });
+
+  it('keeps stored selection when already complete', () => {
+    const resolved = resolveAttemptQuestionIds({
+      bankQuestionIds: [1, 2, 3, 4],
+      storedIds: [3, 1, 4, 2],
+      questionsCount: 4,
+      mode: 'ordered',
+    });
+    expect(resolved.expanded).toBe(false);
+    expect(resolved.questionIds).toEqual([3, 1, 4, 2]);
   });
 });
 

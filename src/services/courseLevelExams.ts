@@ -15,6 +15,7 @@ import {
   normalizeQuestionDisplayMode,
   orderItemsByIds,
   parseSelectedQuestionIds,
+  resolveAttemptQuestionIds,
   selectAttemptQuestions,
   shouldListExamForStudent,
 } from './examAccessPolicy';
@@ -913,27 +914,35 @@ export class CourseLevelExamsService {
   }
 
   private static async loadAttemptQuestions(exam: any, attempt: any, studentId: number) {
+    const examId = Number(exam.id ?? exam.exam_id);
     const questionsRes = await pool.query(
       `SELECT * FROM course_level_exam_questions
        WHERE exam_id = $1
        ORDER BY created_at ASC, id ASC`,
-      [exam.id ?? exam.exam_id],
+      [examId],
     );
-    const stored = parseSelectedQuestionIds(attempt?.selected_question_ids);
-    const selectedIds =
-      stored && stored.length
-        ? stored
-        : selectAttemptQuestions(
-            questionsRes.rows.map((q) => q.id),
-            exam.questions_count,
-            exam.question_display_mode,
-            attemptQuestionSeed(
-              Number(exam.id ?? exam.exam_id),
-              studentId,
-              Number(attempt?.attempt_number || 1),
-            ),
-          );
-    const ordered = orderItemsByIds(questionsRes.rows, selectedIds);
+    const bankIds = questionsRes.rows.map((q) => Number(q.id));
+    const resolved = resolveAttemptQuestionIds({
+      bankQuestionIds: bankIds,
+      storedIds: parseSelectedQuestionIds(attempt?.selected_question_ids),
+      questionsCount: exam.questions_count,
+      mode: exam.question_display_mode,
+      seed: attemptQuestionSeed(
+        examId,
+        studentId,
+        Number(attempt?.attempt_number || 1),
+      ),
+    });
+    if (resolved.expanded && attempt?.id) {
+      await pool.query(
+        `UPDATE course_level_exam_attempts
+         SET selected_question_ids = $1::int[]
+         WHERE id = $2 AND status = 'in_progress'`,
+        [resolved.questionIds, attempt.id],
+      );
+      attempt.selected_question_ids = resolved.questionIds;
+    }
+    const ordered = orderItemsByIds(questionsRes.rows, resolved.questionIds);
     return TeacherReadingPassagesService.attachPassagesByTeacherQuestionIds(ordered);
   }
 
@@ -2405,6 +2414,16 @@ export class CourseLevelExamsService {
       [examId],
     );
     exam.actual_questions_count = actualCountRes.rows[0]?.count || 0;
+    // إن زاد بنك الأسئلة عن questions_count في الوضع المرتب، ارفع العدد ليطابق البنك.
+    // هذا يصلح الامتحانات التي أُضيفت لها أسئلة بعد ضبط «عدد الأسئلة» دون تحديثه.
+    if (normalizeQuestionDisplayMode(exam.question_display_mode) === 'ordered') {
+      exam.questions_count = await this.alignOrderedQuestionsCount(
+        examId,
+        exam.questions_count,
+        exam.actual_questions_count,
+        exam.question_display_mode,
+      );
+    }
 
     await this.expireOverdueAttemptIfNeeded(examId, studentId);
 
@@ -2581,6 +2600,82 @@ export class CourseLevelExamsService {
     return this.buildStudentAttemptPayload(exam, attempt, studentId, false);
   }
 
+  /**
+   * يرفع questions_count إلى حجم البنك في الوضع المرتب عندما يكون أقل منه.
+   * الوضع العشوائي يبقى كما هو (عينة من بنك أكبر).
+   */
+  private static async alignOrderedQuestionsCount(
+    examId: number,
+    questionsCount: number | null | undefined,
+    actualCount: number | null | undefined,
+    displayMode: unknown,
+  ): Promise<number | null | undefined> {
+    const actual = Number(actualCount);
+    const configured = Number(questionsCount);
+    if (
+      normalizeQuestionDisplayMode(displayMode) !== 'ordered' ||
+      !Number.isFinite(actual) ||
+      actual <= 0 ||
+      !Number.isFinite(configured) ||
+      configured <= 0 ||
+      configured >= actual
+    ) {
+      return questionsCount;
+    }
+    try {
+      await pool.query(
+        `UPDATE course_level_exams
+         SET questions_count = $1, updated_at = NOW()
+         WHERE id = $2 AND question_display_mode IS DISTINCT FROM 'random'`,
+        [actual, examId],
+      );
+    } catch {
+      await pool.query(
+        `UPDATE course_level_exams
+         SET questions_count = $1
+         WHERE id = $2 AND question_display_mode IS DISTINCT FROM 'random'`,
+        [actual, examId],
+      );
+    }
+    return actual;
+  }
+
+  /** بعد إضافة أسئلة: إن كان العدد يطابق حجم البنك السابق، ارفعه مع البنك */
+  static async syncQuestionsCountAfterAdd(examId: number, previousBankSize: number) {
+    const examRes = await pool.query(
+      `SELECT questions_count, question_display_mode FROM course_level_exams WHERE id = $1`,
+      [examId],
+    );
+    if (!examRes.rowCount) return;
+    const exam = examRes.rows[0];
+    const countRes = await pool.query(
+      `SELECT COUNT(*)::int AS count FROM course_level_exam_questions WHERE exam_id = $1`,
+      [examId],
+    );
+    const actual = Number(countRes.rows[0]?.count || 0);
+    const configured = Number(exam.questions_count);
+    const prev = Number(previousBankSize);
+    const trackingFullBank =
+      actual > 0 &&
+      Number.isFinite(configured) &&
+      configured > 0 &&
+      Number.isFinite(prev) &&
+      configured === prev &&
+      actual > configured;
+    if (!trackingFullBank) return;
+    try {
+      await pool.query(
+        `UPDATE course_level_exams SET questions_count = $1, updated_at = NOW() WHERE id = $2`,
+        [actual, examId],
+      );
+    } catch {
+      await pool.query(`UPDATE course_level_exams SET questions_count = $1 WHERE id = $2`, [
+        actual,
+        examId,
+      ]);
+    }
+  }
+
   private static mapCourseQuestionForStudent(q: any) {
     const essay = String(q.type || '').toUpperCase() === 'ESSAY';
     return {
@@ -2696,20 +2791,17 @@ export class CourseLevelExamsService {
     attempt: { student_id?: number; attempt_number?: number; selected_question_ids?: unknown },
     allQuestionIds: number[],
   ): number[] {
-    const stored = parseSelectedQuestionIds(attempt?.selected_question_ids);
-    if (stored && stored.length) {
-      return stored.filter((id) => allQuestionIds.includes(id));
-    }
-    return selectAttemptQuestions(
-      allQuestionIds,
-      exam.questions_count,
-      exam.question_display_mode ?? 'ordered',
-      attemptQuestionSeed(
+    return resolveAttemptQuestionIds({
+      bankQuestionIds: allQuestionIds,
+      storedIds: parseSelectedQuestionIds(attempt?.selected_question_ids),
+      questionsCount: exam.questions_count,
+      mode: exam.question_display_mode ?? 'ordered',
+      seed: attemptQuestionSeed(
         Number(exam.id),
         Number(attempt.student_id || 0),
         Number(attempt.attempt_number || 1),
       ),
-    );
+    }).questionIds;
   }
 
   private static async fetchWrongQuestionsForAttempt(attemptId: number) {
@@ -4201,6 +4293,12 @@ export class CourseLevelExamsService {
       return 0;
     }
 
+    const previousBankSizeRes = await pool.query(
+      `SELECT COUNT(*)::int AS count FROM course_level_exam_questions WHERE exam_id = $1`,
+      [examId],
+    );
+    const previousBankSize = Number(previousBankSizeRes.rows[0]?.count || 0);
+
     try {
       const bankCols = await this.ensureCourseExamBankLinkColumns();
 
@@ -4509,7 +4607,8 @@ export class CourseLevelExamsService {
         }
       }
 
-      // 4. Update the exam's questions_count
+      // 4. Sync questions_count when it was tracking the full bank
+      await this.syncQuestionsCountAfterAdd(examId, previousBankSize);
       const countRes = await pool.query(
         `SELECT COUNT(*) as count FROM course_level_exam_questions WHERE exam_id = $1`,
         [examId],

@@ -234,9 +234,69 @@ export function selectAttemptQuestions(
   return pool.slice(0, take);
 }
 
+/**
+ * يثبت أسئلة المحاولة، ويوسّعها إن زاد بنك الأسئلة / questions_count بعد بدء المحاولة.
+ * يحافظ على ترتيب الأسئلة المخزّنة سابقاً ويضيف الناقص فقط.
+ */
+export function resolveAttemptQuestionIds(opts: {
+  bankQuestionIds: number[];
+  storedIds?: number[] | null;
+  questionsCount?: number | null;
+  mode?: QuestionDisplayMode | string | null;
+  seed?: string;
+}): { questionIds: number[]; expanded: boolean } {
+  const bank = [...new Set((opts.bankQuestionIds || []).filter((id) => Number.isInteger(id) && id > 0))];
+  const target = selectAttemptQuestions(
+    bank,
+    opts.questionsCount,
+    opts.mode ?? 'ordered',
+    opts.seed || 'attempt',
+  );
+  const stored = (opts.storedIds || []).filter((id) => Number.isInteger(id) && id > 0);
+  if (!stored.length) {
+    return { questionIds: target, expanded: false };
+  }
+
+  const bankSet = new Set(bank);
+  const kept: number[] = [];
+  const keptSet = new Set<number>();
+  for (const id of stored) {
+    if (!bankSet.has(id) || keptSet.has(id)) continue;
+    kept.push(id);
+    keptSet.add(id);
+  }
+
+  const take = target.length;
+  if (kept.length >= take) {
+    const trimmed = kept.slice(0, take);
+    const changed =
+      trimmed.length !== stored.length || trimmed.some((id, index) => id !== stored[index]);
+    return { questionIds: trimmed, expanded: changed };
+  }
+
+  const additions = target.filter((id) => !keptSet.has(id));
+  // إن لم يكفِ ترتيب الهدف (مثلاً عشوائي مختلف)، أكمل من بقية البنك بترتيب ثابت
+  if (kept.length + additions.length < take) {
+    for (const id of bank) {
+      if (keptSet.has(id) || additions.includes(id)) continue;
+      additions.push(id);
+      if (kept.length + additions.length >= take) break;
+    }
+  }
+
+  const questionIds = [...kept, ...additions].slice(0, take);
+  const expanded =
+    questionIds.length !== stored.length || questionIds.some((id, index) => id !== stored[index]);
+  return { questionIds, expanded };
+}
+
 export function orderItemsByIds<T extends { id: number }>(items: T[], ids: number[]): T[] {
-  const byId = new Map(items.map((item) => [item.id, item]));
-  return ids.map((id) => byId.get(id)).filter((item): item is T => Boolean(item));
+  const byId = new Map(
+    items.map((item) => [Number((item as { id: number }).id), item] as const),
+  );
+  return ids
+    .map((id) => byId.get(Number(id)))
+    .filter((item): item is T => Boolean(item));
 }
 
 export function attemptQuestionSeed(

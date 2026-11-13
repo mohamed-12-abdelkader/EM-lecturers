@@ -19,6 +19,7 @@ import {
   normalizeQuestionDisplayMode,
   orderItemsByIds,
   parseSelectedQuestionIds,
+  resolveAttemptQuestionIds,
   selectAttemptQuestions,
 } from './examAccessPolicy';
 import { CourseAccessControl } from './courseAccessControl';
@@ -1674,6 +1675,7 @@ export class ExamFlowService {
       if (isAttemptExpired(activeAttempt.attempt_expire_at)) {
         await this.finalizeInProgressAttempt(exam, activeAttempt, studentId, [], { timedOut: true });
       } else {
+        await this.alignOrderedLectureQuestionsCount(exam);
         return this.buildStudentAttemptPayload(exam, activeAttempt, studentId, true);
       }
     }
@@ -1726,6 +1728,7 @@ export class ExamFlowService {
     });
 
     const questionBank = await this.loadExamQuestions(exam.id, true);
+    await this.alignOrderedLectureQuestionsCount(exam, questionBank.length);
     const selectedQuestionIds = selectAttemptQuestions(
       questionBank.map((q) => q.id),
       exam.questions_count,
@@ -2855,27 +2858,56 @@ export class ExamFlowService {
     return res.rows[0];
   }
 
+  /** في الوضع المرتب: ارفع questions_count ليطابق الأسئلة الظاهرة إن كان أقل */
+  private static async alignOrderedLectureQuestionsCount(
+    exam: any,
+    visibleCount?: number,
+  ): Promise<void> {
+    if (normalizeQuestionDisplayMode(exam.question_display_mode) !== 'ordered') return;
+    let actual = Number(visibleCount);
+    if (!Number.isFinite(actual) || actual <= 0) {
+      const bank = await this.loadExamQuestions(exam.id, true);
+      actual = bank.length;
+    }
+    const configured = Number(exam.questions_count);
+    if (!Number.isFinite(configured) || configured <= 0 || configured >= actual) return;
+    try {
+      await pool.query(`UPDATE exams SET questions_count = $1 WHERE id = $2`, [actual, exam.id]);
+    } catch {
+      // ignore schema issues
+    }
+    exam.questions_count = actual;
+  }
+
   private static async loadStudentAttemptQuestions(
     exam: any,
     attempt: any,
     studentId: number,
   ): Promise<ExamQuestion[]> {
     const allQuestions = await this.loadExamQuestions(exam.id, true);
-    const storedIds = parseSelectedQuestionIds(attempt?.selected_question_ids);
-    const selectedIds =
-      storedIds && storedIds.length
-        ? storedIds
-        : selectAttemptQuestions(
-            allQuestions.map((q) => q.id),
-            exam.questions_count,
-            exam.question_display_mode,
-            attemptQuestionSeed(
-              Number(exam.id),
-              studentId,
-              Number(attempt?.attempt_number || 1),
-            ),
-          );
-    return orderItemsByIds(allQuestions, selectedIds);
+    const resolved = resolveAttemptQuestionIds({
+      bankQuestionIds: allQuestions.map((q) => Number(q.id)),
+      storedIds: parseSelectedQuestionIds(attempt?.selected_question_ids),
+      questionsCount: exam.questions_count,
+      mode: exam.question_display_mode,
+      seed: attemptQuestionSeed(
+        Number(exam.id),
+        studentId,
+        Number(attempt?.attempt_number || 1),
+      ),
+    });
+    if (resolved.expanded && attempt?.id) {
+      await pool.query(
+        `UPDATE exam_submissions
+         SET selected_question_ids = $1::int[]
+         WHERE id = $2 AND status = 'in_progress'`,
+        [resolved.questionIds, attempt.id],
+      ).catch(() => {
+        // selected_question_ids may be missing on older schemas
+      });
+      attempt.selected_question_ids = resolved.questionIds;
+    }
+    return orderItemsByIds(allQuestions, resolved.questionIds);
   }
 
   private static async loadExamQuestions(examId: number, forStudent?: boolean): Promise<ExamQuestion[]> {

@@ -113,6 +113,7 @@ export class CourseLevelExamQuestionsService {
         ? input.passageTitle.trim()
         : null;
 
+    const previousBankSize = await this.countExamQuestions(input.examId);
     const result = await pool.query(
       `INSERT INTO course_level_exam_questions (
         exam_id,
@@ -146,7 +147,21 @@ export class CourseLevelExamQuestionsService {
       ],
     );
 
+    await this.syncExamQuestionsCount(input.examId, previousBankSize);
     return result.rows[0];
+  }
+
+  private static async countExamQuestions(examId: number): Promise<number> {
+    const res = await pool.query(
+      `SELECT COUNT(*)::int AS count FROM course_level_exam_questions WHERE exam_id = $1`,
+      [examId],
+    );
+    return Number(res.rows[0]?.count || 0);
+  }
+
+  private static async syncExamQuestionsCount(examId: number, previousBankSize: number) {
+    const { CourseLevelExamsService } = await import('./courseLevelExams.js');
+    await CourseLevelExamsService.syncQuestionsCountAfterAdd(examId, previousBankSize);
   }
 
   /**
@@ -252,6 +267,7 @@ export class CourseLevelExamQuestionsService {
     }
     await this.verifyExamOwnership(examId, requester.id);
 
+    const previousBankSize = await this.countExamQuestions(examId);
     const created: any[] = [];
     for (const q of questions) {
       const questionText = (q.questionText || '').trim();
@@ -313,6 +329,7 @@ export class CourseLevelExamQuestionsService {
       );
       created.push(result.rows[0]);
     }
+    await this.syncExamQuestionsCount(examId, previousBankSize);
     return created;
   }
 
@@ -331,6 +348,7 @@ export class CourseLevelExamQuestionsService {
       throw new HttpError(400, 'At least one image is required');
     }
 
+    const previousBankSize = await this.countExamQuestions(examId);
     const insertedQuestions = [];
 
     for (const imageUrl of images) {
@@ -353,6 +371,7 @@ export class CourseLevelExamQuestionsService {
       insertedQuestions.push(result.rows[0]);
     }
 
+    await this.syncExamQuestionsCount(examId, previousBankSize);
     return insertedQuestions;
   }
 
