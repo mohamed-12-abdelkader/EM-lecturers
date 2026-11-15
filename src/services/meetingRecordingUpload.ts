@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import pool from '../db/pool';
-import { uploadToBunnyStream } from './bunny';
+import { uploadToBunnyStorage, uploadToBunnyStream } from './bunny';
 import { uploadToYouTube } from './uploadToYoutube';
 import { logger } from '../utils';
 
@@ -13,9 +13,12 @@ export type ProcessMeetingRecordingInput = {
   table: MeetingRecordingTable;
 };
 
-function resolveRecordingProvider(): 'bunny' | 'youtube' {
+function resolveRecordingProvider(): 'bunny' | 'bunny_stream' | 'youtube' {
   const raw = (process.env.MEETING_RECORDING_PROVIDER || 'bunny').trim().toLowerCase();
-  return raw === 'youtube' ? 'youtube' : 'bunny';
+  if (raw === 'youtube') return 'youtube';
+  // Default: original MP4 on Bunny Storage (no Stream re-encode quality loss).
+  if (raw === 'bunny_stream' || raw === 'stream') return 'bunny_stream';
+  return 'bunny';
 }
 
 async function saveRecordingUrl(
@@ -72,7 +75,7 @@ export async function processMeetingRecordingAfterEgress(
         privacyStatus: 'unlisted',
       });
       playbackUrl = `https://www.youtube.com/watch?v=${ytResponse.id}`;
-    } else {
+    } else if (provider === 'bunny_stream') {
       playbackUrl = await uploadToBunnyStream(
         {
           path: recordingFilePath,
@@ -85,6 +88,23 @@ export async function processMeetingRecordingAfterEgress(
           retryDelay: 3000,
           deleteSource: false,
           uploadTimeoutMs: 3_600_000,
+        },
+      );
+    } else {
+      // Original high-quality MP4 — avoids Bunny Stream re-encoding that softens text/code.
+      playbackUrl = await uploadToBunnyStorage(
+        {
+          path: recordingFilePath,
+          ext: 'mp4',
+          mime: 'video/mp4',
+          originalname: meetingTitle,
+        },
+        5,
+        3000,
+        {
+          deleteSource: false,
+          uploadTimeoutMs: 3_600_000,
+          subPath: 'meeting-recordings',
         },
       );
     }

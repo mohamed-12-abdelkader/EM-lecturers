@@ -64,9 +64,21 @@ export async function uploadToBunnyStorage(
   file: UploadFile,
   maxAttempts = 2,
   retryDelay = 0,
+  options?: {
+    deleteSource?: boolean;
+    uploadTimeoutMs?: number;
+    /** Optional folder prefix under MEDIA_PATH, e.g. "recordings" */
+    subPath?: string;
+  },
 ): Promise<string> {
+  const deleteSource = options?.deleteSource ?? true;
+  const uploadTimeoutMs = options?.uploadTimeoutMs ?? 3_600_000;
+  const subPath = String(options?.subPath || '')
+    .replace(/^\/+|\/+$/g, '')
+    .trim();
   const hash = generateHash(16) + '.' + file.ext;
-  const url = `https://storage.bunnycdn.com/${STORAGE_ZONE_NAME}/${MEDIA_PATH}/${hash}`;
+  const objectKey = subPath ? `${MEDIA_PATH}/${subPath}/${hash}` : `${MEDIA_PATH}/${hash}`;
+  const url = `https://storage.bunnycdn.com/${STORAGE_ZONE_NAME}/${objectKey}`;
 
   try {
     await retryRequest(
@@ -77,7 +89,7 @@ export async function uploadToBunnyStorage(
             AccessKey: BUNNY_ACCESS_KEY,
             'Content-Type': file.mime,
           },
-          timeout: 60000,
+          timeout: uploadTimeoutMs,
           maxContentLength: Infinity,
           maxBodyLength: Infinity,
         });
@@ -85,7 +97,7 @@ export async function uploadToBunnyStorage(
       maxAttempts,
       retryDelay,
     );
-    return `https://${PUBLIC_HOSTNAME}/${MEDIA_PATH}/${hash}`;
+    return `https://${PUBLIC_HOSTNAME}/${objectKey}`;
   } catch (error: any) {
     const detail =
       error?.response?.status != null
@@ -93,7 +105,7 @@ export async function uploadToBunnyStorage(
         : error?.message || 'unknown error';
     throw new Error(`Failed to upload to Bunny.net: ${detail}`);
   } finally {
-    if (file?.path) {
+    if (deleteSource && file?.path && fs.existsSync(file.path)) {
       fs.unlinkSync(file.path);
     }
   }

@@ -3,6 +3,7 @@ import path from 'node:path';
 import { exec } from 'node:child_process';
 import { promisify } from 'node:util';
 import {
+  AudioCodec,
   EgressClient,
   EncodedFileOutput,
   EncodingOptions,
@@ -144,18 +145,19 @@ export async function startMeetingRecordingSegment(
   if (meeting.title) egressParams.set('meetingTitle', meeting.title);
   if (teacherName) egressParams.set('teacherName', teacherName);
 
-  // Max-quality file encode only — does not change live WebRTC adaptive layers for viewers.
-  // Powerful host: prefer H.264 High + very high bitrate so screen-share/code stays sharp after save.
+  // High-quality file encode only — does not change live WebRTC adaptive layers for viewers.
+  // Keep bitrate strong but stable (20Mbps overloaded some egress workers and looked worse).
   const egressOpt: RoomCompositeOptions = {
     customBaseUrl: `${RECORDING_COMPOSITE_BASE_URL}?${egressParams.toString()}`,
     layout: 'grid',
     encodingOptions: new EncodingOptions({
       width: 1920,
       height: 1080,
-      framerate: 30, // 30fps keeps more bits per frame for sharp UI/text than 60
+      framerate: 30,
       videoCodec: VideoCodec.H264_HIGH,
-      videoBitrate: 20000, // kbps — archival-grade 1080p for lectures
-      audioBitrate: 256,
+      videoBitrate: 12000, // kbps — sharp 1080p master without encoder thrash
+      audioCodec: AudioCodec.AAC,
+      audioBitrate: 192,
       audioFrequency: 48000,
       keyFrameInterval: 2,
     }),
