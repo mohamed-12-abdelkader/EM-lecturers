@@ -7,6 +7,7 @@ import {
   EncodedFileOutput,
   EncodingOptions,
   RoomCompositeOptions,
+  VideoCodec,
   type RoomServiceClient,
 } from 'livekit-server-sdk';
 import pool from '../db/pool';
@@ -143,17 +144,20 @@ export async function startMeetingRecordingSegment(
   if (meeting.title) egressParams.set('meetingTitle', meeting.title);
   if (teacherName) egressParams.set('teacherName', teacherName);
 
-  // High-quality file encode only — does not change live WebRTC layers/bitrate for viewers.
-  // Default egress preset is 720p@3Mbps which looks soft on screen-share/code after save.
+  // Max-quality file encode only — does not change live WebRTC adaptive layers for viewers.
+  // Powerful host: prefer H.264 High + very high bitrate so screen-share/code stays sharp after save.
   const egressOpt: RoomCompositeOptions = {
     customBaseUrl: `${RECORDING_COMPOSITE_BASE_URL}?${egressParams.toString()}`,
     layout: 'grid',
     encodingOptions: new EncodingOptions({
       width: 1920,
       height: 1080,
-      framerate: 30,
-      videoBitrate: 10000, // kbps — sharper text/UI than 1080p preset (4500)
-      audioBitrate: 192,
+      framerate: 30, // 30fps keeps more bits per frame for sharp UI/text than 60
+      videoCodec: VideoCodec.H264_HIGH,
+      videoBitrate: 20000, // kbps — archival-grade 1080p for lectures
+      audioBitrate: 256,
+      audioFrequency: 48000,
+      keyFrameInterval: 2,
     }),
   };
 

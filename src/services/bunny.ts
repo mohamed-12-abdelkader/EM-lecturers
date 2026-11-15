@@ -133,7 +133,10 @@ export async function uploadToBunnyStream(
       },
     );
     const videoId = createResponse.data.guid;
-    const videoUploadUrl = `${STREAM_BASE}/${videoId}`;
+    // Prefer high renditions so Bunny keeps a sharp top tier from our 1080p master.
+    const videoUploadUrl = `${STREAM_BASE}/${videoId}?enabledResolutions=${encodeURIComponent(
+      '720p,1080p,1440p',
+    )}&enabledOutputCodecs=${encodeURIComponent('x264')}`;
 
     await retryRequest(
       async () => {
