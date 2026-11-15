@@ -7,9 +7,6 @@ const execPromise = promisify(exec);
 import {
   WebhookReceiver,
   RoomServiceClient,
-  EgressClient,
-  RoomCompositeOptions,
-  EncodedFileOutput,
 } from 'livekit-server-sdk';
 
 import { Router } from 'express';
@@ -30,9 +27,20 @@ import {
 } from '../middleware/meetings';
 import { canIssueScreenShareToken as canUserIssueScreenShareToken, generateParticipantToken, getParticipantsCount, resolveMeetingTeacherDisplay, sameUserId } from '../services/meetings-room-services';
 import {
-  processMeetingRecordingAfterEgress,
-  type MeetingRecordingTable,
-} from '../services/meetingRecordingUpload';
+  ensureInitialRecordingStarted,
+  finalizeMeetingRecording,
+  pauseMeetingRecording,
+  resumeMeetingRecording,
+  syncRecordingWithTeacherPresence,
+  uploadFinalizedMeetingRecording,
+} from '../services/meetingRecordingControl';
+import {
+  buildMeetingParticipantIdentity,
+  buildScreenShareIdentity,
+  normalizeMeetingDeviceId,
+  normalizeMeetingDeviceRole,
+  parseUserIdFromMeetingIdentity,
+} from '../services/meetingIdentity';
 import { enforceTeacherLiveCreationLimit } from '../services/teacherLivePackagePolicy';
 import { buildScreenShareAppInfo } from '../services/easAppClient';
 
@@ -41,49 +49,9 @@ const router = Router();
 const { LIVEKIT_API_KEY, LIVEKIT_API_SECRET, LIVEKIT_URL: LIVEKIT_SERVER_URL } = config;
 
 const roomService = new RoomServiceClient(LIVEKIT_SERVER_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET);
-const egressClient = new EgressClient(LIVEKIT_SERVER_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET);
 
-const RECORDING_COMPOSITE_BASE_URL =
-  process.env.LK_RECORDING_BASE_URL || 'https://lk-recording.next-edu.online';
-
-type MeetingEgressRow = { title: string; created_by: number };
-
-async function startMeetingRecordingEgress(
-  roomName: string,
-  meeting: MeetingEgressRow,
-): Promise<void> {
-  const egressToken = await generateParticipantToken({
-    roomName,
-    identity: `recorder_${Date.now()}`,
-    name: 'egress',
-    role: 'egress',
-    ttl: '8760h',
-  });
-
-  const outputFile = new EncodedFileOutput({
-    filepath: `/recordings/${roomName}.mp4`,
-  });
-
-  const { teacherName } = await resolveMeetingTeacherDisplay(meeting.created_by);
-
-  const egressParams = new URLSearchParams({
-    token: egressToken,
-    url: LIVEKIT_SERVER_URL,
-  });
-  if (meeting.title) {
-    egressParams.set('meetingTitle', meeting.title);
-  }
-  if (teacherName) {
-    egressParams.set('teacherName', teacherName);
-  }
-
-  const egressOpt: RoomCompositeOptions = {
-    customBaseUrl: `${RECORDING_COMPOSITE_BASE_URL}?${egressParams.toString()}`,
-    layout: 'grid',
-  };
-
-  await egressClient.startRoomCompositeEgress(roomName, outputFile, egressOpt);
-  console.log('[Meeting] Started recording egress for room:', roomName);
+async function startMeetingRecordingEgress(roomName: string): Promise<void> {
+  await ensureInitialRecordingStarted(roomName);
 }
 
 /**
@@ -186,12 +154,21 @@ router.delete(
 );
 
 // Close meeting room (كورس عادي أو جلسة مجموعة كورس عام)
+// body.saveLive=true → إنهاء وحفظ التسجيل نهائياً
+// body.saveLive=false → إيقاف مؤقت للتسجيل ثم إغلاق الغرفة (بدون دمج نهائي إن رغبت المنصة لاحقاً)
 router.post(
   '/:id/close',
   isMeetingOwnerOrAdminOrGroupManager,
   asyncWrapper(async (req, res) => {
     const { id } = req.params;
     const meetingSource = (req as any).meetingSource;
+    const saveLive = req.body?.saveLive !== false && req.body?.saveLive !== 'false';
+
+    if (saveLive) {
+      await finalizeMeetingRecording(id);
+    } else {
+      await pauseMeetingRecording(id);
+    }
 
     try {
       await roomService.deleteRoom(id);
@@ -205,7 +182,40 @@ router.post(
       await pool.query(`UPDATE meeting SET status = 'ended' WHERE id = $1`, [id]);
     }
 
-    res.json({ message: 'Meeting closed' });
+    res.json({
+      message: 'Meeting closed',
+      recordingFinalized: !!saveLive,
+    });
+  }),
+);
+
+// إيقاف مؤقت للتسجيل مع بقاء الغرفة
+router.post(
+  '/:id/recording/pause',
+  isMeetingOwnerOrAdminOrGroupManager,
+  asyncWrapper(async (req, res) => {
+    const result = await pauseMeetingRecording(req.params.id);
+    res.json({ message: result.paused ? 'Recording paused' : 'Nothing to pause', ...result });
+  }),
+);
+
+// استكمال التسجيل بعد الإيقاف المؤقت
+router.post(
+  '/:id/recording/resume',
+  isMeetingOwnerOrAdminOrGroupManager,
+  asyncWrapper(async (req, res) => {
+    const result = await resumeMeetingRecording(req.params.id);
+    res.json({ message: result.resumed ? 'Recording resumed' : 'Nothing to resume', ...result });
+  }),
+);
+
+// إنهاء وحفظ التسجيل نهائياً دون إغلاق الغرفة إجبارياً
+router.post(
+  '/:id/recording/finalize',
+  isMeetingOwnerOrAdminOrGroupManager,
+  asyncWrapper(async (req, res) => {
+    const result = await finalizeMeetingRecording(req.params.id);
+    res.json({ message: result.finalized ? 'Recording finalized' : 'Nothing to finalize', ...result });
   }),
 );
 
@@ -262,9 +272,10 @@ router.post(
 
     await roomService.removeParticipant(meetingId, participantId);
 
+    const kickedUserId = parseUserIdFromMeetingIdentity(participantId) ?? participantId;
     await pool.query(`INSERT INTO kicked_participants (meeting_id, user_id) VALUES ($1, $2)`, [
       meetingId,
-      participantId,
+      String(kickedUserId),
     ]);
 
     res.json({ message: 'Participant kicked successfully.' });
@@ -420,40 +431,72 @@ router.get(
       const participantName =
         (typeof req.query.name === 'string' && req.query.name.trim()) || user.name || 'Guest';
 
-      const participantIdentity = `user_${user.id}_meeting_${meetingId}`;
-
+      const deviceId = normalizeMeetingDeviceId(
+        req.query.deviceId ?? req.query.device_id ?? null,
+      );
+      const deviceRole = normalizeMeetingDeviceRole(
+        req.query.deviceRole ?? req.query.device_role ?? null,
+      );
       const hostRole = isOwner || canScreenShare;
 
+      // أجهزة المدرس المتعددة: هوية مستقلة لكل جهاز حتى لا يفصل LiveKit الجلسة السابقة
+      const participantIdentity = hostRole
+        ? buildMeetingParticipantIdentity({
+            userId: user.id,
+            meetingId,
+            deviceId,
+          })
+        : `user_${user.id}_meeting_${meetingId}`;
+
+      const canPublishMedia = hostRole && deviceRole !== 'observer';
       const participantToken = await generateParticipantToken({
         roomName: meetingId, // meeting.id is also the LiveKit room name
         identity: participantIdentity,
-        name: participantName,
+        name:
+          hostRole && deviceRole !== 'general'
+            ? `${participantName} (${deviceRole})`
+            : participantName,
         role: hostRole ? 'host' : 'participant',
         allowChat: (meeting as any).allow_chat !== false,
         metadata: JSON.stringify({
           avatar: user.avatar || null,
           role: hostRole ? 'host' : 'participant',
+          userId: user.id,
+          deviceId: hostRole ? deviceId : null,
+          deviceRole: hostRole ? deviceRole : null,
+          observer: hostRole && deviceRole === 'observer',
         }),
       });
 
       let screenShareToken: string | undefined;
       let screenShareApp: ReturnType<typeof buildScreenShareAppInfo> | undefined;
 
-      if (canScreenShare) {
+      if (canScreenShare && deviceRole !== 'observer') {
         screenShareApp = buildScreenShareAppInfo(req, meetingId);
         // الموقع يحتاج التوكن لفتح التطبيق. لا نمنع الإصدار بسبب غياب هيدر EAS.
         screenShareToken = await generateParticipantToken({
           roomName: meetingId,
-          identity: `${participantIdentity}_screenShare`,
+          identity: buildScreenShareIdentity(participantIdentity),
           name: participantName,
           role: 'host',
           ttl: '2h',
           metadata: JSON.stringify({
             role: 'host',
             hidden: true,
+            userId: user.id,
+            deviceId,
             easProjectId: screenShareApp.easProjectId,
           }),
         });
+      }
+
+      // إن عاد المدرس بعد إيقاف مؤقت للتسجيل — استكمل تلقائياً
+      if (hostRole) {
+        try {
+          await resumeMeetingRecording(meetingId);
+        } catch (resumeErr) {
+          console.warn('[Meeting] resume recording on connection failed:', resumeErr);
+        }
       }
 
       return res.json({
@@ -467,6 +510,10 @@ router.get(
         teacherIcon,
         participantName,
         isOwner: hostRole,
+        deviceId: hostRole ? deviceId : null,
+        deviceRole: hostRole ? deviceRole : null,
+        autoPublishMedia: canPublishMedia,
+        multiDeviceHost: !!hostRole,
       });
     } catch (err) {
       console.log('error', err);
@@ -729,9 +776,22 @@ router.post('/webhook', async (req, res) => {
 
       if (shouldStartEgress && startedMeeting) {
         console.log('[Meeting webhook] room_started → starting egress for', name);
-        await startMeetingRecordingEgress(name, startedMeeting);
+        await startMeetingRecordingEgress(name);
       } else {
         console.warn('Skipping egress restart for room (already claimed or ended):', name);
+      }
+    } else if (event.event === 'participant_joined' || event.event === 'participant_left') {
+      const roomName = event.room?.name;
+      const identity = event.participant?.identity;
+      if (roomName && identity) {
+        await syncRecordingWithTeacherPresence({
+          roomService,
+          roomName,
+          event: event.event === 'participant_joined' ? 'joined' : 'left',
+          identity,
+        }).catch((err) => {
+          console.warn('[Meeting webhook] teacher presence recording sync failed:', err);
+        });
       }
     } else if (event.event === 'room_finished') {
       const sid = event.room!.sid;
@@ -773,20 +833,26 @@ router.post('/webhook', async (req, res) => {
         return res.status(400).send('Room name missing');
       }
 
-      const recordingFilePath = `/recordings/${roomName}.mp4`;
+      // أثناء الإيقاف المؤقت لا نرفع/نُنهي — الرفع يحدث فقط بعد finalize
+      const meetingResult = await pool.query(
+        `SELECT title, recording_status FROM meeting WHERE id = $1 LIMIT 1`,
+        [roomName],
+      );
       let meetingTitle: string | null = null;
+      let recordingStatus = 'idle';
       let table: 'meeting' | 'general_course_group_meeting' = 'meeting';
 
-      const meetingResult = await pool.query(`SELECT title FROM meeting WHERE id = $1 LIMIT 1`, [roomName]);
       if (meetingResult.rowCount && meetingResult.rowCount > 0) {
         meetingTitle = meetingResult.rows[0].title;
+        recordingStatus = String(meetingResult.rows[0].recording_status || 'idle');
       } else {
         const groupResult = await pool.query(
-          `SELECT title FROM general_course_group_meeting WHERE id = $1 LIMIT 1`,
+          `SELECT title, recording_status FROM general_course_group_meeting WHERE id = $1 LIMIT 1`,
           [roomName],
         );
         if (groupResult.rowCount && groupResult.rowCount > 0) {
           meetingTitle = groupResult.rows[0].title;
+          recordingStatus = String(groupResult.rows[0].recording_status || 'idle');
           table = 'general_course_group_meeting';
         }
       }
@@ -796,15 +862,16 @@ router.post('/webhook', async (req, res) => {
         return res.status(404).send('Meeting not found');
       }
 
-      const recordingTable: MeetingRecordingTable = table;
-      void processMeetingRecordingAfterEgress({
-        roomName,
-        recordingFilePath,
-        meetingTitle,
-        table: recordingTable,
-      }).catch((uploadError) => {
+      if (recordingStatus === 'paused' || recordingStatus === 'recording') {
+        console.log('[Meeting webhook] egress_ended ignored during', recordingStatus, roomName);
+        return res.status(200).send('OK');
+      }
+
+      void uploadFinalizedMeetingRecording(roomName).catch((uploadError) => {
         console.error('Async meeting recording upload failed:', uploadError);
       });
+      void table;
+      void meetingTitle;
     }
     res.status(200).send('OK');
   } catch (err) {

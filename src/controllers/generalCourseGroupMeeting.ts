@@ -6,6 +6,13 @@ import pool from '../db/pool';
 import { config } from '../utils';
 import { z } from 'zod';
 import { canIssueScreenShareToken as canUserIssueScreenShareToken, generateParticipantToken, getParticipantsCount, resolveMeetingTeacherDisplay, sameUserId } from '../services/meetings-room-services';
+import {
+  buildMeetingParticipantIdentity,
+  buildScreenShareIdentity,
+  normalizeMeetingDeviceId,
+  normalizeMeetingDeviceRole,
+} from '../services/meetingIdentity';
+import { resumeMeetingRecording } from '../services/meetingRecordingControl';
 import { enforceTeacherLiveCreationLimit } from '../services/teacherLivePackagePolicy';
 import { buildScreenShareAppInfo } from '../services/easAppClient';
 
@@ -437,33 +444,58 @@ router.get(
 
     const participantName =
       (typeof req.query.name === 'string' && req.query.name.trim()) || (user as any).name || 'Guest';
-    const participantIdentity = `user_${user.id}_meeting_${meetingId}`;
+    const deviceId = normalizeMeetingDeviceId(req.query.deviceId ?? req.query.device_id ?? null);
+    const deviceRole = normalizeMeetingDeviceRole(req.query.deviceRole ?? req.query.device_role ?? null);
+    const participantIdentity = hostRole
+      ? buildMeetingParticipantIdentity({ userId: user.id, meetingId, deviceId })
+      : `user_${user.id}_meeting_${meetingId}`;
+    const canPublishMedia = hostRole && deviceRole !== 'observer';
 
     const participantToken = await generateParticipantToken({
       roomName: meetingId,
       identity: participantIdentity,
-      name: participantName,
+      name:
+        hostRole && deviceRole !== 'general'
+          ? `${participantName} (${deviceRole})`
+          : participantName,
       role: hostRole ? 'host' : 'participant',
       allowChat: meeting.allow_chat !== false,
-      metadata: JSON.stringify({ avatar: (user as any).avatar || null, role: hostRole ? 'host' : 'participant' }),
+      metadata: JSON.stringify({
+        avatar: (user as any).avatar || null,
+        role: hostRole ? 'host' : 'participant',
+        userId: user.id,
+        deviceId: hostRole ? deviceId : null,
+        deviceRole: hostRole ? deviceRole : null,
+        observer: hostRole && deviceRole === 'observer',
+      }),
     });
 
     let screenShareToken: string | undefined;
     let screenShareApp: ReturnType<typeof buildScreenShareAppInfo> | undefined;
-    if (canScreenShare) {
+    if (canScreenShare && deviceRole !== 'observer') {
       screenShareApp = buildScreenShareAppInfo(req, meetingId);
       screenShareToken = await generateParticipantToken({
         roomName: meetingId,
-        identity: `${participantIdentity}_screenShare`,
+        identity: buildScreenShareIdentity(participantIdentity),
         name: participantName,
         role: 'host',
         ttl: '2h',
         metadata: JSON.stringify({
           role: 'host',
           hidden: true,
+          userId: user.id,
+          deviceId,
           easProjectId: screenShareApp.easProjectId,
         }),
       });
+    }
+
+    if (hostRole) {
+      try {
+        await resumeMeetingRecording(meetingId);
+      } catch (resumeErr) {
+        console.warn('[GroupMeeting] resume recording on connection failed:', resumeErr);
+      }
     }
 
     res.json({
@@ -477,6 +509,10 @@ router.get(
       teacherIcon,
       participantName,
       isOwner: hostRole,
+      deviceId: hostRole ? deviceId : null,
+      deviceRole: hostRole ? deviceRole : null,
+      autoPublishMedia: canPublishMedia,
+      multiDeviceHost: !!hostRole,
     });
   }),
 );

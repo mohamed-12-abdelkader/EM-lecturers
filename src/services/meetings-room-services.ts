@@ -101,8 +101,18 @@ export async function canIssueScreenShareToken(params: {
 
 export const getParticipantsCount = async (roomName: string, roomService: any) => {
   try {
+    const { parseUserIdFromMeetingIdentity, isRecorderIdentity, isScreenShareIdentity } =
+      await import('./meetingIdentity.js');
     const participants = await roomService.listParticipants(roomName);
-    return participants.length;
+    // لا تحسب أجهزة المدرس المتعددة / مشاركة الشاشة / المسجّل كمستخدمين منفصلين في الإحصاء
+    const uniqueUsers = new Set<string>();
+    for (const p of participants) {
+      const identity = String(p.identity || '');
+      if (isRecorderIdentity(identity) || isScreenShareIdentity(identity)) continue;
+      const userId = parseUserIdFromMeetingIdentity(identity);
+      uniqueUsers.add(userId != null ? `u:${userId}` : `id:${identity}`);
+    }
+    return uniqueUsers.size;
   } catch {
     return null;
   }
