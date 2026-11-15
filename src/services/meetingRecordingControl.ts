@@ -5,6 +5,7 @@ import { promisify } from 'node:util';
 import {
   EgressClient,
   EncodedFileOutput,
+  EncodingOptions,
   RoomCompositeOptions,
   type RoomServiceClient,
 } from 'livekit-server-sdk';
@@ -142,9 +143,18 @@ export async function startMeetingRecordingSegment(
   if (meeting.title) egressParams.set('meetingTitle', meeting.title);
   if (teacherName) egressParams.set('teacherName', teacherName);
 
+  // High-quality file encode only — does not change live WebRTC layers/bitrate for viewers.
+  // Default egress preset is 720p@3Mbps which looks soft on screen-share/code after save.
   const egressOpt: RoomCompositeOptions = {
     customBaseUrl: `${RECORDING_COMPOSITE_BASE_URL}?${egressParams.toString()}`,
     layout: 'grid',
+    encodingOptions: new EncodingOptions({
+      width: 1920,
+      height: 1080,
+      framerate: 30,
+      videoBitrate: 10000, // kbps — sharper text/UI than 1080p preset (4500)
+      audioBitrate: 192,
+    }),
   };
 
   const info = await egressClient.startRoomCompositeEgress(roomName, outputFile, egressOpt);

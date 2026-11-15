@@ -1,8 +1,4 @@
 import fs from 'node:fs';
-import { exec } from 'node:child_process';
-import { promisify } from 'node:util';
-
-const execPromise = promisify(exec);
 
 import {
   WebhookReceiver,
@@ -328,37 +324,19 @@ router.get(
   }),
 );
 
-// Download recording (Teacher/Admin)
+// Download recording (Teacher/Admin) — always serve the original high-quality MP4
 router.get(
   '/:id/recording/download',
   isMeetingOwnerOrAdmin,
   asyncWrapper(async (req, res) => {
     const { id } = req.params;
     const recordingPath = `/recordings/${id}.mp4`;
-    const lowResPath = `/recordings/${id}_low.mp4`;
 
     if (!fs.existsSync(recordingPath)) {
       return res.status(404).json({ message: 'Recording not found' });
     }
 
-    // If compressed version doesn't exist, create it
-    if (!fs.existsSync(lowResPath)) {
-      try {
-        console.log(`Starting compression for ${id}...`);
-        // -crf 28 is a good balance for size/quality
-        // -preset faster makes it reasonably quick
-        await execPromise(
-          `ffmpeg -i "${recordingPath}" -vcodec libx264 -crf 28 -preset faster -acodec aac -b:a 128k "${lowResPath}"`,
-        );
-        console.log(`Compression finished for ${id}`);
-      } catch (err) {
-        console.error('Compression error:', err);
-        // If compression fails, fallback to original
-        return res.download(recordingPath, `recording-${id}.mp4`);
-      }
-    }
-
-    res.download(lowResPath, `recording-${id}-low.mp4`);
+    res.download(recordingPath, `recording-${id}.mp4`);
   }),
 );
 
