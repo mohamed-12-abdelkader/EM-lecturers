@@ -211,6 +211,9 @@ export function getCorsOriginDelegate(): CorsOptionsDelegate<Request> {
         'X-Tenant-Subdomain',
         'X-Access-Token',
         'ngrok-skip-browser-warning',
+        // بعض العملاء يرسلونهم مع cache: no-store؛ لازم يمرّوا في preflight
+        'Cache-Control',
+        'Pragma',
       ],
       exposedHeaders: [
         'X-Access-Token',
