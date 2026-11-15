@@ -492,6 +492,9 @@ router.get(
     const bundle = await TenantService.getPublicBundle(subdomain);
     if (!bundle) return res.status(404).json({ success: false, code: 'TENANT_NOT_FOUND' });
 
+    // لازم يتحدّث فور تغيير landing.layout — منع 304/كاش المتصفح
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+    res.setHeader('Pragma', 'no-cache');
     res.json({ success: true, data: bundle });
   }),
 );

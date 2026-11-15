@@ -9,13 +9,24 @@ import { SeoHooks } from './seo/hooks';
 import { TenantSitemapService } from './seo/sitemap';
 import { seoCacheDeletePrefix } from './seo/cache';
 
-const TENANT_LANDING_LAYOUTS = new Set(['bento', 'editorial', 'nocturne', 'horizon']);
+/** التصاميم المتاحة للاختيار عند إنشاء/تعديل منصة المدرس */
+const TENANT_LANDING_LAYOUTS = new Set(['navy', 'ember', 'sky', 'bento']);
+
+/** توافق خلفي مع أسماء التصاميم القديمة */
+const TENANT_LANDING_LAYOUT_ALIASES: Record<string, string> = {
+  editorial: 'ember',
+  nocturne: 'navy',
+  horizon: 'sky',
+};
 
 /** يحفظ تصميم اللاندينج المختار عند الإنشاء أو التعديل، ويرفض قيمة غير معروفة. */
 function withValidLandingLayout<T extends Record<string, unknown>>(page: T): T {
-  if (page.layout == null || page.layout === '') return page;
-  const raw = String(page.layout).trim().toLowerCase();
-  return { ...page, layout: TENANT_LANDING_LAYOUTS.has(raw) ? raw : 'bento' };
+  const raw =
+    page.layout == null || page.layout === ''
+      ? 'sky'
+      : String(page.layout).trim().toLowerCase();
+  const mapped = TENANT_LANDING_LAYOUT_ALIASES[raw] || raw;
+  return { ...page, layout: TENANT_LANDING_LAYOUTS.has(mapped) ? mapped : 'sky' };
 }
 
 function buildArchivedSubdomain(tenantId: number, currentSubdomain: string): string {
