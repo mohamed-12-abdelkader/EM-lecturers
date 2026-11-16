@@ -42,6 +42,11 @@ import { CourseGroupAccessService } from './courseGroupAccess';
 import { TeacherReadingPassagesService } from './teacherReadingPassages';
 import { normalizeStudentCodeInput } from './teacherManagedStudents';
 import { EssayReviewService } from './essayReview';
+import {
+  isCourseExamPointsEnabled,
+  normalizeCourseExamPointsAttemptMode,
+  resolveCourseExamPointsAttempt,
+} from './courseExamPointsPolicy';
 
 interface RequestUser {
   id: number;
@@ -70,6 +75,12 @@ interface CreateCourseLevelExamInput {
   timingMode?: 'relative' | 'fixed' | null;
   audienceType?: 'all' | 'groups';
   groupIds?: number[];
+  /** When false, this exam awards no points. Default true. */
+  pointsEnabled?: boolean;
+  /** Which attempt feeds EXAM_SCORE: first | last | highest | second */
+  pointsAttemptMode?: string;
+  /** After exam ends, allow completing unanswered questions on the submitted attempt */
+  allowUnansweredCompletion?: boolean;
 }
 
 interface UpdateCourseLevelExamInput {
@@ -91,6 +102,9 @@ interface UpdateCourseLevelExamInput {
   timingMode?: 'relative' | 'fixed' | null;
   audienceType?: 'all' | 'groups';
   groupIds?: number[];
+  pointsEnabled?: boolean;
+  pointsAttemptMode?: string;
+  allowUnansweredCompletion?: boolean;
 }
 
 export class CourseLevelExamsService {
@@ -199,9 +213,12 @@ export class CourseLevelExamsService {
         answers_release_mode,
         show_answers_after_hours,
         timing_mode,
-        audience_type
+        audience_type,
+        points_enabled,
+        points_attempt_mode,
+        allow_unanswered_completion
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
       RETURNING *`,
       [
         courseId,
@@ -224,6 +241,9 @@ export class CourseLevelExamsService {
         releaseFlags.showAnswersAfterHours,
         timingMode,
         audienceType,
+        input.pointsEnabled !== false,
+        normalizeCourseExamPointsAttemptMode(input.pointsAttemptMode),
+        input.allowUnansweredCompletion === true,
       ],
     );
 
@@ -381,6 +401,12 @@ export class CourseLevelExamsService {
       answersVisibleAt: row.answers_visible_at,
       isActive: row.is_active,
       attemptLimit: row.attempt_limit,
+      pointsEnabled: row.points_enabled !== false,
+      pointsAttemptMode: normalizeCourseExamPointsAttemptMode(row.points_attempt_mode),
+      points_enabled: row.points_enabled !== false,
+      points_attempt_mode: normalizeCourseExamPointsAttemptMode(row.points_attempt_mode),
+      allowUnansweredCompletion: row.allow_unanswered_completion === true,
+      allow_unanswered_completion: row.allow_unanswered_completion === true,
       submissionsCount: row.submissions_count,
       studentsAttemptedCount: row.students_attempted_count,
       createdAt: row.created_at,
@@ -412,6 +438,12 @@ export class CourseLevelExamsService {
       answersVisibleAt: row.answers_visible_at,
       isActive: row.is_active,
       attemptLimit: row.attempt_limit,
+      pointsEnabled: row.points_enabled !== false,
+      pointsAttemptMode: normalizeCourseExamPointsAttemptMode(row.points_attempt_mode),
+      points_enabled: row.points_enabled !== false,
+      points_attempt_mode: normalizeCourseExamPointsAttemptMode(row.points_attempt_mode),
+      allowUnansweredCompletion: row.allow_unanswered_completion === true,
+      allow_unanswered_completion: row.allow_unanswered_completion === true,
       timingMode: row.timing_mode ?? null,
       timing_mode: row.timing_mode ?? null,
       audienceType: row.audience_type || 'all',
@@ -616,6 +648,18 @@ export class CourseLevelExamsService {
     if (input.attemptLimit !== undefined) {
       updates.push(`attempt_limit = $${paramIndex++}`);
       values.push(input.attemptLimit);
+    }
+    if (input.pointsEnabled !== undefined) {
+      updates.push(`points_enabled = $${paramIndex++}`);
+      values.push(!!input.pointsEnabled);
+    }
+    if (input.pointsAttemptMode !== undefined) {
+      updates.push(`points_attempt_mode = $${paramIndex++}`);
+      values.push(normalizeCourseExamPointsAttemptMode(input.pointsAttemptMode));
+    }
+    if (input.allowUnansweredCompletion !== undefined) {
+      updates.push(`allow_unanswered_completion = $${paramIndex++}`);
+      values.push(!!input.allowUnansweredCompletion);
     }
     if (input.timingMode !== undefined) {
       updates.push(`timing_mode = $${paramIndex++}`);
@@ -1128,6 +1172,7 @@ export class CourseLevelExamsService {
     studentId: number,
   ) {
     try {
+      if (!isCourseExamPointsEnabled(exam)) return;
       const teacherId =
         exam.teacher_id != null
           ? Number(exam.teacher_id)
@@ -1157,27 +1202,55 @@ export class CourseLevelExamsService {
     options: { syncExisting?: boolean } = {},
   ): Promise<{ awarded: boolean; points: number; reason?: string } | null> {
     try {
+      if (!isCourseExamPointsEnabled(exam)) {
+        return { awarded: false, points: 0, reason: 'exam_points_disabled' };
+      }
       const teacherId =
         exam.teacher_id != null
           ? Number(exam.teacher_id)
           : await TeacherPointsService.resolveTeacherIdForCourse(Number(exam.course_id));
       if (!teacherId) return null;
+
+      const mode = normalizeCourseExamPointsAttemptMode(exam.points_attempt_mode);
+      const selected = await resolveCourseExamPointsAttempt({
+        examId: Number(exam.id),
+        studentId,
+        mode,
+      });
+      // Prefer resolved attempt; fall back to the just-submitted attempt if needed.
+      const scoringAttempt = selected ?? {
+        id: Number(attempt.id),
+        attempt_number: Number(attempt.attempt_number) || 1,
+        obtained_grade: obtainedGrade,
+        total_grade: totalGrade,
+        submitted_at: null,
+      };
       const scoreOpts = {
         studentId,
         teacherId,
         courseId: exam.course_id != null ? Number(exam.course_id) : null,
-        attemptId: Number(attempt.id),
+        attemptId: Number(scoringAttempt.id),
         examId: Number(exam.id),
         isAssignment: false as const,
         examKind: 'course' as const,
-        obtainedGrade,
-        totalGrade,
+        obtainedGrade: Math.max(0, Number(scoringAttempt.obtained_grade ?? obtainedGrade) || 0),
+        totalGrade: Math.max(
+          0,
+          Number(scoringAttempt.total_grade ?? totalGrade) || 0,
+        ),
         title: exam.title ?? null,
       };
+
       if (options.syncExisting) {
         return TeacherPointsService.syncExamOrAssignmentScore(scoreOpts);
       }
-      return TeacherPointsService.awardExamOrAssignmentScore(scoreOpts);
+
+      // One record per student/exam: create on first award, update on later attempts.
+      const awarded = await TeacherPointsService.awardExamOrAssignmentScore(scoreOpts);
+      if (awarded.reason === 'duplicate') {
+        return TeacherPointsService.syncExamOrAssignmentScore(scoreOpts);
+      }
+      return awarded;
     } catch (error) {
       console.error('Error awarding course exam score points:', error);
       return null;
@@ -1191,6 +1264,7 @@ export class CourseLevelExamsService {
   ) {
     const res = await pool.query(
       `SELECT a.id, a.student_id, e.id AS exam_id, e.title, e.course_id,
+              e.points_enabled, e.points_attempt_mode,
               COALESCE(e.teacher_id, c.teacher_id) AS teacher_id
        FROM course_level_exam_attempts a
        JOIN course_level_exams e ON e.id = a.exam_id
@@ -1206,6 +1280,8 @@ export class CourseLevelExamsService {
         course_id: row.course_id,
         teacher_id: row.teacher_id,
         title: row.title,
+        points_enabled: row.points_enabled,
+        points_attempt_mode: row.points_attempt_mode,
       },
       { id: attemptId },
       Number(row.student_id),
@@ -2115,6 +2191,336 @@ export class CourseLevelExamsService {
     };
   }
 
+  private static isExamEndedForUnansweredCompletion(exam: any, now = new Date()): boolean {
+    const status = getStudentExamAvailability(courseLevelExamAvailabilityInput(exam), now);
+    return status === 'expired';
+  }
+
+  private static async loadLatestSubmittedAttempt(examId: number, studentId: number) {
+    const res = await pool.query(
+      `SELECT *
+       FROM course_level_exam_attempts
+       WHERE exam_id = $1 AND student_id = $2 AND status = 'submitted'
+       ORDER BY attempt_number DESC, id DESC
+       LIMIT 1`,
+      [examId, studentId],
+    );
+    return res.rowCount ? res.rows[0] : null;
+  }
+
+  private static async listUnansweredQuestionIdsForAttempt(
+    exam: any,
+    attempt: any,
+    studentId: number,
+  ): Promise<number[]> {
+    const questions = await this.loadAttemptQuestions(exam, attempt, studentId);
+    if (!questions.length) return [];
+
+    const answersRes = await pool.query(
+      `SELECT question_id, selected_answer, answer_text, answer_images
+       FROM course_level_exam_answers
+       WHERE attempt_id = $1`,
+      [attempt.id],
+    );
+    const byQuestion = new Map<number, any>();
+    for (const row of answersRes.rows) {
+      byQuestion.set(Number(row.question_id), row);
+    }
+
+    const unanswered: number[] = [];
+    for (const question of questions) {
+      const qid = Number(question.id);
+      const row = byQuestion.get(qid);
+      const isEssay = String(question.type || '').toUpperCase() === 'ESSAY';
+      if (isEssay) {
+        const text = String(row?.answer_text || '').trim();
+        const images = Array.isArray(row?.answer_images) ? row.answer_images : [];
+        if (!text && images.length === 0) unanswered.push(qid);
+        continue;
+      }
+      if (!row?.selected_answer) unanswered.push(qid);
+    }
+    return unanswered;
+  }
+
+  private static async computeUnansweredCompletionFlags(
+    exam: any,
+    studentId: number,
+    now = new Date(),
+  ): Promise<{
+    allow_unanswered_completion: boolean;
+    can_complete_unanswered: boolean;
+    unanswered_count: number;
+    unanswered_completion_open: boolean;
+    unanswered_completion_attempt_id: number | null;
+  }> {
+    const allow = exam.allow_unanswered_completion === true;
+    const empty = {
+      allow_unanswered_completion: allow,
+      can_complete_unanswered: false,
+      unanswered_count: 0,
+      unanswered_completion_open: false,
+      unanswered_completion_attempt_id: null as number | null,
+    };
+    if (!allow) return empty;
+
+    const attempt = await this.loadLatestSubmittedAttempt(Number(exam.id), studentId);
+    if (!attempt) return empty;
+
+    const open =
+      !!attempt.unanswered_completion_opened_at &&
+      !attempt.unanswered_completion_submitted_at;
+    let unansweredIds: number[] = [];
+    if (
+      open &&
+      Array.isArray(attempt.unanswered_completion_question_ids) &&
+      attempt.unanswered_completion_question_ids.length
+    ) {
+      unansweredIds = attempt.unanswered_completion_question_ids.map(Number);
+    } else {
+      unansweredIds = await this.listUnansweredQuestionIdsForAttempt(exam, attempt, studentId);
+    }
+
+    const ended = this.isExamEndedForUnansweredCompletion(exam, now);
+    const canComplete =
+      unansweredIds.length > 0 && (open || ended);
+
+    return {
+      allow_unanswered_completion: true,
+      can_complete_unanswered: canComplete,
+      unanswered_count: unansweredIds.length,
+      unanswered_completion_open: open,
+      unanswered_completion_attempt_id: canComplete ? Number(attempt.id) : null,
+    };
+  }
+
+  static async startUnansweredCompletion(examId: number, studentId: number) {
+    const examRes = await pool.query(`SELECT * FROM course_level_exams WHERE id = $1`, [examId]);
+    if (!examRes.rowCount) throw new HttpError(404, 'Exam not found');
+    const exam = examRes.rows[0];
+
+    if (exam.allow_unanswered_completion !== true) {
+      throw new HttpError(403, 'المدرس لم يسمح باستكمال الأسئلة المتروكة لهذا الامتحان');
+    }
+
+    const now = new Date();
+    const attempt = await this.loadLatestSubmittedAttempt(examId, studentId);
+    if (!attempt) {
+      throw new HttpError(400, 'لا توجد محاولة مُسلَّمة لاستكمال الأسئلة المتروكة');
+    }
+
+    const alreadyOpen =
+      !!attempt.unanswered_completion_opened_at &&
+      !attempt.unanswered_completion_submitted_at;
+
+    if (!alreadyOpen && !this.isExamEndedForUnansweredCompletion(exam, now)) {
+      throw new HttpError(403, 'استكمال الأسئلة المتروكة متاح بعد انتهاء الامتحان فقط');
+    }
+
+    let unansweredIds = alreadyOpen && Array.isArray(attempt.unanswered_completion_question_ids)
+      ? attempt.unanswered_completion_question_ids.map(Number)
+      : await this.listUnansweredQuestionIdsForAttempt(exam, attempt, studentId);
+
+    // Re-open after a previous completion if new unanswered still exist.
+    if (!alreadyOpen) {
+      unansweredIds = await this.listUnansweredQuestionIdsForAttempt(exam, attempt, studentId);
+    }
+
+    if (!unansweredIds.length) {
+      throw new HttpError(400, 'لا توجد أسئلة متروكة لاستكمالها');
+    }
+
+    if (!alreadyOpen) {
+      await pool.query(
+        `UPDATE course_level_exam_attempts
+         SET unanswered_completion_opened_at = NOW(),
+             unanswered_completion_submitted_at = NULL,
+             unanswered_completion_question_ids = $1::int[]
+         WHERE id = $2`,
+        [unansweredIds, attempt.id],
+      );
+      attempt.unanswered_completion_opened_at = now;
+      attempt.unanswered_completion_submitted_at = null;
+      attempt.unanswered_completion_question_ids = unansweredIds;
+    }
+
+    const allQuestions = await this.loadAttemptQuestions(exam, attempt, studentId);
+    const allowed = new Set(unansweredIds.map(Number));
+    const questions = allQuestions
+      .filter((q) => allowed.has(Number(q.id)))
+      .map((q) => this.mapCourseQuestionForStudent(q));
+
+    const savedObjective = (await this.loadSavedAnswersForStudent(Number(attempt.id))).filter(
+      (row) => allowed.has(Number(row.questionId)),
+    );
+    const savedEssays = (await this.loadSavedEssayDrafts(Number(attempt.id))).filter((row) =>
+      allowed.has(Number(row.questionId)),
+    );
+
+    return {
+      attemptId: Number(attempt.id),
+      examId: Number(exam.id),
+      examTitle: exam.title,
+      completionMode: true,
+      completion_mode: true,
+      durationMinutes: null,
+      durationUnlimited: true,
+      duration_unlimited: true,
+      questionsCount: questions.length,
+      unansweredCount: questions.length,
+      baseObtainedGrade: Number(attempt.obtained_grade ?? 0),
+      baseTotalGrade: Number(attempt.total_grade ?? 0),
+      startedAt: attempt.unanswered_completion_opened_at || now.toISOString(),
+      attemptExpiresAt: null,
+      remainingSeconds: null,
+      resumed: alreadyOpen,
+      questions,
+      savedAnswers: [...savedObjective, ...savedEssays],
+      serverNow: now.toISOString(),
+    };
+  }
+
+  static async autosaveUnansweredCompletion(
+    examId: number,
+    studentId: number,
+    answers: CourseExamAnswer[],
+    attemptId?: number,
+  ) {
+    const attempt = await this.loadLatestSubmittedAttempt(examId, studentId);
+    if (!attempt) throw new HttpError(404, 'Attempt not found');
+    if (attemptId != null && Number(attemptId) !== Number(attempt.id)) {
+      throw new HttpError(400, 'Attempt mismatch');
+    }
+    if (!attempt.unanswered_completion_opened_at || attempt.unanswered_completion_submitted_at) {
+      throw new HttpError(403, 'جلسة استكمال الأسئلة المتروكة غير مفتوحة');
+    }
+
+    const allowedIds = Array.isArray(attempt.unanswered_completion_question_ids)
+      ? attempt.unanswered_completion_question_ids.map(Number)
+      : [];
+    const allowed = new Set(allowedIds);
+    const valid = answers.filter((a) => allowed.has(Number(a.questionId)));
+
+    const examRes = await pool.query(`SELECT * FROM course_level_exams WHERE id = $1`, [examId]);
+    const exam = examRes.rows[0];
+    const questions = (await this.loadAttemptQuestions(exam, attempt, studentId)).filter((q) =>
+      allowed.has(Number(q.id)),
+    );
+    const correctByQuestionId = this.buildCorrectByQuestionId(
+      questions.filter((q) => String(q.type || '').toUpperCase() !== 'ESSAY'),
+    );
+
+    await this.upsertAttemptAnswers(Number(attempt.id), valid, correctByQuestionId);
+    const essayQuestions = questions.filter((q) => String(q.type || '').toUpperCase() === 'ESSAY');
+    await EssayReviewService.persistCourseDrafts(
+      Number(attempt.id),
+      essayQuestions.map((q) => ({ id: Number(q.id) })),
+      valid.filter((answer) => answer.essay),
+    );
+    await pool.query(
+      `UPDATE course_level_exam_attempts SET last_autosave_at = NOW() WHERE id = $1`,
+      [attempt.id],
+    );
+
+    return {
+      attemptId: Number(attempt.id),
+      autosaved: true,
+      completionMode: true,
+      savedCount: valid.length,
+      remainingSeconds: null,
+      attemptExpiresAt: null,
+      durationUnlimited: true,
+    };
+  }
+
+  static async submitUnansweredCompletion(
+    examId: number,
+    studentId: number,
+    attemptId: number,
+    answers: CourseExamAnswer[],
+  ) {
+    const attempt = await this.loadLatestSubmittedAttempt(examId, studentId);
+    if (!attempt || Number(attempt.id) !== Number(attemptId)) {
+      throw new HttpError(404, 'Attempt not found');
+    }
+    if (!attempt.unanswered_completion_opened_at || attempt.unanswered_completion_submitted_at) {
+      throw new HttpError(403, 'جلسة استكمال الأسئلة المتروكة غير مفتوحة');
+    }
+
+    const allowedIds = Array.isArray(attempt.unanswered_completion_question_ids)
+      ? attempt.unanswered_completion_question_ids.map(Number)
+      : [];
+    const allowed = new Set(allowedIds);
+    const valid = answers.filter((a) => allowed.has(Number(a.questionId)));
+
+    const examRes = await pool.query(`SELECT * FROM course_level_exams WHERE id = $1`, [examId]);
+    if (!examRes.rowCount) throw new HttpError(404, 'Exam not found');
+    const exam = examRes.rows[0];
+
+    const questions = (await this.loadAttemptQuestions(exam, attempt, studentId)).filter((q) =>
+      allowed.has(Number(q.id)),
+    );
+    const essayIds = new Set(
+      questions
+        .filter((q) => String(q.type || '').toUpperCase() === 'ESSAY')
+        .map((q) => Number(q.id)),
+    );
+    const objectiveQuestions = questions.filter((q) => !essayIds.has(Number(q.id)));
+    const correctByQuestionId = this.buildCorrectByQuestionId(objectiveQuestions);
+    const graded = gradeCourseAttemptAnswers({
+      questionIds: objectiveQuestions.map((q) => Number(q.id)),
+      correctByQuestionId,
+      answers: valid.filter((answer) => !essayIds.has(Number(answer.questionId))),
+    });
+
+    await this.upsertAttemptAnswers(
+      Number(attempt.id),
+      graded.results.map((row) => ({
+        questionId: row.questionId,
+        selectedAnswer: row.selectedAnswer,
+      })),
+      correctByQuestionId,
+    );
+    await EssayReviewService.persistCourseDrafts(
+      Number(attempt.id),
+      [...essayIds].map((id) => ({ id })),
+      valid.filter((answer) => answer.essay),
+    );
+
+    const totals = await EssayReviewService.recomputeCourseAttempt(Number(attempt.id), {
+      syncPoints: true,
+    });
+
+    await pool.query(
+      `UPDATE course_level_exam_attempts
+       SET unanswered_completion_submitted_at = NOW(),
+           unanswered_completion_opened_at = unanswered_completion_opened_at
+       WHERE id = $1`,
+      [attempt.id],
+    );
+
+    // Keep points in sync with exam attempt-mode settings.
+    await this.maybeAwardCourseExamScorePoints(
+      exam,
+      attempt,
+      studentId,
+      totals.obtained,
+      totals.max,
+      { syncExisting: true },
+    );
+
+    return {
+      attemptId: Number(attempt.id),
+      completionMode: true,
+      totalGrade: totals.obtained,
+      maxGrade: totals.max,
+      correctCount: graded.correctCount,
+      timedOut: false,
+      showAnswers: false,
+      submittedAt: new Date().toISOString(),
+    };
+  }
+
   /**
    * Get visible exams for a student in a course
    */
@@ -2198,6 +2604,11 @@ export class CourseLevelExamsService {
         const canStartNew =
           canStudentStartExam(courseLevelExamAvailabilityInput(exam), now) || lateBypass;
         const inProgressExpireAt = attemptsRes.rows[0]?.in_progress_expire_at ?? null;
+        const unansweredFlags = await this.computeUnansweredCompletionFlags(
+          exam,
+          studentId,
+          now,
+        );
 
         return {
           ...exam,
@@ -2226,6 +2637,7 @@ export class CourseLevelExamsService {
             exam.attempt_limit === null
               ? null
               : Math.max(0, exam.attempt_limit - attemptsCount),
+          ...unansweredFlags,
         };
       }),
     );
@@ -2346,6 +2758,11 @@ export class CourseLevelExamsService {
         const canStartNew =
           canStudentStartExam(courseLevelExamAvailabilityInput(exam), now) || lateBypass;
         const inProgressExpireAt = attemptsRes.rows[0]?.in_progress_expire_at ?? null;
+        const unansweredFlags = await this.computeUnansweredCompletionFlags(
+          exam,
+          studentId,
+          now,
+        );
 
         return {
           ...exam,
@@ -2369,6 +2786,7 @@ export class CourseLevelExamsService {
             exam.attempt_limit === null
               ? null
               : Math.max(0, exam.attempt_limit - attemptsCount),
+          ...unansweredFlags,
         };
       }),
     );

@@ -28,6 +28,7 @@ import {
   pauseMeetingRecording,
   resumeMeetingRecording,
   syncRecordingWithTeacherPresence,
+  syncRecordingWithTeacherTracks,
   uploadFinalizedMeetingRecording,
 } from '../services/meetingRecordingControl';
 import {
@@ -324,7 +325,7 @@ router.get(
   }),
 );
 
-// Download recording (Teacher/Admin) — always serve the original high-quality MP4
+// Download recording (Teacher/Admin) — original track-composite master MP4 (no post-save recompress)
 router.get(
   '/:id/recording/download',
   isMeetingOwnerOrAdmin,
@@ -336,6 +337,7 @@ router.get(
       return res.status(404).json({ message: 'Recording not found' });
     }
 
+    res.setHeader('Cache-Control', 'no-store');
     res.download(recordingPath, `recording-${id}.mp4`);
   }),
 );
@@ -770,6 +772,27 @@ router.post('/webhook', async (req, res) => {
         }).catch((err) => {
           console.warn('[Meeting webhook] teacher presence recording sync failed:', err);
         });
+      }
+    } else if (event.event === 'track_published' || event.event === 'track_unpublished') {
+      // Switch recording to screen-share (or back to camera) without browser composite.
+      const roomName = event.room?.name;
+      const identity = event.participant?.identity;
+      const trackSource = (event as any).track?.source ?? (event as any).trackSource;
+      if (roomName && identity) {
+        await syncRecordingWithTeacherTracks({
+          roomName,
+          identity,
+          event: event.event === 'track_published' ? 'published' : 'unpublished',
+          trackSource,
+        }).catch((err) => {
+          console.warn('[Meeting webhook] teacher track recording sync failed:', err);
+        });
+        // First camera/mic publish after room_started may have deferred recording.
+        if (event.event === 'track_published') {
+          await ensureInitialRecordingStarted(roomName).catch((err) => {
+            console.warn('[Meeting webhook] deferred recording start failed:', err);
+          });
+        }
       }
     } else if (event.event === 'room_finished') {
       const sid = event.room!.sid;

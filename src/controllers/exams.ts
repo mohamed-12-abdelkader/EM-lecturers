@@ -312,6 +312,26 @@ router.post(
         }
       }
 
+      const pointsEnabledInput = parseBooleanInput(
+        pickBodyValue(req.body, 'pointsEnabled', 'points_enabled'),
+      );
+      const pointsEnabled = pointsEnabledInput ?? true;
+      const rawPointsAttemptMode = pickBodyValue(
+        req.body,
+        'pointsAttemptMode',
+        'points_attempt_mode',
+      );
+      const pointsAttemptMode =
+        rawPointsAttemptMode === undefined ||
+        rawPointsAttemptMode === null ||
+        rawPointsAttemptMode === ''
+          ? 'first'
+          : String(rawPointsAttemptMode);
+      const allowUnansweredCompletion =
+        parseBooleanInput(
+          pickBodyValue(req.body, 'allowUnansweredCompletion', 'allow_unanswered_completion'),
+        ) ?? false;
+
       const timingModeRaw = pickBodyValue(req.body, 'timingMode', 'timing_mode');
       const timingMode =
         timingModeRaw === undefined || timingModeRaw === null || timingModeRaw === ''
@@ -346,6 +366,9 @@ router.post(
         showAnswersAfterHours,
         isActive,
         attemptLimit,
+        pointsEnabled,
+        pointsAttemptMode,
+        allowUnansweredCompletion,
         questionDisplayMode: normalizeQuestionDisplayMode(questionDisplayMode),
         timingMode,
         audienceType: audienceType ?? 'all',
@@ -935,6 +958,46 @@ router.patch(
           throw new HttpError(400, 'attemptLimit must be a positive integer or null');
         }
       }
+    }
+
+    if (req.body.pointsEnabled !== undefined || req.body.points_enabled !== undefined) {
+      const pointsEnabled = parseBooleanInput(
+        pickBodyValue(req.body, 'pointsEnabled', 'points_enabled'),
+      );
+      if (pointsEnabled === undefined) {
+        throw new HttpError(400, 'pointsEnabled must be a boolean');
+      }
+      updateData.pointsEnabled = pointsEnabled;
+    }
+
+    if (
+      req.body.pointsAttemptMode !== undefined ||
+      req.body.points_attempt_mode !== undefined
+    ) {
+      const rawMode = pickBodyValue(req.body, 'pointsAttemptMode', 'points_attempt_mode');
+      const mode = String(rawMode ?? '')
+        .trim()
+        .toLowerCase();
+      if (!['first', 'last', 'highest', 'second'].includes(mode)) {
+        throw new HttpError(
+          400,
+          'pointsAttemptMode must be one of: first, last, highest, second',
+        );
+      }
+      updateData.pointsAttemptMode = mode;
+    }
+
+    if (
+      req.body.allowUnansweredCompletion !== undefined ||
+      req.body.allow_unanswered_completion !== undefined
+    ) {
+      const allowUnansweredCompletion = parseBooleanInput(
+        pickBodyValue(req.body, 'allowUnansweredCompletion', 'allow_unanswered_completion'),
+      );
+      if (allowUnansweredCompletion === undefined) {
+        throw new HttpError(400, 'allowUnansweredCompletion must be a boolean');
+      }
+      updateData.allowUnansweredCompletion = allowUnansweredCompletion;
     }
 
     if (req.body.timingMode !== undefined || req.body.timing_mode !== undefined) {
@@ -2114,6 +2177,71 @@ router.post(
       }
       throw error;
     }
+  }),
+);
+
+// POST /api/exams/:examId/unanswered-completion/start
+router.post(
+  '/:examId/unanswered-completion/start',
+  authMiddleware(['student']),
+  asyncWrapper(async (req, res) => {
+    const examId = Number(req.params.examId);
+    if (Number.isNaN(examId)) {
+      return res.status(400).json({ message: 'Invalid exam id' });
+    }
+    const session = await CourseLevelExamsService.startUnansweredCompletion(
+      examId,
+      req.user!.id,
+    );
+    return res.json(session);
+  }),
+);
+
+// POST /api/exams/:examId/unanswered-completion/autosave
+router.post(
+  '/:examId/unanswered-completion/autosave',
+  authMiddleware(['student']),
+  asyncWrapper(async (req, res) => {
+    const examId = Number(req.params.examId);
+    if (Number.isNaN(examId)) {
+      return res.status(400).json({ message: 'Invalid exam id' });
+    }
+    const answers = CourseLevelExamsService.parseAnswersFromRequestBody(req.body, {
+      required: false,
+    });
+    const result = await CourseLevelExamsService.autosaveUnansweredCompletion(
+      examId,
+      req.user!.id,
+      answers,
+      req.body.attemptId ?? req.body.attempt_id,
+    );
+    return res.json(result);
+  }),
+);
+
+// POST /api/exams/:examId/unanswered-completion/submit
+router.post(
+  '/:examId/unanswered-completion/submit',
+  authMiddleware(['student']),
+  asyncWrapper(async (req, res) => {
+    const examId = Number(req.params.examId);
+    if (Number.isNaN(examId)) {
+      return res.status(400).json({ message: 'Invalid exam id' });
+    }
+    const attemptId = Number(req.body.attemptId ?? req.body.attempt_id);
+    if (!Number.isInteger(attemptId) || attemptId <= 0) {
+      return res.status(400).json({ message: 'attemptId is required' });
+    }
+    const answers = CourseLevelExamsService.parseAnswersFromRequestBody(req.body, {
+      required: false,
+    });
+    const result = await CourseLevelExamsService.submitUnansweredCompletion(
+      examId,
+      req.user!.id,
+      attemptId,
+      answers,
+    );
+    return res.json(result);
   }),
 );
 

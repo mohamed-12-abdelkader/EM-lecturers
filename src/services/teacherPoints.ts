@@ -1,6 +1,11 @@
 import { randomUUID } from 'crypto';
 import pool from '../db/pool';
 import { HttpError } from '../utils';
+import {
+  isCourseExamPointsEnabled,
+  normalizeCourseExamPointsAttemptMode,
+  resolveCourseExamPointsAttempt,
+} from './courseExamPointsPolicy';
 
 export type PointsEventType =
   | 'VIDEO_WATCH'
@@ -657,7 +662,23 @@ export class TeacherPointsService {
 
     const oldPoints = Math.max(0, Math.floor(Number(existing.rows[0].points) || 0));
     const delta = newPoints - oldPoints;
+    const metadataPatch = {
+      examId: opts.examId,
+      attemptId: opts.attemptId,
+      obtainedGrade: opts.obtainedGrade,
+      totalGrade: opts.totalGrade,
+      title: opts.title ?? null,
+      regraded: true,
+    };
+
     if (delta === 0) {
+      // Keep attempt/metadata in sync even when the points value is unchanged.
+      await pool.query(
+        `UPDATE point_transactions
+         SET metadata = COALESCE(metadata, '{}'::jsonb) || $1::jsonb
+         WHERE id = $2`,
+        [JSON.stringify(metadataPatch), existing.rows[0].id],
+      );
       const bal = await this.getBalance(opts.studentId, opts.teacherId, gradeId);
       return { awarded: false, points: 0, totalPoints: bal, reason: 'duplicate' };
     }
@@ -670,17 +691,7 @@ export class TeacherPointsService {
          SET points = $1,
              metadata = COALESCE(metadata, '{}'::jsonb) || $2::jsonb
          WHERE id = $3`,
-        [
-          newPoints,
-          JSON.stringify({
-            examId: opts.examId,
-            obtainedGrade: opts.obtainedGrade,
-            totalGrade: opts.totalGrade,
-            title: opts.title ?? null,
-            regraded: true,
-          }),
-          existing.rows[0].id,
-        ],
+        [newPoints, JSON.stringify(metadataPatch), existing.rows[0].id],
       );
 
       const balRes = await client.query(
@@ -1340,27 +1351,46 @@ export class TeacherPointsService {
         // ignore if table missing mid-migrate
       }
 
-      // لكل طالب: آخر محاولة مُسلَّمة على هذا الامتحان فقط
-      const attemptsRes = await pool.query<{
-        id: number;
-        student_id: number;
-        obtained_grade: number | null;
-        total_grade: number | null;
+      const examSettings = await pool.query<{
+        points_enabled: boolean | null;
+        points_attempt_mode: string | null;
       }>(
-        `SELECT DISTINCT ON (a.student_id)
-           a.id, a.student_id, a.obtained_grade, a.total_grade
-         FROM course_level_exam_attempts a
-         WHERE a.exam_id = $1 AND a.status = 'submitted'
-         ORDER BY a.student_id, a.submitted_at DESC NULLS LAST, a.attempt_number DESC, a.id DESC`,
+        `SELECT points_enabled, points_attempt_mode FROM course_level_exams WHERE id = $1`,
+        [lastExam.id],
+      );
+      if (!isCourseExamPointsEnabled(examSettings.rows[0] || {})) {
+        examsUsed.push({
+          gradeId,
+          examId: lastExam.id,
+          examTitle: lastExam.title,
+          students: 0,
+        });
+        continue;
+      }
+      const mode = normalizeCourseExamPointsAttemptMode(
+        examSettings.rows[0]?.points_attempt_mode,
+      );
+
+      const studentsRes = await pool.query<{ student_id: number }>(
+        `SELECT DISTINCT student_id
+         FROM course_level_exam_attempts
+         WHERE exam_id = $1 AND status = 'submitted'`,
         [lastExam.id],
       );
 
       let gradeStudents = 0;
-      for (const attempt of attemptsRes.rows) {
-        const studentId = Number(attempt.student_id);
-        const attemptId = Number(attempt.id);
-        const obtained = Math.max(0, Math.floor(Number(attempt.obtained_grade ?? 0)));
-        const total = Math.max(obtained, Math.floor(Number(attempt.total_grade ?? 0)));
+      for (const row of studentsRes.rows) {
+        const studentId = Number(row.student_id);
+        const selected = await resolveCourseExamPointsAttempt({
+          examId: lastExam.id,
+          studentId,
+          mode,
+        });
+        if (!selected) continue;
+
+        const attemptId = Number(selected.id);
+        const obtained = Math.max(0, Math.floor(Number(selected.obtained_grade ?? 0)));
+        const total = Math.max(obtained, Math.floor(Number(selected.total_grade ?? 0)));
 
         const start = await this.awardExamOrAssignmentStart({
           studentId,
@@ -1386,6 +1416,20 @@ export class TeacherPointsService {
           totalGrade: total,
           title: lastExam.title,
         });
+        if (score.reason === 'duplicate') {
+          await this.syncExamOrAssignmentScore({
+            studentId,
+            teacherId: opts.teacherId,
+            courseId: lastExam.course_id,
+            attemptId,
+            examId: lastExam.id,
+            isAssignment: false,
+            examKind: 'course',
+            obtainedGrade: obtained,
+            totalGrade: total,
+            title: lastExam.title,
+          });
+        }
         if (score.awarded) scoreAwards += 1;
 
         if (start.awarded || score.awarded) {
@@ -1734,29 +1778,37 @@ export class TeacherPointsService {
         id: number;
         title: string | null;
         course_id: number | null;
-      }>(`SELECT id, title, course_id FROM course_level_exams WHERE id = $1`, [examId]);
+        points_enabled: boolean | null;
+        points_attempt_mode: string | null;
+      }>(
+        `SELECT id, title, course_id, points_enabled, points_attempt_mode
+         FROM course_level_exams WHERE id = $1`,
+        [examId],
+      );
       if (!examMeta.rowCount) continue;
       const exam = examMeta.rows[0];
+      if (!isCourseExamPointsEnabled(exam)) continue;
 
-      const attemptsRes = await pool.query<{
-        id: number;
-        student_id: number;
-        obtained_grade: number | null;
-        total_grade: number | null;
-      }>(
-        `SELECT DISTINCT ON (a.student_id)
-           a.id, a.student_id, a.obtained_grade, a.total_grade
-         FROM course_level_exam_attempts a
-         WHERE a.exam_id = $1 AND a.status = 'submitted'
-         ORDER BY a.student_id, a.submitted_at DESC NULLS LAST, a.attempt_number DESC, a.id DESC`,
+      const mode = normalizeCourseExamPointsAttemptMode(exam.points_attempt_mode);
+      const studentsRes = await pool.query<{ student_id: number }>(
+        `SELECT DISTINCT student_id
+         FROM course_level_exam_attempts
+         WHERE exam_id = $1 AND status = 'submitted'`,
         [examId],
       );
 
-      for (const attempt of attemptsRes.rows) {
-        const studentId = Number(attempt.student_id);
-        const attemptId = Number(attempt.id);
-        const obtained = Math.max(0, Math.floor(Number(attempt.obtained_grade ?? 0)));
-        const total = Math.max(obtained, Math.floor(Number(attempt.total_grade ?? 0)));
+      for (const row of studentsRes.rows) {
+        const studentId = Number(row.student_id);
+        const selected = await resolveCourseExamPointsAttempt({
+          examId,
+          studentId,
+          mode,
+        });
+        if (!selected) continue;
+
+        const attemptId = Number(selected.id);
+        const obtained = Math.max(0, Math.floor(Number(selected.obtained_grade ?? 0)));
+        const total = Math.max(obtained, Math.floor(Number(selected.total_grade ?? 0)));
 
         const start = await this.awardExamOrAssignmentStart({
           studentId,
@@ -1782,6 +1834,20 @@ export class TeacherPointsService {
           totalGrade: total,
           title: exam.title,
         });
+        if (score.reason === 'duplicate') {
+          await this.syncExamOrAssignmentScore({
+            studentId,
+            teacherId: opts.teacherId,
+            courseId: exam.course_id,
+            attemptId,
+            examId,
+            isAssignment: false,
+            examKind: 'course',
+            obtainedGrade: obtained,
+            totalGrade: total,
+            title: exam.title,
+          });
+        }
         if (score.awarded) scoreAwards += 1;
         if (start.awarded || score.awarded) awardedStudents.add(studentId);
       }

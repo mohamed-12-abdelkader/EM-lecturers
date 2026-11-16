@@ -17,7 +17,13 @@ function resolveRecordingProvider(): 'bunny' | 'bunny_stream' | 'youtube' {
   const raw = (process.env.MEETING_RECORDING_PROVIDER || 'bunny').trim().toLowerCase();
   if (raw === 'youtube') return 'youtube';
   // Default: original MP4 on Bunny Storage (no Stream re-encode quality loss).
-  if (raw === 'bunny_stream' || raw === 'stream') return 'bunny_stream';
+  // bunny_stream re-encodes renditions and softens text/code — avoid for teaching masters.
+  if (raw === 'bunny_stream' || raw === 'stream') {
+    logger.warn(
+      'MEETING_RECORDING_PROVIDER=bunny_stream re-encodes recordings; prefer bunny (Storage) for live-quality masters',
+    );
+    return 'bunny_stream';
+  }
   return 'bunny';
 }
 

@@ -230,6 +230,25 @@ function parseExamSettingsFromBody(body: any) {
   const attemptLimit = parseAttemptLimit(
     pickBodyValue(body, 'attemptLimit', 'attempt_limit'),
   );
+  const pointsEnabledInput = parseBooleanInput(
+    pickBodyValue(body, 'pointsEnabled', 'points_enabled'),
+  );
+  const pointsEnabled = pointsEnabledInput ?? true;
+  const rawPointsAttemptMode = pickBodyValue(
+    body,
+    'pointsAttemptMode',
+    'points_attempt_mode',
+  );
+  const pointsAttemptMode =
+    rawPointsAttemptMode === undefined ||
+    rawPointsAttemptMode === null ||
+    rawPointsAttemptMode === ''
+      ? 'first'
+      : String(rawPointsAttemptMode);
+  const allowUnansweredCompletion =
+    parseBooleanInput(
+      pickBodyValue(body, 'allowUnansweredCompletion', 'allow_unanswered_completion'),
+    ) ?? false;
 
   return {
     titleInput,
@@ -246,6 +265,9 @@ function parseExamSettingsFromBody(body: any) {
     questionDisplayMode,
     isActive,
     attemptLimit,
+    pointsEnabled,
+    pointsAttemptMode,
+    allowUnansweredCompletion,
   };
 }
 
@@ -284,6 +306,9 @@ router.post(
       showAnswersAfterHours: settings.showAnswersAfterHours,
       isActive: settings.isActive,
       attemptLimit: settings.attemptLimit,
+      pointsEnabled: settings.pointsEnabled,
+      pointsAttemptMode: settings.pointsAttemptMode,
+      allowUnansweredCompletion: settings.allowUnansweredCompletion,
       questionDisplayMode: normalizeQuestionDisplayMode(settings.questionDisplayMode),
     });
 
@@ -509,6 +534,35 @@ router.patch(
       updateData.attemptLimit = parseAttemptLimit(
         pickBodyValue(req.body, 'attemptLimit', 'attempt_limit'),
       );
+    }
+
+    const pointsEnabled = parseBooleanInput(
+      pickBodyValue(req.body, 'pointsEnabled', 'points_enabled'),
+    );
+    if (pointsEnabled !== undefined) updateData.pointsEnabled = pointsEnabled;
+
+    if (
+      pickBodyValue(req.body, 'pointsAttemptMode', 'points_attempt_mode') !== undefined
+    ) {
+      const mode = String(
+        pickBodyValue(req.body, 'pointsAttemptMode', 'points_attempt_mode') ?? '',
+      )
+        .trim()
+        .toLowerCase();
+      if (!['first', 'last', 'highest', 'second'].includes(mode)) {
+        throw new HttpError(
+          400,
+          'pointsAttemptMode must be one of: first, last, highest, second',
+        );
+      }
+      updateData.pointsAttemptMode = mode;
+    }
+
+    const allowUnansweredCompletion = parseBooleanInput(
+      pickBodyValue(req.body, 'allowUnansweredCompletion', 'allow_unanswered_completion'),
+    );
+    if (allowUnansweredCompletion !== undefined) {
+      updateData.allowUnansweredCompletion = allowUnansweredCompletion;
     }
 
     const updated = await CourseLevelExamsService.updateExam(examId, req.user!, updateData as any);
