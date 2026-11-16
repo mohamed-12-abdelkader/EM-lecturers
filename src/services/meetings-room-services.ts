@@ -143,6 +143,7 @@ export async function generateParticipantToken({
   hidden,
   // canPublishSources = [],
 }: GenerateParticipantTokenParams): Promise<string> {
+  const isEgress = role === 'egress';
   const at = new AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET, {
     identity,
     name,
@@ -155,26 +156,26 @@ export async function generateParticipantToken({
     roomJoin: true,
     canSubscribe: true,
     canPublishData: allowChat,
-    hidden,
+    // Recorder must stay hidden so it never appears as a participant tile.
+    hidden: hidden ?? (isEgress ? true : undefined),
   };
 
   if (role === 'participant') {
     videoGrant.canPublish = false;
     videoGrant.canUpdateOwnMetadata = false;
-    // Uncomment if you want to restrict publishing to specific sources
-    // videoGrant.canPublishSources = canPublishSources.map(
-    //   source => TrackSource[source.toUpperCase() as keyof typeof TrackSource]
-    // );
   } else if (role === 'host') {
     Object.assign(videoGrant, {
       roomAdmin: true,
       roomCreate: true,
       canUpdateOwnMetadata: true,
     });
-  } else if (role === 'egress') {
+  } else if (isEgress) {
     Object.assign(videoGrant, {
       roomRecord: true,
+      canPublish: false,
+      canSubscribe: true,
       canUpdateOwnMetadata: true,
+      hidden: true,
     });
   }
 

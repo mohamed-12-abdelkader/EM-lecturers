@@ -28,7 +28,6 @@ import {
   pauseMeetingRecording,
   resumeMeetingRecording,
   syncRecordingWithTeacherPresence,
-  syncRecordingWithTeacherTracks,
   uploadFinalizedMeetingRecording,
 } from '../services/meetingRecordingControl';
 import {
@@ -773,26 +772,13 @@ router.post('/webhook', async (req, res) => {
           console.warn('[Meeting webhook] teacher presence recording sync failed:', err);
         });
       }
-    } else if (event.event === 'track_published' || event.event === 'track_unpublished') {
-      // Switch recording to screen-share (or back to camera) without browser composite.
+    } else if (event.event === 'track_published') {
+      // Room composite stays running; only ensure egress started if host media arrived late.
       const roomName = event.room?.name;
-      const identity = event.participant?.identity;
-      const trackSource = (event as any).track?.source ?? (event as any).trackSource;
-      if (roomName && identity) {
-        await syncRecordingWithTeacherTracks({
-          roomName,
-          identity,
-          event: event.event === 'track_published' ? 'published' : 'unpublished',
-          trackSource,
-        }).catch((err) => {
-          console.warn('[Meeting webhook] teacher track recording sync failed:', err);
+      if (roomName) {
+        await ensureInitialRecordingStarted(roomName).catch((err) => {
+          console.warn('[Meeting webhook] deferred recording start failed:', err);
         });
-        // First camera/mic publish after room_started may have deferred recording.
-        if (event.event === 'track_published') {
-          await ensureInitialRecordingStarted(roomName).catch((err) => {
-            console.warn('[Meeting webhook] deferred recording start failed:', err);
-          });
-        }
       }
     } else if (event.event === 'room_finished') {
       const sid = event.room!.sid;

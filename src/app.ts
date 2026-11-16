@@ -80,6 +80,20 @@ app.use('/api', router);
 app.use('/uploads/teacher-library', teacherLibraryStaticMiddleware);
 // Images-only CDN: /cdn/<category>/<file>.jpg → uploads/<category>/<file>.jpg
 app.use('/cdn', createImageCdnStaticMiddleware());
+// LiveKit Room Composite recorder template (screen full + camera PiP)
+app.use(
+  '/lk-recording',
+  express.static(path.join(process.cwd(), 'public', 'lk-recording'), {
+    etag: false,
+    index: ['index.html'],
+    setHeaders(res) {
+      res.setHeader('Cache-Control', 'no-store');
+      // Egress Chromium may load from another origin.
+      res.removeHeader('X-Frame-Options');
+    },
+  }),
+);
+
 app.use(
   '/uploads',
   express.static(path.join(process.cwd(), 'uploads'), {

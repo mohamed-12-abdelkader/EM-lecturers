@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>EM Meeting Recorder</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        width: 100vw;
+        height: 100vh;
+        overflow: hidden;
+        background: #000;
+        color: #fff;
+        font-family: system-ui, sans-serif;
+      }
+      #stage {
+        position: relative;
+        width: 100vw;
+        height: 100vh;
+        background: #000;
+      }
+      #main,
+      #pip {
+        background: #000;
+      }
+      #main {
+        position: absolute;
+        inset: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+      #main video {
+        width: 100%;
+        height: 100%;
+        object-fit: contain;
+        background: #000;
+      }
+      #main.camera-fill video {
+        object-fit: cover;
+      }
+      #pip {
+        position: absolute;
+        right: 2.2%;
+        bottom: 3.2%;
+        width: min(26vw, 420px);
+        aspect-ratio: 16 / 9;
+        border-radius: 14px;
+        overflow: hidden;
+        border: 2px solid rgba(255, 255, 255, 0.35);
+        box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
+        z-index: 5;
+        display: none;
+      }
+      #pip video {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+        background: #111;
+      }
+      #status {
+        position: absolute;
+        left: 16px;
+        top: 14px;
+        z-index: 6;
+        font-size: 12px;
+        opacity: 0.55;
+        pointer-events: none;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="stage">
+      <div id="main"></div>
+      <div id="pip"></div>
+      <div id="status">Connecting recorder…</div>
+    </div>
+    <script src="https://cdn.jsdelivr.net/npm/livekit-client@2.11.3/dist/livekit-client.umd.min.js"></script>
+    <script>
+      (function () {
+        const LivekitClient = window.LivekitClient || window.livekit;
+        if (!LivekitClient) {
+          document.getElementById('status').textContent = 'livekit-client failed to load';
+          return;
+        }
+
+        const {
+          Room,
+          RoomEvent,
+          Track,
+          VideoQuality,
+          ConnectionState,
+        } = LivekitClient;
+
+        const params = new URLSearchParams(window.location.search);
+        const token = params.get('token');
+        const url = params.get('url');
+        const statusEl = document.getElementById('status');
+        const mainEl = document.getElementById('main');
+        const pipEl = document.getElementById('pip');
+
+        let started = false;
+        let mainVideo = null;
+        let pipVideo = null;
+        let mainTrackSid = null;
+        let pipTrackSid = null;
+
+        function setStatus(text) {
+          statusEl.textContent = text;
+        }
+
+        function signalStart() {
+          if (started) return;
+          started = true;
+          // LiveKit egress waits for this console message before capturing.
+          console.log('START_RECORDING');
+          setStatus('Recording');
+        }
+
+        function ensureVideo(container, existing) {
+          if (existing && existing.isConnected) return existing;
+          const video = document.createElement('video');
+          video.autoplay = true;
+          video.playsInline = true;
+          video.muted = true;
+          video.setAttribute('playsinline', 'true');
+          container.innerHTML = '';
+          container.appendChild(video);
+          return video;
+        }
+
+        function clearContainer(container) {
+          container.innerHTML = '';
+          container.style.display = container === pipEl ? 'none' : '';
+        }
+
+        function isRecorder(identity) {
+          return String(identity || '').startsWith('recorder_');
+        }
+
+        function parseRole(participant) {
+          try {
+            const meta = JSON.parse(participant.metadata || '{}');
+            return String(meta.role || '').toLowerCase();
+          } catch {
+            return '';
+          }
+        }
+
+        function boostPublication(publication) {
+          if (!publication || publication.kind !== Track.Kind.Video) return;
+          try {
+            publication.setVideoQuality(VideoQuality.HIGH);
+          } catch (_) {}
+          try {
+            publication.setVideoDimensions({ width: 1920, height: 1080 });
+          } catch (_) {}
+        }
+
+        function collectVideoPubs(room) {
+          const cams = [];
+          const screens = [];
+          room.remoteParticipants.forEach((participant) => {
+            if (isRecorder(participant.identity)) return;
+            const role = parseRole(participant);
+            participant.trackPublications.forEach((pub) => {
+              if (pub.kind !== Track.Kind.Video || !pub.track) return;
+              boostPublication(pub);
+              const item = { participant, publication: pub, role, track: pub.track };
+              if (pub.source === Track.Source.ScreenShare) screens.push(item);
+              else if (pub.source === Track.Source.Camera) cams.push(item);
+            });
+          });
+          const hostFirst = (a, b) => {
+            const ah = a.role === 'host' ? 0 : 1;
+            const bh = b.role === 'host' ? 0 : 1;
+            return ah - bh;
+          };
+          screens.sort(hostFirst);
+          cams.sort(hostFirst);
+          return { screen: screens[0] || null, camera: cams[0] || null };
+        }
+
+        function attachTrack(container, item, mode) {
+          if (!item?.track) {
+            if (mode === 'pip') {
+              clearContainer(pipEl);
+              pipVideo = null;
+              pipTrackSid = null;
+            } else {
+              clearContainer(mainEl);
+              mainVideo = null;
+              mainTrackSid = null;
+            }
+            return;
+          }
+          const sid = item.publication?.trackSid || item.track.sid;
+          if (mode === 'pip') {
+            pipEl.style.display = 'block';
+            if (pipTrackSid === sid && pipVideo) return;
+            pipVideo = ensureVideo(pipEl, pipVideo);
+            item.track.attach(pipVideo);
+            pipTrackSid = sid;
+          } else {
+            mainEl.classList.toggle('camera-fill', item.publication.source === Track.Source.Camera);
+            if (mainTrackSid === sid && mainVideo) return;
+            mainVideo = ensureVideo(mainEl, mainVideo);
+            item.track.attach(mainVideo);
+            mainTrackSid = sid;
+          }
+        }
+
+        function renderLayout(room) {
+          const { screen, camera } = collectVideoPubs(room);
+          if (screen && camera) {
+            attachTrack(mainEl, screen, 'main');
+            attachTrack(pipEl, camera, 'pip');
+            signalStart();
+            return;
+          }
+          if (screen) {
+            attachTrack(mainEl, screen, 'main');
+            clearContainer(pipEl);
+            pipVideo = null;
+            pipTrackSid = null;
+            signalStart();
+            return;
+          }
+          if (camera) {
+            attachTrack(mainEl, camera, 'main');
+            clearContainer(pipEl);
+            pipVideo = null;
+            pipTrackSid = null;
+            signalStart();
+            return;
+          }
+          // Keep waiting for teacher media — do not start empty black forever.
+          setStatus('Waiting for teacher camera/screen…');
+        }
+
+        async function main() {
+          if (!token || !url) {
+            setStatus('Missing token/url query params');
+            return;
+          }
+
+          const room = new Room({
+            adaptiveStream: false,
+            dynacast: false,
+            reconnectPolicy: undefined,
+          });
+
+          room.on(RoomEvent.TrackSubscribed, (track, publication) => {
+            if (track.kind === Track.Kind.Audio) {
+              const audio = track.attach();
+              audio.style.display = 'none';
+              document.body.appendChild(audio);
+              return;
+            }
+            boostPublication(publication);
+            renderLayout(room);
+          });
+          room.on(RoomEvent.TrackUnsubscribed, () => renderLayout(room));
+          room.on(RoomEvent.TrackMuted, () => renderLayout(room));
+          room.on(RoomEvent.TrackUnmuted, () => renderLayout(room));
+          room.on(RoomEvent.TrackPublished, (_pub, participant) => {
+            // Ensure we subscribe at highest quality as soon as tracks appear.
+            participant.trackPublications.forEach((pub) => boostPublication(pub));
+            renderLayout(room);
+          });
+          room.on(RoomEvent.ParticipantConnected, () => renderLayout(room));
+          room.on(RoomEvent.ParticipantDisconnected, () => renderLayout(room));
+          room.on(RoomEvent.ConnectionStateChanged, (state) => {
+            if (state === ConnectionState.Connected) {
+              setStatus('Connected — preparing layout');
+              renderLayout(room);
+              // Fallback start if media already present or arrives slowly.
+              setTimeout(() => {
+                renderLayout(room);
+                if (!started) signalStart();
+              }, 2500);
+            }
+          });
+
+          setStatus('Joining room…');
+          await room.connect(url, token);
+          room.remoteParticipants.forEach((participant) => {
+            participant.trackPublications.forEach((pub) => {
+              boostPublication(pub);
+              if (pub.kind === Track.Kind.Audio && pub.track) {
+                const audio = pub.track.attach();
+                audio.style.display = 'none';
+                document.body.appendChild(audio);
+              }
+            });
+          });
+          renderLayout(room);
+        }
+
+        main().catch((err) => {
+          console.error(err);
+          setStatus(String(err && err.message ? err.message : err));
+        });
+      })();
+    </script>
+  </body>
+</html>
