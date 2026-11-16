@@ -4,6 +4,12 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>EM Meeting Recorder</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Cairo:wght@600;700;800&family=Changa:wght@700;800&family=El+Messiri:wght@700;800&display=swap"
+      rel="stylesheet"
+    />
     <style>
       html,
       body {
@@ -11,72 +17,415 @@
         width: 100vw;
         height: 100vh;
         overflow: hidden;
-        background: #000;
+        background: #03102a;
         color: #fff;
-        font-family: system-ui, sans-serif;
       }
-      #stage {
-        position: relative;
+
+      #app {
         width: 100vw;
         height: 100vh;
-        background: #000;
+        padding: 14px;
+        box-sizing: border-box;
+        display: flex;
+        align-items: stretch;
+        justify-content: center;
       }
-      #main,
-      #pip {
-        background: #000;
+
+      .dual-stream-frame {
+        --ds-blue: #1e88e5;
+        position: relative;
+        width: 100%;
+        height: 100%;
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+        font-family: "Cairo", "Segoe UI", Tahoma, sans-serif;
+        border-radius: 24px;
+        border: 3px solid rgba(255, 255, 255, 0.92);
+        background:
+          radial-gradient(ellipse 120% 60% at 50% -20%, rgba(255, 255, 255, 0.28), transparent 55%),
+          radial-gradient(ellipse 70% 50% at 100% 115%, rgba(13, 71, 161, 0.5), transparent 60%),
+          radial-gradient(ellipse 70% 50% at 0% 115%, rgba(13, 71, 161, 0.42), transparent 60%),
+          linear-gradient(180deg, #4dabf5 0%, #2196f3 45%, #1976d2 100%);
+        box-shadow:
+          0 0 0 1px rgba(13, 71, 161, 0.35),
+          0 18px 40px rgba(13, 71, 161, 0.35),
+          inset 0 1px 0 rgba(255, 255, 255, 0.4);
       }
-      #main {
+
+      .dual-stream-frame::before {
+        content: "";
         position: absolute;
         inset: 0;
+        border-radius: inherit;
+        pointer-events: none;
+        background-image:
+          radial-gradient(rgba(255, 255, 255, 0.4) 1.5px, transparent 2px),
+          radial-gradient(rgba(255, 255, 255, 0.22) 2.5px, transparent 3px);
+        background-size: 38px 38px, 64px 64px;
+        background-position: 0 0, 19px 27px;
+        opacity: 0.35;
+        z-index: 1;
+      }
+
+      .frame-header {
+        position: relative;
+        z-index: 2;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 10px 16px 6px;
+        direction: rtl;
+        flex-shrink: 0;
+      }
+
+      .brand-pill,
+      .avatar-pill {
+        flex-shrink: 0;
         display: flex;
         align-items: center;
         justify-content: center;
+        border-radius: 999px;
+        border: 2px solid #fff;
+        background: rgba(255, 255, 255, 0.95);
+        box-shadow: 0 4px 10px rgba(13, 71, 161, 0.35);
       }
-      #main video {
-        width: 100%;
-        height: 100%;
-        object-fit: contain;
-        background: #000;
+
+      .brand-pill {
+        padding: 6px 12px;
+        font-weight: 800;
+        color: #0d47a1;
+        font-size: 13px;
+        letter-spacing: 0.02em;
       }
-      #main.camera-fill video {
-        object-fit: cover;
-      }
-      #pip {
-        position: absolute;
-        right: 2.2%;
-        bottom: 3.2%;
-        width: min(26vw, 420px);
-        aspect-ratio: 16 / 9;
-        border-radius: 14px;
+
+      .avatar-pill {
+        width: 42px;
+        height: 42px;
         overflow: hidden;
-        border: 2px solid rgba(255, 255, 255, 0.35);
-        box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
-        z-index: 5;
-        display: none;
+        position: relative;
       }
-      #pip video {
+
+      .avatar-pill img {
         width: 100%;
         height: 100%;
         object-fit: cover;
-        background: #111;
       }
+
+      .avatar-fallback {
+        width: 100%;
+        height: 100%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: linear-gradient(135deg, #1976d2, #0d47a1);
+        color: #fff;
+        font-weight: 800;
+        font-size: 16px;
+      }
+
+      .live-dot {
+        position: absolute;
+        bottom: -1px;
+        left: -1px;
+        width: 11px;
+        height: 11px;
+        border-radius: 999px;
+        border: 2px solid #fff;
+        background: #ef4444;
+        box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.55);
+        animation: pulse 1.6s ease-out infinite;
+      }
+
+      @keyframes pulse {
+        0% {
+          box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.55);
+        }
+        70% {
+          box-shadow: 0 0 0 8px rgba(239, 68, 68, 0);
+        }
+        100% {
+          box-shadow: 0 0 0 0 rgba(239, 68, 68, 0);
+        }
+      }
+
+      .identity {
+        min-width: 0;
+        flex: 1 1 auto;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 10px;
+        text-align: center;
+      }
+
+      .identity-title {
+        font-family: "El Messiri", "Cairo", sans-serif;
+        color: #fff;
+        font-weight: 800;
+        font-size: 22px;
+        line-height: 1.2;
+        margin: 0;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        text-shadow:
+          0 1px 0 rgba(9, 38, 72, 0.4),
+          0 3px 10px rgba(5, 32, 74, 0.5);
+      }
+
+      .identity-sep {
+        width: 2px;
+        height: 1.2em;
+        border-radius: 999px;
+        background: linear-gradient(180deg, transparent, #ffd54f, transparent);
+        box-shadow: 0 0 8px rgba(255, 213, 79, 0.55);
+        flex-shrink: 0;
+      }
+
+      .identity-teacher {
+        font-family: "Changa", "Cairo", sans-serif;
+        color: #ffe082;
+        font-weight: 800;
+        font-size: 18px;
+        line-height: 1.2;
+        margin: 0;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        text-shadow:
+          0 1px 0 rgba(9, 38, 72, 0.55),
+          0 3px 10px rgba(5, 32, 74, 0.45);
+      }
+
+      .content {
+        position: relative;
+        z-index: 2;
+        flex: 1 1 auto;
+        min-height: 0;
+        display: flex;
+        gap: 12px;
+        padding: 4px 14px 14px;
+        direction: ltr;
+      }
+
+      .col {
+        display: flex;
+        flex-direction: column;
+        min-width: 0;
+        min-height: 0;
+      }
+
+      .col-screen {
+        flex: 2.2 1 0;
+      }
+
+      .col-camera {
+        flex: 0 0 26%;
+        max-width: 420px;
+        min-width: 220px;
+      }
+
+      .col-solo {
+        flex: 1 1 auto;
+      }
+
+      .col-label {
+        margin: 0 0 6px;
+        text-align: center;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        padding: 0 6px;
+        flex-shrink: 0;
+      }
+
+      .col-label.lesson {
+        font-family: "El Messiri", "Cairo", sans-serif;
+        color: #fff;
+        font-weight: 800;
+        font-size: 16px;
+        text-shadow: 0 2px 8px rgba(5, 32, 74, 0.45);
+      }
+
+      .col-label.teacher {
+        font-family: "Changa", "Cairo", sans-serif;
+        color: #ffe082;
+        font-weight: 800;
+        font-size: 16px;
+        text-shadow: 0 2px 8px rgba(5, 32, 74, 0.45);
+      }
+
+      .panel {
+        position: relative;
+        flex: 1 1 auto;
+        min-height: 0;
+        overflow: hidden;
+        border-radius: 18px;
+        border: 3px solid #ffffff;
+        background: #0d2c4f;
+      }
+
+      .panel-screen {
+        box-shadow:
+          0 0 0 3px rgba(21, 101, 192, 0.55),
+          0 12px 26px rgba(13, 71, 161, 0.4);
+        background: #ffffff;
+      }
+
+      .panel-camera {
+        box-shadow:
+          0 0 0 3px rgba(255, 179, 0, 0.75),
+          0 12px 26px rgba(13, 71, 161, 0.4);
+      }
+
+      .panel video {
+        width: 100%;
+        height: 100%;
+        display: block;
+        background: #0d2c4f;
+      }
+
+      .panel-screen video {
+        object-fit: contain;
+        background: #ffffff;
+      }
+
+      .panel-camera video,
+      .panel-camera-only video {
+        object-fit: cover;
+      }
+
+      .camera-badge {
+        position: absolute;
+        top: 10px;
+        right: 10px;
+        z-index: 3;
+        direction: rtl;
+        background: rgba(13, 71, 161, 0.92);
+        color: #fff;
+        border: 1.5px solid rgba(255, 255, 255, 0.85);
+        border-radius: 999px;
+        padding: 4px 10px;
+        font-size: 12px;
+        font-weight: 800;
+        max-width: calc(100% - 24px);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        box-shadow: 0 6px 14px rgba(0, 0, 0, 0.25);
+      }
+
+      .waiting {
+        position: relative;
+        z-index: 2;
+        flex: 1;
+        margin: 8px 14px 14px;
+        border-radius: 18px;
+        border: 3px solid #fff;
+        background: linear-gradient(180deg, #ffffff 0%, #e3f2fd 100%);
+        box-shadow:
+          0 0 0 3px rgba(21, 101, 192, 0.45),
+          0 12px 26px rgba(13, 71, 161, 0.35);
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        color: #0d47a1;
+        text-align: center;
+        gap: 8px;
+        padding: 24px;
+      }
+
+      .waiting h1 {
+        margin: 0;
+        font-family: "El Messiri", "Cairo", sans-serif;
+        font-size: 28px;
+        color: #0f172a;
+      }
+
+      .waiting p {
+        margin: 0;
+        font-size: 15px;
+        color: #475569;
+        font-weight: 600;
+      }
+
       #status {
         position: absolute;
-        left: 16px;
-        top: 14px;
-        z-index: 6;
-        font-size: 12px;
-        opacity: 0.55;
+        left: 18px;
+        bottom: 16px;
+        z-index: 20;
+        font-size: 11px;
+        opacity: 0.45;
         pointer-events: none;
+        font-family: ui-monospace, monospace;
+      }
+
+      .mode-screen-only .col-camera,
+      .mode-camera-only .col-screen,
+      .mode-waiting .content {
+        display: none;
+      }
+
+      .mode-waiting .waiting {
+        display: flex;
+      }
+
+      .waiting {
+        display: none;
+      }
+
+      .mode-camera-only .col-camera {
+        flex: 1 1 auto;
+        max-width: none;
+        min-width: 0;
+      }
+
+      .mode-screen-only .col-screen {
+        flex: 1 1 auto;
       }
     </style>
   </head>
   <body>
-    <div id="stage">
-      <div id="main"></div>
-      <div id="pip"></div>
+    <div id="app">
+      <div class="dual-stream-frame mode-waiting" id="frame">
+        <div class="frame-header">
+          <div class="brand-pill">EM Online</div>
+          <div class="identity" id="headerIdentity">
+            <p class="identity-title" id="meetingTitleLabel">البث المباشر</p>
+            <span class="identity-sep" id="identitySep"></span>
+            <p class="identity-teacher" id="teacherNameLabel">أ/ المدرس</p>
+          </div>
+          <div class="avatar-pill" id="avatarPill">
+            <div class="avatar-fallback" id="avatarFallback">م</div>
+            <span class="live-dot"></span>
+          </div>
+        </div>
+
+        <div class="content" id="content">
+          <div class="col col-screen" id="screenCol">
+            <p class="col-label lesson" id="screenLessonLabel"></p>
+            <div class="panel panel-screen" id="screenPanel"></div>
+          </div>
+          <div class="col col-camera" id="cameraCol">
+            <p class="col-label teacher" id="cameraTeacherLabel"></p>
+            <div class="panel panel-camera" id="cameraPanel">
+              <div class="camera-badge" id="cameraBadge"></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="waiting" id="waiting">
+          <h1 id="waitingTitle">البث المباشر</h1>
+          <p id="waitingTeacher">أ/ المدرس</p>
+          <p>بانتظار كاميرا المدرس أو مشاركة الشاشة…</p>
+        </div>
+      </div>
       <div id="status">Connecting recorder…</div>
     </div>
+
     <script src="https://cdn.jsdelivr.net/npm/livekit-client@2.11.3/dist/livekit-client.umd.min.js"></script>
     <script>
       (function () {
@@ -86,26 +435,38 @@
           return;
         }
 
-        const {
-          Room,
-          RoomEvent,
-          Track,
-          VideoQuality,
-          ConnectionState,
-        } = LivekitClient;
-
+        const { Room, RoomEvent, Track, VideoQuality, ConnectionState } = LivekitClient;
         const params = new URLSearchParams(window.location.search);
         const token = params.get('token');
         const url = params.get('url');
+        const meetingTitle = (params.get('meetingTitle') || 'البث المباشر').trim();
+        const teacherName = (params.get('teacherName') || 'المدرس').trim();
+        const teacherIcon = (params.get('teacherIcon') || '').trim();
+        const teacherUserId = Number(params.get('teacherUserId') || 0) || null;
+
+        const frameEl = document.getElementById('frame');
         const statusEl = document.getElementById('status');
-        const mainEl = document.getElementById('main');
-        const pipEl = document.getElementById('pip');
+        const screenPanel = document.getElementById('screenPanel');
+        const cameraPanel = document.getElementById('cameraPanel');
+        const screenCol = document.getElementById('screenCol');
+        const cameraCol = document.getElementById('cameraCol');
+        const screenLessonLabel = document.getElementById('screenLessonLabel');
+        const cameraTeacherLabel = document.getElementById('cameraTeacherLabel');
+        const cameraBadge = document.getElementById('cameraBadge');
+        const meetingTitleLabel = document.getElementById('meetingTitleLabel');
+        const teacherNameLabel = document.getElementById('teacherNameLabel');
+        const identitySep = document.getElementById('identitySep');
+        const waitingTitle = document.getElementById('waitingTitle');
+        const waitingTeacher = document.getElementById('waitingTeacher');
+        const avatarFallback = document.getElementById('avatarFallback');
+        const avatarPill = document.getElementById('avatarPill');
 
         let started = false;
-        let mainVideo = null;
-        let pipVideo = null;
-        let mainTrackSid = null;
-        let pipTrackSid = null;
+        let screenVideo = null;
+        let cameraVideo = null;
+        let screenSid = null;
+        let cameraSid = null;
+        let currentMode = 'waiting';
 
         function setStatus(text) {
           statusEl.textContent = text;
@@ -114,133 +475,228 @@
         function signalStart() {
           if (started) return;
           started = true;
-          // LiveKit egress waits for this console message before capturing.
           console.log('START_RECORDING');
-          setStatus('Recording');
+          setStatus('Recording · ' + currentMode);
         }
 
-        function ensureVideo(container, existing) {
-          if (existing && existing.isConnected) return existing;
-          const video = document.createElement('video');
-          video.autoplay = true;
-          video.playsInline = true;
-          video.muted = true;
-          video.setAttribute('playsinline', 'true');
-          container.innerHTML = '';
-          container.appendChild(video);
-          return video;
+        function normalize(value) {
+          return String(value || '')
+            .replace(/^أ\/\s*/u, '')
+            .trim()
+            .toLowerCase();
         }
 
-        function clearContainer(container) {
-          container.innerHTML = '';
-          container.style.display = container === pipEl ? 'none' : '';
+        function setupIdentity() {
+          meetingTitleLabel.textContent = meetingTitle || 'البث المباشر';
+          teacherNameLabel.textContent = 'أ/ ' + (teacherName || 'المدرس');
+          waitingTitle.textContent = meetingTitle || 'البث المباشر';
+          waitingTeacher.textContent = 'أ/ ' + (teacherName || 'المدرس');
+          screenLessonLabel.textContent = meetingTitle || 'البث المباشر';
+          cameraTeacherLabel.textContent = 'أ/ ' + (teacherName || 'المدرس');
+          cameraBadge.textContent = 'أ/ ' + (teacherName || 'المدرس');
+          avatarFallback.textContent = (teacherName || 'م').trim().charAt(0) || 'م';
+
+          const same = normalize(meetingTitle) === normalize(teacherName);
+          identitySep.style.display = same ? 'none' : '';
+          teacherNameLabel.style.display = same ? 'none' : '';
+
+          if (teacherIcon) {
+            const img = document.createElement('img');
+            img.src = teacherIcon;
+            img.alt = teacherName || 'teacher';
+            img.onerror = function () {
+              img.remove();
+            };
+            avatarPill.insertBefore(img, avatarFallback);
+            avatarFallback.style.display = 'none';
+          }
         }
 
         function isRecorder(identity) {
           return String(identity || '').startsWith('recorder_');
         }
 
-        function parseRole(participant) {
+        function parseMeta(participant) {
           try {
-            const meta = JSON.parse(participant.metadata || '{}');
-            return String(meta.role || '').toLowerCase();
-          } catch {
-            return '';
+            return JSON.parse(participant.metadata || '{}') || {};
+          } catch (_) {
+            return {};
           }
+        }
+
+        function parseUserId(identity) {
+          const match = String(identity || '').match(/^user_(\d+)_meeting_/);
+          return match ? Number(match[1]) : null;
+        }
+
+        function isTeacherParticipant(participant) {
+          if (isRecorder(participant.identity)) return false;
+          const meta = parseMeta(participant);
+          if (String(meta.role || '').toLowerCase() === 'host') return true;
+          if (teacherUserId && parseUserId(participant.identity) === teacherUserId) return true;
+          // Multi-device / screenShare identities for the same teacher.
+          if (String(participant.identity || '').includes('_screenShare')) {
+            if (!teacherUserId) return true;
+            return parseUserId(participant.identity) === teacherUserId;
+          }
+          return false;
         }
 
         function boostPublication(publication) {
           if (!publication || publication.kind !== Track.Kind.Video) return;
           try {
+            publication.setSubscribed(true);
+          } catch (_) {}
+          try {
             publication.setVideoQuality(VideoQuality.HIGH);
           } catch (_) {}
           try {
+            // Prefer sharp layers for both camera and screen in the recorder browser.
             publication.setVideoDimensions({ width: 1920, height: 1080 });
           } catch (_) {}
         }
 
-        function collectVideoPubs(room) {
-          const cams = [];
-          const screens = [];
-          room.remoteParticipants.forEach((participant) => {
-            if (isRecorder(participant.identity)) return;
-            const role = parseRole(participant);
-            participant.trackPublications.forEach((pub) => {
-              if (pub.kind !== Track.Kind.Video || !pub.track) return;
-              boostPublication(pub);
-              const item = { participant, publication: pub, role, track: pub.track };
-              if (pub.source === Track.Source.ScreenShare) screens.push(item);
-              else if (pub.source === Track.Source.Camera) cams.push(item);
-            });
-          });
-          const hostFirst = (a, b) => {
-            const ah = a.role === 'host' ? 0 : 1;
-            const bh = b.role === 'host' ? 0 : 1;
-            return ah - bh;
-          };
-          screens.sort(hostFirst);
-          cams.sort(hostFirst);
-          return { screen: screens[0] || null, camera: cams[0] || null };
+        function ensureVideo(panel, existing, keepBadge) {
+          if (existing && existing.isConnected) return existing;
+          const badge = keepBadge ? panel.querySelector('.camera-badge') : null;
+          panel.querySelectorAll('video').forEach((node) => node.remove());
+          const video = document.createElement('video');
+          video.autoplay = true;
+          video.playsInline = true;
+          video.muted = true;
+          video.setAttribute('playsinline', 'true');
+          if (badge) panel.insertBefore(video, badge);
+          else panel.appendChild(video);
+          return video;
         }
 
-        function attachTrack(container, item, mode) {
+        function clearVideo(panel, keepBadge) {
+          panel.querySelectorAll('video').forEach((node) => node.remove());
+          if (!keepBadge) return;
+          if (!panel.querySelector('.camera-badge') && cameraBadge) {
+            panel.appendChild(cameraBadge);
+          }
+        }
+
+        function attach(panel, item, kind) {
           if (!item?.track) {
-            if (mode === 'pip') {
-              clearContainer(pipEl);
-              pipVideo = null;
-              pipTrackSid = null;
+            if (kind === 'screen') {
+              clearVideo(screenPanel, false);
+              screenVideo = null;
+              screenSid = null;
             } else {
-              clearContainer(mainEl);
-              mainVideo = null;
-              mainTrackSid = null;
+              clearVideo(cameraPanel, true);
+              cameraVideo = null;
+              cameraSid = null;
             }
             return;
           }
           const sid = item.publication?.trackSid || item.track.sid;
-          if (mode === 'pip') {
-            pipEl.style.display = 'block';
-            if (pipTrackSid === sid && pipVideo) return;
-            pipVideo = ensureVideo(pipEl, pipVideo);
-            item.track.attach(pipVideo);
-            pipTrackSid = sid;
+          if (kind === 'screen') {
+            if (screenSid === sid && screenVideo) return;
+            screenVideo = ensureVideo(screenPanel, screenVideo, false);
+            item.track.attach(screenVideo);
+            screenSid = sid;
           } else {
-            mainEl.classList.toggle('camera-fill', item.publication.source === Track.Source.Camera);
-            if (mainTrackSid === sid && mainVideo) return;
-            mainVideo = ensureVideo(mainEl, mainVideo);
-            item.track.attach(mainVideo);
-            mainTrackSid = sid;
+            if (cameraSid === sid && cameraVideo) return;
+            cameraVideo = ensureVideo(cameraPanel, cameraVideo, true);
+            item.track.attach(cameraVideo);
+            cameraSid = sid;
           }
+        }
+
+        function collectTeacherMedia(room) {
+          const screens = [];
+          const cameras = [];
+          room.remoteParticipants.forEach((participant) => {
+            if (!isTeacherParticipant(participant)) return;
+            const meta = parseMeta(participant);
+            const role = String(meta.role || '').toLowerCase();
+            participant.trackPublications.forEach((pub) => {
+              boostPublication(pub);
+              if (pub.kind !== Track.Kind.Video || !pub.track || pub.isMuted) return;
+              const item = { participant, publication: pub, role, track: pub.track };
+              if (pub.source === Track.Source.ScreenShare) screens.push(item);
+              else if (pub.source === Track.Source.Camera) cameras.push(item);
+            });
+          });
+
+          const rank = (a, b) => {
+            const ah = a.role === 'host' ? 0 : 1;
+            const bh = b.role === 'host' ? 0 : 1;
+            if (ah !== bh) return ah - bh;
+            // Prefer larger encoded frames when available.
+            const aw = Number(a.track?.dimensions?.width || a.publication?.dimensions?.width || 0);
+            const bw = Number(b.track?.dimensions?.width || b.publication?.dimensions?.width || 0);
+            return bw - aw;
+          };
+          screens.sort(rank);
+          cameras.sort(rank);
+          return { screen: screens[0] || null, camera: cameras[0] || null };
+        }
+
+        function setMode(mode) {
+          currentMode = mode;
+          frameEl.classList.remove('mode-waiting', 'mode-screen-only', 'mode-camera-only', 'mode-dual');
+          frameEl.classList.add('mode-' + mode);
+
+          const dual = mode === 'dual';
+          const screenOnly = mode === 'screen-only';
+          const cameraOnly = mode === 'camera-only';
+
+          screenCol.classList.toggle('col-solo', screenOnly);
+          cameraCol.classList.toggle('col-solo', cameraOnly);
+          cameraPanel.classList.toggle('panel-camera-only', cameraOnly);
+
+          // Dual: labels above each panel. Solo: use header identity.
+          screenLessonLabel.style.display = dual ? '' : 'none';
+          cameraTeacherLabel.style.display = dual ? '' : 'none';
+          cameraBadge.style.display = dual || cameraOnly ? '' : 'none';
+          document.getElementById('headerIdentity').style.visibility = dual ? 'hidden' : 'visible';
         }
 
         function renderLayout(room) {
-          const { screen, camera } = collectVideoPubs(room);
+          const { screen, camera } = collectTeacherMedia(room);
+
           if (screen && camera) {
-            attachTrack(mainEl, screen, 'main');
-            attachTrack(pipEl, camera, 'pip');
+            setMode('dual');
+            attach(screenPanel, screen, 'screen');
+            attach(cameraPanel, camera, 'camera');
             signalStart();
+            setStatus('Recording · dual (screen + camera)');
             return;
           }
           if (screen) {
-            attachTrack(mainEl, screen, 'main');
-            clearContainer(pipEl);
-            pipVideo = null;
-            pipTrackSid = null;
+            setMode('screen-only');
+            attach(screenPanel, screen, 'screen');
+            attach(cameraPanel, null, 'camera');
             signalStart();
+            setStatus('Recording · screen-only');
             return;
           }
           if (camera) {
-            attachTrack(mainEl, camera, 'main');
-            clearContainer(pipEl);
-            pipVideo = null;
-            pipTrackSid = null;
+            setMode('camera-only');
+            attach(screenPanel, null, 'screen');
+            attach(cameraPanel, camera, 'camera');
             signalStart();
+            setStatus('Recording · camera-only');
             return;
           }
-          // Keep waiting for teacher media — do not start empty black forever.
+
+          setMode('waiting');
+          attach(screenPanel, null, 'screen');
+          attach(cameraPanel, null, 'camera');
           setStatus('Waiting for teacher camera/screen…');
         }
 
+        function wireAudio(track) {
+          const audio = track.attach();
+          audio.style.display = 'none';
+          document.body.appendChild(audio);
+        }
+
         async function main() {
+          setupIdentity();
           if (!token || !url) {
             setStatus('Missing token/url query params');
             return;
@@ -249,14 +705,11 @@
           const room = new Room({
             adaptiveStream: false,
             dynacast: false,
-            reconnectPolicy: undefined,
           });
 
           room.on(RoomEvent.TrackSubscribed, (track, publication) => {
             if (track.kind === Track.Kind.Audio) {
-              const audio = track.attach();
-              audio.style.display = 'none';
-              document.body.appendChild(audio);
+              wireAudio(track);
               return;
             }
             boostPublication(publication);
@@ -265,35 +718,36 @@
           room.on(RoomEvent.TrackUnsubscribed, () => renderLayout(room));
           room.on(RoomEvent.TrackMuted, () => renderLayout(room));
           room.on(RoomEvent.TrackUnmuted, () => renderLayout(room));
-          room.on(RoomEvent.TrackPublished, (_pub, participant) => {
-            // Ensure we subscribe at highest quality as soon as tracks appear.
+          room.on(RoomEvent.TrackPublished, (publication, participant) => {
+            if (!isTeacherParticipant(participant)) return;
+            boostPublication(publication);
+            renderLayout(room);
+          });
+          room.on(RoomEvent.TrackUnpublished, () => renderLayout(room));
+          room.on(RoomEvent.ParticipantConnected, (participant) => {
+            if (!isTeacherParticipant(participant)) return;
             participant.trackPublications.forEach((pub) => boostPublication(pub));
             renderLayout(room);
           });
-          room.on(RoomEvent.ParticipantConnected, () => renderLayout(room));
           room.on(RoomEvent.ParticipantDisconnected, () => renderLayout(room));
           room.on(RoomEvent.ConnectionStateChanged, (state) => {
             if (state === ConnectionState.Connected) {
-              setStatus('Connected — preparing layout');
+              setStatus('Connected — preparing framed layout');
               renderLayout(room);
-              // Fallback start if media already present or arrives slowly.
               setTimeout(() => {
                 renderLayout(room);
                 if (!started) signalStart();
-              }, 2500);
+              }, 2200);
             }
           });
 
           setStatus('Joining room…');
           await room.connect(url, token);
+
           room.remoteParticipants.forEach((participant) => {
             participant.trackPublications.forEach((pub) => {
               boostPublication(pub);
-              if (pub.kind === Track.Kind.Audio && pub.track) {
-                const audio = pub.track.attach();
-                audio.style.display = 'none';
-                document.body.appendChild(audio);
-              }
+              if (pub.kind === Track.Kind.Audio && pub.track) wireAudio(pub.track);
             });
           });
           renderLayout(room);

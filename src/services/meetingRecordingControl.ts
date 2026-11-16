@@ -151,7 +151,9 @@ export async function startMeetingRecordingSegment(
 
   const filePath = segmentFilePath(roomName, segmentIndex);
   const outputFile = new EncodedFileOutput({ filepath: filePath });
-  const { teacherName } = await resolveMeetingTeacherDisplay(meeting.created_by);
+  const { teacherName, teacherIcon } = await resolveMeetingTeacherDisplay(
+    meeting.created_by,
+  );
 
   const egressParams = new URLSearchParams({
     token: egressToken,
@@ -159,6 +161,10 @@ export async function startMeetingRecordingSegment(
   });
   if (meeting.title) egressParams.set('meetingTitle', meeting.title);
   if (teacherName) egressParams.set('teacherName', teacherName);
+  if (teacherIcon) egressParams.set('teacherIcon', teacherIcon);
+  if (meeting.created_by != null) {
+    egressParams.set('teacherUserId', String(meeting.created_by));
+  }
 
   const recordingBase = resolveRecordingCompositeBaseUrl();
   // Room Composite = full meeting timeline (camera ↔ screen switches, both together).
