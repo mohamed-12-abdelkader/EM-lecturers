@@ -217,7 +217,11 @@ export class SessionPoolService {
        FROM wa_service_sessions ps
        JOIN wa_services sv ON sv.id = ps.service_id
        WHERE ps.session_slug = $1 AND ps.is_enabled = TRUE
-       ORDER BY ps.priority DESC, sv.is_enabled DESC, sv.id ASC
+       ORDER BY
+         CASE WHEN sv.type = 'chatbot' THEN 0 ELSE 1 END ASC,
+         ps.priority DESC,
+         sv.is_enabled DESC,
+         sv.id ASC
        LIMIT 1`,
       [sessionSlug],
     );

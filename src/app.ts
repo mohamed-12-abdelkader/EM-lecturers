@@ -18,8 +18,10 @@ import './modules/whatsapp/automations/technicalSupport';
 import './modules/whatsapp/automations/teacherCreative';
 import './modules/whatsapp/automations/teacherDataAnalyst';
 import './modules/whatsapp/automations/studentScientific';
+import './modules/whatsapp/automations/teacherScientificSupport';
 import './modules/whatsapp/automations/teacherExamBuilder';
 import './modules/whatsapp/automations/parentsExamNotify';
+import './modules/whatsapp/automations/teachersManagement';
 
 export const app = express();
 export const server = createServer(app);

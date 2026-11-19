@@ -14,6 +14,29 @@ export class MilvusService {
   private static readonly DEFAULT_METRIC = 'IP' as const;
   private static readonly DEFAULT_CONSISTENCY = 'Bounded' as const;
 
+  /** Drop cached client so the next call can reconnect. */
+  static resetClient(): void {
+    this.client = null;
+  }
+
+  private static withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        reject(new Error(`UNAVAILABLE: ${label} timed out after ${ms}ms`));
+      }, ms);
+      promise.then(
+        (value) => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        (err) => {
+          clearTimeout(timer);
+          reject(err);
+        },
+      );
+    });
+  }
+
   /**
    * Get or create Milvus client instance
    */
@@ -23,14 +46,25 @@ export class MilvusService {
       const username = config.MILVUS_USERNAME;
       const password = config.MILVUS_PASSWORD;
 
-      this.client = new MilvusClient({
+      const client = new MilvusClient({
         address,
         username,
         password,
       });
 
-      await this.client.connectPromise;
-      logger.info('✅ Connected to Milvus');
+      try {
+        await this.withTimeout(client.connectPromise, 8_000, 'Milvus connect');
+        this.client = client;
+        logger.info('✅ Connected to Milvus');
+      } catch (err) {
+        this.client = null;
+        try {
+          await client.closeConnection();
+        } catch {
+          /* ignore */
+        }
+        throw err;
+      }
     }
     return this.client;
   }
@@ -393,3 +427,5 @@ export class MilvusService {
     }
   }
 }
+
+

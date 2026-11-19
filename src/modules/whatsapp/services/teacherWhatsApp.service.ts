@@ -12,7 +12,11 @@ import type { WaServiceRow, WaSessionRow } from '../automations/types';
 import { TeacherReportsService } from '../../../services/teacherReports';
 import { TeacherWhatsAppSend } from './teacherWhatsAppSend';
 
-const TEACHER_SERVICE_KEYS = ['teacher_student_notify', 'teacher_parent_report'] as const;
+const TEACHER_SERVICE_KEYS = [
+  'teacher_student_notify',
+  'teacher_parent_report',
+  'teacher_scientific_support',
+] as const;
 const MAX_SESSIONS_PER_TEACHER = 2;
 const MAX_NOTIFY_RECIPIENTS = 50;
 const MAX_NOTIFY_CHARS = 1000;
@@ -217,14 +221,18 @@ export class TeacherWhatsAppService {
         [serviceId, teacherId],
       );
 
+      // Chatbots (e.g. scientific support) get higher priority so inbound
+      // messages on a shared teacher number route to the reply bot first.
+      const priority = serviceKey === 'teacher_scientific_support' ? 10 : 0;
       for (const slug of uniqueSlugs) {
         await client.query(
           `INSERT INTO wa_service_sessions
              (service_id, session_slug, weight, priority, role, is_enabled)
-           VALUES ($1, $2, 1, 0, 'primary', TRUE)
+           VALUES ($1, $2, 1, $3, 'primary', TRUE)
            ON CONFLICT (service_id, session_slug) DO UPDATE SET
-             is_enabled = TRUE`,
-          [serviceId, slug],
+             is_enabled = TRUE,
+             priority = EXCLUDED.priority`,
+          [serviceId, slug, priority],
         );
       }
 

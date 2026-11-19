@@ -176,6 +176,11 @@ const startServer = async () => {
     );
     startParentsExamSweeper();
 
+    const { startTeachersManagementSweeper } = await import(
+      './modules/whatsapp/automations/teachersManagement/index.js'
+    );
+    startTeachersManagementSweeper();
+
     const { startYoutubeUploadWorker } = await import('./workers/youtubeUploadWorker.js');
     startYoutubeUploadWorker();
 

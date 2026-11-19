@@ -139,7 +139,9 @@ export async function generateParticipantToken({
   metadata,
   role = 'participant',
   allowChat = true,
-  ttl = '10m',
+  // Long TTL: LiveKit server clock can drift hours ahead of the API host;
+  // short tokens (e.g. 10m) then fail /rtc/validate as "expired".
+  ttl = '12h',
   hidden,
   // canPublishSources = [],
 }: GenerateParticipantTokenParams): Promise<string> {
@@ -165,6 +167,7 @@ export async function generateParticipantToken({
     videoGrant.canUpdateOwnMetadata = false;
   } else if (role === 'host') {
     Object.assign(videoGrant, {
+      canPublish: true,
       roomAdmin: true,
       roomCreate: true,
       canUpdateOwnMetadata: true,

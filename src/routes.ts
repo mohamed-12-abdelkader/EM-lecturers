@@ -113,6 +113,7 @@ import { router as academyRouter } from './controllers/academy';
 import { router as courseGroupsRouter } from './controllers/courseGroups';
 import { whatsappAdminRouter } from './modules/whatsapp/controllers/whatsappAdmin.controller';
 import { whatsappTeacherRouter } from './modules/whatsapp/controllers/whatsappTeacher.controller';
+import { router as teacherScheduleRouter } from './controllers/teacherSchedule';
 
 export const router = Router();
 
@@ -154,6 +155,7 @@ router.use('/admin/youtube', adminYoutubeRouter);
 router.use('/cdn', cdnImagesRouter);
 router.use('/whatsapp', whatsappAdminRouter);
 router.use('/teacher/whatsapp', whatsappTeacherRouter);
+router.use('/admin/teacher-schedules', teacherScheduleRouter);
 router.use('/analytics', analyticsRouter);
 router.use('/analytics/tracking', analyticsTrackingRouter);
 router.use('/notifications', notificationsRouter);

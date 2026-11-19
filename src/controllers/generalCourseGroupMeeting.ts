@@ -479,7 +479,8 @@ router.get(
         identity: buildScreenShareIdentity(participantIdentity),
         name: participantName,
         role: 'host',
-        ttl: '2h',
+        // Keep above LiveKit/API clock skew (observed ~4h) + meeting length.
+        ttl: '12h',
         metadata: JSON.stringify({
           role: 'host',
           hidden: true,

@@ -1,9 +1,13 @@
 import { Router } from 'express';
+import path from 'path';
+import multer from 'multer';
 import { z } from 'zod';
 import axios from 'axios';
+import { buildFileUrl } from '../../../config/appUrls';
 import { authMiddleware } from '../../../middleware/authentication';
 import { requireDefaultTenantMiddleware } from '../../../middleware/tenantContext';
 import { validate } from '../../../middleware/validateReq';
+import { ensureUploadsDir } from '../../../services/localImageStorage';
 import { asyncWrapper, HttpError } from '../../../utils';
 import { isWhatsAppConfigured } from '../gateway/whatsappGatewayClient';
 import { whatsappConfig } from '../config/whatsapp';
@@ -13,6 +17,31 @@ import { WhatsAppOutboundQueue } from '../queue/whatsappOutboundQueue';
 import { SessionPoolService } from '../routing/sessionPool.service';
 import { SupportPolicyChatService } from '../automations/supportPolicy/policyChat.service';
 import { ParentsExamNotifyService } from '../automations/parentsExamNotify/service';
+import { TeachersManagementService } from '../automations/teachersManagement/service';
+
+const teachersMediaDir = ensureUploadsDir('whatsapp-teachers');
+const teachersMediaUpload = multer({
+  storage: multer.diskStorage({
+    destination: (_req, _file, cb) => cb(null, teachersMediaDir),
+    filename: (_req, file, cb) => {
+      const ext = path.extname(file.originalname || '').toLowerCase() || '';
+      cb(null, `${Date.now()}-${Math.round(Math.random() * 1e9)}${ext}`);
+    },
+  }),
+  limits: { fileSize: 80 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    const mime = String(file.mimetype || '').toLowerCase();
+    if (
+      mime.startsWith('image/') ||
+      mime.startsWith('video/') ||
+      mime === 'application/octet-stream'
+    ) {
+      cb(null, true);
+      return;
+    }
+    cb(new Error('يُسمح برفع صور أو فيديو فقط'));
+  },
+});
 
 export const whatsappAdminRouter = Router();
 
@@ -548,6 +577,151 @@ whatsappAdminRouter.post(
     const examId = Number(req.params.examId);
     if (!examId) throw new HttpError(400, 'معرف الامتحان غير صحيح');
     const data = await ParentsExamNotifyService.cancelPending(examId);
+    res.json({ success: true, data });
+  }),
+);
+
+const TeachersManagementSettingsBody = z.object({
+  enabled: z.boolean().optional(),
+  sendHour: z.number().int().min(0).max(23).optional(),
+  sendMinute: z.number().int().min(0).max(59).optional(),
+  teacherIds: z.array(z.number().int().positive()).nullable().optional(),
+  subscriptionAlertEnabled: z.boolean().optional(),
+  subscriptionAlertHour: z.number().int().min(0).max(23).optional(),
+  subscriptionAlertMinute: z.number().int().min(0).max(59).optional(),
+  subscriptionAlertMessage: z.string().max(4000).optional(),
+});
+
+whatsappAdminRouter.get(
+  '/teachers-management/settings',
+  asyncWrapper(async (_req, res) => {
+    const data = await TeachersManagementService.getSettings();
+    res.json({ success: true, data });
+  }),
+);
+
+whatsappAdminRouter.put(
+  '/teachers-management/settings',
+  validate(TeachersManagementSettingsBody),
+  asyncWrapper(async (req, res) => {
+    const data = await TeachersManagementService.saveSettings({
+      ...req.body,
+      updatedBy: req.user?.id ?? null,
+    });
+    res.json({ success: true, data });
+  }),
+);
+
+whatsappAdminRouter.get(
+  '/teachers-management/logs',
+  asyncWrapper(async (req, res) => {
+    const status = typeof req.query.status === 'string' ? req.query.status : undefined;
+    const q = typeof req.query.q === 'string' ? req.query.q : undefined;
+    const limit = Number(req.query.limit || 50);
+    const page = Number(req.query.page || 1);
+    const data = await TeachersManagementService.listLogs({ status, q, limit, page });
+    res.json({ success: true, data });
+  }),
+);
+
+whatsappAdminRouter.post(
+  '/teachers-management/retry',
+  validate(
+    z.object({
+      logIds: z.array(z.number().int().positive()).max(100).optional(),
+    }),
+  ),
+  asyncWrapper(async (req, res) => {
+    const data = await TeachersManagementService.retryFailed(req.body.logIds);
+    res.status(202).json({ success: true, data });
+  }),
+);
+
+whatsappAdminRouter.post(
+  '/teachers-management/test',
+  validate(z.object({ teacherId: z.number().int().positive() })),
+  asyncWrapper(async (req, res) => {
+    const data = await TeachersManagementService.testSend(req.body.teacherId);
+    res.status(202).json({ success: true, data });
+  }),
+);
+
+whatsappAdminRouter.post(
+  '/teachers-management/media',
+  teachersMediaUpload.single('file'),
+  asyncWrapper(async (req, res) => {
+    if (!req.file?.filename) {
+      throw new HttpError(400, 'أرفق ملف صورة أو فيديو في الحقل file');
+    }
+    const relative = `/uploads/whatsapp-teachers/${req.file.filename}`;
+    const absolute = buildFileUrl(relative);
+    if (!absolute) {
+      throw new HttpError(500, 'تعذّر بناء رابط الملف');
+    }
+    const mime = String(req.file.mimetype || '').toLowerCase();
+    const kind = mime.startsWith('video/')
+      ? 'video'
+      : mime.startsWith('image/')
+        ? 'image'
+        : path.extname(req.file.filename).match(/\.(mp4|mov|webm|mkv)$/i)
+          ? 'video'
+          : 'image';
+    res.status(201).json({
+      success: true,
+      data: {
+        url: absolute,
+        path: relative,
+        kind,
+        mimetype: req.file.mimetype,
+        bytes: req.file.size,
+        filename: req.file.filename,
+      },
+    });
+  }),
+);
+
+const TeachersBroadcastBody = z.object({
+  body: z.string().max(4000).optional().nullable(),
+  imageUrl: z.string().max(2000).optional().nullable(),
+  videoUrl: z.string().max(2000).optional().nullable(),
+  teacherIds: z.array(z.number().int().positive()).max(500).optional().nullable(),
+});
+
+whatsappAdminRouter.post(
+  '/teachers-management/broadcast',
+  validate(TeachersBroadcastBody),
+  asyncWrapper(async (req, res) => {
+    const data = await TeachersManagementService.broadcast({
+      body: req.body.body,
+      imageUrl: req.body.imageUrl,
+      videoUrl: req.body.videoUrl,
+      teacherIds: req.body.teacherIds,
+      createdBy: req.user?.id ?? null,
+    });
+    res.status(202).json({ success: true, data });
+  }),
+);
+
+whatsappAdminRouter.get(
+  '/teachers-management/broadcasts',
+  asyncWrapper(async (req, res) => {
+    const data = await TeachersManagementService.listBroadcasts({
+      limit: Number(req.query.limit || 20),
+      page: Number(req.query.page || 1),
+    });
+    res.json({ success: true, data });
+  }),
+);
+
+whatsappAdminRouter.get(
+  '/teachers-management/subscription-logs',
+  asyncWrapper(async (req, res) => {
+    const data = await TeachersManagementService.listSubscriptionAlertLogs({
+      status: typeof req.query.status === 'string' ? req.query.status : undefined,
+      q: typeof req.query.q === 'string' ? req.query.q : undefined,
+      limit: Number(req.query.limit || 50),
+      page: Number(req.query.page || 1),
+    });
     res.json({ success: true, data });
   }),
 );

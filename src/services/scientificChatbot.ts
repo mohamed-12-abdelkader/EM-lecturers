@@ -428,8 +428,197 @@ Standalone question:`;
       msg.includes('503') ||
       msg.includes('Bad Gateway') ||
       msg.includes('UNAVAILABLE') ||
-      msg.includes('No connection')
+      msg.includes('No connection') ||
+      msg.includes('ECONNREFUSED') ||
+      msg.includes('ETIMEDOUT') ||
+      msg.includes('connectPromise')
     );
+  }
+
+  /**
+   * Fallback retrieval when Milvus/embeddings are down: keyword search over
+   * course_content_files.content_text stored in Postgres.
+   */
+  private static async searchChunksFromPostgres(opts: {
+    query: string;
+    teacherId: number;
+    courseId?: number | null;
+    limit?: number;
+  }): Promise<
+    Array<{
+      score: number;
+      chunk_text: string;
+      teacher_id: number;
+      course_id: number;
+      file_id: number;
+      chunk_index: number;
+    }>
+  > {
+    const limit = Math.min(8, Math.max(1, opts.limit ?? 3));
+    const terms = String(opts.query || '')
+      .split(/[^\p{L}\p{N}]+/u)
+      .map((t) => t.trim())
+      .filter((t) => t.length >= 2)
+      .slice(0, 12);
+
+    const values: unknown[] = [opts.teacherId];
+    let where = `teacher_id = $1 AND content_text IS NOT NULL AND length(trim(content_text)) > 0`;
+    if (opts.courseId != null) {
+      values.push(opts.courseId);
+      where += ` AND (course_id = $${values.length} OR course_id IS NULL)`;
+    }
+
+    const filesRes = await pool.query<CourseContentFile>(
+      `SELECT id, teacher_id, course_id, content_text
+       FROM course_content_files
+       WHERE ${where}
+       ORDER BY updated_at DESC NULLS LAST, uploaded_at DESC
+       LIMIT 40`,
+      values,
+    );
+
+    if (!filesRes.rowCount) return [];
+
+    const scored: Array<{
+      score: number;
+      chunk_text: string;
+      teacher_id: number;
+      course_id: number;
+      file_id: number;
+      chunk_index: number;
+    }> = [];
+
+    for (const file of filesRes.rows) {
+      const chunks = chunkText(file.content_text || '', this.CHUNK_SIZE, this.CHUNK_OVERLAP);
+      chunks.forEach((chunk, chunkIndex) => {
+        const lower = chunk.toLowerCase();
+        let score = 0;
+        if (terms.length === 0) {
+          score = 0.01;
+        } else {
+          for (const term of terms) {
+            if (lower.includes(term.toLowerCase())) score += 1;
+          }
+        }
+        if (score > 0) {
+          scored.push({
+            score,
+            chunk_text: chunk,
+            teacher_id: Number(file.teacher_id),
+            course_id: Number(file.course_id ?? 0),
+            file_id: Number(file.id),
+            chunk_index: chunkIndex,
+          });
+        }
+      });
+    }
+
+    scored.sort((a, b) => b.score - a.score);
+    if (scored.length) return scored.slice(0, limit);
+
+    // No keyword hits: still return first chunks so the LLM has material.
+    const fallback: typeof scored = [];
+    for (const file of filesRes.rows) {
+      const chunks = chunkText(file.content_text || '', this.CHUNK_SIZE, this.CHUNK_OVERLAP);
+      for (let i = 0; i < chunks.length && fallback.length < limit; i += 1) {
+        fallback.push({
+          score: 0,
+          chunk_text: chunks[i],
+          teacher_id: Number(file.teacher_id),
+          course_id: Number(file.course_id ?? 0),
+          file_id: Number(file.id),
+          chunk_index: i,
+        });
+      }
+      if (fallback.length >= limit) break;
+    }
+    return fallback;
+  }
+
+  private static async retrieveCourseChunks(
+    rewrittenQuestion: string,
+    teacherId: number,
+    courseId: number,
+  ) {
+    try {
+      const questionEmbedding =
+        await EmbeddingService.generateEmbedding(rewrittenQuestion);
+      try {
+        return await MilvusService.searchSimilarChunks(
+          this.COLLECTION_NAME,
+          questionEmbedding,
+          teacherId,
+          courseId,
+          3,
+        );
+      } catch (milvusError: any) {
+        if (!this.isServiceUnavailableError(milvusError)) throw milvusError;
+        logger.warn(
+          { err: milvusError?.message },
+          'Milvus unavailable — falling back to Postgres content search',
+        );
+        MilvusService.resetClient();
+        return this.searchChunksFromPostgres({
+          query: rewrittenQuestion,
+          teacherId,
+          courseId,
+          limit: 3,
+        });
+      }
+    } catch (embedError: any) {
+      if (!this.isServiceUnavailableError(embedError)) throw embedError;
+      logger.warn(
+        { err: embedError?.message },
+        'Embeddings unavailable — falling back to Postgres content search',
+      );
+      return this.searchChunksFromPostgres({
+        query: rewrittenQuestion,
+        teacherId,
+        courseId,
+        limit: 3,
+      });
+    }
+  }
+
+  private static async retrieveTeacherChunks(
+    rewrittenQuestion: string,
+    teacherId: number,
+  ) {
+    try {
+      const questionEmbedding =
+        await EmbeddingService.generateEmbedding(rewrittenQuestion);
+      try {
+        return await MilvusService.searchSimilarChunksByTeacher(
+          this.COLLECTION_NAME,
+          questionEmbedding,
+          teacherId,
+          3,
+        );
+      } catch (milvusError: any) {
+        if (!this.isServiceUnavailableError(milvusError)) throw milvusError;
+        logger.warn(
+          { err: milvusError?.message },
+          'Milvus unavailable — falling back to Postgres teacher content search',
+        );
+        MilvusService.resetClient();
+        return this.searchChunksFromPostgres({
+          query: rewrittenQuestion,
+          teacherId,
+          limit: 3,
+        });
+      }
+    } catch (embedError: any) {
+      if (!this.isServiceUnavailableError(embedError)) throw embedError;
+      logger.warn(
+        { err: embedError?.message },
+        'Embeddings unavailable — falling back to Postgres teacher content search',
+      );
+      return this.searchChunksFromPostgres({
+        query: rewrittenQuestion,
+        teacherId,
+        limit: 3,
+      });
+    }
   }
 
   static async answerQuestion(
@@ -442,35 +631,15 @@ Standalone question:`;
       const recentQuestions = await this.getRecentQuestions(studentId, courseId, 2);
       const rewrittenQuestion = await this.rewriteQuestion(question, recentQuestions);
 
-      let questionEmbedding: number[];
-      try {
-        questionEmbedding = await EmbeddingService.generateEmbedding(rewrittenQuestion);
-      } catch (embedError: any) {
-        if (this.isServiceUnavailableError(embedError)) {
-          return {
-            answer: 'محتوى المادة متوفر، لكن خدمة الإجابة الآلية غير متاحة مؤقتاً. يرجى المحاولة بعد قليل أو إخبار المدرس.',
-            retrievedChunks: [],
-          };
-        }
-        throw embedError;
-      }
-
       const courseResult = await pool.query(`SELECT teacher_id FROM courses WHERE id = $1`, [courseId]);
       if (courseResult.rows.length === 0) throw new Error('Course not found');
       const teacherId = courseResult.rows[0].teacher_id;
 
-      let similarChunks: any[];
-      try {
-        similarChunks = await MilvusService.searchSimilarChunks(this.COLLECTION_NAME, questionEmbedding, teacherId, courseId, 3);
-      } catch (milvusError: any) {
-        if (this.isServiceUnavailableError(milvusError)) {
-          return {
-            answer: 'محتوى المادة متوفر، لكن خدمة الإجابة الآلية غير متاحة مؤقتاً. يرجى المحاولة بعد قليل أو إخبار المدرس.',
-            retrievedChunks: [],
-          };
-        }
-        throw milvusError;
-      }
+      const similarChunks = await this.retrieveCourseChunks(
+        rewrittenQuestion,
+        teacherId,
+        courseId,
+      );
 
       if (similarChunks.length === 0) {
         return { answer: 'لا يمكنني العثور على هذه المعلومات في مواد الدورة التدريبية.', retrievedChunks: [] };
@@ -553,31 +722,10 @@ ${rewrittenQuestion}`;
       const recentQuestions = await this.getRecentTeacherQuestions(studentId, teacherId, 2);
       const rewrittenQuestion = await this.rewriteQuestion(question, recentQuestions);
 
-      let questionEmbedding: number[];
-      try {
-        questionEmbedding = await EmbeddingService.generateEmbedding(rewrittenQuestion);
-      } catch (embedError: any) {
-        if (this.isServiceUnavailableError(embedError)) {
-          return {
-            answer: 'محتوى المادة متوفر، لكن خدمة الإجابة الآلية غير متاحة مؤقتاً. يرجى المحاولة بعد قليل أو إخبار المدرس.',
-            retrievedChunks: [],
-          };
-        }
-        throw embedError;
-      }
-
-      let similarChunks: any[];
-      try {
-        similarChunks = await MilvusService.searchSimilarChunksByTeacher(this.COLLECTION_NAME, questionEmbedding, teacherId, 3);
-      } catch (milvusError: any) {
-        if (this.isServiceUnavailableError(milvusError)) {
-          return {
-            answer: 'محتوى المادة متوفر، لكن خدمة الإجابة الآلية غير متاحة مؤقتاً. يرجى المحاولة بعد قليل أو إخبار المدرس.',
-            retrievedChunks: [],
-          };
-        }
-        throw milvusError;
-      }
+      const similarChunks = await this.retrieveTeacherChunks(
+        rewrittenQuestion,
+        teacherId,
+      );
 
       if (similarChunks.length === 0) {
         return { answer: 'لا يمكنني العثور على هذه المعلومات في مواد الدورة التدريبية.', retrievedChunks: [] };
