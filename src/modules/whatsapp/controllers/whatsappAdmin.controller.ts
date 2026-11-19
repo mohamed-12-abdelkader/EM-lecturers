@@ -80,7 +80,15 @@ whatsappAdminRouter.get(
   asyncWrapper(async (_req, res) => {
     try {
       const sessions = await WhatsAppSessionService.listMerged();
-      res.json({ success: true, data: { sessions } });
+      res.json({
+        success: true,
+        data: {
+          sessions,
+          gatewayReachable: sessions.every(
+            (s) => !String(s.last_error || '').includes('بوابة واتساب غير متاحة'),
+          ),
+        },
+      });
     } catch (err) {
       if (err instanceof HttpError) throw err;
       gatewayError(err);

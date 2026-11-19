@@ -43,15 +43,45 @@ async function upsertLocalFromGateway(gw: GatewaySession): Promise<void> {
   );
 }
 
+function isGatewayUnreachableError(err: unknown): boolean {
+  const anyErr = err as {
+    code?: string;
+    message?: string;
+    response?: unknown;
+  };
+  const code = String(anyErr?.code || '');
+  const msg = String(anyErr?.message || '');
+  return (
+    !anyErr?.response &&
+    (code === 'ECONNRESET' ||
+      code === 'ECONNREFUSED' ||
+      code === 'ETIMEDOUT' ||
+      code === 'ENOTFOUND' ||
+      code === 'EAI_AGAIN' ||
+      msg.includes('ECONNRESET') ||
+      msg.includes('ECONNREFUSED') ||
+      msg.includes('ETIMEDOUT') ||
+      msg.includes('ENOTFOUND') ||
+      msg.includes('socket hang up'))
+  );
+}
+
 export class WhatsAppSessionService {
   static async listMerged(): Promise<MergedSession[]> {
     if (!isWhatsAppConfigured()) {
       throw new HttpError(503, 'WhatsApp gateway is not configured (WHATSAPP_API_KEY).');
     }
 
-    const gatewaySessions = await listSessions();
-    for (const gw of gatewaySessions) {
-      await upsertLocalFromGateway(gw);
+    let gatewaySessions: GatewaySession[] = [];
+    let gatewayUnreachable = false;
+    try {
+      gatewaySessions = await listSessions();
+      for (const gw of gatewaySessions) {
+        await upsertLocalFromGateway(gw);
+      }
+    } catch (err) {
+      if (!isGatewayUnreachableError(err)) throw err;
+      gatewayUnreachable = true;
     }
 
     const local = await pool.query<
@@ -87,14 +117,16 @@ export class WhatsAppSessionService {
       if (!gwById.has(loc.slug)) {
         merged.push({
           id: loc.slug,
-          status: loc.status,
+          status: gatewayUnreachable ? 'disconnected' : loc.status,
           phone_number: loc.phone_number,
           qr: null,
           label: loc.label,
           is_enabled: loc.is_enabled,
           max_messages_per_minute: loc.max_messages_per_minute,
           last_ready_at: loc.last_ready_at,
-          last_error: loc.last_error,
+          last_error: gatewayUnreachable
+            ? loc.last_error || 'بوابة واتساب غير متاحة حالياً (ECONNRESET)'
+            : loc.last_error,
           local_id: loc.id,
           teacher_id: loc.teacher_id ?? null,
           teacher_name: loc.teacher_name ?? null,
