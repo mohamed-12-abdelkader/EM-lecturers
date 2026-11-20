@@ -28,7 +28,6 @@ import {
   pauseMeetingRecording,
   resumeMeetingRecording,
   syncRecordingWithTeacherPresence,
-  upgradeRecordingToScreenShareIfNeeded,
   uploadFinalizedMeetingRecording,
 } from '../services/meetingRecordingControl';
 import {
@@ -841,19 +840,12 @@ router.post('/webhook', async (req, res) => {
         });
       }
     } else if (event.event === 'track_published') {
-      // Ensure egress started if host media arrived late; upgrade to screen share when published.
+      // Room composite stays running; only ensure egress started if host media arrived late.
       const roomName = event.room?.name;
       if (roomName) {
         await ensureInitialRecordingStarted(roomName).catch((err) => {
           console.warn('[Meeting webhook] deferred recording start failed:', err);
         });
-        const trackSource = Number((event as any).track?.source);
-        // TrackSource.SCREEN_SHARE = 3, SCREEN_SHARE_AUDIO = 4
-        if (trackSource === 3 || trackSource === 4) {
-          await upgradeRecordingToScreenShareIfNeeded(roomName).catch((err) => {
-            console.warn('[Meeting webhook] screen-share recording upgrade failed:', err);
-          });
-        }
       }
     } else if (event.event === 'room_finished') {
       const sid = event.room!.sid;
