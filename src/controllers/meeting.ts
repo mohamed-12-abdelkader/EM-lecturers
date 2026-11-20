@@ -28,6 +28,7 @@ import {
   pauseMeetingRecording,
   resumeMeetingRecording,
   syncRecordingWithTeacherPresence,
+  upgradeRecordingToScreenShareIfNeeded,
   uploadFinalizedMeetingRecording,
 } from '../services/meetingRecordingControl';
 import {
@@ -50,6 +51,33 @@ async function startMeetingRecordingEgress(roomName: string): Promise<void> {
   await ensureInitialRecordingStarted(roomName);
 }
 
+/** Parse optional scheduled_start_at from request body. undefined = omit, null = clear. */
+function parseScheduledStartAtInput(
+  value: unknown,
+  { requireFuture = false }: { requireFuture?: boolean } = {},
+): Date | null | undefined {
+  if (value === undefined) return undefined;
+  if (value === null || value === '') return null;
+  const date = new Date(String(value));
+  if (Number.isNaN(date.getTime())) {
+    throw Object.assign(new Error('موعد البداية غير صالح'), { status: 400 });
+  }
+  if (requireFuture) {
+    // Allow ~2 minutes clock skew
+    if (date.getTime() < Date.now() - 2 * 60 * 1000) {
+      throw Object.assign(new Error('موعد البداية يجب أن يكون في المستقبل'), { status: 400 });
+    }
+  }
+  return date;
+}
+
+function isScheduledMeetingStillClosed(meeting: { status?: string; scheduled_start_at?: Date | string | null }, isOwner: boolean): boolean {
+  if (isOwner) return false;
+  if (meeting.status === 'started') return false;
+  if (!meeting.scheduled_start_at) return false;
+  return new Date(meeting.scheduled_start_at).getTime() > Date.now();
+}
+
 /**
  * -------------------------
  * MEETING MANAGEMENT
@@ -65,6 +93,7 @@ router.post(
     z.object({
       title: z.string().min(3, 'Title must be at least 3 characters long'),
       course_id: z.coerce.number().int().positive(),
+      scheduled_start_at: z.union([z.string(), z.null()]).optional(),
     }),
   ),
   asyncWrapper(async (req, res) => {
@@ -74,18 +103,26 @@ router.post(
       await enforceTeacherLiveCreationLimit(user.id);
     }
 
+    let scheduledStartAt: Date | null = null;
+    try {
+      const parsed = parseScheduledStartAtInput(req.body.scheduled_start_at, { requireFuture: true });
+      scheduledStartAt = parsed === undefined ? null : parsed;
+    } catch (err: any) {
+      return res.status(err?.status || 400).json({ message: err?.message || 'موعد البداية غير صالح' });
+    }
+
     const { rows } = await pool.query(
-      `INSERT INTO meeting (title, course_id, created_by, status)
-       VALUES ($1, $2, $3, 'idle')
+      `INSERT INTO meeting (title, course_id, created_by, status, scheduled_start_at)
+       VALUES ($1, $2, $3, 'idle', $4)
        RETURNING *`,
-      [title, course_id, user.id],
+      [title, course_id, user.id, scheduledStartAt],
     );
 
     res.status(201).json({ message: 'Meeting created', meeting: rows[0] });
   }),
 );
 
-// Update meeting (title و/أو حفظ رابط التسجيل egress_url)
+// Update meeting (title و/أو حفظ رابط التسجيل egress_url و/أو موعد البداية)
 router.put(
   '/:id',
   isMeetingOwnerOrAdmin,
@@ -93,11 +130,13 @@ router.put(
     z.object({
       title: z.string().min(3).optional(),
       egress_url: z.union([z.string().url(), z.literal(null)]).optional(),
+      scheduled_start_at: z.union([z.string(), z.null()]).optional(),
     }),
   ),
   asyncWrapper(async (req, res) => {
     const { id } = req.params;
     const { title, egress_url } = req.body;
+    const meeting = (req as any).meeting as { status?: string } | undefined;
 
     const updates: string[] = ['updated_at = CURRENT_TIMESTAMP'];
     const values: any[] = [];
@@ -109,6 +148,22 @@ router.put(
     if (egress_url !== undefined) {
       updates.push(`egress_url = $${idx++}`);
       values.push(egress_url);
+    }
+    if (req.body.scheduled_start_at !== undefined) {
+      if (meeting?.status && meeting.status !== 'idle') {
+        return res.status(400).json({ message: 'لا يمكن تعديل موعد البداية بعد بدء المحاضرة' });
+      }
+      let scheduledStartAt: Date | null;
+      try {
+        const parsed = parseScheduledStartAtInput(req.body.scheduled_start_at, {
+          requireFuture: req.body.scheduled_start_at !== null && req.body.scheduled_start_at !== '',
+        });
+        scheduledStartAt = parsed === undefined ? null : parsed;
+      } catch (err: any) {
+        return res.status(err?.status || 400).json({ message: err?.message || 'موعد البداية غير صالح' });
+      }
+      updates.push(`scheduled_start_at = $${idx++}`);
+      values.push(scheduledStartAt);
     }
     if (values.length === 0) {
       const { rows } = await pool.query(`SELECT * FROM meeting WHERE id = $1 LIMIT 1`, [id]);
@@ -313,13 +368,19 @@ router.get(
       avatar: dbUser.avatar,
     };
 
-    // الطالب يمكنه الدخول فوراً دون انتظار وصول المحاضر (يعتمد الفرونت على canEnter لتفعيل زر الدخول)
-    const canEnter = true;
+    const isOwner = sameUserId(dbUser.id, meeting.created_by);
+    const notYetOpen = isScheduledMeetingStillClosed(meeting as any, isOwner);
+    // الطالب يدخل بعد موعد البداية أو عند بدء المحاضر؛ المحاضر يدخل في أي وقت
+    const canEnter = !notYetOpen;
 
     res.json({
       meeting: { ...req.meeting, participantsCount: participantsCount ?? 0 },
       user,
       canEnter,
+      opensAt: (meeting as any).scheduled_start_at || null,
+      message: notYetOpen
+        ? 'المحاضرة لم تفتح بعد — ستُفتح في الموعد المحدد'
+        : undefined,
     });
   }),
 );
@@ -356,6 +417,12 @@ router.get(
       const meetingSource = (req as any).meetingSource as 'course' | 'general_course_group' | undefined;
 
       const isOwner = sameUserId(user.id, meeting.created_by);
+      if (isScheduledMeetingStillClosed(meeting as any, isOwner)) {
+        return res.status(403).json({
+          message: 'المحاضرة لم تفتح بعد — ستُفتح في الموعد المحدد',
+          opensAt: (meeting as any).scheduled_start_at || null,
+        });
+      }
       const canScreenShare = await canUserIssueScreenShareToken({
         user,
         meeting,
@@ -774,12 +841,19 @@ router.post('/webhook', async (req, res) => {
         });
       }
     } else if (event.event === 'track_published') {
-      // Room composite stays running; only ensure egress started if host media arrived late.
+      // Ensure egress started if host media arrived late; upgrade to screen share when published.
       const roomName = event.room?.name;
       if (roomName) {
         await ensureInitialRecordingStarted(roomName).catch((err) => {
           console.warn('[Meeting webhook] deferred recording start failed:', err);
         });
+        const trackSource = Number((event as any).track?.source);
+        // TrackSource.SCREEN_SHARE = 3, SCREEN_SHARE_AUDIO = 4
+        if (trackSource === 3 || trackSource === 4) {
+          await upgradeRecordingToScreenShareIfNeeded(roomName).catch((err) => {
+            console.warn('[Meeting webhook] screen-share recording upgrade failed:', err);
+          });
+        }
       }
     } else if (event.event === 'room_finished') {
       const sid = event.room!.sid;

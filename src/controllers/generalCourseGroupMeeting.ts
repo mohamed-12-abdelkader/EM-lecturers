@@ -60,6 +60,22 @@ async function isEnrolledInGroup(groupId: number, userId: number): Promise<boole
   return (r.rowCount ?? 0) > 0;
 }
 
+function parseScheduledStartAtInput(
+  value: unknown,
+  { requireFuture = false }: { requireFuture?: boolean } = {},
+): Date | null | undefined {
+  if (value === undefined) return undefined;
+  if (value === null || value === '') return null;
+  const date = new Date(String(value));
+  if (Number.isNaN(date.getTime())) {
+    throw Object.assign(new Error('موعد البداية غير صالح'), { status: 400 });
+  }
+  if (requireFuture && date.getTime() < Date.now() - 2 * 60 * 1000) {
+    throw Object.assign(new Error('موعد البداية يجب أن يكون في المستقبل'), { status: 400 });
+  }
+  return date;
+}
+
 // إنشاء جلسة بث مباشر لمجموعة
 router.post(
   '/groups/:groupId/meeting',
@@ -84,11 +100,23 @@ router.post(
         message: 'لديك بالفعل جلسة بث نشطة. يُرجى إنهاؤها قبل إنشاء جلسة جديدة.',
       });
     }
-    const parse = z.object({ title: z.string().min(3, 'العنوان 3 أحرف على الأقل') }).safeParse(req.body);
+    const parse = z
+      .object({
+        title: z.string().min(3, 'العنوان 3 أحرف على الأقل'),
+        scheduled_start_at: z.union([z.string(), z.null()]).optional(),
+      })
+      .safeParse(req.body);
     if (!parse.success) {
       return res.status(400).json({ success: false, message: 'بيانات غير صحيحة', errors: parse.error.errors });
     }
     const title = parse.data.title;
+    let scheduledStartAt: Date | null = null;
+    try {
+      const parsed = parseScheduledStartAtInput(parse.data.scheduled_start_at, { requireFuture: true });
+      scheduledStartAt = parsed === undefined ? null : parsed;
+    } catch (err: any) {
+      return res.status(err?.status || 400).json({ success: false, message: err?.message || 'موعد البداية غير صالح' });
+    }
 
     const groupCheck = await pool.query(
       'SELECT id, general_course_id FROM general_course_groups WHERE id = $1',
@@ -100,9 +128,9 @@ router.post(
     const general_course_id = groupCheck.rows[0].general_course_id;
 
     const insert = await pool.query(
-      `INSERT INTO general_course_group_meeting (group_id, title, created_by, status)
-       VALUES ($1, $2, $3, 'idle') RETURNING *`,
-      [groupId, title, user.id],
+      `INSERT INTO general_course_group_meeting (group_id, title, created_by, status, scheduled_start_at)
+       VALUES ($1, $2, $3, 'idle', $4) RETURNING *`,
+      [groupId, title, user.id, scheduledStartAt],
     );
     const meeting = insert.rows[0];
 
@@ -173,12 +201,13 @@ router.put(
       .object({
         title: z.string().min(3).optional(),
         egress_url: z.union([z.string().url(), z.literal(null)]).optional(),
+        scheduled_start_at: z.union([z.string(), z.null()]).optional(),
       })
       .safeParse(req.body);
     if (!parse.success) {
       return res.status(400).json({ success: false, message: 'بيانات غير صحيحة', errors: parse.error.errors });
     }
-    const { title, egress_url } = parse.data;
+    const { title, egress_url, scheduled_start_at } = parse.data;
     const updates: string[] = ['updated_at = CURRENT_TIMESTAMP'];
     const values: any[] = [];
     let idx = 1;
@@ -189,6 +218,22 @@ router.put(
     if (egress_url !== undefined) {
       updates.push(`egress_url = $${idx++}`);
       values.push(egress_url);
+    }
+    if (scheduled_start_at !== undefined) {
+      if (meeting.status !== 'idle') {
+        return res.status(400).json({ success: false, message: 'لا يمكن تعديل موعد البداية بعد بدء المحاضرة' });
+      }
+      let scheduledStartAt: Date | null;
+      try {
+        const parsed = parseScheduledStartAtInput(scheduled_start_at, {
+          requireFuture: scheduled_start_at !== null && scheduled_start_at !== '',
+        });
+        scheduledStartAt = parsed === undefined ? null : parsed;
+      } catch (err: any) {
+        return res.status(err?.status || 400).json({ success: false, message: err?.message || 'موعد البداية غير صالح' });
+      }
+      updates.push(`scheduled_start_at = $${idx++}`);
+      values.push(scheduledStartAt);
     }
     if (values.length === 0) {
       return res.json({ success: true, message: 'تم التحديث', meeting });

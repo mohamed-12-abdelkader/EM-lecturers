@@ -7,9 +7,12 @@ import {
   EgressClient,
   EncodedFileOutput,
   EncodingOptions,
+  EncodingOptionsPreset,
   RoomCompositeOptions,
+  RoomServiceClient,
+  TrackSource,
   VideoCodec,
-  type RoomServiceClient,
+  type ParticipantInfo,
 } from 'livekit-server-sdk';
 import pool from '../db/pool';
 import { config } from '../utils';
@@ -27,6 +30,23 @@ import {
 const execPromise = promisify(exec);
 
 const { LIVEKIT_API_KEY, LIVEKIT_API_SECRET, LIVEKIT_URL: LIVEKIT_SERVER_URL } = config;
+
+/**
+ * Recording mode:
+ * - teacher_tracks (default): Participant/TrackComposite from teacher media (closer to live quality)
+ * - room_composite: legacy Chrome template composite
+ *
+ * Rollback without code revert: MEETING_RECORDING_MODE=room_composite
+ */
+function resolveRecordingMode(): 'teacher_tracks' | 'room_composite' {
+  const raw = String(process.env.MEETING_RECORDING_MODE || 'teacher_tracks')
+    .trim()
+    .toLowerCase();
+  if (raw === 'room_composite' || raw === 'composite' || raw === 'legacy') {
+    return 'room_composite';
+  }
+  return 'teacher_tracks';
+}
 
 /**
  * Full-meeting recorder template (screen full + camera PiP).
@@ -60,8 +80,55 @@ type MeetingRecordingRow = {
   recording_segments?: unknown;
 };
 
+type TeacherTrackTarget =
+  | {
+      kind: 'track_composite';
+      videoTrackId: string;
+      audioTrackId?: string;
+      reason: string;
+    }
+  | {
+      kind: 'participant';
+      identity: string;
+      screenShare: boolean;
+      reason: string;
+    };
+
 function getEgressClient() {
   return new EgressClient(LIVEKIT_SERVER_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET);
+}
+
+function getRoomServiceClient() {
+  return new RoomServiceClient(LIVEKIT_SERVER_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET);
+}
+
+/** Rooms whose active segment is already capturing teacher screen share. */
+const screenShareSegmentRooms = new Set<string>();
+
+function markScreenShareSegment(roomName: string, enabled: boolean) {
+  if (enabled) screenShareSegmentRooms.add(roomName);
+  else screenShareSegmentRooms.delete(roomName);
+}
+
+function isScreenShareTarget(target: TeacherTrackTarget): boolean {
+  return (
+    (target.kind === 'track_composite' && target.reason === 'teacher_screen_track') ||
+    (target.kind === 'participant' && target.screenShare === true)
+  );
+}
+
+function highQualityEncodingOptions(): EncodingOptions {
+  return new EncodingOptions({
+    width: 1920,
+    height: 1080,
+    framerate: 30,
+    videoCodec: VideoCodec.H264_HIGH,
+    videoBitrate: 14000,
+    audioCodec: AudioCodec.AAC,
+    audioBitrate: 192,
+    audioFrequency: 48000,
+    keyFrameInterval: 2,
+  });
 }
 
 function segmentFilePath(roomName: string, segmentIndex: number): string {
@@ -134,7 +201,168 @@ async function updateRecordingState(
   );
 }
 
-export async function startMeetingRecordingSegment(
+function teacherParticipants(
+  participants: ParticipantInfo[],
+  teacherUserId: number,
+): ParticipantInfo[] {
+  return participants.filter((p) => {
+    const identity = String(p.identity || '');
+    if (isRecorderIdentity(identity)) return false;
+    return parseUserIdFromMeetingIdentity(identity) === Number(teacherUserId);
+  });
+}
+
+function findTrackSid(
+  participants: ParticipantInfo[],
+  source: TrackSource,
+): string | undefined {
+  for (const p of participants) {
+    for (const t of p.tracks || []) {
+      if (Number(t.source) === Number(source) && t.sid) {
+        return String(t.sid);
+      }
+    }
+  }
+  return undefined;
+}
+
+function pickPrimaryTeacherIdentity(participants: ParticipantInfo[]): string | null {
+  const nonScreen = participants.find((p) => !isScreenShareIdentity(p.identity));
+  if (nonScreen?.identity) return String(nonScreen.identity);
+  if (participants[0]?.identity) return String(participants[0].identity);
+  return null;
+}
+
+/**
+ * Prefer teacher screen + mic tracks (closest to live quality).
+ * Fallback: participant camera/mic, then participant screenShare wait.
+ */
+async function resolveTeacherTrackTarget(
+  roomName: string,
+  teacherUserId: number,
+): Promise<TeacherTrackTarget | null> {
+  let participants: ParticipantInfo[] = [];
+  try {
+    participants = await getRoomServiceClient().listParticipants(roomName);
+  } catch (err) {
+    console.warn('[MeetingRecording] listParticipants failed:', err);
+  }
+
+  const teacherParts = teacherParticipants(participants, teacherUserId);
+  const screenVideoId = findTrackSid(teacherParts, TrackSource.SCREEN_SHARE);
+  const screenAudioId = findTrackSid(teacherParts, TrackSource.SCREEN_SHARE_AUDIO);
+  const micId = findTrackSid(
+    teacherParts.filter((p) => !isScreenShareIdentity(p.identity)),
+    TrackSource.MICROPHONE,
+  );
+  const cameraId = findTrackSid(
+    teacherParts.filter((p) => !isScreenShareIdentity(p.identity)),
+    TrackSource.CAMERA,
+  );
+  const primaryIdentity = pickPrimaryTeacherIdentity(teacherParts);
+  const screenShareIdentity =
+    teacherParts.find((p) => isScreenShareIdentity(p.identity))?.identity || null;
+
+  if (screenVideoId) {
+    return {
+      kind: 'track_composite',
+      videoTrackId: screenVideoId,
+      audioTrackId: screenAudioId || micId,
+      reason: 'teacher_screen_track',
+    };
+  }
+
+  if (cameraId || micId) {
+    if (primaryIdentity) {
+      return {
+        kind: 'participant',
+        identity: primaryIdentity,
+        screenShare: false,
+        reason: 'teacher_camera_mic',
+      };
+    }
+  }
+
+  if (screenShareIdentity) {
+    return {
+      kind: 'participant',
+      identity: String(screenShareIdentity),
+      screenShare: true,
+      reason: 'wait_screen_share_identity',
+    };
+  }
+
+  if (primaryIdentity) {
+    // Waits until teacher publishes camera/mic (or we later upgrade on screen publish).
+    return {
+      kind: 'participant',
+      identity: primaryIdentity,
+      screenShare: false,
+      reason: 'wait_teacher_media',
+    };
+  }
+
+  // Teacher not listed yet — still start participant egress on canonical identity.
+  return {
+    kind: 'participant',
+    identity: `user_${teacherUserId}_meeting_${roomName}`,
+    screenShare: false,
+    reason: 'canonical_identity_fallback',
+  };
+}
+
+async function startTeacherTracksRecordingSegment(
+  roomName: string,
+  meeting: { title: string; created_by: number },
+  segmentIndex: number,
+): Promise<{ egressId: string; filePath: string }> {
+  const egressClient = getEgressClient();
+  const filePath = segmentFilePath(roomName, segmentIndex);
+  const outputFile = new EncodedFileOutput({ filepath: filePath });
+  const encodingOptions = highQualityEncodingOptions();
+  const target = await resolveTeacherTrackTarget(roomName, meeting.created_by);
+
+  if (!target) {
+    throw new Error('Unable to resolve teacher recording target');
+  }
+
+  let info;
+  if (target.kind === 'track_composite') {
+    info = await egressClient.startTrackCompositeEgress(roomName, outputFile, {
+      videoTrackId: target.videoTrackId,
+      audioTrackId: target.audioTrackId,
+      encodingOptions,
+    });
+  } else {
+    info = await egressClient.startParticipantEgress(
+      roomName,
+      target.identity,
+      { file: outputFile },
+      {
+        screenShare: target.screenShare,
+        // Prefer explicit high-bitrate options over 1080p preset defaults.
+        encodingOptions:
+          process.env.MEETING_RECORDING_USE_PRESET === '1'
+            ? EncodingOptionsPreset.H264_1080P_30
+            : encodingOptions,
+      },
+    );
+  }
+
+  const egressId = String((info as { egressId?: string }).egressId || '');
+  markScreenShareSegment(roomName, isScreenShareTarget(target));
+  console.log('[MeetingRecording] started teacher-tracks segment', {
+    roomName,
+    segmentIndex,
+    egressId,
+    filePath,
+    target,
+  });
+  return { egressId, filePath };
+}
+
+/** Legacy Room Composite path — kept for MEETING_RECORDING_MODE=room_composite rollback. */
+async function startRoomCompositeRecordingSegment(
   roomName: string,
   meeting: { title: string; created_by: number },
   segmentIndex: number,
@@ -167,22 +395,10 @@ export async function startMeetingRecordingSegment(
   }
 
   const recordingBase = resolveRecordingCompositeBaseUrl();
-  // Room Composite = full meeting timeline (camera ↔ screen switches, both together).
   const egressOpt: RoomCompositeOptions = {
     customBaseUrl: `${recordingBase}?${egressParams.toString()}`,
-    // Template ignores LiveKit built-in layouts and renders screen+camera itself.
     layout: 'speaker',
-    encodingOptions: new EncodingOptions({
-      width: 1920,
-      height: 1080,
-      framerate: 30,
-      videoCodec: VideoCodec.H264_HIGH,
-      videoBitrate: 14000,
-      audioCodec: AudioCodec.AAC,
-      audioBitrate: 192,
-      audioFrequency: 48000,
-      keyFrameInterval: 2,
-    }),
+    encodingOptions: highQualityEncodingOptions(),
   };
 
   const info = await egressClient.startRoomCompositeEgress(roomName, outputFile, egressOpt);
@@ -195,6 +411,18 @@ export async function startMeetingRecordingSegment(
     recordingBase,
   });
   return { egressId, filePath };
+}
+
+export async function startMeetingRecordingSegment(
+  roomName: string,
+  meeting: { title: string; created_by: number },
+  segmentIndex: number,
+): Promise<{ egressId: string; filePath: string }> {
+  const mode = resolveRecordingMode();
+  if (mode === 'room_composite') {
+    return startRoomCompositeRecordingSegment(roomName, meeting, segmentIndex);
+  }
+  return startTeacherTracksRecordingSegment(roomName, meeting, segmentIndex);
 }
 
 export async function ensureInitialRecordingStarted(roomName: string): Promise<void> {
@@ -212,6 +440,35 @@ export async function ensureInitialRecordingStarted(roomName: string): Promise<v
     active_egress_id: started.egressId || null,
     recording_segment_index: segmentIndex,
   });
+}
+
+/**
+ * If we were recording camera-only and teacher just published screen share,
+ * rotate to a new segment that captures the screen track (better teaching quality).
+ */
+export async function upgradeRecordingToScreenShareIfNeeded(
+  roomName: string,
+): Promise<{ upgraded: boolean }> {
+  if (resolveRecordingMode() !== 'teacher_tracks') {
+    return { upgraded: false };
+  }
+  if (screenShareSegmentRooms.has(roomName)) {
+    return { upgraded: false };
+  }
+
+  const loaded = await loadMeetingRow(roomName);
+  if (!loaded) return { upgraded: false };
+  if (String(loaded.row.recording_status || '') !== 'recording') {
+    return { upgraded: false };
+  }
+
+  const target = await resolveTeacherTrackTarget(roomName, loaded.row.created_by);
+  if (!target || !isScreenShareTarget(target)) return { upgraded: false };
+
+  console.log('[MeetingRecording] upgrading segment to screen share', { roomName, target });
+  await pauseMeetingRecording(roomName);
+  await resumeMeetingRecording(roomName);
+  return { upgraded: true };
 }
 
 export async function pauseMeetingRecording(roomName: string): Promise<{ paused: boolean }> {
@@ -242,6 +499,7 @@ export async function pauseMeetingRecording(roomName: string): Promise<{ paused:
     active_egress_id: null,
     recording_segments: segments,
   });
+  markScreenShareSegment(roomName, false);
   return { paused: true };
 }
 
@@ -326,6 +584,7 @@ export async function finalizeMeetingRecording(roomName: string): Promise<{ fina
     active_egress_id: null,
     recording_segments: segments,
   });
+  markScreenShareSegment(roomName, false);
 
   if (egressId) {
     try {
