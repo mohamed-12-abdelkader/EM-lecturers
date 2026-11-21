@@ -722,8 +722,11 @@ export class CourseLevelExamsService {
           Number(examId),
         );
         (updatedExam as any).pointsRecalculation = recalc;
+        (updatedExam as any).points_recalculation = recalc;
       } catch (error) {
         console.error('Error recalculating course exam points after settings change:', error);
+        (updatedExam as any).pointsRecalculationError =
+          error instanceof Error ? error.message : String(error);
       }
     }
 
@@ -1224,6 +1227,10 @@ export class CourseLevelExamsService {
         studentId,
         teacherId,
         courseId: exam.course_id != null ? Number(exam.course_id) : null,
+        preferredGradeId:
+          exam.grade_id != null && Number.isFinite(Number(exam.grade_id))
+            ? Number(exam.grade_id)
+            : null,
         attemptId: Number(scoringAttempt.id),
         examId: Number(exam.id),
         isAssignment: false as const,
@@ -1244,6 +1251,15 @@ export class CourseLevelExamsService {
       const awarded = await TeacherPointsService.awardExamOrAssignmentScore(scoreOpts);
       if (awarded.reason === 'duplicate') {
         return TeacherPointsService.syncExamOrAssignmentScore(scoreOpts);
+      }
+      if (!awarded.awarded && awarded.reason && awarded.reason !== 'zero_points') {
+        console.warn('Course exam score points not awarded', {
+          examId: Number(exam.id),
+          studentId,
+          attemptId: Number(scoringAttempt.id),
+          reason: awarded.reason,
+          obtainedGrade: scoreOpts.obtainedGrade,
+        });
       }
       return awarded;
     } catch (error) {
@@ -1834,10 +1850,13 @@ export class CourseLevelExamsService {
       `SELECT a.*, e.title, e.duration_minutes, e.questions_count, e.question_display_mode,
               e.show_answers_immediately, e.answers_visible_at, e.answers_release_mode,
               e.show_answers_after_hours, e.visibility_end_date, e.course_id,
-              e.grade_id, COALESCE(e.exam_scope, 'course') AS exam_scope, e.teacher_id,
+              e.grade_id, COALESCE(e.exam_scope, 'course') AS exam_scope,
+              e.points_enabled, e.points_attempt_mode,
+              COALESCE(e.teacher_id, c.teacher_id) AS teacher_id,
               e.id as exam_row_id
        FROM course_level_exam_attempts a
        JOIN course_level_exams e ON e.id = a.exam_id
+       LEFT JOIN courses c ON c.id = e.course_id
        WHERE a.exam_id = $1 AND a.student_id = $2 AND a.status = 'in_progress'
        ORDER BY a.started_at DESC
        LIMIT 1`,
@@ -2851,12 +2870,37 @@ export class CourseLevelExamsService {
     if (activeAttemptRes.rowCount) {
       const activeAttempt = activeAttemptRes.rows[0];
       if (isAttemptExpired(activeAttempt.attempt_expire_at)) {
-        await this.finalizeInProgressAttempt(exam, activeAttempt, studentId, [], {
-          timedOut: true,
-        });
-      } else {
-        return this.buildStudentAttemptPayload(exam, activeAttempt, studentId, true);
+        // Finalize expired attempt and surface it as already completed (do not fall through
+        // into a confusing new-attempt / already-completed mismatch).
+        const finalized = await this.finalizeInProgressAttempt(
+          exam,
+          activeAttempt,
+          studentId,
+          [],
+          { timedOut: true },
+        );
+        const error: any = new HttpError(
+          403,
+          'You have already completed this exam. Only one attempt is allowed.',
+        );
+        error.details = {
+          previousAttempt: {
+            attemptId: finalized.attemptId,
+            totalGrade: finalized.totalGrade,
+            maxGrade: finalized.maxGrade,
+            submittedAt: finalized.submittedAt,
+            timedOut: true,
+            showAnswers: finalized.showAnswers,
+            releaseReason: finalized.releaseReason,
+            answersVisibleAt: finalized.answersVisibleAt,
+            wrongQuestions: finalized.wrongQuestions,
+            essayQuestions: finalized.essayQuestions,
+            essayNotice: finalized.essayNotice,
+          },
+        };
+        throw error;
       }
+      return this.buildStudentAttemptPayload(exam, activeAttempt, studentId, true);
     }
 
     const now = new Date();
@@ -3433,9 +3477,12 @@ export class CourseLevelExamsService {
               e.title, e.duration_minutes, e.questions_count, e.question_display_mode,
               e.show_answers_immediately, e.answers_visible_at, e.answers_release_mode,
               e.show_answers_after_hours, e.visibility_end_date, e.course_id,
-              e.grade_id, COALESCE(e.exam_scope, 'course') AS exam_scope, e.teacher_id
+              e.grade_id, COALESCE(e.exam_scope, 'course') AS exam_scope,
+              e.points_enabled, e.points_attempt_mode,
+              COALESCE(e.teacher_id, c.teacher_id) AS teacher_id
        FROM course_level_exam_attempts a
        JOIN course_level_exams e ON a.exam_id = e.id
+       LEFT JOIN courses c ON c.id = e.course_id
        WHERE a.id = $1 AND a.exam_id = $2 AND a.student_id = $3`,
       [attemptId, examId, studentId],
     );

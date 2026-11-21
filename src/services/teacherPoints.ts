@@ -198,6 +198,26 @@ export class TeacherPointsService {
       if (courseGrade.rowCount && courseGrade.rows[0].grade_id != null) {
         return Number(courseGrade.rows[0].grade_id);
       }
+
+      // Multi-grade courses: pick a grade shared between the course and the student.
+      try {
+        const shared = await pool.query<{ grade_id: number }>(
+          `SELECT cg.grade_id
+           FROM course_grades cg
+           JOIN courses c ON c.id = cg.course_id
+           JOIN teacher_grades tg
+             ON tg.grade_id = cg.grade_id AND tg.teacher_id = $2
+           LEFT JOIN user_grades ug
+             ON ug.grade_id = cg.grade_id AND ug.user_id = $3
+           WHERE cg.course_id = $1 AND c.teacher_id = $2
+           ORDER BY CASE WHEN ug.user_id IS NULL THEN 1 ELSE 0 END, cg.grade_id ASC
+           LIMIT 1`,
+          [opts.courseId, opts.teacherId, opts.studentId],
+        );
+        if (shared.rowCount) return Number(shared.rows[0].grade_id);
+      } catch {
+        // course_grades may be missing in older DBs
+      }
     }
 
     return null;
@@ -476,6 +496,7 @@ export class TeacherPointsService {
     studentId: number;
     teacherId: number;
     courseId?: number | null;
+    preferredGradeId?: number | null;
     attemptId: number;
     examId: number;
     isAssignment: boolean;
@@ -499,22 +520,13 @@ export class TeacherPointsService {
       studentId: opts.studentId,
       teacherId: opts.teacherId,
       courseId: opts.courseId,
+      preferredGradeId: opts.preferredGradeId ?? null,
     });
-    if (!opts.isAssignment && gradeId) {
-      const allowed = await this.isCourseExamEligibleForPoints({
-        teacherId: opts.teacherId,
-        gradeId,
-        examId: opts.examId,
-        courseId: opts.courseId,
-      });
-      if (!allowed) {
-        return {
-          awarded: false,
-          points: 0,
-          totalPoints: null,
-          reason: 'exam_outside_points_window',
-        };
-      }
+    // Per-exam `points_enabled` (checked by caller) is the source of truth.
+    // Do NOT reject here via ranking-window eligibility — that contradicted the
+    // teacher UI ("احتساب نقاط لهذا الامتحان") and caused award-then-heal wipes.
+    if (!gradeId) {
+      return { awarded: false, points: 0, totalPoints: null, reason: 'missing_grade' };
     }
     const points = Math.max(0, Math.floor(Number(opts.obtainedGrade) || 0));
     const eventType: PointsEventType = opts.isAssignment ? 'ASSIGNMENT_SCORE' : 'EXAM_SCORE';
@@ -549,11 +561,14 @@ export class TeacherPointsService {
     });
     if (!opts.isAssignment && result.awarded && gradeId) {
       const allowedIds = await this.listEligibleCourseExamIds(opts.teacherId, gradeId);
+      // Always keep the exam we just awarded for.
+      const keep = new Set<number>(allowedIds.map(Number));
+      keep.add(Number(opts.examId));
       await this.purgeStudentExamPointsExceptAllowed(
         opts.teacherId,
         opts.studentId,
         gradeId,
-        allowedIds.length ? allowedIds : [opts.examId],
+        [...keep],
       );
     }
     return result;
@@ -567,6 +582,7 @@ export class TeacherPointsService {
     studentId: number;
     teacherId: number;
     courseId?: number | null;
+    preferredGradeId?: number | null;
     attemptId: number;
     examId: number;
     isAssignment: boolean;
@@ -586,30 +602,6 @@ export class TeacherPointsService {
     if (!enabled) {
       return { awarded: false, points: 0, totalPoints: null, reason: 'disabled' };
     }
-    if (!opts.isAssignment) {
-      const gradeIdForCheck = await this.resolveGradeId({
-        studentId: opts.studentId,
-        teacherId: opts.teacherId,
-        courseId: opts.courseId,
-      });
-      if (gradeIdForCheck) {
-        const allowed = await this.isCourseExamEligibleForPoints({
-          teacherId: opts.teacherId,
-          gradeId: gradeIdForCheck,
-          examId: opts.examId,
-          courseId: opts.courseId,
-        });
-        if (!allowed) {
-          return {
-            awarded: false,
-            points: 0,
-            totalPoints: null,
-            reason: 'exam_outside_points_window',
-          };
-        }
-      }
-    }
-
     const newPoints = Math.max(0, Math.floor(Number(opts.obtainedGrade) || 0));
     const eventType: PointsEventType = opts.isAssignment ? 'ASSIGNMENT_SCORE' : 'EXAM_SCORE';
     const referenceKey = this.examPointsReferenceKey({
@@ -624,6 +616,7 @@ export class TeacherPointsService {
       studentId: opts.studentId,
       teacherId: opts.teacherId,
       courseId: opts.courseId,
+      preferredGradeId: opts.preferredGradeId ?? null,
     });
     if (!gradeId) {
       return { awarded: false, points: 0, totalPoints: null, reason: 'missing_grade' };
@@ -1525,10 +1518,8 @@ export class TeacherPointsService {
     examId: number;
     courseId?: number | null;
   }): Promise<boolean> {
-    const anchor = await this.getGradePointsAnchor(opts.teacherId, opts.gradeId);
-    if (!anchor) {
-      return this.isLatestCourseExamForGrade(opts);
-    }
+    // Must match listEligibleCourseExamIds / purge allow-list exactly.
+    // Do NOT scope "latest" by courseId here — that awarded points then purge deleted them.
     const eligible = await this.listEligibleCourseExamIds(opts.teacherId, opts.gradeId);
     return eligible.includes(Number(opts.examId));
   }
@@ -1864,12 +1855,39 @@ export class TeacherPointsService {
     teacherId: number,
     gradeId: number,
   ): Promise<number[]> {
+    // Keep every comprehensive exam that still has points_enabled.
+    // Matches the teacher toggle: "احتساب نقاط لهذا الامتحان".
+    // Optional start-exam anchor only narrows the window; it must not drop
+    // an enabled exam the teacher explicitly wants counted.
     const anchor = await this.getGradePointsAnchor(teacherId, gradeId);
+
+    const baseWhere = `COALESCE(e.teacher_id, c.teacher_id) = $1
+         AND (
+           e.grade_id = $2
+           OR c.grade_id = $2
+           OR EXISTS (
+             SELECT 1 FROM course_grades cg
+             WHERE cg.course_id = e.course_id AND cg.grade_id = $2
+           )
+         )
+         AND (e.points_enabled IS NULL OR e.points_enabled = TRUE)`;
+
     if (!anchor) {
-      const last = await this.findLatestCourseExamForGrade(teacherId, gradeId, {
-        requireSubmitted: false,
-      });
-      return last ? [Number(last.id)] : [];
+      try {
+        const res = await pool.query<{ id: number }>(
+          `SELECT e.id
+           FROM course_level_exams e
+           LEFT JOIN courses c ON c.id = e.course_id
+           WHERE ${baseWhere}
+           ORDER BY e.created_at ASC NULLS LAST, e.id ASC`,
+          [teacherId, gradeId],
+        );
+        const ids = res.rows.map((r) => Number(r.id)).filter((id) => id > 0);
+        if (ids.length) return ids;
+      } catch {
+        // fall through to legacy latest-per-course
+      }
+      return this.listLatestCourseExamIdsPerCourse(teacherId, gradeId);
     }
 
     const start = await pool.query<{ id: number; created_at: Date | null }>(
@@ -1879,30 +1897,22 @@ export class TeacherPointsService {
     if (!start.rowCount) return [];
     const startCreatedAt = start.rows[0].created_at;
     const startId = Number(start.rows[0].id);
-
     const startTs = startCreatedAt ? new Date(startCreatedAt).toISOString() : '1970-01-01T00:00:00.000Z';
 
-    const sql = `SELECT e.id
-       FROM course_level_exams e
-       LEFT JOIN courses c ON c.id = e.course_id
-       WHERE COALESCE(e.teacher_id, c.teacher_id) = $1
-         AND (
-           e.grade_id = $2
-           OR c.grade_id = $2
-           OR EXISTS (
-             SELECT 1 FROM course_grades cg
-             WHERE cg.course_id = e.course_id AND cg.grade_id = $2
-           )
-         )
-         AND (
-           e.id = $3
-           OR (COALESCE(e.created_at, TIMESTAMPTZ '1970-01-01'), e.id)
-                >= ($4::timestamptz, $3::int)
-         )
-       ORDER BY e.created_at ASC NULLS LAST, e.id ASC`;
-
     try {
-      const res = await pool.query<{ id: number }>(sql, [teacherId, gradeId, startId, startTs]);
+      const res = await pool.query<{ id: number }>(
+        `SELECT e.id
+         FROM course_level_exams e
+         LEFT JOIN courses c ON c.id = e.course_id
+         WHERE ${baseWhere}
+           AND (
+             e.id = $3
+             OR (COALESCE(e.created_at, TIMESTAMPTZ '1970-01-01'), e.id)
+                  >= ($4::timestamptz, $3::int)
+           )
+         ORDER BY e.created_at ASC NULLS LAST, e.id ASC`,
+        [teacherId, gradeId, startId, startTs],
+      );
       return res.rows.map((r) => Number(r.id));
     } catch {
       const res = await pool.query<{ id: number }>(
@@ -1911,6 +1921,7 @@ export class TeacherPointsService {
          LEFT JOIN courses c ON c.id = e.course_id
          WHERE COALESCE(e.teacher_id, c.teacher_id) = $1
            AND (e.grade_id = $2 OR c.grade_id = $2)
+           AND (e.points_enabled IS NULL OR e.points_enabled = TRUE)
            AND e.id >= $3
          ORDER BY e.id ASC`,
         [teacherId, gradeId, startId],
@@ -2145,6 +2156,40 @@ export class TeacherPointsService {
     return this.findLatestCourseExamForGrade(teacherId, gradeId, {
       requireSubmitted: true,
     });
+  }
+
+  /**
+   * Latest course_level_exam id per course for a grade (no submissions required).
+   * Used when the teacher has not set a points start-exam anchor.
+   */
+  private static async listLatestCourseExamIdsPerCourse(
+    teacherId: number,
+    gradeId: number,
+  ): Promise<number[]> {
+    const sql = `SELECT DISTINCT ON (COALESCE(e.course_id, 0)) e.id
+       FROM course_level_exams e
+       LEFT JOIN courses c ON c.id = e.course_id
+       WHERE COALESCE(e.teacher_id, c.teacher_id) = $1
+         AND (
+           e.grade_id = $2
+           OR c.grade_id = $2
+           OR EXISTS (
+             SELECT 1 FROM course_grades cg
+             WHERE cg.course_id = e.course_id AND cg.grade_id = $2
+           )
+         )
+       ORDER BY COALESCE(e.course_id, 0),
+                e.created_at DESC NULLS LAST,
+                e.id DESC`;
+    try {
+      const res = await pool.query<{ id: number }>(sql, [teacherId, gradeId]);
+      return res.rows.map((r) => Number(r.id)).filter((id) => Number.isFinite(id) && id > 0);
+    } catch {
+      const last = await this.findLatestCourseExamForGrade(teacherId, gradeId, {
+        requireSubmitted: false,
+      });
+      return last ? [Number(last.id)] : [];
+    }
   }
 
   private static async findLatestCourseExamForGrade(
@@ -2944,24 +2989,40 @@ export class TeacherPointsService {
   /**
    * Recalculate EXAM_SCORE for every student who submitted this course exam,
    * using the exam's current points_enabled + points_attempt_mode.
+   * Creates missing rows, updates existing ones, and removes scores when disabled.
    * Also strips any leftover EXAM_START rows for this exam.
    */
   static async recalculateCourseExamPointsForExam(examId: number): Promise<{
     examId: number;
     studentsProcessed: number;
     scoresSynced: number;
+    scoresCreated: number;
+    scoresAdjusted: number;
     scoresRemoved: number;
     startsRemoved: number;
+    skippedMissingGrade: number;
   }> {
+    const empty = {
+      examId,
+      studentsProcessed: 0,
+      scoresSynced: 0,
+      scoresCreated: 0,
+      scoresAdjusted: 0,
+      scoresRemoved: 0,
+      startsRemoved: 0,
+      skippedMissingGrade: 0,
+    };
+
     const examRes = await pool.query<{
       id: number;
       title: string | null;
       course_id: number | null;
+      grade_id: number | null;
       teacher_id: number | null;
       points_enabled: boolean | null;
       points_attempt_mode: string | null;
     }>(
-      `SELECT e.id, e.title, e.course_id, e.points_enabled, e.points_attempt_mode,
+      `SELECT e.id, e.title, e.course_id, e.grade_id, e.points_enabled, e.points_attempt_mode,
               COALESCE(e.teacher_id, c.teacher_id) AS teacher_id
        FROM course_level_exams e
        LEFT JOIN courses c ON c.id = e.course_id
@@ -2969,27 +3030,16 @@ export class TeacherPointsService {
        LIMIT 1`,
       [examId],
     );
-    if (!examRes.rowCount) {
-      return {
-        examId,
-        studentsProcessed: 0,
-        scoresSynced: 0,
-        scoresRemoved: 0,
-        startsRemoved: 0,
-      };
-    }
+    if (!examRes.rowCount) return empty;
 
     const exam = examRes.rows[0];
     const teacherId = Number(exam.teacher_id);
-    if (!Number.isInteger(teacherId) || teacherId <= 0) {
-      return {
-        examId,
-        studentsProcessed: 0,
-        scoresSynced: 0,
-        scoresRemoved: 0,
-        startsRemoved: 0,
-      };
-    }
+    if (!Number.isInteger(teacherId) || teacherId <= 0) return empty;
+
+    const preferredGradeId =
+      exam.grade_id != null && Number.isFinite(Number(exam.grade_id))
+        ? Number(exam.grade_id)
+        : null;
 
     // Always drop start-exam bonuses for this exam.
     const startDel = await pool.query<{ student_id: number; grade_id: number }>(
@@ -3013,7 +3063,10 @@ export class TeacherPointsService {
 
     let scoresRemoved = 0;
     let scoresSynced = 0;
+    let scoresCreated = 0;
+    let scoresAdjusted = 0;
     let studentsProcessed = 0;
+    let skippedMissingGrade = 0;
 
     if (!isCourseExamPointsEnabled(exam)) {
       const scoreDel = await pool.query<{ student_id: number; grade_id: number }>(
@@ -3037,9 +3090,8 @@ export class TeacherPointsService {
         await this.recomputeStudentBalance(item.studentId, teacherId, item.gradeId);
       }
       return {
-        examId,
+        ...empty,
         studentsProcessed: touched.size,
-        scoresSynced: 0,
         scoresRemoved,
         startsRemoved,
       };
@@ -3070,6 +3122,7 @@ export class TeacherPointsService {
         studentId,
         teacherId,
         courseId: exam.course_id,
+        preferredGradeId,
         attemptId,
         examId,
         isAssignment: false as const,
@@ -3079,15 +3132,48 @@ export class TeacherPointsService {
         title: exam.title,
       };
 
-      let result = await this.awardExamOrAssignmentScore(scoreOpts);
-      if (result.reason === 'duplicate') {
+      // Upsert immediately: create missing scores, update existing (including down to 0).
+      let result: AwardResult;
+      let createdNow = false;
+      if (obtained <= 0) {
         result = await this.syncExamOrAssignmentScore(scoreOpts);
+        if (result.reason === 'no_existing_transaction') {
+          // Nothing to create for a zero score.
+          result = {
+            awarded: false,
+            points: 0,
+            totalPoints: result.totalPoints,
+            reason: 'zero_points',
+          };
+        }
+      } else {
+        result = await this.awardExamOrAssignmentScore(scoreOpts);
+        if (result.awarded) {
+          createdNow = true;
+        } else if (result.reason === 'duplicate') {
+          result = await this.syncExamOrAssignmentScore(scoreOpts);
+        }
       }
-      if (
+
+      if (result.reason === 'missing_grade') {
+        skippedMissingGrade += 1;
+        console.warn('recalculateCourseExamPointsForExam skipped student (missing_grade)', {
+          examId,
+          studentId,
+          attemptId,
+        });
+        continue;
+      }
+
+      if (createdNow) {
+        scoresCreated += 1;
+        scoresSynced += 1;
+      } else if (
         result.awarded ||
-        result.reason === 'duplicate' ||
-        result.reason === 'adjusted_down'
+        result.reason === 'adjusted_down' ||
+        result.reason === 'duplicate'
       ) {
+        scoresAdjusted += 1;
         scoresSynced += 1;
       }
 
@@ -3095,6 +3181,7 @@ export class TeacherPointsService {
         studentId,
         teacherId,
         courseId: exam.course_id,
+        preferredGradeId,
       });
       if (gradeId) {
         touched.set(`${studentId}:${gradeId}`, { studentId, gradeId });
@@ -3109,8 +3196,11 @@ export class TeacherPointsService {
       examId,
       studentsProcessed,
       scoresSynced,
+      scoresCreated,
+      scoresAdjusted,
       scoresRemoved,
       startsRemoved,
+      skippedMissingGrade,
     };
   }
 
