@@ -1,3 +1,6 @@
+import type { Pool } from 'pg';
+import pool from '../db/pool';
+
 export type CourseExamPointsAttemptMode = 'first' | 'last' | 'highest' | 'second';
 
 export type CourseExamPointsAttemptRow = {
@@ -7,6 +10,23 @@ export type CourseExamPointsAttemptRow = {
   total_grade: number | null;
   submitted_at: Date | string | null;
 };
+
+/** Resolve pg Pool across CJS/ESM default-export interop shapes. */
+function resolvePgPool(modOrPool: unknown): Pool {
+  const candidates = [
+    modOrPool,
+    (modOrPool as { default?: unknown })?.default,
+    (modOrPool as { default?: { default?: unknown } })?.default?.default,
+  ];
+  for (const candidate of candidates) {
+    if (candidate && typeof (candidate as { query?: unknown }).query === 'function') {
+      return candidate as Pool;
+    }
+  }
+  throw new Error('pool.query is not a function (invalid pg pool export)');
+}
+
+const db = resolvePgPool(pool);
 
 const MODES = new Set<CourseExamPointsAttemptMode>([
   'first',
@@ -85,11 +105,7 @@ export async function resolveCourseExamPointsAttempt(opts: {
   mode?: unknown;
 }): Promise<CourseExamPointsAttemptRow | null> {
   const mode = normalizeCourseExamPointsAttemptMode(opts.mode);
-  // Lazy import avoids pulling env/config into pure unit tests of selection helpers.
-  // Extension required under moduleResolution node16/nodenext.
-  const poolMod = await import('../db/pool.js');
-  const pool = (poolMod as unknown as { default: import('pg').Pool }).default;
-  const res = await pool.query<CourseExamPointsAttemptRow>(
+  const res = await db.query<CourseExamPointsAttemptRow>(
     `SELECT id, attempt_number, obtained_grade, total_grade, submitted_at
      FROM course_level_exam_attempts
      WHERE exam_id = $1
