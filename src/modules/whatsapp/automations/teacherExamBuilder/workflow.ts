@@ -7,7 +7,6 @@ import {
   createDraftExamFromWorkflow,
   detectExamType,
   detectSourceType,
-  extractQuestionsFromSessionFiles,
   generateFromBank,
   getTodayExamTasks,
   isAffirmative,
@@ -35,11 +34,21 @@ import {
   replyUnclear,
 } from './conversationReplies';
 import {
-  addBulkTextToExam,
   applyDraftExamEdit,
-  replyReviewExtracted,
   resolveEditableExam,
 } from './examEditActions';
+import {
+  createDraftFromCollectedContext,
+  finishFilesWithGuidedContext,
+  handleAskCourse,
+  handleAskExamSettings,
+  handleAskGrade,
+  handleAskLecture,
+  handleAskSource,
+  handleSelectExamTypeEarly,
+  handleSelectLessonGuided,
+  startGuidedExamIntake,
+} from './guidedIntake';
 
 export type WorkflowResult = {
   reply: string;
@@ -353,28 +362,15 @@ export async function runExamAssistantWorkflow(
           const edited = await applyDraftExamEdit({ session, message: text });
           return finish(edited.session, text, edited.reply, { action: 'modify' });
         }
-        case 'use_files': {
-          session = await ExamAssistantSessionStore.update(session.id, teacherId, {
-            state: 'WAITING_FOR_FILES',
-            source_type: 'files',
-            context: {
-              ...session.context,
-              awaiting_more_files: true,
-              pending_media_intent: 'create',
-              exam_title: text,
-            },
-          });
-          return finish(
-            session,
-            text,
-            'تمام، ابعت الملف أو الصور دلوقتي. لما تخلّص ابعت «خلصت».',
-            { action: 'wait_files' },
-          );
-        }
+        case 'use_files':
         case 'use_bank':
-        case 'create_exam':
-          // fall through to existing IDLE generation below
-          break;
+        case 'create_exam': {
+          const started = await startGuidedExamIntake(session, teacherId);
+          return finish(started.session, text, started.reply, {
+            action: 'guided_start',
+            choices: started.choices,
+          });
+        }
         default:
           break;
       }
@@ -488,63 +484,45 @@ export async function runExamAssistantWorkflow(
           );
         }
 
-        const source = detectSourceType(text);
-        if (source === 'files' || intentResult?.intent === 'use_files') {
-          session = await ExamAssistantSessionStore.update(session.id, teacherId, {
-            state: 'WAITING_FOR_FILES',
-            source_type: 'files',
-            context: {
-              ...session.context,
-              awaiting_more_files: true,
-              exam_title: text,
-              pending_media_intent: 'create',
-            },
-          });
-          return finish(
-            session,
-            text,
-            'تمام، ابعت الملف أو الصور دلوقتي. لما تخلّص ابعت «خلصت».',
-          );
-        }
-
-        // Only auto-generate when clearly an exam request
+        // Only start guided intake when clearly an exam request
         if (
           !isNewExamRequest(text) &&
           intentResult?.intent !== 'create_exam' &&
-          intentResult?.intent !== 'use_bank'
+          intentResult?.intent !== 'use_bank' &&
+          intentResult?.intent !== 'use_files'
         ) {
           return finish(session, text, replyUnclear(), { action: 'idle_unclear' });
         }
 
-        session = await ExamAssistantSessionStore.update(session.id, teacherId, {
-          state: 'GENERATING_EXAM',
-          source_type: 'question_bank',
+        const started = await startGuidedExamIntake(session, teacherId);
+        return finish(started.session, text, started.reply, {
+          action: 'guided_start',
+          choices: started.choices,
         });
-        try {
-          const generated = await generateFromBank(session, text);
-          if (generated.session.state === 'EXAM_REVIEW') {
-            return finish(generated.session, text, generated.reply, { action: 'proposal' });
-          }
-          session = await ExamAssistantSessionStore.update(session.id, teacherId, {
-            state: 'ASK_SOURCE',
-          });
-          return finish(
-            generated.session,
-            text,
-            generated.reply +
-              '\n\nتحب الامتحان من *بنك الأسئلة* ولا عندك *ملف/صور* أعمل منه الامتحان؟',
-          );
-        } catch (err: any) {
-          session = await ExamAssistantSessionStore.update(session.id, teacherId, {
-            state: 'ASK_SOURCE',
-            last_error: err?.message || 'generate_failed',
-          });
-          return finish(
-            session,
-            text,
-            'تحب الامتحان من *بنك الأسئلة* ولا من ملف أو صور؟\nولو من البنك، امتحان على أنهي درس؟',
-          );
-        }
+      }
+
+      case 'ASK_GRADE': {
+        const result = await handleAskGrade(session, teacherId, text);
+        return finish(result.session, text, result.reply, {
+          action: 'ask_grade',
+          choices: result.choices,
+        });
+      }
+
+      case 'ASK_COURSE': {
+        const result = await handleAskCourse(session, teacherId, text);
+        return finish(result.session, text, result.reply, {
+          action: 'ask_course',
+          choices: result.choices,
+        });
+      }
+
+      case 'ASK_LECTURE': {
+        const result = await handleAskLecture(session, teacherId, text);
+        return finish(result.session, text, result.reply, {
+          action: 'ask_lecture',
+          choices: result.choices,
+        });
       }
 
       case 'CHECK_TEACHER_TASK': {
@@ -588,62 +566,15 @@ export async function runExamAssistantWorkflow(
         );
       }
 
-      case 'ASK_SOURCE': {
-        if (intentResult?.intent === 'greeting') {
-          return finish(session, text, replyGreeting(text));
-        }
-        const source = detectSourceType(text) || (isAffirmative(text) ? 'question_bank' : null);
-        if (source === 'files' || intentResult?.intent === 'use_files') {
-          session = await ExamAssistantSessionStore.update(session.id, teacherId, {
-            state: 'WAITING_FOR_FILES',
-            source_type: 'files',
-          });
-          return finish(session, text, 'ابعت PDF أو الصور، ولما تخلّص ابعت «خلصت».');
-        }
-        if (
-          source === 'question_bank' ||
-          intentResult?.intent === 'use_bank' ||
-          /(درس|أسئلة|اسئلة)/.test(text)
-        ) {
-          const lessons = await searchLessons(teacherId, text);
-          if (lessons.length === 1) {
-            session = await ExamAssistantSessionStore.update(session.id, teacherId, {
-              state: 'ASK_EXAM_SETTINGS',
-              source_type: 'question_bank',
-              context: {
-                ...session.context,
-                lesson_id: lessons[0].id,
-                lesson_name: lessons[0].name,
-              },
-            });
-            return finish(
-              session,
-              text,
-              `تمام، هجهّز امتحان على درس *${lessons[0].name}*.\nتحب كام سؤال؟ ومدة الامتحان كام دقيقة؟`,
-            );
-          }
-          if (lessons.length > 1) {
-            session = await ExamAssistantSessionStore.update(session.id, teacherId, {
-              state: 'SELECT_LESSON',
-              source_type: 'question_bank',
-              context: { ...session.context, lesson_candidates: lessons },
-            });
-            return finish(
-              session,
-              text,
-              `لقيت دروس مشابهة:\n${formatLessonChoices(lessons)}\n\nاختار رقم أو اسم الدرس.`,
-            );
-          }
-          session = await ExamAssistantSessionStore.update(session.id, teacherId, {
-            state: 'SELECT_LESSON',
-            source_type: 'question_bank',
-          });
-          return finish(session, text, 'امتحان على أنهي درس؟ اكتب اسم الدرس.');
-        }
-        return finish(session, text, 'قولّي: من البنك ولا من ملف/صور؟');
-      }
-
       case 'SELECT_LESSON': {
+        // Guided: settings already collected → generate from bank after lesson pick
+        if (session.context.question_count || session.context.exam_type) {
+          const result = await handleSelectLessonGuided(session, teacherId, text);
+          return finish(result.session, text, result.reply, {
+            action: 'lesson_generate',
+            choices: result.choices,
+          });
+        }
         const candidates = session.context.lesson_candidates || [];
         const asNum = Number(text);
         let chosen =
@@ -679,58 +610,27 @@ export async function runExamAssistantWorkflow(
       }
 
       case 'ASK_EXAM_SETTINGS': {
-        const countMatch = text.match(/(\d+)\s*سؤال/);
-        const durationMatch = text.match(/(\d+)\s*(دقيقة|دقايق|د)/);
-        const questionCount = countMatch
-          ? Number(countMatch[1])
-          : Number(text.match(/\b(\d+)\b/)?.[1]);
-        const duration = durationMatch
-          ? Number(durationMatch[1])
-          : session.context.duration_minutes || 30;
-        const qCount = Number.isFinite(questionCount) && questionCount > 0 ? questionCount : 10;
-        session = await ExamAssistantSessionStore.mergeContext(session.id, teacherId, {
-          question_count: qCount,
-          duration_minutes: duration,
+        const result = await handleAskExamSettings(session, teacherId, text);
+        return finish(result.session, text, result.reply, {
+          action: 'ask_settings',
+          choices: result.choices,
         });
-        session = await ExamAssistantSessionStore.update(session.id, teacherId, {
-          state: 'GENERATING_EXAM',
+      }
+
+      case 'ASK_SOURCE': {
+        const result = await handleAskSource(session, teacherId, text);
+        return finish(result.session, text, result.reply, {
+          action: 'ask_source',
+          choices: result.choices,
         });
-        const lessonName = session.context.lesson_name || 'الدرس';
-        const msg = `اعمل امتحان ${qCount} سؤال على درس ${lessonName}`;
-        const generated = await generateFromBank(session, msg);
-        return finish(generated.session, text, generated.reply, { action: 'proposal' });
       }
 
       case 'WAITING_FOR_FILES': {
         if (isDoneSendingFiles(text) || isAffirmative(text)) {
-          const mediaIntent = session.context.pending_media_intent || 'create';
-          const extracted = await extractQuestionsFromSessionFiles(session);
-          if (!extracted.count) {
-            return finish(extracted.session, text, extracted.reply, {
-              action: 'extract_failed',
-            });
-          }
-
-          if (mediaIntent === 'review') {
-            const reviewed = await replyReviewExtracted(extracted.session);
-            return finish(reviewed.session, text, reviewed.reply, { action: 'review_only' });
-          }
-
-          if ((mediaIntent === 'add' || mediaIntent === 'edit') && resolveEditableExam(extracted.session)) {
-            const target = resolveEditableExam(extracted.session)!;
-            const added = await addBulkTextToExam({
-              session: extracted.session,
-              examId: target.examId,
-              kind: target.kind,
-              bulkText: extracted.session.context.extracted_bulk_text || '',
-            });
-            return finish(added.session, text, added.reply, { action: 'added_to_exam' });
-          }
-
-          // Default: create flow (SELECT_EXAM_TYPE)
-          return finish(extracted.session, text, extracted.reply, {
-            action: 'extracted',
-            count: extracted.count,
+          const done = await finishFilesWithGuidedContext(session);
+          return finish(done.session, text, done.reply, {
+            action: 'files_done',
+            count: done.count,
           });
         }
         return finish(
@@ -743,16 +643,13 @@ export async function runExamAssistantWorkflow(
       case 'EXAM_REVIEW':
       case 'MODIFYING_EXAM': {
         if (isAffirmative(text) || /(كمل|انشر|موافق)/.test(text)) {
-          // Files path may already be at SELECT_EXAM_TYPE after extract
-          if (session.source_type === 'files' && !session.draft_exam_id) {
-            session = await ExamAssistantSessionStore.update(session.id, teacherId, {
-              state: 'SELECT_EXAM_TYPE',
-            });
-            return finish(
-              session,
-              text,
-              'تحب الامتحان يكون:\n1) امتحان عام\n2) واجب\n3) امتحان شامل\n\nاكتب النوع بالعربي عادي.',
-            );
+          // Guided path already collected course/lecture/type → create draft now
+          if (
+            session.context.exam_type &&
+            (session.context.target_course_id || session.context.target_lecture_id)
+          ) {
+            const created = await createDraftFromCollectedContext(session);
+            return finish(created.session, text, created.reply, { action: 'draft_created' });
           }
           session = await ExamAssistantSessionStore.update(session.id, teacherId, {
             state: 'SELECT_EXAM_TYPE',
@@ -774,6 +671,14 @@ export async function runExamAssistantWorkflow(
       }
 
       case 'SELECT_EXAM_TYPE': {
+        // Early in guided flow (after course, before source) OR legacy fallback
+        if (session.context.target_course_id && !session.source_type) {
+          const result = await handleSelectExamTypeEarly(session, teacherId, text);
+          return finish(result.session, text, result.reply, {
+            action: 'select_exam_type',
+            choices: result.choices,
+          });
+        }
         const examType = detectExamType(text);
         if (!examType) {
           return finish(session, text, 'اختار: امتحان عام، أو واجب، أو امتحان شامل.');
@@ -783,7 +688,7 @@ export async function runExamAssistantWorkflow(
         });
 
         if (examType === 'comprehensive') {
-          const courses = await listTeacherCourses(teacherId);
+          const courses = await listTeacherCourses(teacherId, session.context.grade_id);
           session = await ExamAssistantSessionStore.update(session.id, teacherId, {
             state: 'SELECT_TARGET',
             context: { ...session.context, exam_type: examType, course_candidates: courses },
@@ -799,7 +704,7 @@ export async function runExamAssistantWorkflow(
           );
         }
 
-        const courses = await listTeacherCourses(teacherId);
+        const courses = await listTeacherCourses(teacherId, session.context.grade_id);
         session = await ExamAssistantSessionStore.update(session.id, teacherId, {
           state: 'SELECT_TARGET',
           context: { ...session.context, exam_type: examType, course_candidates: courses },

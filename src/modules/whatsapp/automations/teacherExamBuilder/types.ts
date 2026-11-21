@@ -1,16 +1,19 @@
 export type ExamAssistantState =
   | 'IDLE'
   | 'CHECK_TEACHER_TASK'
+  | 'ASK_GRADE'
+  | 'ASK_COURSE'
+  | 'ASK_LECTURE'
+  | 'SELECT_EXAM_TYPE'
+  | 'ASK_EXAM_SETTINGS'
   | 'ASK_SOURCE'
   | 'SELECT_LESSON'
-  | 'ASK_EXAM_SETTINGS'
   | 'WAITING_FOR_FILES'
   | 'PROCESSING_FILES'
   | 'EXTRACTING_QUESTIONS'
   | 'GENERATING_EXAM'
   | 'EXAM_REVIEW'
   | 'MODIFYING_EXAM'
-  | 'SELECT_EXAM_TYPE'
   | 'SELECT_TARGET'
   | 'READY_TO_PUBLISH'
   | 'PUBLISHED'
@@ -40,10 +43,16 @@ export type ExamAssistantSessionContext = {
   exam_title?: string | null;
   question_types?: string | null;
   exam_type?: ExamAssistantExamType | null;
+  grade_id?: number | null;
+  grade_name?: string | null;
+  grade_candidates?: Array<{ id: number; name: string }>;
   target_course_id?: number | null;
+  target_course_title?: string | null;
   target_lecture_id?: number | null;
-  course_candidates?: Array<{ id: number; title: string }>;
+  target_lecture_title?: string | null;
+  course_candidates?: Array<{ id: number; title: string; grade_id?: number | null }>;
   lecture_candidates?: Array<{ id: number; title: string; course_id: number }>;
+  channel?: 'whatsapp' | 'web' | null;
   extracted_question_count?: number | null;
   extracted_bulk_text?: string | null;
   review_url?: string | null;

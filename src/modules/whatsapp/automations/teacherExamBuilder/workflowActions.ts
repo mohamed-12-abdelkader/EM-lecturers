@@ -75,15 +75,46 @@ export async function searchLessons(teacherId: number, query: string) {
   return lessons.slice(0, 12);
 }
 
-export async function listTeacherCourses(teacherId: number) {
+export async function listTeacherGrades(teacherId: number) {
   const res = await pool.query(
-    `SELECT id, title FROM courses
-     WHERE teacher_id = $1 AND COALESCE(is_visible, true) = true
-     ORDER BY title ASC
+    `SELECT g.id, g.name
+     FROM teacher_grades tg
+     JOIN grades g ON g.id = tg.grade_id
+     WHERE tg.teacher_id = $1
+     ORDER BY g.name ASC
      LIMIT 40`,
     [teacherId],
   );
-  return res.rows.map((r) => ({ id: Number(r.id), title: String(r.title) }));
+  return res.rows.map((r) => ({ id: Number(r.id), name: String(r.name || `صف ${r.id}`) }));
+}
+
+export async function listTeacherCourses(teacherId: number, gradeId?: number | null) {
+  const params: unknown[] = [teacherId];
+  let gradeSql = '';
+  if (gradeId != null && Number.isFinite(Number(gradeId))) {
+    params.push(Number(gradeId));
+    gradeSql = ` AND (
+      c.grade_id = $2
+      OR EXISTS (
+        SELECT 1 FROM course_grades cg
+        WHERE cg.course_id = c.id AND cg.grade_id = $2
+      )
+    )`;
+  }
+  const res = await pool.query(
+    `SELECT c.id, c.title, c.grade_id
+     FROM courses c
+     WHERE c.teacher_id = $1 AND COALESCE(c.is_visible, true) = true
+     ${gradeSql}
+     ORDER BY c.title ASC
+     LIMIT 40`,
+    params,
+  );
+  return res.rows.map((r) => ({
+    id: Number(r.id),
+    title: String(r.title),
+    grade_id: r.grade_id != null ? Number(r.grade_id) : null,
+  }));
 }
 
 export async function listCourseLectures(teacherId: number, courseId: number) {

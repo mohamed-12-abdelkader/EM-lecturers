@@ -1,9 +1,11 @@
 import { Router } from 'express';
+import multer from 'multer';
 import { z } from 'zod';
 import { authMiddleware } from '../middleware/authentication';
 import { requireTeacherPlanFeature } from '../middleware/teacherPlanGate';
 import { asyncWrapper } from '../utils';
 import { ExamBuilderChatbotService } from '../services/examBuilderChatbot';
+import { ExamIntakeWorkflowService } from '../services/examIntakeWorkflow';
 import {
   buildPlanFeatureAccess,
   getTeacherPackage,
@@ -13,9 +15,18 @@ export const router = Router();
 
 const planGateExamBuilder = requireTeacherPlanFeature('exam_builder_ai');
 
+const intakeUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 15 * 1024 * 1024, files: 10 },
+});
+
 const MessageSchema = z.object({
   message: z.string().min(1).max(4000),
   session_id: z.string().uuid().optional(),
+});
+
+const IntakeMessageSchema = z.object({
+  message: z.string().min(1).max(4000),
 });
 
 const ApproveSchema = z.object({
@@ -393,5 +404,88 @@ router.get(
       source,
     );
     res.json({ success: true, data: preview });
+  }),
+);
+
+/** Guided intake (same engine as WhatsApp exam assistant) */
+router.get(
+  '/intake/session',
+  authMiddleware(['teacher']),
+  planGateExamBuilder,
+  asyncWrapper(async (req, res) => {
+    const session = await ExamIntakeWorkflowService.getActiveSession(req.user!.id);
+    res.json({
+      success: true,
+      session: session
+        ? {
+            id: session.id,
+            state: session.state,
+            source_type: session.source_type,
+            context: session.context,
+            draft_exam_id: session.draft_exam_id,
+            draft_exam_kind: session.draft_exam_kind,
+            exam_builder_session_id: session.exam_builder_session_id,
+            status: session.status,
+            recent_turns: session.context.recent_turns || [],
+          }
+        : null,
+    });
+  }),
+);
+
+router.post(
+  '/intake/reset',
+  authMiddleware(['teacher']),
+  planGateExamBuilder,
+  asyncWrapper(async (req, res) => {
+    const result = await ExamIntakeWorkflowService.reset(req.user!.id);
+    res.json({
+      success: true,
+      reply: result.reply,
+      state: result.session.state,
+      session: { id: result.session.id, state: result.session.state },
+    });
+  }),
+);
+
+router.post(
+  '/intake/message',
+  authMiddleware(['teacher']),
+  planGateExamBuilder,
+  asyncWrapper(async (req, res) => {
+    const parsed = IntakeMessageSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({
+        success: false,
+        message: 'Validation failed',
+        errors: parsed.error.errors,
+      });
+    }
+    const result = await ExamIntakeWorkflowService.sendMessage(
+      req.user!.id,
+      parsed.data.message,
+    );
+    res.json({ success: true, ...result });
+  }),
+);
+
+router.post(
+  '/intake/upload',
+  authMiddleware(['teacher']),
+  planGateExamBuilder,
+  intakeUpload.array('files', 10),
+  asyncWrapper(async (req, res) => {
+    const files = (req.files as Express.Multer.File[]) || [];
+    if (!files.length) {
+      return res.status(400).json({ success: false, message: 'ارفع ملفًا واحدًا على الأقل' });
+    }
+    const caption =
+      typeof req.body?.caption === 'string' ? req.body.caption : null;
+    const result = await ExamIntakeWorkflowService.uploadFiles(
+      req.user!.id,
+      files,
+      caption,
+    );
+    res.json({ success: true, ...result });
   }),
 );
