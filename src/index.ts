@@ -184,6 +184,14 @@ const startServer = async () => {
     const { startYoutubeUploadWorker } = await import('./workers/youtubeUploadWorker.js');
     startYoutubeUploadWorker();
 
+    const { startSocialPublishWorker } = await import('./workers/socialPublishWorker.js');
+    startSocialPublishWorker();
+
+    const { startTeacherSocialAutoPublishSweeper } = await import(
+      './services/teacherSocialAutoPublishJob.js'
+    );
+    startTeacherSocialAutoPublishSweeper();
+
     io.use(async (socket, next) => {
       try {
         const token =

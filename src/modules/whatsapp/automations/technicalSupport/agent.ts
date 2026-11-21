@@ -7,7 +7,7 @@ import { SUPPORT_TOOL_DEFINITIONS, executeSupportTool } from './tools';
 import { sanitizeAppOnlyTeacherReply } from './appOnlyTeachers';
 import pool from '../../../../db/pool';
 
-const MAX_TOOL_ROUNDS = 6;
+const MAX_TOOL_ROUNDS = 8;
 const DEEPSEEK_URL = `${config.DEEPSEEK_API_URL}/v1/chat/completions`;
 
 type ChatMessage = {

@@ -180,6 +180,16 @@ export const config = cleanEnv(process.env, {
   GOOGLE_API_KEY: str({ default: '' }),
   /** Public HTTPS callback for admin YouTube OAuth (must match Google Cloud redirect URI). */
   YOUTUBE_OAUTH_REDIRECT_URL: str({ default: '' }),
+
+  // Meta (Facebook / Instagram) social publishing
+  META_APP_ID: str({ default: '' }),
+  META_APP_SECRET: str({ default: '' }),
+  META_API_VERSION: str({ default: 'v21.0' }),
+  META_OAUTH_REDIRECT_URL: str({ default: '' }),
+  META_TOKEN_ENCRYPTION_KEY: str({ default: '' }),
+  /** Frontend return URL after OAuth callback (e.g. https://app.../social?tab=connections). */
+  META_FRONTEND_RETURN_URL: str({ default: '' }),
+
   /** Absolute path to LiveKit recording files on this host. */
   RECORDINGS_DIR: str({ default: '/recordings' }),
 

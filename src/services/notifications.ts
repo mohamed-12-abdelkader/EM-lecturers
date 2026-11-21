@@ -101,6 +101,10 @@ export interface NotificationData {
   | 'task_rejected'
   | 'task_approved'
   | 'teacher_creative_reminder'
+  | 'teacher_social_publish_success'
+  | 'teacher_social_publish_failed'
+  | 'teacher_social_needs_reauth'
+  | 'teacher_social_pending_approval'
   | 'course'
   | 'lesson'
   | 'exam'
@@ -467,6 +471,104 @@ export class NotificationService {
       return { success: true, notification };
     } catch (error) {
       console.error('خطأ في إرسال تذكير مساعد المدرسين الإبداعي:', error);
+      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  static async notifyTeacherSocialPublishResult(opts: {
+    userId: number;
+    success: boolean;
+    postId: number;
+    platform?: string;
+    postUrl?: string | null;
+    errorMessage?: string;
+    needsReauth?: boolean;
+  }) {
+    const type = opts.needsReauth
+      ? 'teacher_social_needs_reauth'
+      : opts.success
+        ? 'teacher_social_publish_success'
+        : 'teacher_social_publish_failed';
+    const title = opts.needsReauth
+      ? 'يلزم إعادة ربط حساب السوشيال'
+      : opts.success
+        ? 'تم نشر البوست بنجاح'
+        : 'فشل نشر البوست';
+    const message = opts.needsReauth
+      ? 'انتهت صلاحية الاتصال بحساب فيسبوك/إنستجرام. افتح الحسابات المرتبطة وأعد الربط.'
+      : opts.success
+        ? `تم نشر البوست #${opts.postId} على ${opts.platform === 'instagram_business' ? 'إنستجرام' : 'فيسبوك'}.`
+        : `فشل نشر البوست #${opts.postId}: ${String(opts.errorMessage || 'خطأ غير معروف').slice(0, 180)}`;
+    const metadata = {
+      target: 'teacher_social_publishing',
+      route: '/social?tab=posts',
+      post_id: opts.postId,
+      platform: opts.platform || null,
+      post_url: opts.postUrl || null,
+      needs_reauth: !!opts.needsReauth,
+    };
+
+    try {
+      const result = await pool.query(
+        `INSERT INTO notifications (user_id, title, message, description, type, metadata)
+         VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+         RETURNING *`,
+        [opts.userId, title, message, message, type, JSON.stringify(metadata)],
+      );
+      const notification = result.rows[0];
+      broadcastNotification(opts.userId, {
+        id: `notification_${notification.id}`,
+        type: 'notification',
+        notification_type: type,
+        title: notification.title,
+        message: notification.message,
+        description: notification.description,
+        metadata: notification.metadata,
+        is_read: notification.is_read,
+        created_at: notification.created_at,
+      });
+      enqueueWebPush(opts.userId, title, message, type, notification.id, metadata);
+      ExpoPushService.sendPushNotification(opts.userId, title, message, {
+        type,
+        ...metadata,
+      }).catch(() => undefined);
+      return { success: true, notification };
+    } catch (error) {
+      console.error('خطأ في إشعار نشر السوشيال:', error);
+      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  static async notifyTeacherSocialPendingApproval(userId: number, postId: number) {
+    const type = 'teacher_social_pending_approval';
+    const title = 'بوست بانتظار موافقتك';
+    const message = `يوجد بوست جديد (#${postId}) جاهز للمراجعة قبل النشر التلقائي.`;
+    const metadata = {
+      target: 'teacher_social_publishing',
+      route: '/social?tab=approval',
+      post_id: postId,
+    };
+    try {
+      const result = await pool.query(
+        `INSERT INTO notifications (user_id, title, message, description, type, metadata)
+         VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+         RETURNING *`,
+        [userId, title, message, message, type, JSON.stringify(metadata)],
+      );
+      const notification = result.rows[0];
+      broadcastNotification(userId, {
+        id: `notification_${notification.id}`,
+        type: 'notification',
+        notification_type: type,
+        title: notification.title,
+        message: notification.message,
+        metadata: notification.metadata,
+        is_read: notification.is_read,
+        created_at: notification.created_at,
+      });
+      enqueueWebPush(userId, title, message, type, notification.id, metadata);
+      return { success: true, notification };
+    } catch (error) {
       return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
     }
   }

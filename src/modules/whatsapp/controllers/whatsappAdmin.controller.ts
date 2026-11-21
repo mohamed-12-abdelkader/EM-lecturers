@@ -258,6 +258,77 @@ whatsappAdminRouter.get(
 );
 
 whatsappAdminRouter.get(
+  '/exam-assistant/overview',
+  asyncWrapper(async (_req, res) => {
+    const { ExamAssistantSessionStore } = await import(
+      '../automations/teacherExamBuilder/sessionStore.js'
+    );
+    const data = await ExamAssistantSessionStore.getOverview();
+    res.json({ success: true, data });
+  }),
+);
+
+whatsappAdminRouter.get(
+  '/exam-assistant/sessions',
+  asyncWrapper(async (req, res) => {
+    const { ExamAssistantSessionStore } = await import(
+      '../automations/teacherExamBuilder/sessionStore.js'
+    );
+    const data = await ExamAssistantSessionStore.listForAdmin({
+      limit: Number(req.query.limit) || 50,
+      offset: Number(req.query.offset) || 0,
+      status: typeof req.query.status === 'string' ? req.query.status : undefined,
+      state: typeof req.query.state === 'string' ? req.query.state : undefined,
+      teacherId: req.query.teacher_id ? Number(req.query.teacher_id) : undefined,
+      search: typeof req.query.search === 'string' ? req.query.search : undefined,
+    });
+    res.json({ success: true, data });
+  }),
+);
+
+whatsappAdminRouter.get(
+  '/exam-assistant/sessions/:id',
+  asyncWrapper(async (req, res) => {
+    const id = Number(req.params.id);
+    if (!id) throw new HttpError(400, 'معرف الجلسة غير صحيح');
+    const { ExamAssistantSessionStore } = await import(
+      '../automations/teacherExamBuilder/sessionStore.js'
+    );
+    const data = await ExamAssistantSessionStore.getForAdmin(id);
+    if (!data) throw new HttpError(404, 'الجلسة غير موجودة');
+    res.json({ success: true, data });
+  }),
+);
+
+whatsappAdminRouter.post(
+  '/exam-assistant/sessions/:id/cancel',
+  asyncWrapper(async (req, res) => {
+    const id = Number(req.params.id);
+    if (!id) throw new HttpError(400, 'معرف الجلسة غير صحيح');
+    const { ExamAssistantSessionStore } = await import(
+      '../automations/teacherExamBuilder/sessionStore.js'
+    );
+    const session = await ExamAssistantSessionStore.adminCancel(id);
+    if (!session) throw new HttpError(404, 'لا توجد جلسة نشطة للإلغاء');
+    res.json({ success: true, data: session, message: 'تم إلغاء الجلسة' });
+  }),
+);
+
+whatsappAdminRouter.post(
+  '/exam-assistant/sessions/:id/reopen',
+  asyncWrapper(async (req, res) => {
+    const id = Number(req.params.id);
+    if (!id) throw new HttpError(400, 'معرف الجلسة غير صحيح');
+    const { ExamAssistantSessionStore } = await import(
+      '../automations/teacherExamBuilder/sessionStore.js'
+    );
+    const session = await ExamAssistantSessionStore.adminReopen(id);
+    if (!session) throw new HttpError(404, 'لا يمكن إعادة فتح هذه الجلسة');
+    res.json({ success: true, data: session, message: 'تم إعادة فتح الجلسة' });
+  }),
+);
+
+whatsappAdminRouter.get(
   '/conversations/:id',
   asyncWrapper(async (req, res) => {
     const id = Number(req.params.id);

@@ -626,39 +626,14 @@ Standalone question:`;
     courseId: number,
     question: string,
     images: string[] = [],
-  ): Promise<{ answer: string; retrievedChunks: any[]; toolsUsed?: string[] }> {
+  ): Promise<{ answer: string; retrievedChunks: any[] }> {
     try {
+      const recentQuestions = await this.getRecentQuestions(studentId, courseId, 2);
+      const rewrittenQuestion = await this.rewriteQuestion(question, recentQuestions);
+
       const courseResult = await pool.query(`SELECT teacher_id FROM courses WHERE id = $1`, [courseId]);
       if (courseResult.rows.length === 0) throw new Error('Course not found');
       const teacherId = courseResult.rows[0].teacher_id;
-
-      // Text questions → Platform Assistant (tools + study content).
-      // Image questions keep the dedicated vision RAG path.
-      if (!images || images.length === 0) {
-        const { runPlatformAssistant } = await import('./platformAssistant/index.js');
-        const result = await runPlatformAssistant({
-          ctx: { studentId, courseId, teacherId: Number(teacherId) },
-          question,
-        });
-        await this.saveChatHistory(
-          studentId,
-          courseId,
-          question,
-          question,
-          result.answer,
-          result.retrievedChunks,
-          images,
-          teacherId,
-        );
-        return {
-          answer: result.answer,
-          retrievedChunks: result.retrievedChunks,
-          toolsUsed: result.toolsUsed,
-        };
-      }
-
-      const recentQuestions = await this.getRecentQuestions(studentId, courseId, 2);
-      const rewrittenQuestion = await this.rewriteQuestion(question, recentQuestions);
 
       const similarChunks = await this.retrieveCourseChunks(
         rewrittenQuestion,
@@ -681,28 +656,42 @@ ${retrievedChunksText}
 Question:
 ${rewrittenQuestion}`;
 
-      const mistralConfig = { apiBaseUrl: config.MISTRAL_API_BASE_URL, apiKey: config.MISTRAL_API_KEY };
-      const contentArr: any[] = [{ type: 'text', text: rewrittenQuestion }];
-      for (const imgPath of images) {
-        try {
-          const buffer = await fs.readFile(imgPath);
-          const base64 = buffer.toString('base64');
-          const mimeType = imgPath.endsWith('.png') ? 'image/png' : imgPath.endsWith('.webp') ? 'image/webp' : 'image/jpeg';
-          contentArr.push({ type: 'image_url', image_url: `data:${mimeType};base64,${base64}` });
-        } catch (err: any) {
-          logger.warn(`Could not read image ${imgPath}:`, err.message);
+      let response: Response;
+      if (images && images.length > 0) {
+        const mistralConfig = { apiBaseUrl: config.MISTRAL_API_BASE_URL, apiKey: config.MISTRAL_API_KEY };
+        const contentArr: any[] = [{ type: 'text', text: rewrittenQuestion }];
+        for (const imgPath of images) {
+          try {
+            const buffer = await fs.readFile(imgPath);
+            const base64 = buffer.toString('base64');
+            const mimeType = imgPath.endsWith('.png') ? 'image/png' : imgPath.endsWith('.webp') ? 'image/webp' : 'image/jpeg';
+            contentArr.push({ type: 'image_url', image_url: `data:${mimeType};base64,${base64}` });
+          } catch (err: any) {
+            logger.warn(`Could not read image ${imgPath}:`, err.message);
+          }
         }
+        response = await fetch(`${mistralConfig.apiBaseUrl}/chat/completions`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${mistralConfig.apiKey}` },
+          body: JSON.stringify({
+            model: 'pixtral-12b-2409',
+            messages: [{ role: 'system', content: ragPrompt }, { role: 'user', content: contentArr }],
+            temperature: 0.7,
+            max_tokens: 1000,
+          }),
+        });
+      } else {
+        response = await fetch(`${config.DEEPSEEK_API_URL}/v1/chat/completions`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${config.DEEPSEEK_API_KEY}` },
+          body: JSON.stringify({
+            model: 'deepseek-chat',
+            messages: [{ role: 'system', content: ragPrompt }, { role: 'user', content: rewrittenQuestion }],
+            temperature: 0.7,
+            max_tokens: 1000,
+          }),
+        });
       }
-      const response = await fetch(`${mistralConfig.apiBaseUrl}/chat/completions`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${mistralConfig.apiKey}` },
-        body: JSON.stringify({
-          model: 'pixtral-12b-2409',
-          messages: [{ role: 'system', content: ragPrompt }, { role: 'user', content: contentArr }],
-          temperature: 0.7,
-          max_tokens: 1000,
-        }),
-      });
 
       const data = (await response.json()) as any;
       const answer = data.choices[0]?.message?.content?.trim() || 'عذراً، لم أتمكن من إنشاء إجابة. يرجى المحاولة مرة أخرى.';
@@ -728,31 +717,8 @@ ${rewrittenQuestion}`;
     teacherId: number,
     question: string,
     images: string[] = [],
-  ): Promise<{ answer: string; retrievedChunks: any[]; toolsUsed?: string[] }> {
+  ): Promise<{ answer: string; retrievedChunks: any[] }> {
     try {
-      if (!images || images.length === 0) {
-        const { runPlatformAssistant } = await import('./platformAssistant/index.js');
-        const result = await runPlatformAssistant({
-          ctx: { studentId, courseId: null, teacherId: Number(teacherId) },
-          question,
-        });
-        await this.saveChatHistory(
-          studentId,
-          null,
-          question,
-          question,
-          result.answer,
-          result.retrievedChunks,
-          images,
-          teacherId,
-        );
-        return {
-          answer: result.answer,
-          retrievedChunks: result.retrievedChunks,
-          toolsUsed: result.toolsUsed,
-        };
-      }
-
       const recentQuestions = await this.getRecentTeacherQuestions(studentId, teacherId, 2);
       const rewrittenQuestion = await this.rewriteQuestion(question, recentQuestions);
 
@@ -776,28 +742,42 @@ ${retrievedChunksText}
 Question:
 ${rewrittenQuestion}`;
 
-      const mistralConfig = { apiBaseUrl: config.MISTRAL_API_BASE_URL, apiKey: config.MISTRAL_API_KEY };
-      const contentArr: any[] = [{ type: 'text', text: rewrittenQuestion }];
-      for (const imgPath of images) {
-        try {
-          const buffer = await fs.readFile(imgPath);
-          const base64 = buffer.toString('base64');
-          const mimeType = imgPath.endsWith('.png') ? 'image/png' : imgPath.endsWith('.webp') ? 'image/webp' : 'image/jpeg';
-          contentArr.push({ type: 'image_url', image_url: `data:${mimeType};base64,${base64}` });
-        } catch (err: any) {
-          logger.warn(`Could not read image ${imgPath}:`, err.message);
+      let response: Response;
+      if (images && images.length > 0) {
+        const mistralConfig = { apiBaseUrl: config.MISTRAL_API_BASE_URL, apiKey: config.MISTRAL_API_KEY };
+        const contentArr: any[] = [{ type: 'text', text: rewrittenQuestion }];
+        for (const imgPath of images) {
+          try {
+            const buffer = await fs.readFile(imgPath);
+            const base64 = buffer.toString('base64');
+            const mimeType = imgPath.endsWith('.png') ? 'image/png' : imgPath.endsWith('.webp') ? 'image/webp' : 'image/jpeg';
+            contentArr.push({ type: 'image_url', image_url: `data:${mimeType};base64,${base64}` });
+          } catch (err: any) {
+            logger.warn(`Could not read image ${imgPath}:`, err.message);
+          }
         }
+        response = await fetch(`${mistralConfig.apiBaseUrl}/chat/completions`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${mistralConfig.apiKey}` },
+          body: JSON.stringify({
+            model: 'pixtral-12b-2409',
+            messages: [{ role: 'system', content: ragPrompt }, { role: 'user', content: contentArr }],
+            temperature: 0.7,
+            max_tokens: 1000,
+          }),
+        });
+      } else {
+        response = await fetch(`${config.DEEPSEEK_API_URL}/v1/chat/completions`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${config.DEEPSEEK_API_KEY}` },
+          body: JSON.stringify({
+            model: 'deepseek-chat',
+            messages: [{ role: 'system', content: ragPrompt }, { role: 'user', content: rewrittenQuestion }],
+            temperature: 0.7,
+            max_tokens: 1000,
+          }),
+        });
       }
-      const response = await fetch(`${mistralConfig.apiBaseUrl}/chat/completions`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${mistralConfig.apiKey}` },
-        body: JSON.stringify({
-          model: 'pixtral-12b-2409',
-          messages: [{ role: 'system', content: ragPrompt }, { role: 'user', content: contentArr }],
-          temperature: 0.7,
-          max_tokens: 1000,
-        }),
-      });
 
       const data = (await response.json()) as any;
       const answer = data.choices[0]?.message?.content?.trim() || 'عذراً، لم أتمكن من إنشاء إجابة. يرجى المحاولة مرة أخرى.';

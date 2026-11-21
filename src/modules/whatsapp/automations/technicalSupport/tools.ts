@@ -1,5 +1,10 @@
 import pool from '../../../../db/pool';
 import { getActivationCodeDetails } from '../../../../services/activationCodeLookup';
+import {
+  PLATFORM_TOOL_DEFINITIONS,
+  executePlatformTool,
+} from '../../../../services/platformAssistant/tools';
+import type { PlatformAssistantContext } from '../../../../services/platformAssistant/types';
 import { tenantAccessForSubdomain } from './appOnlyTeachers';
 import { getPlatformHelp } from './faq';
 import { maskPhone, phoneMatchVariants, phonesMatch } from './phoneMatch';
@@ -9,6 +14,44 @@ export type ToolExecutionContext = {
   fromPhone: string;
   conversationId: number | null;
 };
+
+/** Platform student-data tools available to technical support (no scientific RAG). */
+const EXCLUDED_PLATFORM_TOOLS = new Set(['search_study_content']);
+
+const STUDENT_USER_ID_PARAM = {
+  type: 'integer',
+  description:
+    'معرف حساب الطالب المرتبط برقم واتساب المتصل حالياً فقط. مطلوب إذا وُجد أكثر من حساب لنفس الرقم — استخدم lookup_students_by_whatsapp أولاً واختر student_user_id الصحيح.',
+};
+
+const PLATFORM_SUPPORT_TOOL_DEFINITIONS = PLATFORM_TOOL_DEFINITIONS.filter(
+  (t) => !EXCLUDED_PLATFORM_TOOLS.has(t.function.name),
+).map((t) => {
+  const params = (t.function.parameters || { type: 'object', properties: {} }) as {
+    type: string;
+    properties?: Record<string, unknown>;
+    required?: string[];
+    additionalProperties?: boolean;
+  };
+  return {
+    ...t,
+    function: {
+      ...t.function,
+      parameters: {
+        ...params,
+        type: 'object',
+        properties: {
+          ...(params.properties || {}),
+          student_user_id: STUDENT_USER_ID_PARAM,
+        },
+      },
+    },
+  };
+});
+
+const PLATFORM_TOOL_NAME_SET = new Set(
+  PLATFORM_SUPPORT_TOOL_DEFINITIONS.map((t) => t.function.name),
+);
 
 export const SUPPORT_TOOL_DEFINITIONS = [
   {
@@ -127,7 +170,82 @@ export const SUPPORT_TOOL_DEFINITIONS = [
       },
     },
   },
+  ...PLATFORM_SUPPORT_TOOL_DEFINITIONS,
 ];
+
+async function resolvePlatformStudentContext(
+  fromPhone: string,
+  args: Record<string, unknown>,
+): Promise<
+  | { ok: true; ctx: PlatformAssistantContext }
+  | { ok: false; error: string; guidance?: string; students?: unknown[] }
+> {
+  const lookup = await lookupStudentsByWhatsapp(fromPhone);
+  if (!lookup.ok || !lookup.students?.length) {
+    return {
+      ok: false,
+      error: 'no_account_for_whatsapp',
+      guidance:
+        'مفيش حساب طالب مربوط برقم الواتساب الحالي. اطلب من الطالب يتأكد إنه بيبعت من نفس رقم الموبايل المسجّل، أو يساعده في إنشاء حساب/الدخول أولاً.',
+    };
+  }
+
+  const requested =
+    args.student_user_id != null && Number.isFinite(Number(args.student_user_id))
+      ? Number(args.student_user_id)
+      : null;
+
+  if (requested) {
+    const match = lookup.students.find((s) => s.student_user_id === requested);
+    if (!match) {
+      return {
+        ok: false,
+        error: 'student_not_linked_to_this_whatsapp',
+        guidance: 'الحساب المطلوب مش مربوط برقم واتساب المتصل. استخدم حساب من نتيجة lookup_students_by_whatsapp فقط.',
+        students: lookup.students,
+      };
+    }
+    return {
+      ok: true,
+      ctx: {
+        studentId: match.student_user_id,
+        courseId:
+          args.course_id != null && Number.isFinite(Number(args.course_id))
+            ? Number(args.course_id)
+            : null,
+        teacherId: null,
+      },
+    };
+  }
+
+  if (lookup.students.length > 1) {
+    return {
+      ok: false,
+      error: 'multiple_accounts',
+      guidance:
+        'فيه أكتر من حساب لنفس رقم الواتساب. اسأل الطالب أنهي منصة/مدرس، ثم أعد استدعاء الأداة مع student_user_id.',
+      students: lookup.students.map((s) => ({
+        student_user_id: s.student_user_id,
+        name: s.name,
+        tenant_display_name: s.tenant_display_name,
+        tenant_subdomain: s.tenant_subdomain,
+      })),
+    };
+  }
+
+  const only = lookup.students[0];
+  return {
+    ok: true,
+    ctx: {
+      studentId: only.student_user_id,
+      courseId:
+        args.course_id != null && Number.isFinite(Number(args.course_id))
+          ? Number(args.course_id)
+          : null,
+      teacherId: null,
+    },
+  };
+}
 
 function normalizeActivationCodeInput(raw: string): string {
   const trimmed = String(raw || '').trim();
@@ -538,7 +656,13 @@ export async function executeSupportTool(
         newPassword,
       });
     }
-    default:
+    default: {
+      if (PLATFORM_TOOL_NAME_SET.has(name)) {
+        const resolved = await resolvePlatformStudentContext(ctx.fromPhone, args);
+        if (!resolved.ok) return resolved;
+        return executePlatformTool(name, args, resolved.ctx);
+      }
       return { ok: false, error: `unknown tool: ${name}` };
+    }
   }
 }
