@@ -175,10 +175,14 @@ export class TeacherPointsService {
       const preferred = Number(opts.preferredGradeId);
       if (Number.isInteger(preferred) && preferred > 0) {
         const ok = await pool.query(
-          `SELECT 1 FROM teacher_grades WHERE teacher_id = $1 AND grade_id = $2
-           UNION ALL
-           SELECT 1 FROM grades WHERE id = $2
-           LIMIT 1`,
+          `SELECT 1
+           WHERE EXISTS (
+             SELECT 1 FROM teacher_grades
+             WHERE teacher_id = $1 AND grade_id = $2
+           )
+           OR EXISTS (
+             SELECT 1 FROM grades WHERE id = $2
+           )`,
           [opts.teacherId, preferred],
         );
         if (ok.rowCount) return preferred;
@@ -528,6 +532,8 @@ export class TeacherPointsService {
     totalGrade: number;
     title?: string | null;
     examKind?: 'lecture' | 'course';
+    /** Skip per-award purge (used by bulk recalculate/backfill). */
+    skipPurge?: boolean;
   }): Promise<AwardResult> {
     // الترتيب يعتمد على آخر امتحان شامل (course) فقط — امتحانات المحاضرات لا تُحتسب
     if (!opts.isAssignment && opts.examKind !== 'course') {
@@ -583,7 +589,7 @@ export class TeacherPointsService {
         title: opts.title ?? null,
       },
     });
-    if (!opts.isAssignment && result.awarded && gradeId) {
+    if (!opts.isAssignment && result.awarded && gradeId && !opts.skipPurge) {
       const allowedIds = await this.listEligibleCourseExamIds(opts.teacherId, gradeId);
       // Always keep the exam we just awarded for.
       const keep = new Set<number>(allowedIds.map(Number));
@@ -3029,6 +3035,8 @@ export class TeacherPointsService {
     scoresRemoved: number;
     startsRemoved: number;
     skippedMissingGrade: number;
+    studentErrors: number;
+    lastError?: string;
   }> {
     const empty = {
       examId,
@@ -3039,6 +3047,7 @@ export class TeacherPointsService {
       scoresRemoved: 0,
       startsRemoved: 0,
       skippedMissingGrade: 0,
+      studentErrors: 0,
     };
 
     const examRes = await pool.query<{
@@ -3095,6 +3104,8 @@ export class TeacherPointsService {
     let scoresAdjusted = 0;
     let studentsProcessed = 0;
     let skippedMissingGrade = 0;
+    let studentErrors = 0;
+    let lastError: string | undefined;
 
     if (!isCourseExamPointsEnabled(exam)) {
       const scoreDel = await pool.query<{ student_id: number; grade_id: number }>(
@@ -3136,88 +3147,108 @@ export class TeacherPointsService {
     for (const row of studentsRes.rows) {
       const studentId = Number(row.student_id);
       studentsProcessed += 1;
-      const selected = await resolveCourseExamPointsAttempt({
-        examId,
-        studentId,
-        mode,
-      });
-      if (!selected) continue;
-
-      const attemptId = Number(selected.id);
-      const obtained = Math.max(0, Number(selected.obtained_grade ?? 0));
-      const total = Math.max(obtained, Number(selected.total_grade ?? 0));
-      const scoreOpts = {
-        studentId,
-        teacherId,
-        courseId: exam.course_id,
-        preferredGradeId,
-        attemptId,
-        examId,
-        isAssignment: false as const,
-        examKind: 'course' as const,
-        obtainedGrade: obtained,
-        totalGrade: total,
-        title: exam.title,
-      };
-
-      // Upsert immediately: create missing scores, update existing (including down to 0).
-      let result: AwardResult;
-      let createdNow = false;
-      if (obtained <= 0) {
-        result = await this.syncExamOrAssignmentScore(scoreOpts);
-        if (result.reason === 'no_existing_transaction') {
-          // Nothing to create for a zero score.
-          result = {
-            awarded: false,
-            points: 0,
-            totalPoints: result.totalPoints,
-            reason: 'zero_points',
-          };
-        }
-      } else {
-        result = await this.awardExamOrAssignmentScore(scoreOpts);
-        if (result.awarded) {
-          createdNow = true;
-        } else if (result.reason === 'duplicate') {
-          result = await this.syncExamOrAssignmentScore(scoreOpts);
-        }
-      }
-
-      if (result.reason === 'missing_grade') {
-        skippedMissingGrade += 1;
-        console.warn('recalculateCourseExamPointsForExam skipped student (missing_grade)', {
+      try {
+        const selected = await resolveCourseExamPointsAttempt({
           examId,
           studentId,
-          attemptId,
+          mode,
         });
-        continue;
-      }
+        if (!selected) continue;
 
-      if (createdNow) {
-        scoresCreated += 1;
-        scoresSynced += 1;
-      } else if (
-        result.awarded ||
-        result.reason === 'adjusted_down' ||
-        result.reason === 'duplicate'
-      ) {
-        scoresAdjusted += 1;
-        scoresSynced += 1;
-      }
+        const attemptId = Number(selected.id);
+        const obtained = Math.max(0, Number(selected.obtained_grade ?? 0));
+        const total = Math.max(obtained, Number(selected.total_grade ?? 0));
+        const scoreOpts = {
+          studentId,
+          teacherId,
+          courseId: exam.course_id,
+          preferredGradeId,
+          attemptId,
+          examId,
+          isAssignment: false as const,
+          examKind: 'course' as const,
+          obtainedGrade: obtained,
+          totalGrade: total,
+          title: exam.title,
+          skipPurge: true,
+        };
 
-      const gradeId = await this.resolveGradeId({
-        studentId,
-        teacherId,
-        courseId: exam.course_id,
-        preferredGradeId,
-      });
-      if (gradeId) {
-        touched.set(`${studentId}:${gradeId}`, { studentId, gradeId });
+        // Upsert immediately: create missing scores, update existing (including down to 0).
+        let result: AwardResult;
+        let createdNow = false;
+        if (obtained <= 0) {
+          result = await this.syncExamOrAssignmentScore(scoreOpts);
+          if (result.reason === 'no_existing_transaction') {
+            // Nothing to create for a zero score.
+            result = {
+              awarded: false,
+              points: 0,
+              totalPoints: result.totalPoints,
+              reason: 'zero_points',
+            };
+          }
+        } else {
+          result = await this.awardExamOrAssignmentScore(scoreOpts);
+          if (result.awarded) {
+            createdNow = true;
+          } else if (result.reason === 'duplicate') {
+            result = await this.syncExamOrAssignmentScore(scoreOpts);
+          } else if (result.reason === 'disabled') {
+            // Teacher global exam_score_enabled is off — stop early with a clear signal.
+            lastError = 'exam_score_disabled_in_teacher_settings';
+            break;
+          }
+        }
+
+        if (result.reason === 'missing_grade') {
+          skippedMissingGrade += 1;
+          console.warn('recalculateCourseExamPointsForExam skipped student (missing_grade)', {
+            examId,
+            studentId,
+            attemptId,
+          });
+          continue;
+        }
+
+        if (createdNow) {
+          scoresCreated += 1;
+          scoresSynced += 1;
+        } else if (
+          result.awarded ||
+          result.reason === 'adjusted_down' ||
+          result.reason === 'duplicate'
+        ) {
+          scoresAdjusted += 1;
+          scoresSynced += 1;
+        }
+
+        const gradeId = await this.resolveGradeId({
+          studentId,
+          teacherId,
+          courseId: exam.course_id,
+          preferredGradeId,
+        });
+        if (gradeId) {
+          touched.set(`${studentId}:${gradeId}`, { studentId, gradeId });
+        }
+      } catch (err: any) {
+        studentErrors += 1;
+        lastError = err?.message || String(err);
+        console.error('recalculateCourseExamPointsForExam student failed', {
+          examId,
+          studentId,
+          err: lastError,
+        });
       }
     }
 
     for (const item of touched.values()) {
-      await this.recomputeStudentBalance(item.studentId, teacherId, item.gradeId);
+      try {
+        await this.recomputeStudentBalance(item.studentId, teacherId, item.gradeId);
+      } catch (err: any) {
+        studentErrors += 1;
+        lastError = err?.message || String(err);
+      }
     }
 
     return {
@@ -3229,6 +3260,8 @@ export class TeacherPointsService {
       scoresRemoved,
       startsRemoved,
       skippedMissingGrade,
+      studentErrors,
+      lastError,
     };
   }
 

@@ -477,45 +477,83 @@ router.post(
   '/recalculate-course-exam-scores',
   authMiddleware(['teacher', 'academy', 'admin']),
   asyncWrapper(async (req, res) => {
-    const teacherId = resolveTeacherId(req);
-    const examIdRaw = req.body?.examId ?? req.body?.exam_id ?? req.query.examId;
-    const examId =
-      examIdRaw != null && Number.isFinite(Number(examIdRaw)) && Number(examIdRaw) > 0
-        ? Number(examIdRaw)
-        : null;
+    try {
+      const teacherId = resolveTeacherId(req);
+      const examIdRaw = req.body?.examId ?? req.body?.exam_id ?? req.query.examId;
+      const examId =
+        examIdRaw != null && Number.isFinite(Number(examIdRaw)) && Number(examIdRaw) > 0
+          ? Number(examIdRaw)
+          : null;
 
-    if (examId) {
-      const owned = await pool.query(
-        `SELECT e.id
-         FROM course_level_exams e
-         LEFT JOIN courses c ON c.id = e.course_id
-         WHERE e.id = $1 AND COALESCE(e.teacher_id, c.teacher_id) = $2
-         LIMIT 1`,
-        [examId, teacherId],
-      );
-      if (!owned.rowCount) {
-        return res.status(404).json({
-          success: false,
-          message: 'الامتحان غير موجود أو لا تملك صلاحية عليه',
+      if (examId) {
+        const owned = await pool.query(
+          `SELECT e.id
+           FROM course_level_exams e
+           LEFT JOIN courses c ON c.id = e.course_id
+           WHERE e.id = $1
+             AND (
+               COALESCE(e.teacher_id, c.teacher_id) = $2
+               OR EXISTS (
+                 SELECT 1 FROM teacher_grades tg
+                 WHERE tg.teacher_id = $2
+                   AND (
+                     tg.grade_id = e.grade_id
+                     OR tg.grade_id = c.grade_id
+                   )
+               )
+             )
+           LIMIT 1`,
+          [examId, teacherId],
+        );
+        if (!owned.rowCount) {
+          return res.status(404).json({
+            success: false,
+            message: 'الامتحان غير موجود أو لا تملك صلاحية عليه',
+          });
+        }
+        const result = await TeacherPointsService.recalculateCourseExamPointsForExam(examId);
+        if (result.lastError === 'exam_score_disabled_in_teacher_settings') {
+          return res.status(400).json({
+            success: false,
+            message:
+              'احتساب نقاط الامتحانات معطّل من إعدادات نقاط المدرس العامة. فعّله ثم أعد المحاولة.',
+            data: result,
+          });
+        }
+        return res.json({
+          success: true,
+          message: 'تم إعادة احتساب نقاط الامتحان للطلاب الذين سلّموا',
+          data: result,
         });
       }
-      const result = await TeacherPointsService.recalculateCourseExamPointsForExam(examId);
+
+      const result = await TeacherPointsService.backfillEnabledCourseExamScores({
+        teacherId,
+        limit: 300,
+      });
       return res.json({
         success: true,
-        message: 'تم إعادة احتساب نقاط الامتحان للطلاب الذين سلّموا',
+        message: 'تم إعادة احتساب نقاط كل الامتحانات الشاملة المفعّلة',
         data: result,
       });
+    } catch (error: any) {
+      console.error('recalculate-course-exam-scores failed', {
+        body: req.body,
+        err: error?.message || error,
+        stack: error?.stack,
+      });
+      if (error instanceof HttpError) {
+        return res.status(error.status).json({
+          success: false,
+          message: error.message,
+        });
+      }
+      return res.status(500).json({
+        success: false,
+        message: error?.message || 'تعذّر إعادة احتساب نقاط الامتحان',
+        name: error?.name || 'InternalServerError',
+      });
     }
-
-    const result = await TeacherPointsService.backfillEnabledCourseExamScores({
-      teacherId,
-      limit: 300,
-    });
-    return res.json({
-      success: true,
-      message: 'تم إعادة احتساب نقاط كل الامتحانات الشاملة المفعّلة',
-      data: result,
-    });
   }),
 );
 
