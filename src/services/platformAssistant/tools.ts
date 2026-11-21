@@ -543,13 +543,17 @@ export async function executePlatformTool(
         if (!pointsCtx) return fail('points_context_unavailable');
         const limitRaw = Number(args.limit ?? 30);
         const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(limitRaw, 1), 100) : 30;
-        const transactions = await TeacherPointsService.listStudentTransactions({
+        const pointsHistory = await TeacherPointsService.listStudentTransactions({
           teacherId: pointsCtx.teacherId,
           studentId,
           gradeId: pointsCtx.gradeId,
           limit,
         });
-        return ok({ count: transactions.length, transactions });
+        return ok({
+          count: pointsHistory.transactions.length,
+          totalPoints: pointsHistory.totalPoints,
+          transactions: pointsHistory.transactions,
+        });
       }
 
       case 'diagnose_exam_points': {
@@ -581,18 +585,22 @@ export async function executePlatformTool(
         const pointsCtx = await TeacherPointsService.resolveStudentPointsContext(studentId);
         let relatedTx: any[] = [];
         if (pointsCtx) {
-          const txs = await TeacherPointsService.listStudentTransactions({
+          const pointsHistory = await TeacherPointsService.listStudentTransactions({
             teacherId: pointsCtx.teacherId,
             studentId,
             gradeId: pointsCtx.gradeId,
             limit: 100,
           });
-          relatedTx = txs.filter(
-            (tx) =>
+          relatedTx = pointsHistory.transactions.filter((tx) => {
+            const meta =
+              tx.metadata && typeof tx.metadata === 'object'
+                ? (tx.metadata as Record<string, unknown>)
+                : {};
+            return (
               tx.eventType === 'EXAM_SCORE' &&
-              (Number(tx.referenceId) === examId ||
-                Number(tx.metadata?.examId) === examId),
-          );
+              (Number(tx.referenceId) === examId || Number(meta.examId) === examId)
+            );
+          });
         }
 
         const reasons: string[] = [];

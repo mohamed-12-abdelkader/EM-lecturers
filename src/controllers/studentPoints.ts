@@ -62,7 +62,7 @@ router.get(
     const ctx = await requireStudentContext(studentId);
     const limitRaw = req.query.limit ? Number(req.query.limit) : 100;
     const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(limitRaw, 1), 300) : 100;
-    const transactions = await TeacherPointsService.listStudentTransactions({
+    const result = await TeacherPointsService.listStudentTransactions({
       teacherId: ctx.teacherId,
       studentId,
       gradeId: ctx.gradeId,
@@ -74,7 +74,9 @@ router.get(
         studentId,
         teacherId: ctx.teacherId,
         gradeId: ctx.gradeId,
-        transactions,
+        transactions: result.transactions,
+        totalPoints: result.totalPoints,
+        transactionsSum: result.transactionsSum,
       },
     });
   }),

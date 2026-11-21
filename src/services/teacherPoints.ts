@@ -2870,9 +2870,24 @@ export class TeacherPointsService {
           teacherId: opts.teacherId,
           limit: 100,
         });
+        // Critical: award() increments balances; always rebuild from ledger SUM.
+        await this.syncBalancesFromTransactions({
+          teacherId: opts.teacherId,
+          gradeId: opts.gradeId ?? null,
+        });
         this.leaderboardHealAt.set(healKey, Date.now());
       } catch (err) {
         console.error('leaderboard points heal/backfill failed:', err);
+      }
+    } else {
+      // Cheap integrity sync every request so UI total matches the ledger.
+      try {
+        await this.syncBalancesFromTransactions({
+          teacherId: opts.teacherId,
+          gradeId: opts.gradeId ?? null,
+        });
+      } catch (err) {
+        console.error('syncBalancesFromTransactions failed:', err);
       }
     }
 
@@ -3018,6 +3033,59 @@ export class TeacherPointsService {
       [studentId, teacherId, gradeId],
     );
     return Number(res.rows[0]?.total_points ?? 0);
+  }
+
+  /**
+   * Force every balance row for a teacher (optional grade) to equal SUM(transactions).
+   * Fixes stale totals that drifted above/below the visible ledger.
+   */
+  static async syncBalancesFromTransactions(opts: {
+    teacherId: number;
+    gradeId?: number | null;
+    studentId?: number | null;
+  }): Promise<{ updated: number }> {
+    const gradeId =
+      opts.gradeId != null && Number.isFinite(Number(opts.gradeId))
+        ? Number(opts.gradeId)
+        : null;
+    const studentId =
+      opts.studentId != null && Number.isFinite(Number(opts.studentId))
+        ? Number(opts.studentId)
+        : null;
+
+    const res = await pool.query(
+      `INSERT INTO student_point_balances (student_id, teacher_id, grade_id, total_points)
+       SELECT t.student_id, t.teacher_id, t.grade_id, GREATEST(0, SUM(t.points)::int)
+       FROM point_transactions t
+       WHERE t.teacher_id = $1
+         AND ($2::int IS NULL OR t.grade_id = $2)
+         AND ($3::int IS NULL OR t.student_id = $3)
+       GROUP BY t.student_id, t.teacher_id, t.grade_id
+       ON CONFLICT (student_id, teacher_id, grade_id)
+       DO UPDATE SET
+         total_points = EXCLUDED.total_points,
+         updated_at = NOW()`,
+      [opts.teacherId, gradeId, studentId],
+    );
+
+    // Zero out balances that no longer have any ledger rows.
+    const zero = await pool.query(
+      `UPDATE student_point_balances b
+       SET total_points = 0, updated_at = NOW()
+       WHERE b.teacher_id = $1
+         AND ($2::int IS NULL OR b.grade_id = $2)
+         AND ($3::int IS NULL OR b.student_id = $3)
+         AND NOT EXISTS (
+           SELECT 1 FROM point_transactions t
+           WHERE t.teacher_id = b.teacher_id
+             AND t.student_id = b.student_id
+             AND t.grade_id = b.grade_id
+         )
+         AND b.total_points <> 0`,
+      [opts.teacherId, gradeId, studentId],
+    );
+
+    return { updated: (res.rowCount ?? 0) + (zero.rowCount ?? 0) };
   }
 
   /**
@@ -3352,8 +3420,23 @@ export class TeacherPointsService {
     studentId: number;
     gradeId?: number | null;
     limit?: number;
-  }) {
-    // تصفية تلقائية: السجل يعرض آخر امتحان شامل فقط (+ يدوي/فيديو)
+  }): Promise<{
+    transactions: Array<{
+      id: number;
+      points: number;
+      eventType: string;
+      referenceType: string | null;
+      referenceId: number | null;
+      referenceKey: string | null;
+      metadata: unknown;
+      gradeId: number;
+      createdAt: Date;
+    }>;
+    totalPoints: number;
+    transactionsSum: number;
+    gradeId: number | null;
+  }> {
+    // تصفية تلقائية: السجل يعرض امتحانات النقاط المفعّلة (+ يدوي/فيديو)
     try {
       await this.healStudentToLastCourseExamOnly({
         teacherId: opts.teacherId,
@@ -3364,12 +3447,27 @@ export class TeacherPointsService {
       console.error('healStudentToLastCourseExamOnly failed:', err);
     }
 
-    const limit = Math.min(Math.max(opts.limit ?? 100, 1), 500);
+    const gradeId =
+      opts.gradeId != null && Number.isFinite(Number(opts.gradeId))
+        ? Number(opts.gradeId)
+        : await this.resolveGradeId({
+            studentId: opts.studentId,
+            teacherId: opts.teacherId,
+          });
+
+    // Always force balance = SUM(ledger) so the ranking number matches the drawer.
+    await this.syncBalancesFromTransactions({
+      teacherId: opts.teacherId,
+      studentId: opts.studentId,
+      gradeId,
+    });
+
+    const limit = Math.min(Math.max(opts.limit ?? 200, 1), 500);
     const params: unknown[] = [opts.teacherId, opts.studentId];
     let where = `teacher_id = $1 AND student_id = $2`;
-    if (opts.gradeId) {
+    if (gradeId) {
       where += ` AND grade_id = $3`;
-      params.push(opts.gradeId);
+      params.push(gradeId);
     }
     params.push(limit);
     const res = await pool.query(
@@ -3380,7 +3478,8 @@ export class TeacherPointsService {
        LIMIT $${params.length}`,
       params,
     );
-    return res.rows.map((row) => ({
+
+    const transactions = res.rows.map((row) => ({
       id: Number(row.id),
       points: Number(row.points),
       eventType: row.event_type,
@@ -3391,6 +3490,25 @@ export class TeacherPointsService {
       gradeId: Number(row.grade_id),
       createdAt: row.created_at,
     }));
+
+    const sumRes = await pool.query<{ sum: string | number | null }>(
+      `SELECT COALESCE(SUM(points), 0) AS sum
+       FROM point_transactions
+       WHERE teacher_id = $1 AND student_id = $2
+         AND ($3::int IS NULL OR grade_id = $3)`,
+      [opts.teacherId, opts.studentId, gradeId],
+    );
+    const transactionsSum = Math.max(0, Math.floor(Number(sumRes.rows[0]?.sum) || 0));
+    const totalPoints = gradeId
+      ? await this.getBalance(opts.studentId, opts.teacherId, gradeId)
+      : transactionsSum;
+
+    return {
+      transactions,
+      totalPoints,
+      transactionsSum,
+      gradeId,
+    };
   }
 
   /** Context for student-facing APIs: teacher + primary grade. */

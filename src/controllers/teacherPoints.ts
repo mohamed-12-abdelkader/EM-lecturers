@@ -168,13 +168,22 @@ router.get(
     }
     const gradeId = req.query.gradeId ? Number(req.query.gradeId) : null;
     const limit = req.query.limit ? Number(req.query.limit) : 100;
-    const transactions = await TeacherPointsService.listStudentTransactions({
+    const result = await TeacherPointsService.listStudentTransactions({
       teacherId,
       studentId,
       gradeId: gradeId && Number.isFinite(gradeId) ? gradeId : null,
       limit,
     });
-    res.json({ success: true, data: { studentId, transactions } });
+    res.json({
+      success: true,
+      data: {
+        studentId,
+        transactions: result.transactions,
+        totalPoints: result.totalPoints,
+        transactionsSum: result.transactionsSum,
+        gradeId: result.gradeId,
+      },
+    });
   }),
 );
 
