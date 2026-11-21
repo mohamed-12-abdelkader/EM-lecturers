@@ -2711,6 +2711,11 @@ export class TeacherPointsService {
     teacherId: number;
     gradeId: number;
   }) {
+    await this.syncBalancesFromTransactions({
+      teacherId: opts.teacherId,
+      gradeId: opts.gradeId,
+      studentId: opts.studentId,
+    });
     const totalPoints = await this.getBalance(opts.studentId, opts.teacherId, opts.gradeId);
 
     const totalsRes = await pool.query<{ cnt: string }>(
@@ -2800,35 +2805,37 @@ export class TeacherPointsService {
     limit?: number;
   }) {
     const limit = Math.min(Math.max(opts.limit ?? 10, 1), 50);
+    await this.syncBalancesFromTransactions({
+      teacherId: opts.teacherId,
+      gradeId: opts.gradeId,
+    });
     const res = await pool.query(
-      `SELECT
-         b.student_id,
-         b.total_points,
+      `WITH ledger_balances AS (
+         SELECT
+           t.student_id,
+           t.teacher_id,
+           t.grade_id,
+           GREATEST(0, SUM(t.points)::int) AS total_points,
+           MAX(t.created_at) AS last_tx_at
+         FROM point_transactions t
+         WHERE t.teacher_id = $1 AND t.grade_id = $2
+         GROUP BY t.student_id, t.teacher_id, t.grade_id
+       )
+       SELECT
+         lb.student_id,
+         lb.total_points,
          u.name AS student_name,
          u.avatar AS student_avatar,
          RANK() OVER (
-           ORDER BY b.total_points DESC,
-                    COALESCE(
-                      (SELECT MAX(t.created_at) FROM point_transactions t
-                       WHERE t.student_id = b.student_id
-                         AND t.teacher_id = b.teacher_id
-                         AND t.grade_id = b.grade_id),
-                      b.updated_at
-                    ) ASC,
-                    b.student_id ASC
+           ORDER BY lb.total_points DESC,
+                    lb.last_tx_at ASC NULLS LAST,
+                    lb.student_id ASC
          ) AS rank
-       FROM student_point_balances b
-       JOIN users u ON u.id = b.student_id
-       WHERE b.teacher_id = $1 AND b.grade_id = $2
-       ORDER BY b.total_points DESC,
-                COALESCE(
-                  (SELECT MAX(t.created_at) FROM point_transactions t
-                   WHERE t.student_id = b.student_id
-                     AND t.teacher_id = b.teacher_id
-                     AND t.grade_id = b.grade_id),
-                  b.updated_at
-                ) ASC,
-                b.student_id ASC
+       FROM ledger_balances lb
+       JOIN users u ON u.id = lb.student_id
+       ORDER BY lb.total_points DESC,
+                lb.last_tx_at ASC NULLS LAST,
+                lb.student_id ASC
        LIMIT $3`,
       [opts.teacherId, opts.gradeId, limit],
     );
@@ -2857,85 +2864,109 @@ export class TeacherPointsService {
     page?: number;
     limit?: number;
   }) {
-    // تنظيف + تعويض نقاط الامتحانات المفعّلة قبل عرض الترتيب (مرة/دقيقة لكل مدرس+صف)
+    // تعويض المحاولات الناقصة — مرة/دقيقة فقط
     const healKey = `${opts.teacherId}:${opts.gradeId ?? 'all'}`;
-    const lastHeal = this.leaderboardHealAt.get(healKey) ?? 0;
-    if (Date.now() - lastHeal > 60_000) {
+    const lastBackfill = this.leaderboardHealAt.get(healKey) ?? 0;
+    if (Date.now() - lastBackfill > 60_000) {
       try {
-        await this.healTeacherExamPointsToLastOnly({
-          teacherId: opts.teacherId,
-          gradeId: opts.gradeId ?? null,
-        });
         await this.backfillEnabledCourseExamScores({
           teacherId: opts.teacherId,
           limit: 100,
         });
-        // Critical: award() increments balances; always rebuild from ledger SUM.
-        await this.syncBalancesFromTransactions({
-          teacherId: opts.teacherId,
-          gradeId: opts.gradeId ?? null,
-        });
         this.leaderboardHealAt.set(healKey, Date.now());
       } catch (err) {
-        console.error('leaderboard points heal/backfill failed:', err);
+        console.error('leaderboard points backfill failed:', err);
       }
-    } else {
-      // Cheap integrity sync every request so UI total matches the ledger.
-      try {
-        await this.syncBalancesFromTransactions({
-          teacherId: opts.teacherId,
-          gradeId: opts.gradeId ?? null,
-        });
-      } catch (err) {
-        console.error('syncBalancesFromTransactions failed:', err);
-      }
+    }
+
+    // نفس تنظيف فتح السجل بعد أي backfill: احذف نقاط خارج النافذة
+    // حتى يظهر مجموع القائمة = مجموع سجل الطالب بدون فتح كل طالب.
+    try {
+      await this.healTeacherExamPointsToLastOnly({
+        teacherId: opts.teacherId,
+        gradeId: opts.gradeId ?? null,
+      });
+    } catch (err) {
+      console.error('leaderboard points heal failed:', err);
+    }
+
+    // Always rebuild stored balances from the ledger before listing.
+    try {
+      await this.syncBalancesFromTransactions({
+        teacherId: opts.teacherId,
+        gradeId: opts.gradeId ?? null,
+      });
+    } catch (err) {
+      console.error('syncBalancesFromTransactions failed:', err);
     }
 
     const page = Math.max(1, opts.page ?? 1);
     const limit = Math.min(Math.max(opts.limit ?? 50, 1), 200);
     const offset = (page - 1) * limit;
 
-    const params: unknown[] = [opts.teacherId];
-    let where = `b.teacher_id = $1`;
-    let i = 2;
+    // Rank from live ledger SUM so the list total always equals the student's record sum.
+    const ledgerBalancesCte = `ledger_balances AS (
+         SELECT
+           t.student_id,
+           t.teacher_id,
+           t.grade_id,
+           GREATEST(0, SUM(t.points)::int) AS total_points,
+           MAX(t.created_at) AS last_tx_at
+         FROM point_transactions t
+         WHERE t.teacher_id = $1
+           AND ($2::int IS NULL OR t.grade_id = $2)
+         GROUP BY t.student_id, t.teacher_id, t.grade_id
+       )`;
+
+    // params[1] used inside CTE for optional grade filter — keep grade as $2 always.
+    const gradeParamForCte =
+      opts.gradeId != null && Number.isFinite(Number(opts.gradeId))
+        ? Number(opts.gradeId)
+        : null;
+
+    // Rebuild params so $1=teacherId and $2=gradeId for the CTE, then continue filters.
+    const queryParams: unknown[] = [opts.teacherId, gradeParamForCte];
+    let filterSql = `lb.teacher_id = $1`;
+    let p = 3;
 
     if (opts.gradeId) {
-      where += ` AND b.grade_id = $${i++}`;
-      params.push(opts.gradeId);
+      filterSql += ` AND lb.grade_id = $2`;
     }
 
     if (opts.groupId) {
-      where += ` AND EXISTS (
+      filterSql += ` AND EXISTS (
         SELECT 1 FROM group_students gs
         JOIN study_groups sg ON sg.id = gs.group_id
-        WHERE gs.student_id = b.student_id
-          AND gs.group_id = $${i}
+        WHERE gs.student_id = lb.student_id
+          AND gs.group_id = $${p}
           AND sg.teacher_id = $1
       )`;
-      params.push(opts.groupId);
-      i++;
+      queryParams.push(opts.groupId);
+      p++;
     }
 
     if (opts.search?.trim()) {
-      where += ` AND (u.name ILIKE $${i} OR u.email ILIKE $${i} OR COALESCE(u.phone, '') ILIKE $${i})`;
-      params.push(`%${opts.search.trim()}%`);
-      i++;
+      filterSql += ` AND (u.name ILIKE $${p} OR u.email ILIKE $${p} OR COALESCE(u.phone, '') ILIKE $${p})`;
+      queryParams.push(`%${opts.search.trim()}%`);
+      p++;
     }
 
     const countRes = await pool.query(
-      `SELECT COUNT(*)::int AS cnt
-       FROM student_point_balances b
-       JOIN users u ON u.id = b.student_id
-       WHERE ${where}`,
-      params,
+      `WITH ${ledgerBalancesCte}
+       SELECT COUNT(*)::int AS cnt
+       FROM ledger_balances lb
+       JOIN users u ON u.id = lb.student_id
+       WHERE ${filterSql}`,
+      queryParams,
     );
 
-    params.push(limit, offset);
+    queryParams.push(limit, offset);
     const res = await pool.query(
-      `SELECT
-         b.student_id,
-         b.grade_id,
-         b.total_points,
+      `WITH ${ledgerBalancesCte}
+       SELECT
+         lb.student_id,
+         lb.grade_id,
+         lb.total_points,
          u.name AS student_name,
          u.email AS student_email,
          u.avatar AS student_avatar,
@@ -2945,43 +2976,31 @@ export class TeacherPointsService {
          cg.grade_id AS course_group_grade_id,
          cg.status AS course_group_status,
          RANK() OVER (
-           PARTITION BY b.grade_id
-           ORDER BY b.total_points DESC,
-                    COALESCE(
-                      (SELECT MAX(t.created_at) FROM point_transactions t
-                       WHERE t.student_id = b.student_id
-                         AND t.teacher_id = b.teacher_id
-                         AND t.grade_id = b.grade_id),
-                      b.updated_at
-                    ) ASC,
-                    b.student_id ASC
+           PARTITION BY lb.grade_id
+           ORDER BY lb.total_points DESC,
+                    lb.last_tx_at ASC NULLS LAST,
+                    lb.student_id ASC
          ) AS rank
-       FROM student_point_balances b
-       JOIN users u ON u.id = b.student_id
-       LEFT JOIN grades g ON g.id = b.grade_id
+       FROM ledger_balances lb
+       JOIN users u ON u.id = lb.student_id
+       LEFT JOIN grades g ON g.id = lb.grade_id
        LEFT JOIN LATERAL (
          SELECT m.group_id
          FROM student_course_group_memberships m
          JOIN course_groups cg0 ON cg0.id = m.group_id
-         WHERE m.student_id = b.student_id
+         WHERE m.student_id = lb.student_id
            AND cg0.teacher_id = $1
            AND cg0.status = 'active'
          ORDER BY m.updated_at DESC
          LIMIT 1
        ) cg_ref ON TRUE
        LEFT JOIN course_groups cg ON cg.id = cg_ref.group_id
-       WHERE ${where}
-       ORDER BY b.total_points DESC,
-                COALESCE(
-                  (SELECT MAX(t.created_at) FROM point_transactions t
-                   WHERE t.student_id = b.student_id
-                     AND t.teacher_id = b.teacher_id
-                     AND t.grade_id = b.grade_id),
-                  b.updated_at
-                ) ASC,
-                b.student_id ASC
-       LIMIT $${i++} OFFSET $${i}`,
-      params,
+       WHERE ${filterSql}
+       ORDER BY lb.total_points DESC,
+                lb.last_tx_at ASC NULLS LAST,
+                lb.student_id ASC
+       LIMIT $${p++} OFFSET $${p}`,
+      queryParams,
     );
 
     return {
