@@ -353,15 +353,20 @@ export class TeacherPointsService {
         };
       }
 
+      // Always recompute from ledger SUM — never += — so balances cannot drift above the record.
       const balRes = await client.query(
         `INSERT INTO student_point_balances (student_id, teacher_id, grade_id, total_points)
-         VALUES ($1, $2, $3, $4)
+         SELECT $1, $2, $3, COALESCE((
+           SELECT GREATEST(0, SUM(points)::int)
+           FROM point_transactions
+           WHERE student_id = $1 AND teacher_id = $2 AND grade_id = $3
+         ), 0)
          ON CONFLICT (student_id, teacher_id, grade_id)
          DO UPDATE SET
-           total_points = student_point_balances.total_points + EXCLUDED.total_points,
+           total_points = EXCLUDED.total_points,
            updated_at = NOW()
          RETURNING total_points`,
-        [input.studentId, input.teacherId, gradeId, points],
+        [input.studentId, input.teacherId, gradeId],
       );
 
       await client.query('COMMIT');
@@ -703,13 +708,17 @@ export class TeacherPointsService {
 
       const balRes = await client.query(
         `INSERT INTO student_point_balances (student_id, teacher_id, grade_id, total_points)
-         VALUES ($1, $2, $3, GREATEST(0, $4))
+         SELECT $1, $2, $3, COALESCE((
+           SELECT GREATEST(0, SUM(points)::int)
+           FROM point_transactions
+           WHERE student_id = $1 AND teacher_id = $2 AND grade_id = $3
+         ), 0)
          ON CONFLICT (student_id, teacher_id, grade_id)
          DO UPDATE SET
-           total_points = GREATEST(0, student_point_balances.total_points + $4),
+           total_points = EXCLUDED.total_points,
            updated_at = NOW()
          RETURNING total_points`,
-        [opts.studentId, opts.teacherId, gradeId, delta],
+        [opts.studentId, opts.teacherId, gradeId],
       );
 
       await client.query('COMMIT');
@@ -2706,88 +2715,191 @@ export class TeacherPointsService {
 
   // ─── Ranking ─────────────────────────────────────────────────────────────
 
+  /** Cache eligible exam ids so ranking stays fast under repeated loads. */
+  private static eligibleExamCache = new Map<string, { at: number; ids: number[] }>();
+  private static leaderboardMaintAt = new Map<string, number>();
+  private static leaderboardMaintRunning = new Set<string>();
+
+  private static async getEligibleCourseExamIdsCached(
+    teacherId: number,
+    gradeId: number,
+  ): Promise<number[]> {
+    const key = `${teacherId}:${gradeId}`;
+    const hit = this.eligibleExamCache.get(key);
+    if (hit && Date.now() - hit.at < 60_000) return hit.ids;
+    const ids = await this.listEligibleCourseExamIds(teacherId, gradeId);
+    this.eligibleExamCache.set(key, { at: Date.now(), ids });
+    return ids;
+  }
+
+  private static async resolveEligibleExamIdsForScope(opts: {
+    teacherId: number;
+    gradeId?: number | null;
+  }): Promise<number[]> {
+    if (opts.gradeId != null && Number.isFinite(Number(opts.gradeId))) {
+      return this.getEligibleCourseExamIdsCached(opts.teacherId, Number(opts.gradeId));
+    }
+    const gradesRes = await pool.query<{ grade_id: number }>(
+      `SELECT grade_id FROM teacher_grades WHERE teacher_id = $1`,
+      [opts.teacherId],
+    );
+    const all = new Set<number>();
+    for (const g of gradesRes.rows) {
+      const ids = await this.getEligibleCourseExamIdsCached(
+        opts.teacherId,
+        Number(g.grade_id),
+      );
+      for (const id of ids) all.add(id);
+    }
+    return [...all];
+  }
+
+  /**
+   * Same keep-rule as heal/purge, applied in SELECT so the UI can show the real
+   * total without waiting for a full DELETE/rebuild on every request.
+   */
+  private static eligiblePointsWhereSql(opts: {
+    teacherParam: string;
+    gradeParam: string;
+    eligibleParam: string;
+    studentParam?: string;
+  }): string {
+    const studentClause = opts.studentParam
+      ? ` AND t.student_id = ${opts.studentParam}`
+      : '';
+    return `t.teacher_id = ${opts.teacherParam}
+      AND (${opts.gradeParam}::int IS NULL OR t.grade_id = ${opts.gradeParam})
+      ${studentClause}
+      AND (
+        t.event_type NOT IN (
+          'EXAM_START', 'EXAM_SCORE', 'ASSIGNMENT_START', 'ASSIGNMENT_SCORE'
+        )
+        OR (
+          t.event_type IN ('EXAM_START', 'EXAM_SCORE')
+          AND t.reference_type = 'course_exam'
+          AND t.reference_id = ANY(${opts.eligibleParam}::int[])
+        )
+      )`;
+  }
+
+  /** Non-blocking heal/sync — never on the leaderboard response path. */
+  private static scheduleLeaderboardMaintenance(opts: {
+    teacherId: number;
+    gradeId?: number | null;
+  }) {
+    const key = `${opts.teacherId}:${opts.gradeId ?? 'all'}`;
+    if (this.leaderboardMaintRunning.has(key)) return;
+    const last = this.leaderboardMaintAt.get(key) ?? 0;
+    if (Date.now() - last < 5 * 60_000) return;
+    this.leaderboardMaintRunning.add(key);
+    this.leaderboardMaintAt.set(key, Date.now());
+    void (async () => {
+      try {
+        await this.healTeacherExamPointsToLastOnly({
+          teacherId: opts.teacherId,
+          gradeId: opts.gradeId ?? null,
+        });
+        await this.syncBalancesFromTransactions({
+          teacherId: opts.teacherId,
+          gradeId: opts.gradeId ?? null,
+        });
+        for (const cacheKey of [...this.eligibleExamCache.keys()]) {
+          if (cacheKey.startsWith(`${opts.teacherId}:`)) {
+            this.eligibleExamCache.delete(cacheKey);
+          }
+        }
+      } catch (err) {
+        console.error('background leaderboard maintenance failed:', err);
+      } finally {
+        this.leaderboardMaintRunning.delete(key);
+      }
+    })();
+  }
+
   static async getStudentRankSummary(opts: {
     studentId: number;
     teacherId: number;
     gradeId: number;
   }) {
-    await this.syncBalancesFromTransactions({
+    this.scheduleLeaderboardMaintenance({
       teacherId: opts.teacherId,
       gradeId: opts.gradeId,
-      studentId: opts.studentId,
     });
-    const totalPoints = await this.getBalance(opts.studentId, opts.teacherId, opts.gradeId);
 
-    const totalsRes = await pool.query<{ cnt: string }>(
-      `SELECT COUNT(*)::text AS cnt
-       FROM student_point_balances
-       WHERE teacher_id = $1 AND grade_id = $2`,
-      [opts.teacherId, opts.gradeId],
+    const eligibleIds = await this.getEligibleCourseExamIdsCached(
+      opts.teacherId,
+      opts.gradeId,
     );
-    // Include students with 0 points who have a grade but no balance row:
-    // count balances + ensure current student is counted.
-    let totalStudents = Number(totalsRes.rows[0]?.cnt || 0);
-    if (totalPoints === 0 && totalStudents === 0) {
-      totalStudents = 1;
-    } else if (totalPoints === 0) {
-      const hasRow = await pool.query(
-        `SELECT 1 FROM student_point_balances
-         WHERE student_id = $1 AND teacher_id = $2 AND grade_id = $3`,
-        [opts.studentId, opts.teacherId, opts.gradeId],
-      );
-      if (!hasRow.rowCount) {
-        totalStudents += 1;
-      }
+    const eligibleParam = eligibleIds.length ? eligibleIds : [-1];
+    const whereSql = this.eligiblePointsWhereSql({
+      teacherParam: '$1',
+      gradeParam: '$2',
+      eligibleParam: '$3',
+    });
+
+    const mineRes = await pool.query<{
+      total_points: number;
+      last_tx_at: Date | null;
+    }>(
+      `SELECT
+         GREATEST(0, COALESCE(SUM(t.points), 0)::int) AS total_points,
+         MAX(t.created_at) AS last_tx_at
+       FROM point_transactions t
+       WHERE ${whereSql}
+         AND t.student_id = $4`,
+      [opts.teacherId, opts.gradeId, eligibleParam, opts.studentId],
+    );
+    const totalPoints = Number(mineRes.rows[0]?.total_points || 0);
+    const mineReachedAt = mineRes.rows[0]?.last_tx_at ?? null;
+
+    const boardRes = await pool.query<{
+      student_id: number;
+      total_points: number;
+      last_tx_at: Date | null;
+    }>(
+      `SELECT
+         t.student_id,
+         GREATEST(0, SUM(t.points)::int) AS total_points,
+         MAX(t.created_at) AS last_tx_at
+       FROM point_transactions t
+       WHERE ${whereSql}
+       GROUP BY t.student_id`,
+      [opts.teacherId, opts.gradeId, eligibleParam],
+    );
+
+    let totalStudents = boardRes.rows.length;
+    if (totalPoints === 0 && !boardRes.rows.some((r) => Number(r.student_id) === opts.studentId)) {
+      totalStudents += 1;
     }
 
-    const higherRes = await pool.query<{ cnt: string }>(
-      `WITH mine AS (
-         SELECT COALESCE(
-           (SELECT MAX(created_at) FROM point_transactions
-            WHERE student_id = $4 AND teacher_id = $1 AND grade_id = $2),
-           (SELECT updated_at FROM student_point_balances
-            WHERE student_id = $4 AND teacher_id = $1 AND grade_id = $2),
-           NOW()
-         ) AS reached_at
-       ),
-       others AS (
-         SELECT b.student_id, b.total_points,
-           COALESCE(
-             (SELECT MAX(t.created_at) FROM point_transactions t
-              WHERE t.student_id = b.student_id
-                AND t.teacher_id = b.teacher_id
-                AND t.grade_id = b.grade_id),
-             b.updated_at
-           ) AS reached_at
-         FROM student_point_balances b
-         WHERE b.teacher_id = $1 AND b.grade_id = $2 AND b.student_id <> $4
-       )
-       SELECT COUNT(*)::text AS cnt
-       FROM others, mine
-       WHERE others.total_points > $3
-          OR (
-            others.total_points = $3
-            AND (
-              others.reached_at < mine.reached_at
-              OR (others.reached_at = mine.reached_at AND others.student_id < $4)
-            )
-          )`,
-      [opts.teacherId, opts.gradeId, totalPoints, opts.studentId],
-    );
-    const rank = Number(higherRes.rows[0]?.cnt || 0) + 1;
+    let higher = 0;
+    for (const row of boardRes.rows) {
+      const sid = Number(row.student_id);
+      if (sid === opts.studentId) continue;
+      const pts = Number(row.total_points || 0);
+      const reached = row.last_tx_at ? new Date(row.last_tx_at).getTime() : 0;
+      const mineReached = mineReachedAt ? new Date(mineReachedAt).getTime() : Number.MAX_SAFE_INTEGER;
+      if (
+        pts > totalPoints ||
+        (pts === totalPoints &&
+          (reached < mineReached || (reached === mineReached && sid < opts.studentId)))
+      ) {
+        higher += 1;
+      }
+    }
+    const rank = higher + 1;
 
-    const nextRes = await pool.query<{ total_points: number }>(
-      `SELECT total_points
-       FROM student_point_balances
-       WHERE teacher_id = $1 AND grade_id = $2 AND total_points > $3
-       ORDER BY total_points ASC
-       LIMIT 1`,
-      [opts.teacherId, opts.gradeId, totalPoints],
-    );
-    const pointsToNextRank =
-      rank === 1 || !nextRes.rowCount
-        ? 0
-        : Number(nextRes.rows[0].total_points) - totalPoints;
+    let pointsToNextRank = 0;
+    if (rank > 1) {
+      let nextAbove: number | null = null;
+      for (const row of boardRes.rows) {
+        const pts = Number(row.total_points || 0);
+        if (pts > totalPoints && (nextAbove == null || pts < nextAbove)) {
+          nextAbove = pts;
+        }
+      }
+      if (nextAbove != null) pointsToNextRank = nextAbove - totalPoints;
+    }
 
     return {
       totalPoints,
@@ -2805,21 +2917,31 @@ export class TeacherPointsService {
     limit?: number;
   }) {
     const limit = Math.min(Math.max(opts.limit ?? 10, 1), 50);
-    await this.syncBalancesFromTransactions({
+    this.scheduleLeaderboardMaintenance({
       teacherId: opts.teacherId,
       gradeId: opts.gradeId,
     });
+
+    const eligibleIds = await this.getEligibleCourseExamIdsCached(
+      opts.teacherId,
+      opts.gradeId,
+    );
+    const eligibleParam = eligibleIds.length ? eligibleIds : [-1];
+    const whereSql = this.eligiblePointsWhereSql({
+      teacherParam: '$1',
+      gradeParam: '$2',
+      eligibleParam: '$3',
+    });
+
     const res = await pool.query(
       `WITH ledger_balances AS (
          SELECT
            t.student_id,
-           t.teacher_id,
-           t.grade_id,
            GREATEST(0, SUM(t.points)::int) AS total_points,
            MAX(t.created_at) AS last_tx_at
          FROM point_transactions t
-         WHERE t.teacher_id = $1 AND t.grade_id = $2
-         GROUP BY t.student_id, t.teacher_id, t.grade_id
+         WHERE ${whereSql}
+         GROUP BY t.student_id
        )
        SELECT
          lb.student_id,
@@ -2836,8 +2958,8 @@ export class TeacherPointsService {
        ORDER BY lb.total_points DESC,
                 lb.last_tx_at ASC NULLS LAST,
                 lb.student_id ASC
-       LIMIT $3`,
-      [opts.teacherId, opts.gradeId, limit],
+       LIMIT $4`,
+      [opts.teacherId, opts.gradeId, eligibleParam, limit],
     );
 
     return {
@@ -2853,9 +2975,6 @@ export class TeacherPointsService {
     };
   }
 
-  /** تجنب إعادة تنظيف الترتيب في كل طلب خلال دقيقة */
-  private static leaderboardHealAt = new Map<string, number>();
-
   static async getTeacherLeaderboard(opts: {
     teacherId: number;
     gradeId?: number | null;
@@ -2864,47 +2983,33 @@ export class TeacherPointsService {
     page?: number;
     limit?: number;
   }) {
-    // تعويض المحاولات الناقصة — مرة/دقيقة فقط
-    const healKey = `${opts.teacherId}:${opts.gradeId ?? 'all'}`;
-    const lastBackfill = this.leaderboardHealAt.get(healKey) ?? 0;
-    if (Date.now() - lastBackfill > 60_000) {
-      try {
-        await this.backfillEnabledCourseExamScores({
-          teacherId: opts.teacherId,
-          limit: 100,
-        });
-        this.leaderboardHealAt.set(healKey, Date.now());
-      } catch (err) {
-        console.error('leaderboard points backfill failed:', err);
-      }
-    }
-
-    // نفس تنظيف فتح السجل بعد أي backfill: احذف نقاط خارج النافذة
-    // حتى يظهر مجموع القائمة = مجموع سجل الطالب بدون فتح كل طالب.
-    try {
-      await this.healTeacherExamPointsToLastOnly({
-        teacherId: opts.teacherId,
-        gradeId: opts.gradeId ?? null,
-      });
-    } catch (err) {
-      console.error('leaderboard points heal failed:', err);
-    }
-
-    // Always rebuild stored balances from the ledger before listing.
-    try {
-      await this.syncBalancesFromTransactions({
-        teacherId: opts.teacherId,
-        gradeId: opts.gradeId ?? null,
-      });
-    } catch (err) {
-      console.error('syncBalancesFromTransactions failed:', err);
-    }
+    // Heavy heal/backfill must NOT block list load — schedule in background.
+    this.scheduleLeaderboardMaintenance({
+      teacherId: opts.teacherId,
+      gradeId: opts.gradeId ?? null,
+    });
 
     const page = Math.max(1, opts.page ?? 1);
     const limit = Math.min(Math.max(opts.limit ?? 50, 1), 200);
     const offset = (page - 1) * limit;
 
-    // Rank from live ledger SUM so the list total always equals the student's record sum.
+    const gradeParamForCte =
+      opts.gradeId != null && Number.isFinite(Number(opts.gradeId))
+        ? Number(opts.gradeId)
+        : null;
+
+    const eligibleIds = await this.resolveEligibleExamIdsForScope({
+      teacherId: opts.teacherId,
+      gradeId: gradeParamForCte,
+    });
+    const eligibleParam = eligibleIds.length ? eligibleIds : [-1];
+
+    // Rank from eligible ledger SUM only (matches student record after heal).
+    const whereSql = this.eligiblePointsWhereSql({
+      teacherParam: '$1',
+      gradeParam: '$2',
+      eligibleParam: '$3',
+    });
     const ledgerBalancesCte = `ledger_balances AS (
          SELECT
            t.student_id,
@@ -2913,21 +3018,13 @@ export class TeacherPointsService {
            GREATEST(0, SUM(t.points)::int) AS total_points,
            MAX(t.created_at) AS last_tx_at
          FROM point_transactions t
-         WHERE t.teacher_id = $1
-           AND ($2::int IS NULL OR t.grade_id = $2)
+         WHERE ${whereSql}
          GROUP BY t.student_id, t.teacher_id, t.grade_id
        )`;
 
-    // params[1] used inside CTE for optional grade filter — keep grade as $2 always.
-    const gradeParamForCte =
-      opts.gradeId != null && Number.isFinite(Number(opts.gradeId))
-        ? Number(opts.gradeId)
-        : null;
-
-    // Rebuild params so $1=teacherId and $2=gradeId for the CTE, then continue filters.
-    const queryParams: unknown[] = [opts.teacherId, gradeParamForCte];
+    const queryParams: unknown[] = [opts.teacherId, gradeParamForCte, eligibleParam];
     let filterSql = `lb.teacher_id = $1`;
-    let p = 3;
+    let p = 4;
 
     if (opts.gradeId) {
       filterSql += ` AND lb.grade_id = $2`;
@@ -2951,15 +3048,6 @@ export class TeacherPointsService {
       p++;
     }
 
-    const countRes = await pool.query(
-      `WITH ${ledgerBalancesCte}
-       SELECT COUNT(*)::int AS cnt
-       FROM ledger_balances lb
-       JOIN users u ON u.id = lb.student_id
-       WHERE ${filterSql}`,
-      queryParams,
-    );
-
     queryParams.push(limit, offset);
     const res = await pool.query(
       `WITH ${ledgerBalancesCte}
@@ -2980,7 +3068,8 @@ export class TeacherPointsService {
            ORDER BY lb.total_points DESC,
                     lb.last_tx_at ASC NULLS LAST,
                     lb.student_id ASC
-         ) AS rank
+         ) AS rank,
+         COUNT(*) OVER ()::int AS total_count
        FROM ledger_balances lb
        JOIN users u ON u.id = lb.student_id
        LEFT JOIN grades g ON g.id = lb.grade_id
@@ -3006,7 +3095,7 @@ export class TeacherPointsService {
     return {
       page,
       limit,
-      total: Number(countRes.rows[0]?.cnt || 0),
+      total: Number(res.rows[0]?.total_count || 0),
       students: res.rows.map((row) => ({
         rank: Number(row.rank),
         studentId: Number(row.student_id),
@@ -3455,17 +3544,6 @@ export class TeacherPointsService {
     transactionsSum: number;
     gradeId: number | null;
   }> {
-    // تصفية تلقائية: السجل يعرض امتحانات النقاط المفعّلة (+ يدوي/فيديو)
-    try {
-      await this.healStudentToLastCourseExamOnly({
-        teacherId: opts.teacherId,
-        studentId: opts.studentId,
-        gradeId: opts.gradeId ?? null,
-      });
-    } catch (err) {
-      console.error('healStudentToLastCourseExamOnly failed:', err);
-    }
-
     const gradeId =
       opts.gradeId != null && Number.isFinite(Number(opts.gradeId))
         ? Number(opts.gradeId)
@@ -3474,28 +3552,36 @@ export class TeacherPointsService {
             teacherId: opts.teacherId,
           });
 
-    // Always force balance = SUM(ledger) so the ranking number matches the drawer.
-    await this.syncBalancesFromTransactions({
+    const eligibleIds = gradeId
+      ? await this.getEligibleCourseExamIdsCached(opts.teacherId, gradeId)
+      : await this.resolveEligibleExamIdsForScope({
+          teacherId: opts.teacherId,
+          gradeId: null,
+        });
+    const eligibleParam = eligibleIds.length ? eligibleIds : [-1];
+
+    // Show only eligible rows immediately (same total as ranking). Cleanup in background.
+    void this.healStudentToLastCourseExamOnly({
       teacherId: opts.teacherId,
       studentId: opts.studentId,
-      gradeId,
-    });
+      gradeId: gradeId ?? null,
+    }).catch((err) => console.error('healStudentToLastCourseExamOnly failed:', err));
 
     const limit = Math.min(Math.max(opts.limit ?? 200, 1), 500);
-    const params: unknown[] = [opts.teacherId, opts.studentId];
-    let where = `teacher_id = $1 AND student_id = $2`;
-    if (gradeId) {
-      where += ` AND grade_id = $3`;
-      params.push(gradeId);
-    }
-    params.push(limit);
+    const whereSql = this.eligiblePointsWhereSql({
+      teacherParam: '$1',
+      gradeParam: '$3',
+      eligibleParam: '$4',
+      studentParam: '$2',
+    });
+
     const res = await pool.query(
       `SELECT id, points, event_type, reference_type, reference_id, reference_key, metadata, grade_id, created_at
-       FROM point_transactions
-       WHERE ${where}
+       FROM point_transactions t
+       WHERE ${whereSql}
        ORDER BY created_at DESC
-       LIMIT $${params.length}`,
-      params,
+       LIMIT $5`,
+      [opts.teacherId, opts.studentId, gradeId, eligibleParam, limit],
     );
 
     const transactions = res.rows.map((row) => ({
@@ -3510,21 +3596,18 @@ export class TeacherPointsService {
       createdAt: row.created_at,
     }));
 
+    // Window sum is only over the limited page — compute full eligible sum separately when needed.
     const sumRes = await pool.query<{ sum: string | number | null }>(
-      `SELECT COALESCE(SUM(points), 0) AS sum
-       FROM point_transactions
-       WHERE teacher_id = $1 AND student_id = $2
-         AND ($3::int IS NULL OR grade_id = $3)`,
-      [opts.teacherId, opts.studentId, gradeId],
+      `SELECT COALESCE(SUM(t.points), 0) AS sum
+       FROM point_transactions t
+       WHERE ${whereSql}`,
+      [opts.teacherId, opts.studentId, gradeId, eligibleParam],
     );
     const transactionsSum = Math.max(0, Math.floor(Number(sumRes.rows[0]?.sum) || 0));
-    const totalPoints = gradeId
-      ? await this.getBalance(opts.studentId, opts.teacherId, gradeId)
-      : transactionsSum;
 
     return {
       transactions,
-      totalPoints,
+      totalPoints: transactionsSum,
       transactionsSum,
       gradeId,
     };
