@@ -54,8 +54,9 @@ export interface AwardInput {
 const DEFAULT_SETTINGS: Omit<TeacherPointsSettings, 'teacher_id'> = {
   video_watch_enabled: true,
   video_watch_points: 5,
-  exam_start_enabled: true,
-  exam_start_points: 5,
+  // Exam points come from score only — start bonus removed.
+  exam_start_enabled: false,
+  exam_start_points: 0,
   assignment_start_enabled: true,
   assignment_start_points: 3,
   exam_score_enabled: true,
@@ -67,8 +68,8 @@ function mapSettings(row: any, teacherId: number): TeacherPointsSettings {
     teacher_id: teacherId,
     video_watch_enabled: row.video_watch_enabled !== false,
     video_watch_points: Number(row.video_watch_points ?? 5),
-    exam_start_enabled: row.exam_start_enabled !== false,
-    exam_start_points: Number(row.exam_start_points ?? 5),
+    exam_start_enabled: row.exam_start_enabled === true,
+    exam_start_points: Number(row.exam_start_points ?? 0),
     assignment_start_enabled: row.assignment_start_enabled !== false,
     assignment_start_points: Number(row.assignment_start_points ?? 3),
     exam_score_enabled: row.exam_score_enabled !== false,
@@ -125,12 +126,9 @@ export class TeacherPointsService {
       if (!Number.isFinite(n)) throw new HttpError(400, 'Invalid video_watch_points');
       add('video_watch_points', n);
     }
-    if (patch.exam_start_enabled !== undefined) add('exam_start_enabled', !!patch.exam_start_enabled);
-    if (patch.exam_start_points !== undefined) {
-      const n = Math.max(0, Math.floor(Number(patch.exam_start_points)));
-      if (!Number.isFinite(n)) throw new HttpError(400, 'Invalid exam_start_points');
-      add('exam_start_points', n);
-    }
+    // Exam start bonus removed — always keep disabled regardless of client payload.
+    add('exam_start_enabled', false);
+    add('exam_start_points', 0);
     if (patch.assignment_start_enabled !== undefined) {
       add('assignment_start_enabled', !!patch.assignment_start_enabled);
     }
@@ -417,10 +415,12 @@ export class TeacherPointsService {
     if (!opts.isAssignment && opts.examKind !== 'course') {
       return { awarded: false, points: 0, totalPoints: null, reason: 'lecture_exams_excluded' };
     }
+    // نقاط الامتحان من الدرجة فقط — لا تُمنح نقاط لبدء الامتحان
+    if (!opts.isAssignment) {
+      return { awarded: false, points: 0, totalPoints: null, reason: 'exam_start_removed' };
+    }
     const settings = await this.getOrCreateSettings(opts.teacherId);
-    const enabled = opts.isAssignment
-      ? settings.assignment_start_enabled
-      : settings.exam_start_enabled;
+    const enabled = settings.assignment_start_enabled;
     if (!enabled) {
       return { awarded: false, points: 0, totalPoints: null, reason: 'disabled' };
     }
@@ -445,30 +445,24 @@ export class TeacherPointsService {
         };
       }
     }
-    const points = opts.isAssignment
-      ? settings.assignment_start_points
-      : settings.exam_start_points;
-    const eventType: PointsEventType = opts.isAssignment ? 'ASSIGNMENT_START' : 'EXAM_START';
+    const points = settings.assignment_start_points;
+    const eventType: PointsEventType = 'ASSIGNMENT_START';
     const referenceKey = this.examPointsReferenceKey({
       eventType,
       teacherId: opts.teacherId,
       studentId: opts.studentId,
       examId: opts.examId,
-      isAssignment: opts.isAssignment,
+      isAssignment: true,
       examKind: opts.examKind,
     });
-    const result = await this.award({
+    return this.award({
       studentId: opts.studentId,
       teacherId: opts.teacherId,
       gradeId,
       eventType,
       points,
       referenceKey,
-      referenceType: opts.isAssignment
-        ? 'assignment'
-        : opts.examKind === 'course'
-          ? 'course_exam'
-          : 'lecture_exam',
+      referenceType: 'assignment',
       referenceId: opts.examId,
       metadata: {
         examId: opts.examId,
@@ -476,16 +470,6 @@ export class TeacherPointsService {
         title: opts.title ?? null,
       },
     });
-    if (!opts.isAssignment && result.awarded && gradeId) {
-      const allowedIds = await this.listEligibleCourseExamIds(opts.teacherId, gradeId);
-      await this.purgeStudentExamPointsExceptAllowed(
-        opts.teacherId,
-        opts.studentId,
-        gradeId,
-        allowedIds.length ? allowedIds : [opts.examId],
-      );
-    }
-    return result;
   }
 
   static async awardExamOrAssignmentScore(opts: {
@@ -1392,18 +1376,6 @@ export class TeacherPointsService {
         const obtained = Math.max(0, Math.floor(Number(selected.obtained_grade ?? 0)));
         const total = Math.max(obtained, Math.floor(Number(selected.total_grade ?? 0)));
 
-        const start = await this.awardExamOrAssignmentStart({
-          studentId,
-          teacherId: opts.teacherId,
-          courseId: lastExam.course_id,
-          attemptId,
-          examId: lastExam.id,
-          isAssignment: false,
-          examKind: 'course',
-          title: lastExam.title,
-        });
-        if (start.awarded) startAwards += 1;
-
         const score = await this.awardExamOrAssignmentScore({
           studentId,
           teacherId: opts.teacherId,
@@ -1430,9 +1402,8 @@ export class TeacherPointsService {
             title: lastExam.title,
           });
         }
-        if (score.awarded) scoreAwards += 1;
-
-        if (start.awarded || score.awarded) {
+        if (score.awarded || score.reason === 'duplicate' || score.reason === 'adjusted_down') {
+          scoreAwards += 1;
           studentsAwarded += 1;
           gradeStudents += 1;
         }
@@ -1810,18 +1781,6 @@ export class TeacherPointsService {
         const obtained = Math.max(0, Math.floor(Number(selected.obtained_grade ?? 0)));
         const total = Math.max(obtained, Math.floor(Number(selected.total_grade ?? 0)));
 
-        const start = await this.awardExamOrAssignmentStart({
-          studentId,
-          teacherId: opts.teacherId,
-          courseId: exam.course_id,
-          attemptId,
-          examId,
-          isAssignment: false,
-          examKind: 'course',
-          title: exam.title,
-        });
-        if (start.awarded) startAwards += 1;
-
         const score = await this.awardExamOrAssignmentScore({
           studentId,
           teacherId: opts.teacherId,
@@ -1848,8 +1807,10 @@ export class TeacherPointsService {
             title: exam.title,
           });
         }
-        if (score.awarded) scoreAwards += 1;
-        if (start.awarded || score.awarded) awardedStudents.add(studentId);
+        if (score.awarded || score.reason === 'duplicate' || score.reason === 'adjusted_down') {
+          scoreAwards += 1;
+          awardedStudents.add(studentId);
+        }
       }
     }
 
@@ -2954,6 +2915,202 @@ export class TeacherPointsService {
             }
           : null,
       })),
+    };
+  }
+
+  /** Recompute one student balance from ledger rows. */
+  static async recomputeStudentBalance(
+    studentId: number,
+    teacherId: number,
+    gradeId: number,
+  ): Promise<number> {
+    const res = await pool.query<{ total_points: number }>(
+      `INSERT INTO student_point_balances (student_id, teacher_id, grade_id, total_points)
+       SELECT $1, $2, $3, COALESCE((
+         SELECT GREATEST(0, SUM(points)::int)
+         FROM point_transactions
+         WHERE teacher_id = $2 AND student_id = $1 AND grade_id = $3
+       ), 0)
+       ON CONFLICT (student_id, teacher_id, grade_id)
+       DO UPDATE SET
+         total_points = EXCLUDED.total_points,
+         updated_at = NOW()
+       RETURNING total_points`,
+      [studentId, teacherId, gradeId],
+    );
+    return Number(res.rows[0]?.total_points ?? 0);
+  }
+
+  /**
+   * Recalculate EXAM_SCORE for every student who submitted this course exam,
+   * using the exam's current points_enabled + points_attempt_mode.
+   * Also strips any leftover EXAM_START rows for this exam.
+   */
+  static async recalculateCourseExamPointsForExam(examId: number): Promise<{
+    examId: number;
+    studentsProcessed: number;
+    scoresSynced: number;
+    scoresRemoved: number;
+    startsRemoved: number;
+  }> {
+    const examRes = await pool.query<{
+      id: number;
+      title: string | null;
+      course_id: number | null;
+      teacher_id: number | null;
+      points_enabled: boolean | null;
+      points_attempt_mode: string | null;
+    }>(
+      `SELECT e.id, e.title, e.course_id, e.points_enabled, e.points_attempt_mode,
+              COALESCE(e.teacher_id, c.teacher_id) AS teacher_id
+       FROM course_level_exams e
+       LEFT JOIN courses c ON c.id = e.course_id
+       WHERE e.id = $1
+       LIMIT 1`,
+      [examId],
+    );
+    if (!examRes.rowCount) {
+      return {
+        examId,
+        studentsProcessed: 0,
+        scoresSynced: 0,
+        scoresRemoved: 0,
+        startsRemoved: 0,
+      };
+    }
+
+    const exam = examRes.rows[0];
+    const teacherId = Number(exam.teacher_id);
+    if (!Number.isInteger(teacherId) || teacherId <= 0) {
+      return {
+        examId,
+        studentsProcessed: 0,
+        scoresSynced: 0,
+        scoresRemoved: 0,
+        startsRemoved: 0,
+      };
+    }
+
+    // Always drop start-exam bonuses for this exam.
+    const startDel = await pool.query<{ student_id: number; grade_id: number }>(
+      `DELETE FROM point_transactions
+       WHERE teacher_id = $1
+         AND event_type = 'EXAM_START'
+         AND reference_type = 'course_exam'
+         AND reference_id = $2
+       RETURNING student_id, grade_id`,
+      [teacherId, examId],
+    );
+    const startsRemoved = startDel.rowCount ?? 0;
+    const touched = new Map<string, { studentId: number; gradeId: number }>();
+    for (const row of startDel.rows) {
+      const studentId = Number(row.student_id);
+      const gradeId = Number(row.grade_id);
+      if (studentId > 0 && gradeId > 0) {
+        touched.set(`${studentId}:${gradeId}`, { studentId, gradeId });
+      }
+    }
+
+    let scoresRemoved = 0;
+    let scoresSynced = 0;
+    let studentsProcessed = 0;
+
+    if (!isCourseExamPointsEnabled(exam)) {
+      const scoreDel = await pool.query<{ student_id: number; grade_id: number }>(
+        `DELETE FROM point_transactions
+         WHERE teacher_id = $1
+           AND event_type = 'EXAM_SCORE'
+           AND reference_type = 'course_exam'
+           AND reference_id = $2
+         RETURNING student_id, grade_id`,
+        [teacherId, examId],
+      );
+      scoresRemoved = scoreDel.rowCount ?? 0;
+      for (const row of scoreDel.rows) {
+        const studentId = Number(row.student_id);
+        const gradeId = Number(row.grade_id);
+        if (studentId > 0 && gradeId > 0) {
+          touched.set(`${studentId}:${gradeId}`, { studentId, gradeId });
+        }
+      }
+      for (const item of touched.values()) {
+        await this.recomputeStudentBalance(item.studentId, teacherId, item.gradeId);
+      }
+      return {
+        examId,
+        studentsProcessed: touched.size,
+        scoresSynced: 0,
+        scoresRemoved,
+        startsRemoved,
+      };
+    }
+
+    const mode = normalizeCourseExamPointsAttemptMode(exam.points_attempt_mode);
+    const studentsRes = await pool.query<{ student_id: number }>(
+      `SELECT DISTINCT student_id
+       FROM course_level_exam_attempts
+       WHERE exam_id = $1 AND status = 'submitted'`,
+      [examId],
+    );
+
+    for (const row of studentsRes.rows) {
+      const studentId = Number(row.student_id);
+      studentsProcessed += 1;
+      const selected = await resolveCourseExamPointsAttempt({
+        examId,
+        studentId,
+        mode,
+      });
+      if (!selected) continue;
+
+      const attemptId = Number(selected.id);
+      const obtained = Math.max(0, Number(selected.obtained_grade ?? 0));
+      const total = Math.max(obtained, Number(selected.total_grade ?? 0));
+      const scoreOpts = {
+        studentId,
+        teacherId,
+        courseId: exam.course_id,
+        attemptId,
+        examId,
+        isAssignment: false as const,
+        examKind: 'course' as const,
+        obtainedGrade: obtained,
+        totalGrade: total,
+        title: exam.title,
+      };
+
+      let result = await this.awardExamOrAssignmentScore(scoreOpts);
+      if (result.reason === 'duplicate') {
+        result = await this.syncExamOrAssignmentScore(scoreOpts);
+      }
+      if (
+        result.awarded ||
+        result.reason === 'duplicate' ||
+        result.reason === 'adjusted_down'
+      ) {
+        scoresSynced += 1;
+      }
+
+      const gradeId = await this.resolveGradeId({
+        studentId,
+        teacherId,
+        courseId: exam.course_id,
+      });
+      if (gradeId) {
+        touched.set(`${studentId}:${gradeId}`, { studentId, gradeId });
+      }
+    }
+
+    for (const item of touched.values()) {
+      await this.recomputeStudentBalance(item.studentId, teacherId, item.gradeId);
+    }
+
+    return {
+      examId,
+      studentsProcessed,
+      scoresSynced,
+      scoresRemoved,
+      startsRemoved,
     };
   }
 

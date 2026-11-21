@@ -714,6 +714,19 @@ export class CourseLevelExamsService {
       updatedExam = await this.enrichExamAudienceFields(updatedExam);
     }
 
+    const pointsPolicyChanged =
+      input.pointsEnabled !== undefined || input.pointsAttemptMode !== undefined;
+    if (pointsPolicyChanged) {
+      try {
+        const recalc = await TeacherPointsService.recalculateCourseExamPointsForExam(
+          Number(examId),
+        );
+        (updatedExam as any).pointsRecalculation = recalc;
+      } catch (error) {
+        console.error('Error recalculating course exam points after settings change:', error);
+      }
+    }
+
     return updatedExam;
   }
 
@@ -1167,30 +1180,12 @@ export class CourseLevelExamsService {
   }
 
   private static async maybeAwardCourseExamStartPoints(
-    exam: any,
-    attempt: any,
-    studentId: number,
+    _exam: any,
+    _attempt: any,
+    _studentId: number,
   ) {
-    try {
-      if (!isCourseExamPointsEnabled(exam)) return;
-      const teacherId =
-        exam.teacher_id != null
-          ? Number(exam.teacher_id)
-          : await TeacherPointsService.resolveTeacherIdForCourse(Number(exam.course_id));
-      if (!teacherId) return;
-      await TeacherPointsService.awardExamOrAssignmentStart({
-        studentId,
-        teacherId,
-        courseId: exam.course_id != null ? Number(exam.course_id) : null,
-        attemptId: Number(attempt.id),
-        examId: Number(exam.id),
-        isAssignment: false,
-        examKind: 'course',
-        title: exam.title ?? null,
-      });
-    } catch (error) {
-      console.error('Error awarding course exam start points:', error);
-    }
+    // Exam points are score-only; start bonus removed.
+    return;
   }
 
   private static async maybeAwardCourseExamScorePoints(

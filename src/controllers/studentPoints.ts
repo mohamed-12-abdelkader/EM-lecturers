@@ -52,3 +52,30 @@ router.get(
     });
   }),
 );
+
+/** GET /api/student/points/transactions — student's own points calculation log */
+router.get(
+  '/transactions',
+  authMiddleware(['student']),
+  asyncWrapper(async (req, res) => {
+    const studentId = req.user!.id;
+    const ctx = await requireStudentContext(studentId);
+    const limitRaw = req.query.limit ? Number(req.query.limit) : 100;
+    const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(limitRaw, 1), 300) : 100;
+    const transactions = await TeacherPointsService.listStudentTransactions({
+      teacherId: ctx.teacherId,
+      studentId,
+      gradeId: ctx.gradeId,
+      limit,
+    });
+    res.json({
+      success: true,
+      data: {
+        studentId,
+        teacherId: ctx.teacherId,
+        gradeId: ctx.gradeId,
+        transactions,
+      },
+    });
+  }),
+);
