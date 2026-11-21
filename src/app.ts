@@ -38,10 +38,10 @@ app.use(securityHeadersMiddleware);
 
 // Parse JSON bodies; include text/plain because some clients (e.g. Postman "raw" default) send JSON with Content-Type: text/plain
 // Capture rawBody for WhatsApp webhook HMAC verification
-// Limit raised for wwebjs inbound media (base64 images up to ~5MB)
+// 25mb covers base64 WhatsApp media (~15–18MB binary + JSON envelope)
 app.use(
   express.json({
-    limit: '8mb',
+    limit: '25mb',
     type: ['application/json', 'text/plain'],
     verify: (req, _res, buf) => {
       (req as express.Request & { rawBody?: Buffer }).rawBody = buf;

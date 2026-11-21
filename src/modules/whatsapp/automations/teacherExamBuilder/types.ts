@@ -21,6 +21,13 @@ export type ExamAssistantSourceType = 'question_bank' | 'files';
 
 export type ExamAssistantExamType = 'general' | 'assignment' | 'comprehensive';
 
+export type ExamAssistantMediaIntent =
+  | 'create'
+  | 'review'
+  | 'add'
+  | 'edit'
+  | 'ask';
+
 export type ExamAssistantSessionContext = {
   scheduled_task_id?: number | null;
   scheduled_task_title?: string | null;
@@ -43,6 +50,15 @@ export type ExamAssistantSessionContext = {
   publish_confirmed?: boolean;
   awaiting_more_files?: boolean;
   last_user_intent?: string | null;
+  /** Last ~8 turns for natural conversation context */
+  recent_turns?: Array<{ role: 'teacher' | 'assistant'; text: string; at: string }>;
+  active_exam_id?: number | null;
+  active_exam_kind?: 'lecture-exam' | 'course-exam' | null;
+  recent_exam_ids?: Array<{ id: number; kind: 'lecture-exam' | 'course-exam'; at: string }>;
+  pending_media_intent?: ExamAssistantMediaIntent | null;
+  awaiting_clarification?: boolean;
+  last_assistant_question?: string | null;
+  pending_destructive_edit?: string | null;
 };
 
 export type ExamAssistantSessionRow = {

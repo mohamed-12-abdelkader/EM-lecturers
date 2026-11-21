@@ -163,9 +163,28 @@ export async function saveInboundMediaFile(opts: {
   teacherId: number;
   waMessageId?: string | null;
   media: { data: string; mimetype?: string | null; filename?: string | null };
-}) {
+}): Promise<
+  | { ok: true; filePath: string; mime: string; size: number }
+  | { ok: false; reply: string; kind: string }
+> {
+  const { validateDecodedMediaBuffer } = await import('./mediaErrors.js');
   await fs.promises.mkdir(UPLOAD_DIR, { recursive: true });
   const mime = (opts.media.mimetype || 'application/octet-stream').toLowerCase();
+  let buffer: Buffer;
+  try {
+    buffer = Buffer.from(opts.media.data || '', 'base64');
+  } catch {
+    return {
+      ok: false,
+      kind: 'corrupt',
+      reply: 'الملف تالف أو غير قابل للقراءة.\nابعت نسخة تانية.',
+    };
+  }
+  const validated = validateDecodedMediaBuffer({ buffer, mimetype: mime });
+  if (!validated.ok) {
+    return { ok: false, kind: validated.kind, reply: validated.reply };
+  }
+
   const ext = mime.includes('pdf')
     ? 'pdf'
     : mime.includes('png')
@@ -177,7 +196,6 @@ export async function saveInboundMediaFile(opts: {
     opts.media.filename ||
     `wa-exam-${opts.teacherId}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
   const filePath = path.join(UPLOAD_DIR, filename);
-  const buffer = Buffer.from(opts.media.data, 'base64');
   await fs.promises.writeFile(filePath, buffer);
   await ExamAssistantSessionStore.addFile({
     sessionId: opts.sessionId,
@@ -188,7 +206,7 @@ export async function saveInboundMediaFile(opts: {
     filePath,
     fileSize: buffer.length,
   });
-  return { filePath, mime, size: buffer.length };
+  return { ok: true, filePath, mime, size: buffer.length };
 }
 
 function toMulterFile(filePath: string, mimeType: string | null, originalName: string | null): Express.Multer.File {
@@ -356,12 +374,13 @@ export async function createDraftExamFromWorkflow(opts: {
         questionIds,
       );
       const reviewUrl = buildCourseExamReviewUrl(examId);
+      const { withTrackedExam } = await import('./examEditActions.js');
       const updated = await ExamAssistantSessionStore.update(session.id, session.teacher_id, {
         state: 'READY_TO_PUBLISH',
         draft_exam_id: examId,
         draft_exam_kind: 'course-exam',
         context: {
-          ...session.context,
+          ...withTrackedExam(session.context, examId, 'course-exam'),
           exam_type: examType,
           target_course_id: opts.courseId,
           review_url: reviewUrl,
@@ -374,6 +393,7 @@ export async function createDraftExamFromWorkflow(opts: {
           `رابط المراجعة: ${reviewUrl}`,
           '',
           'راجع الامتحان على المنصة، ولو تمام ابعت «انشر» أو «موافق على النشر».',
+          'لو عايز تعديل قول مثلاً: «احذف السؤال 3».',
         ].join('\n'),
         session: updated,
       };
@@ -392,12 +412,13 @@ export async function createDraftExamFromWorkflow(opts: {
     const examId = Number(exam.id);
     await ExamFlowService.addQuestionsFromBank(session.teacher_id, examId, questionIds);
     const reviewUrl = buildLectureExamReviewUrl(examId);
+    const { withTrackedExam: trackLecture } = await import('./examEditActions.js');
     const updated = await ExamAssistantSessionStore.update(session.id, session.teacher_id, {
       state: 'READY_TO_PUBLISH',
       draft_exam_id: examId,
       draft_exam_kind: 'lecture-exam',
       context: {
-        ...session.context,
+        ...trackLecture(session.context, examId, 'lecture-exam'),
         exam_type: examType,
         target_lecture_id: opts.lectureId,
         review_url: reviewUrl,
@@ -410,6 +431,7 @@ export async function createDraftExamFromWorkflow(opts: {
         `رابط المراجعة: ${reviewUrl}`,
         '',
         'راجع الامتحان، ولو تمام ابعت «انشر».',
+        'للتعديل: «احذف السؤال 3» أو «درجة السؤال 1 تبقى 2».',
       ].join('\n'),
       session: updated,
     };
@@ -462,11 +484,17 @@ export async function createDraftExamFromWorkflow(opts: {
       }
     }
     const reviewUrl = buildCourseExamReviewUrl(examId);
+    const { withTrackedExam: trackCourseFiles } = await import('./examEditActions.js');
     const updated = await ExamAssistantSessionStore.update(session.id, session.teacher_id, {
       state: 'READY_TO_PUBLISH',
       draft_exam_id: examId,
       draft_exam_kind: 'course-exam',
-      context: { ...session.context, exam_type: examType, target_course_id: opts.courseId, review_url: reviewUrl },
+      context: {
+        ...trackCourseFiles(session.context, examId, 'course-exam'),
+        exam_type: examType,
+        target_course_id: opts.courseId,
+        review_url: reviewUrl,
+      },
     });
     return {
       reply: [
@@ -503,12 +531,13 @@ export async function createDraftExamFromWorkflow(opts: {
     );
   }
   const reviewUrl = buildLectureExamReviewUrl(examId);
+  const { withTrackedExam: trackLectureFiles } = await import('./examEditActions.js');
   const updated = await ExamAssistantSessionStore.update(session.id, session.teacher_id, {
     state: 'READY_TO_PUBLISH',
     draft_exam_id: examId,
     draft_exam_kind: 'lecture-exam',
     context: {
-      ...session.context,
+      ...trackLectureFiles(session.context, examId, 'lecture-exam'),
       exam_type: examType,
       target_lecture_id: opts.lectureId,
       review_url: reviewUrl,
@@ -545,10 +574,17 @@ export async function publishDraftExam(
     );
   }
 
+  const kind = session.draft_exam_kind;
+  const examId = session.draft_exam_id;
+  const { withTrackedExam } = await import('./examEditActions.js');
+  const ctx =
+    examId && kind
+      ? withTrackedExam({ ...session.context, publish_confirmed: true }, examId, kind)
+      : { ...session.context, publish_confirmed: true };
   const updated = await ExamAssistantSessionStore.update(session.id, session.teacher_id, {
     state: 'PUBLISHED',
     status: 'completed',
-    context: { ...session.context, publish_confirmed: true },
+    context: ctx,
   });
 
   return {
@@ -556,7 +592,7 @@ export async function publishDraftExam(
       'تم نشر الامتحان للطلاب بنجاح ✅',
       session.context.review_url ? `الرابط: ${session.context.review_url}` : null,
       '',
-      'لو عايز تبدأ امتحان جديد ابعت طلبك.',
+      'لو عايز تعدّل عليه قولّي، أو ابدأ امتحان جديد.',
     ]
       .filter(Boolean)
       .join('\n'),

@@ -45,6 +45,25 @@ const errorHandler = (err: Error, req: Request, res: Response<ErrorBody>, _: Nex
     return;
   }
 
+  // express.json body limit (WhatsApp webhook base64 media)
+  const anyErr = err as Error & { status?: number; type?: string; statusCode?: number };
+  const isPayloadTooLarge =
+    anyErr?.type === 'entity.too.large' ||
+    anyErr?.status === 413 ||
+    anyErr?.statusCode === 413 ||
+    /request entity too large|payload too large/i.test(anyErr?.message || '');
+  if (isPayloadTooLarge) {
+    logger.warn({ err: anyErr.message, url: req.url }, 'PayloadTooLarge');
+    res.status(413).send({
+      status: 413,
+      success: false,
+      message:
+        'Request body too large. For WhatsApp media, reduce file size or raise reverse-proxy client_max_body_size.',
+      name: 'PayloadTooLargeError',
+    });
+    return;
+  }
+
   logger.error(err, loggerMsg);
 
   // في development mode، أرسل تفاصيل أكثر
