@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { authMiddleware } from '../middleware/authentication';
 import { asyncWrapper, HttpError } from '../utils';
 import { TeacherPointsService } from '../services/teacherPoints';
+import pool from '../db/pool';
 
 export const router = Router();
 
@@ -465,6 +466,56 @@ router.post(
       }
       throw error;
     }
+  }),
+);
+
+/**
+ * POST /api/teacher/points/recalculate-course-exam-scores
+ * Body: { examId?: number } — إن لم يُرسل يعيد احتساب كل الامتحانات الشاملة المفعّلة للمدرس
+ */
+router.post(
+  '/recalculate-course-exam-scores',
+  authMiddleware(['teacher', 'academy', 'admin']),
+  asyncWrapper(async (req, res) => {
+    const teacherId = resolveTeacherId(req);
+    const examIdRaw = req.body?.examId ?? req.body?.exam_id ?? req.query.examId;
+    const examId =
+      examIdRaw != null && Number.isFinite(Number(examIdRaw)) && Number(examIdRaw) > 0
+        ? Number(examIdRaw)
+        : null;
+
+    if (examId) {
+      const owned = await pool.query(
+        `SELECT e.id
+         FROM course_level_exams e
+         LEFT JOIN courses c ON c.id = e.course_id
+         WHERE e.id = $1 AND COALESCE(e.teacher_id, c.teacher_id) = $2
+         LIMIT 1`,
+        [examId, teacherId],
+      );
+      if (!owned.rowCount) {
+        return res.status(404).json({
+          success: false,
+          message: 'الامتحان غير موجود أو لا تملك صلاحية عليه',
+        });
+      }
+      const result = await TeacherPointsService.recalculateCourseExamPointsForExam(examId);
+      return res.json({
+        success: true,
+        message: 'تم إعادة احتساب نقاط الامتحان للطلاب الذين سلّموا',
+        data: result,
+      });
+    }
+
+    const result = await TeacherPointsService.backfillEnabledCourseExamScores({
+      teacherId,
+      limit: 300,
+    });
+    return res.json({
+      success: true,
+      message: 'تم إعادة احتساب نقاط كل الامتحانات الشاملة المفعّلة',
+      data: result,
+    });
   }),
 );
 

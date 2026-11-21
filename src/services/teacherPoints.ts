@@ -172,11 +172,17 @@ export class TeacherPointsService {
     preferredGradeId?: number | null;
   }): Promise<number | null> {
     if (opts.preferredGradeId) {
-      const ok = await pool.query(
-        `SELECT 1 FROM teacher_grades WHERE teacher_id = $1 AND grade_id = $2`,
-        [opts.teacherId, opts.preferredGradeId],
-      );
-      if (ok.rowCount) return Number(opts.preferredGradeId);
+      const preferred = Number(opts.preferredGradeId);
+      if (Number.isInteger(preferred) && preferred > 0) {
+        const ok = await pool.query(
+          `SELECT 1 FROM teacher_grades WHERE teacher_id = $1 AND grade_id = $2
+           UNION ALL
+           SELECT 1 FROM grades WHERE id = $2
+           LIMIT 1`,
+          [opts.teacherId, preferred],
+        );
+        if (ok.rowCount) return preferred;
+      }
     }
 
     const studentGrade = await pool.query<{ grade_id: number }>(
@@ -218,6 +224,24 @@ export class TeacherPointsService {
       } catch {
         // course_grades may be missing in older DBs
       }
+    }
+
+    // Enrollment fallback: student enrolled in one of the teacher's courses.
+    try {
+      const enrolled = await pool.query<{ grade_id: number }>(
+        `SELECT c.grade_id
+         FROM enrollments e
+         JOIN courses c ON c.id = e.course_id
+         WHERE e.student_id = $1
+           AND c.teacher_id = $2
+           AND c.grade_id IS NOT NULL
+         ORDER BY e.id DESC
+         LIMIT 1`,
+        [opts.studentId, opts.teacherId],
+      );
+      if (enrolled.rowCount) return Number(enrolled.rows[0].grade_id);
+    } catch {
+      // ignore
     }
 
     return null;
@@ -2827,7 +2851,7 @@ export class TeacherPointsService {
     page?: number;
     limit?: number;
   }) {
-    // تنظيف تلقائي قبل عرض الترتيب: آخر امتحان شامل فقط (مرة/دقيقة لكل مدرس+صف)
+    // تنظيف + تعويض نقاط الامتحانات المفعّلة قبل عرض الترتيب (مرة/دقيقة لكل مدرس+صف)
     const healKey = `${opts.teacherId}:${opts.gradeId ?? 'all'}`;
     const lastHeal = this.leaderboardHealAt.get(healKey) ?? 0;
     if (Date.now() - lastHeal > 60_000) {
@@ -2836,9 +2860,13 @@ export class TeacherPointsService {
           teacherId: opts.teacherId,
           gradeId: opts.gradeId ?? null,
         });
+        await this.backfillEnabledCourseExamScores({
+          teacherId: opts.teacherId,
+          limit: 100,
+        });
         this.leaderboardHealAt.set(healKey, Date.now());
       } catch (err) {
-        console.error('healTeacherExamPointsToLastOnly failed:', err);
+        console.error('leaderboard points heal/backfill failed:', err);
       }
     }
 
@@ -3201,6 +3229,88 @@ export class TeacherPointsService {
       scoresRemoved,
       startsRemoved,
       skippedMissingGrade,
+    };
+  }
+
+  /**
+   * Production repair: recalculate EXAM_SCORE for every points-enabled course exam
+   * that already has submitted attempts (optionally scoped to one teacher / exam).
+   */
+  static async backfillEnabledCourseExamScores(opts: {
+    teacherId?: number | null;
+    examId?: number | null;
+    limit?: number;
+  } = {}): Promise<{
+    examsProcessed: number;
+    scoresCreated: number;
+    scoresSynced: number;
+    scoresAdjusted: number;
+    scoresRemoved: number;
+    skippedMissingGrade: number;
+    examIds: number[];
+  }> {
+    const examId =
+      opts.examId != null && Number.isFinite(Number(opts.examId))
+        ? Number(opts.examId)
+        : null;
+    const teacherId =
+      opts.teacherId != null && Number.isFinite(Number(opts.teacherId))
+        ? Number(opts.teacherId)
+        : null;
+    const limit = Math.min(Math.max(Number(opts.limit) || 200, 1), 1000);
+
+    const params: unknown[] = [];
+    let where = `(e.points_enabled IS NULL OR e.points_enabled = TRUE)
+         AND EXISTS (
+           SELECT 1 FROM course_level_exam_attempts a
+           WHERE a.exam_id = e.id AND a.status = 'submitted'
+         )`;
+    if (examId) {
+      params.push(examId);
+      where += ` AND e.id = $${params.length}`;
+    }
+    if (teacherId) {
+      params.push(teacherId);
+      where += ` AND COALESCE(e.teacher_id, c.teacher_id) = $${params.length}`;
+    }
+    params.push(limit);
+
+    const examsRes = await pool.query<{ id: number }>(
+      `SELECT e.id
+       FROM course_level_exams e
+       LEFT JOIN courses c ON c.id = e.course_id
+       WHERE ${where}
+       ORDER BY e.id DESC
+       LIMIT $${params.length}`,
+      params,
+    );
+
+    let scoresCreated = 0;
+    let scoresSynced = 0;
+    let scoresAdjusted = 0;
+    let scoresRemoved = 0;
+    let skippedMissingGrade = 0;
+    const examIds: number[] = [];
+
+    for (const row of examsRes.rows) {
+      const id = Number(row.id);
+      examIds.push(id);
+      const result = await this.recalculateCourseExamPointsForExam(id);
+      scoresCreated += Number(result.scoresCreated || 0);
+      scoresSynced += Number(result.scoresSynced || 0);
+      scoresAdjusted += Number(result.scoresAdjusted || 0);
+      scoresRemoved += Number(result.scoresRemoved || 0);
+      skippedMissingGrade += Number(result.skippedMissingGrade || 0);
+    }
+
+    return {
+      examsProcessed: examIds.length,
+      scoresCreated,
+      scoresSynced,
+      scoresAdjusted,
+      scoresRemoved,
+      skippedMissingGrade,
+      examIds,
     };
   }
 

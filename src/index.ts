@@ -109,7 +109,7 @@ const startServer = async () => {
         })();
       }
 
-      // تنظيف نقاط الترتيب عند الإقلاع: آخر امتحان شامل فقط (يحذف نقاط المحاضرات/القديمة)
+      // تنظيف + تعويض نقاط الامتحانات الشاملة المفعّلة عند الإقلاع
       void (async () => {
         try {
           const { TeacherPointsService } = await import('./services/teacherPoints.js');
@@ -120,6 +120,11 @@ const startServer = async () => {
                SELECT teacher_id FROM point_transactions
                UNION
                SELECT teacher_id FROM teacher_points_settings
+               UNION
+               SELECT COALESCE(e.teacher_id, c.teacher_id) AS teacher_id
+               FROM course_level_exams e
+               LEFT JOIN courses c ON c.id = e.course_id
+               WHERE COALESCE(e.teacher_id, c.teacher_id) IS NOT NULL
              ) t WHERE teacher_id IS NOT NULL`,
           );
           for (const row of teachers.rows) {
@@ -132,8 +137,17 @@ const startServer = async () => {
                 `🧹 Points heal teacher=${teacherId}: purged=${result.purged} allowedExams=${result.allowedExamIds.join(',')}`,
               );
             }
+            const backfill = await TeacherPointsService.backfillEnabledCourseExamScores({
+              teacherId,
+              limit: 300,
+            });
+            if (backfill.scoresCreated > 0 || backfill.scoresSynced > 0) {
+              logger.info(
+                `🏅 Points backfill teacher=${teacherId}: exams=${backfill.examsProcessed} created=${backfill.scoresCreated} synced=${backfill.scoresSynced} missingGrade=${backfill.skippedMissingGrade}`,
+              );
+            }
           }
-          logger.info('✅ Points heal-on-boot finished (last comprehensive exam only)');
+          logger.info('✅ Points heal+backfill on boot finished');
         } catch (healErr: any) {
           logger.warn('⚠️  Points heal-on-boot skipped:', healErr?.message || healErr);
         }
