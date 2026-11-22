@@ -3206,6 +3206,80 @@ export class CourseLevelExamsService {
     return 'Answers are not available yet';
   }
 
+  /** Live MCQ grading against current answer keys (not stale stored is_correct). */
+  private static isCourseMcqAnswerLiveCorrect(question: any, selectedAnswer: unknown): boolean {
+    if (String(question?.type || '').toUpperCase() === 'ESSAY') return false;
+    const selected =
+      selectedAnswer != null && String(selectedAnswer).trim()
+        ? String(selectedAnswer).trim().toUpperCase()
+        : null;
+    if (!selected) return false;
+    const { correctAnswers } = this.formatQuestionCorrectAnswers(question);
+    return isSelectedAnswerCorrect(selected, correctAnswers);
+  }
+
+  /**
+   * Heal stale MCQ is_correct flags vs current keys and refresh attempt obtained_grade.
+   * Fixes reports where student answer matches the key but stored is_correct was wrong/outdated.
+   */
+  private static async syncAttemptMcqGradingFromCurrentKeys(attemptId: number): Promise<{
+    obtained: number;
+    changed: boolean;
+  }> {
+    const rowsRes = await pool.query(
+      `SELECT a.id AS answer_id, a.selected_answer, a.is_correct, a.final_score,
+              q.type, q.correct_answer, q.correct_answer_2
+       FROM course_level_exam_answers a
+       JOIN course_level_exam_questions q ON q.id = a.question_id
+       WHERE a.attempt_id = $1`,
+      [attemptId],
+    );
+
+    let changed = false;
+    for (const row of rowsRes.rows) {
+      if (String(row.type || '').toUpperCase() === 'ESSAY') continue;
+      const liveCorrect = this.isCourseMcqAnswerLiveCorrect(row, row.selected_answer);
+      if (Boolean(row.is_correct) !== liveCorrect) {
+        await pool.query(`UPDATE course_level_exam_answers SET is_correct = $1 WHERE id = $2`, [
+          liveCorrect,
+          row.answer_id,
+        ]);
+        changed = true;
+      }
+    }
+
+    const scoreRes = await pool.query(
+      `SELECT COALESCE(SUM(
+          CASE
+            WHEN UPPER(COALESCE(q.type, 'TEXT')) = 'ESSAY' THEN COALESCE(a.final_score, 0)
+            WHEN a.is_correct THEN 1
+            ELSE 0
+          END
+        ), 0) AS obtained
+       FROM course_level_exam_answers a
+       JOIN course_level_exam_questions q ON q.id = a.question_id
+       WHERE a.attempt_id = $1`,
+      [attemptId],
+    );
+    const obtained = Number(scoreRes.rows[0]?.obtained ?? 0);
+
+    const attRes = await pool.query(
+      `SELECT obtained_grade FROM course_level_exam_attempts WHERE id = $1`,
+      [attemptId],
+    );
+    if (Number(attRes.rows[0]?.obtained_grade ?? 0) !== obtained) {
+      await pool.query(
+        `UPDATE course_level_exam_attempts
+         SET obtained_grade = $1
+         WHERE id = $2 AND status = 'submitted'`,
+        [obtained, attemptId],
+      );
+      changed = true;
+    }
+
+    return { obtained, changed };
+  }
+
   private static mapCourseWrongQuestion(question: any, answer?: any) {
     const optionText = (letter: string | null) => {
       if (!letter) return null;
@@ -3339,8 +3413,8 @@ export class CourseLevelExamsService {
         const selected = answer?.selected_answer
           ? String(answer.selected_answer).trim().toUpperCase()
           : null;
-        const isCorrect = Boolean(answer?.is_correct) && Boolean(selected);
-        if (isCorrect) return null;
+        // Compare against current answer key (not stale stored is_correct)
+        if (this.isCourseMcqAnswerLiveCorrect(question, selected)) return null;
         return this.mapCourseWrongQuestion(question, answer);
       })
       .filter((row): row is NonNullable<typeof row> => row != null);
@@ -3556,7 +3630,15 @@ export class CourseLevelExamsService {
       throw new HttpError(404, 'No completed attempt found for this exam');
     }
 
-    const attempt = attemptQuery.rows[0];
+    let attempt = attemptQuery.rows[0];
+    // Heal stale is_correct / score when answer keys changed after submit
+    await this.syncAttemptMcqGradingFromCurrentKeys(Number(attempt.id));
+    const refreshedAttempt = await pool.query(
+      `SELECT * FROM course_level_exam_attempts WHERE id = $1`,
+      [attempt.id],
+    );
+    if (refreshedAttempt.rowCount) attempt = refreshedAttempt.rows[0];
+
     const now = new Date();
     const release = this.buildAnswerReleaseContext(exam, attempt, now);
     const attemptSummary = this.mapAttemptSummary(attempt);
@@ -3676,7 +3758,7 @@ export class CourseLevelExamsService {
       throw new HttpError(404, 'لا توجد محاولة مُسلَّمة لهذا الامتحان');
     }
 
-    const attempt = attemptRes.rows[0];
+    let attempt = attemptRes.rows[0];
     const now = new Date();
     const release = this.buildAnswerReleaseContext(exam, attempt, now);
 
@@ -3686,6 +3768,13 @@ export class CourseLevelExamsService {
         this.pendingReleaseMessage(release),
       );
     }
+
+    await this.syncAttemptMcqGradingFromCurrentKeys(Number(attempt.id));
+    const refreshedAttempt = await pool.query(
+      `SELECT * FROM course_level_exam_attempts WHERE id = $1`,
+      [attempt.id],
+    );
+    if (refreshedAttempt.rowCount) attempt = refreshedAttempt.rows[0];
 
     const allAnswersRes = await pool.query(
       `SELECT a.question_id, a.selected_answer, a.is_correct,
@@ -3701,6 +3790,7 @@ export class CourseLevelExamsService {
 
     const questions = allAnswersRes.rows.map((row) => {
       const formatted = this.formatQuestionCorrectAnswers(row);
+      const liveCorrect = this.isCourseMcqAnswerLiveCorrect(row, row.selected_answer);
       return {
         questionId: row.question_id,
         questionText: row.question_text,
@@ -3714,7 +3804,7 @@ export class CourseLevelExamsService {
         correctAnswer: formatted.correctAnswer,
         correctAnswer2: formatted.correctAnswer2,
         correctAnswers: formatted.correctAnswers,
-        isCorrect: !!row.is_correct,
+        isCorrect: liveCorrect,
       };
     });
 
@@ -3904,8 +3994,7 @@ export class CourseLevelExamsService {
               ? String(answer.selected_answer).trim().toUpperCase()
               : null;
             if (selected) answeredCount += 1;
-            const isCorrect = Boolean(answer?.is_correct) && Boolean(selected);
-            if (!isCorrect) {
+            if (!this.isCourseMcqAnswerLiveCorrect(question, selected)) {
               wrongQuestions.push(this.mapCourseWrongQuestion(question, answer));
             }
           }
@@ -5261,8 +5350,7 @@ export class CourseLevelExamsService {
           ? String(answer.selected_answer).trim().toUpperCase()
           : null;
         if (selected) answeredCount += 1;
-        const isCorrect = Boolean(answer?.is_correct) && Boolean(selected);
-        if (!isCorrect) {
+        if (!this.isCourseMcqAnswerLiveCorrect(question, selected)) {
           wrong.push(this.mapCourseWrongQuestion(question, answer));
         }
       }
