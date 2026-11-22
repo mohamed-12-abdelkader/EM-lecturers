@@ -5,6 +5,7 @@ export type ExamAssistantState =
   | 'ASK_COURSE'
   | 'ASK_LECTURE'
   | 'SELECT_EXAM_TYPE'
+  | 'ASK_EXAM_TITLE'
   | 'ASK_EXAM_SETTINGS'
   | 'ASK_SOURCE'
   | 'SELECT_LESSON'
@@ -55,6 +56,8 @@ export type ExamAssistantSessionContext = {
   channel?: 'whatsapp' | 'web' | null;
   extracted_question_count?: number | null;
   extracted_bulk_text?: string | null;
+  /** Full Mistral extraction questions (preserves images/options) */
+  extracted_questions?: unknown[] | null;
   review_url?: string | null;
   publish_confirmed?: boolean;
   awaiting_more_files?: boolean;

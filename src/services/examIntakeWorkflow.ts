@@ -33,6 +33,9 @@ function toInbound(opts: {
 }
 
 async function ensureWebSession(teacherId: number): Promise<ExamAssistantSessionRow> {
+  // Close leftover failed sessions so a new guided intake can start cleanly.
+  await ExamAssistantSessionStore.cancelFailedForTeacher(teacherId).catch(() => undefined);
+
   const existing = await ExamAssistantSessionStore.getActiveForTeacher(teacherId);
   if (existing) {
     if (existing.context.channel !== 'web') {

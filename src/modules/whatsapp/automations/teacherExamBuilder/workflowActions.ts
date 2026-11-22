@@ -256,26 +256,157 @@ function toMulterFile(filePath: string, mimeType: string | null, originalName: s
   };
 }
 
+/** Same composition rules as the OCR tool frontend (composeOcrQuestionText). */
+export function composeExtractedQuestionText(q: any): string {
+  const blocks = Array.isArray(q?.display_blocks)
+    ? q.display_blocks.filter((b: any) => String(b?.text ?? '').trim())
+    : [];
+  if (blocks.length) {
+    return blocks.map((b: any) => String(b.text).trim()).join('\n\n');
+  }
+  const structured = [q?.intro_text, q?.stimulus_text, q?.prompt_text]
+    .map((t) => String(t ?? '').trim())
+    .filter(Boolean);
+  if (structured.length) return structured.join('\n\n');
+
+  let text = String(q?.question_text ?? q?.text ?? q?.stem ?? '').trim();
+  const verses = Array.isArray(q?.verses) ? q.verses : [];
+  if (!text && verses.length) {
+    text = verses
+      .map((v: any) => {
+        const a = String(v?.firstHemistich ?? '').trim();
+        const b = String(v?.secondHemistich ?? '').trim();
+        if (!a && !b) return '';
+        if (a && b) return `${a} . : ${b}`;
+        return a || b;
+      })
+      .filter(Boolean)
+      .join('\n');
+  }
+  return text;
+}
+
+function resolveExtractedCorrectLetter(q: any, optionTexts: string[]): 'A' | 'B' | 'C' | 'D' {
+  const letters: Array<'A' | 'B' | 'C' | 'D'> = ['A', 'B', 'C', 'D'];
+  if (
+    Number.isInteger(q?.correct_answer_index) &&
+    q.correct_answer_index >= 0 &&
+    q.correct_answer_index < optionTexts.length
+  ) {
+    return letters[Math.min(q.correct_answer_index, 3)]!;
+  }
+  const raw = String(q?.correct_answer ?? '').trim();
+  if (!raw) return 'A';
+  const upper = raw.toUpperCase();
+  if (['A', 'B', 'C', 'D'].includes(upper)) return upper as 'A' | 'B' | 'C' | 'D';
+  const arMap: Record<string, 'A' | 'B' | 'C' | 'D'> = {
+    أ: 'A',
+    ا: 'A',
+    ب: 'B',
+    ج: 'C',
+    د: 'D',
+  };
+  if (arMap[raw]) return arMap[raw]!;
+  const opts = Array.isArray(q?.options) ? q.options : [];
+  const byLabel = opts.findIndex(
+    (o: any) => String(o?.label ?? '').trim().toLowerCase() === raw.toLowerCase(),
+  );
+  if (byLabel >= 0 && byLabel < 4) return letters[byLabel]!;
+  const byText = optionTexts.findIndex((t) => t === raw);
+  if (byText >= 0 && byText < 4) return letters[byText]!;
+  return 'A';
+}
+
+function firstQuestionImageUrl(q: any): string | null {
+  const imgs = Array.isArray(q?.question_images) ? q.question_images : [];
+  for (const img of imgs) {
+    const url = typeof img?.image_url === 'string' ? img.image_url.trim() : '';
+    if (url && url !== 'null') return url;
+  }
+  if (typeof q?.image_url === 'string' && q.image_url.trim()) return q.image_url.trim();
+  return null;
+}
+
+/**
+ * Map Mistral extraction questions to exam bulk payload — keep parity with the OCR tool.
+ */
+export function mapExtractedQuestionsToExamPayload(questions: any[]): Array<{
+  questionText: string;
+  optionA: string;
+  optionB: string;
+  optionC: string;
+  optionD: string;
+  correctAnswer: 'A' | 'B' | 'C' | 'D';
+  questionImage: string | null;
+  passageText: string | null;
+  passageTitle: string | null;
+}> {
+  const out: Array<{
+    questionText: string;
+    optionA: string;
+    optionB: string;
+    optionC: string;
+    optionD: string;
+    correctAnswer: 'A' | 'B' | 'C' | 'D';
+    questionImage: string | null;
+    passageText: string | null;
+    passageTitle: string | null;
+  }> = [];
+
+  for (const q of questions || []) {
+    const questionText = composeExtractedQuestionText(q);
+    const opts = Array.isArray(q?.options) ? q.options : [];
+    const optionTexts = opts
+      .map((o: any) => (typeof o === 'string' ? o : String(o?.text ?? '').trim()))
+      .filter((t: string) => t.length > 0);
+
+    // Image-only / essay-like: keep image even if options missing
+    const questionImage = firstQuestionImageUrl(q);
+    if (!questionText && !questionImage) continue;
+
+    // Pad to 4 options for exam schemas that require A–D
+    const padded = [...optionTexts];
+    while (padded.length < 4) padded.push(padded.length === 0 ? '—' : `خيار ${padded.length + 1}`);
+    const optionA = padded[0]!;
+    const optionB = padded[1]!;
+    const optionC = padded[2]!;
+    const optionD = padded[3]!;
+
+    out.push({
+      questionText: questionText || (questionImage ? 'انظر الصورة' : 'سؤال'),
+      optionA,
+      optionB,
+      optionC,
+      optionD,
+      correctAnswer: resolveExtractedCorrectLetter(q, optionTexts),
+      questionImage,
+      passageText:
+        typeof q?.passage_text === 'string' && q.passage_text.trim()
+          ? q.passage_text.trim()
+          : null,
+      passageTitle:
+        typeof q?.passage_title === 'string' && q.passage_title.trim()
+          ? q.passage_title.trim()
+          : null,
+    });
+  }
+  return out;
+}
+
 function extractedToBulkText(questions: any[]): string {
-  const blocks: string[] = [];
-  questions.forEach((q, idx) => {
-    const text = String(q.question_text || q.text || q.stem || '').trim();
-    if (!text) return;
-    const opts = q.options || q.choices || [];
-    const letters = ['a', 'b', 'c', 'd', 'e'];
-    const lines = [`${idx + 1}- ${text}`];
-    if (Array.isArray(opts) && opts.length) {
-      opts.slice(0, 5).forEach((opt: any, i: number) => {
-        const optText = typeof opt === 'string' ? opt : opt?.text || opt?.label || '';
-        if (optText) lines.push(`${letters[i]}. ${String(optText).trim()}`);
-      });
-    } else {
-      // Ensure parseable MCQ shape if model returned question only
-      lines.push('a. —', 'b. —', 'c. —', 'd. —');
-    }
-    blocks.push(lines.join('\n'));
-  });
-  return blocks.join('\n\n');
+  const mapped = mapExtractedQuestionsToExamPayload(questions);
+  return mapped
+    .map((q, idx) => {
+      const lines = [
+        `${idx + 1}- ${q.questionText}`,
+        `a. ${q.optionA}`,
+        `b. ${q.optionB}`,
+        `c. ${q.optionC}`,
+        `d. ${q.optionD}`,
+      ];
+      return lines.join('\n');
+    })
+    .join('\n\n');
 }
 
 export async function extractQuestionsFromSessionFiles(
@@ -298,6 +429,7 @@ export async function extractQuestionsFromSessionFiles(
     toMulterFile(f.file_path, f.mime_type, f.original_name),
   );
 
+  // Same options as the OCR extract-questions tool for parity.
   const extraction = await MistralQuestionExtractionService.extractQuestionsFromFiles(multerFiles, {
     inferCorrectAnswer: true,
     includeQuestionImages: true,
@@ -310,8 +442,34 @@ export async function extractQuestionsFromSessionFiles(
       ? (extraction as any).data.questions
       : [];
 
+  const mapped = mapExtractedQuestionsToExamPayload(questions);
   const bulkText = extractedToBulkText(questions);
-  const count = questions.length;
+  const count = mapped.length;
+  // Persist structured questions (URLs only — no huge base64) for faithful import.
+  const slimQuestions = questions.map((q: any) => ({
+    number: q?.number,
+    question_text: q?.question_text,
+    intro_text: q?.intro_text,
+    stimulus_text: q?.stimulus_text,
+    prompt_text: q?.prompt_text,
+    display_blocks: q?.display_blocks,
+    verses: q?.verses,
+    poetry: q?.poetry,
+    options: q?.options,
+    correct_answer: q?.correct_answer,
+    correct_answer_index: q?.correct_answer_index,
+    passage_id: q?.passage_id,
+    passage_text: q?.passage_text,
+    passage_title: q?.passage_title,
+    question_images: Array.isArray(q?.question_images)
+      ? q.question_images.map((img: any) => ({
+          image_id: img?.image_id,
+          image_url: img?.image_url,
+          short_description: img?.short_description,
+        }))
+      : [],
+  }));
+
   const updated = await ExamAssistantSessionStore.update(session.id, session.teacher_id, {
     state: count > 0 ? 'EXAM_REVIEW' : 'FAILED',
     source_type: 'files',
@@ -320,6 +478,7 @@ export async function extractQuestionsFromSessionFiles(
       ...session.context,
       extracted_question_count: count,
       extracted_bulk_text: bulkText || null,
+      extracted_questions: slimQuestions,
       awaiting_more_files: false,
     },
   });
@@ -468,9 +627,14 @@ export async function createDraftExamFromWorkflow(opts: {
     };
   }
 
-  // Files path: create draft then bulk-import extracted text
+  // Files path: create draft then import structured extraction (same as OCR tool quality)
+  const structured = mapExtractedQuestionsToExamPayload(
+    Array.isArray(session.context.extracted_questions)
+      ? (session.context.extracted_questions as any[])
+      : [],
+  );
   const bulkText = session.context.extracted_bulk_text;
-  if (!bulkText) throw new Error('لا يوجد نص أسئلة مستخرج');
+  if (!structured.length && !bulkText) throw new Error('لا يوجد نص أسئلة مستخرج');
 
   if (examType === 'comprehensive') {
     if (!opts.courseId) throw new Error('course_id مطلوب');
@@ -480,7 +644,7 @@ export async function createDraftExamFromWorkflow(opts: {
         title,
         courseId: opts.courseId,
         durationMinutes: opts.durationMinutes ?? session.context.duration_minutes ?? 30,
-        questionsCount: session.context.extracted_question_count || 1,
+        questionsCount: structured.length || session.context.extracted_question_count || 1,
         isVisibleToStudents: false,
         visibilityEndDate: null,
         showAnswersImmediately: true,
@@ -489,28 +653,36 @@ export async function createDraftExamFromWorkflow(opts: {
       },
     );
     const examId = Number(exam.id);
-    // Prefer lecture bulk parser via course exam APIs when available
     const { CourseLevelExamQuestionsService } = await import(
       '../../../../services/courseLevelExamQuestions.js'
     );
-    const parsed = CourseLevelExamQuestionsService.parseBulkQuestionText(bulkText);
     let imported = 0;
-    if (parsed.length) {
+    const payload =
+      structured.length > 0
+        ? structured
+        : CourseLevelExamQuestionsService.parseBulkQuestionText(String(bulkText || '')).map(
+            (p: any) => ({
+              questionText: p.questionText,
+              optionA: p.optionA,
+              optionB: p.optionB,
+              optionC: p.optionC,
+              optionD: p.optionD,
+              correctAnswer: (p.correctAnswer || 'A') as 'A' | 'B' | 'C' | 'D',
+              questionImage: null,
+              passageText: null,
+              passageTitle: null,
+            }),
+          );
+    if (payload.length) {
       try {
         const created = await CourseLevelExamQuestionsService.createTextQuestionsBulk(
           { id: session.teacher_id, role: 'teacher' },
           examId,
-          parsed.map((p: any) => ({
-            questionText: p.questionText,
-            optionA: p.optionA,
-            optionB: p.optionB,
-            optionC: p.optionC,
-            optionD: p.optionD,
-            correctAnswer: (p.correctAnswer || 'A') as 'A' | 'B' | 'C' | 'D',
-          })),
+          payload,
         );
-        imported = Array.isArray(created) ? created.length : parsed.length;
-      } catch {
+        imported = Array.isArray(created) ? created.length : payload.length;
+      } catch (err: any) {
+        console.error('course exam import from extraction failed:', err?.message || err);
         imported = 0;
       }
     }
@@ -530,8 +702,8 @@ export async function createDraftExamFromWorkflow(opts: {
     return {
       reply: [
         'تم إنشاء مسودة الامتحان الشامل من الملفات ✅',
-        `الأسئلة المستخرجة: ${session.context.extracted_question_count || parsed.length}`,
-        imported > 0 ? `تم استيراد ${imported} سؤال تلقائياً.` : 'راجع الأسئلة على المنصة وأكمل الاستيراد إن لزم.',
+        `الأسئلة المستخرجة: ${session.context.extracted_question_count || payload.length}`,
+        imported > 0 ? `تم استيراد ${imported} سؤال تلقائياً (مع الصور إن وُجدت).` : 'راجع الأسئلة على المنصة وأكمل الاستيراد إن لزم.',
         `رابط المراجعة: ${reviewUrl}`,
         '',
         'بعد المراجعة ابعت «انشر» عشان يظهر للطلاب.',
@@ -553,12 +725,23 @@ export async function createDraftExamFromWorkflow(opts: {
   const { CourseLevelExamQuestionsService } = await import(
     '../../../../services/courseLevelExamQuestions.js'
   );
-  const parsed = CourseLevelExamQuestionsService.parseBulkQuestionText(bulkText);
-  if (parsed.length) {
+  const lecturePayload =
+    structured.length > 0
+      ? structured
+      : CourseLevelExamQuestionsService.parseBulkQuestionText(String(bulkText || ''));
+  if (lecturePayload.length) {
     await QuestionsManagementService.createBulkQuestionsForLectureExamFromParsed(
       examId,
       session.teacher_id,
-      parsed,
+      lecturePayload.map((p: any) => ({
+        questionText: p.questionText,
+        optionA: p.optionA,
+        optionB: p.optionB,
+        optionC: p.optionC,
+        optionD: p.optionD,
+        correctAnswer: (p.correctAnswer || 'A') as 'A' | 'B' | 'C' | 'D',
+        questionImage: p.questionImage ?? null,
+      })),
     );
   }
   const reviewUrl = buildLectureExamReviewUrl(examId);
@@ -577,7 +760,7 @@ export async function createDraftExamFromWorkflow(opts: {
   return {
     reply: [
       `تم إنشاء مسودة ${examType === 'assignment' ? 'الواجب' : 'الامتحان'} من الملفات ✅`,
-      `عدد الأسئلة المضافة تقريباً: ${parsed.length || session.context.extracted_question_count || 0}`,
+      `عدد الأسئلة المضافة تقريباً: ${lecturePayload.length || session.context.extracted_question_count || 0}`,
       `راجع من: ${reviewUrl}`,
       '',
       'لو كله تمام ابعت «انشر».',

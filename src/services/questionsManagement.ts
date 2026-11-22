@@ -188,6 +188,8 @@ export class QuestionsManagementService {
       optionC: string;
       optionD: string;
       correctAnswer: 'A' | 'B' | 'C' | 'D';
+      questionImage?: string | null;
+      image?: string | null;
     }>,
   ) {
     const examCheck = await pool.query(
@@ -236,9 +238,16 @@ export class QuestionsManagementService {
         );
       }
 
+      const rawImage = (q as any).questionImage ?? (q as any).image ?? null;
+      const questionImage =
+        typeof rawImage === 'string' && rawImage.trim() && rawImage !== 'null'
+          ? rawImage.trim()
+          : null;
+
       const examQuestionResult = await pool.query(
-        `INSERT INTO exam_questions (exam_id, question_text, grade, question_id) VALUES ($1, $2, 1, $3) RETURNING id`,
-        [examId, questionText, questionId],
+        `INSERT INTO exam_questions (exam_id, question_text, grade, question_id, image)
+         VALUES ($1, $2, 1, $3, $4) RETURNING id`,
+        [examId, questionText, questionId, questionImage],
       );
       const examQuestionId = examQuestionResult.rows[0].id;
 

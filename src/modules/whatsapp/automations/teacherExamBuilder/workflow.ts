@@ -42,6 +42,7 @@ import {
   finishFilesWithGuidedContext,
   handleAskCourse,
   handleAskExamSettings,
+  handleAskExamTitle,
   handleAskGrade,
   handleAskLecture,
   handleAskSource,
@@ -525,6 +526,14 @@ export async function runExamAssistantWorkflow(
         });
       }
 
+      case 'ASK_EXAM_TITLE': {
+        const result = await handleAskExamTitle(session, teacherId, text);
+        return finish(result.session, text, result.reply, {
+          action: 'ask_exam_title',
+          choices: result.choices,
+        });
+      }
+
       case 'CHECK_TEACHER_TASK': {
         if (isAffirmative(text)) {
           const lessonHint = session.context.scheduled_task_title || session.context.lesson_name || '';
@@ -593,6 +602,21 @@ export async function runExamAssistantWorkflow(
         }
         if (!chosen) {
           return finish(session, text, 'مش لاقي الدرس. اكتب الاسم بشكل أوضح أو رقم من القائمة.');
+        }
+        if (!session.context.exam_title) {
+          session = await ExamAssistantSessionStore.update(session.id, teacherId, {
+            state: 'ASK_EXAM_TITLE',
+            context: {
+              ...session.context,
+              lesson_id: chosen.id,
+              lesson_name: chosen.name,
+            },
+          });
+          return finish(
+            session,
+            text,
+            `تمام، درس *${chosen.name}*.\nاكتب *اسم الامتحان* (العنوان اللي هيظهر للطلاب).`,
+          );
         }
         session = await ExamAssistantSessionStore.update(session.id, teacherId, {
           state: 'ASK_EXAM_SETTINGS',

@@ -367,7 +367,16 @@ export async function addBulkTextToExam(opts: {
 }): Promise<{ reply: string; session: ExamAssistantSessionRow }> {
   const { session, examId, kind, bulkText } = opts;
   await assertTeacherOwnsExam(session.teacher_id, examId, kind);
-  const parsed = CourseLevelExamQuestionsService.parseBulkQuestionText(bulkText);
+  const { mapExtractedQuestionsToExamPayload } = await import('./workflowActions.js');
+  const structured = mapExtractedQuestionsToExamPayload(
+    Array.isArray(session.context.extracted_questions)
+      ? (session.context.extracted_questions as any[])
+      : [],
+  );
+  const parsed =
+    structured.length > 0
+      ? structured
+      : CourseLevelExamQuestionsService.parseBulkQuestionText(bulkText);
   if (!parsed.length) {
     return {
       reply: 'مقدرتش أحوّل النص المستخرج لأسئلة قابلة للإضافة.',
@@ -387,6 +396,9 @@ export async function addBulkTextToExam(opts: {
         optionC: p.optionC,
         optionD: p.optionD,
         correctAnswer: (p.correctAnswer || 'A') as 'A' | 'B' | 'C' | 'D',
+        questionImage: p.questionImage ?? null,
+        passageText: p.passageText ?? null,
+        passageTitle: p.passageTitle ?? null,
       })),
     );
     imported = Array.isArray(created) ? created.length : parsed.length;
@@ -394,7 +406,15 @@ export async function addBulkTextToExam(opts: {
     await QuestionsManagementService.createBulkQuestionsForLectureExamFromParsed(
       examId,
       session.teacher_id,
-      parsed,
+      parsed.map((p: any) => ({
+        questionText: p.questionText,
+        optionA: p.optionA,
+        optionB: p.optionB,
+        optionC: p.optionC,
+        optionD: p.optionD,
+        correctAnswer: (p.correctAnswer || 'A') as 'A' | 'B' | 'C' | 'D',
+        questionImage: p.questionImage ?? null,
+      })),
     );
     imported = parsed.length;
   }

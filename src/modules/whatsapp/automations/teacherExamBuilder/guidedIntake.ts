@@ -167,13 +167,12 @@ export async function handleSelectExamTypeEarly(
 
   if (examType === 'comprehensive') {
     const updated = await ExamAssistantSessionStore.update(session.id, teacherId, {
-      state: 'ASK_EXAM_SETTINGS',
+      state: 'ASK_EXAM_TITLE',
       context: { ...session.context, exam_type: examType },
     });
     return {
       session: updated,
-      reply:
-        'تمام، امتحان شامل.\nقولّي الإعدادات: كام سؤال؟ ومدة الامتحان كام دقيقة؟\nمثال: 20 سؤال، 40 دقيقة',
+      reply: 'تمام، امتحان شامل.\nاكتب *اسم الامتحان* (العنوان اللي هيظهر للطلاب).',
     };
   }
 
@@ -234,7 +233,7 @@ export async function handleAskLecture(
   }
 
   const updated = await ExamAssistantSessionStore.update(session.id, teacherId, {
-    state: 'ASK_EXAM_SETTINGS',
+    state: 'ASK_EXAM_TITLE',
     context: {
       ...session.context,
       target_lecture_id: chosen.id,
@@ -244,7 +243,29 @@ export async function handleAskLecture(
 
   return {
     session: updated,
-    reply: `محاضرة *${chosen.name || chosen.title}* ✅\nقولّي الإعدادات: كام سؤال؟ ومدة الامتحان كام دقيقة؟\nمثال: 15 سؤال، 30 دقيقة`,
+    reply: `محاضرة *${chosen.name || chosen.title}* ✅\nاكتب *اسم الامتحان* (العنوان اللي هيظهر للطلاب).`,
+  };
+}
+
+export async function handleAskExamTitle(
+  session: ExamAssistantSessionRow,
+  teacherId: number,
+  text: string,
+): Promise<{ reply: string; session: ExamAssistantSessionRow; choices?: string[] }> {
+  const title = text.trim().replace(/^["«]|["»]$/g, '').slice(0, 200);
+  if (title.length < 2) {
+    return {
+      session,
+      reply: 'اكتب اسم أوضح للامتحان، مثال: امتحان أولى ثانوي — الباب الأول',
+    };
+  }
+  const updated = await ExamAssistantSessionStore.update(session.id, teacherId, {
+    state: 'ASK_EXAM_SETTINGS',
+    context: { ...session.context, exam_title: title },
+  });
+  return {
+    session: updated,
+    reply: `اسم الامتحان: *${title}* ✅\nقولّي الإعدادات: كام سؤال؟ ومدة الامتحان كام دقيقة؟\nمثال: 15 سؤال، 30 دقيقة`,
   };
 }
 

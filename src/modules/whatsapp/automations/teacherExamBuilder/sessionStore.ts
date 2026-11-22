@@ -288,6 +288,16 @@ export class ExamAssistantSessionStore {
     };
   }
 
+  static async cancelFailedForTeacher(teacherId: number): Promise<number> {
+    const res = await pool.query(
+      `UPDATE wa_exam_assistant_sessions
+       SET status = 'cancelled', state = 'CANCELLED', updated_at = NOW()
+       WHERE teacher_id = $1 AND status = 'failed'`,
+      [teacherId],
+    );
+    return res.rowCount || 0;
+  }
+
   static async adminCancel(sessionId: number) {
     const res = await pool.query(
       `UPDATE wa_exam_assistant_sessions
