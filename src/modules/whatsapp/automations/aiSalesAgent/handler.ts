@@ -62,14 +62,33 @@ async function onInbound(ctx: InboundContext): Promise<HandlerResult> {
     };
   }
 
-  if (salesSession.status !== 'active') {
+  // paused/archived stay silent; error is treated as recoverable and re-activated
+  if (salesSession.status === 'paused' || salesSession.status === 'archived') {
     return { handled: true, metadata: { skipped: true, reason: 'session_not_active' } };
+  }
+  if (salesSession.status === 'draft') {
+    return {
+      handled: true,
+      reply: 'جلسة المبيعات لسه مسودة. من لوحة التحكم اضغط «تشغيل» بعد ربط الرقم.',
+      metadata: { skipped: true, reason: 'session_draft' },
+    };
+  }
+  if (salesSession.status === 'error') {
+    await SalesAgentSessionStore.setStatus(salesSession.id, 'active', null).catch(() => undefined);
+    salesSession.status = 'active';
   }
 
   try {
     const result = await runSalesAgent({ ctx, session: salesSession });
     if (result.metadata?.skipped && !result.reply) {
       return { handled: true, metadata: result.metadata };
+    }
+
+    // Clear previous last_error after a successful reply
+    if (result.reply && salesSession.last_error) {
+      await SalesAgentSessionStore.update(salesSession.id, { last_error: null }).catch(
+        () => undefined,
+      );
     }
 
     if (result.escalate && ctx.conversation?.id) {
@@ -85,16 +104,19 @@ async function onInbound(ctx: InboundContext): Promise<HandlerResult> {
       metadata: result.metadata,
     };
   } catch (err) {
-    logger.error({ err, sessionSlug: ctx.sessionSlug }, 'sales agent handler failed');
-    await SalesAgentSessionStore.setStatus(
-      salesSession.id,
-      'error',
-      err instanceof Error ? err.message.slice(0, 300) : 'handler_error',
-    ).catch(() => undefined);
+    const message = err instanceof Error ? err.message : String(err);
+    logger.error(
+      { err, sessionSlug: ctx.sessionSlug, salesSessionId: salesSession.id, message },
+      'sales agent handler failed',
+    );
+    // Keep session active — only store the error for the admin UI
+    await SalesAgentSessionStore.update(salesSession.id, {
+      last_error: message.slice(0, 500),
+    }).catch(() => undefined);
     return {
       handled: true,
       reply: 'حاضر، ثانية واحدة… حصل خطأ بسيط. جرّب تبعت تاني ولو استمرت المشكلة فريقنا هيتابع.',
-      metadata: { error: true },
+      metadata: { error: true, last_error: message.slice(0, 300) },
     };
   }
 }

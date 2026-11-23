@@ -2,6 +2,7 @@ import { config, logger } from '../../../../utils';
 import type { InboundContext } from '../types';
 import { SalesKnowledgeStore } from './knowledgeStore';
 import { SalesLeadStore } from './leadStore';
+import { SalesAgentSessionStore } from './sessionStore';
 import type { SalesAgentSessionRow, SalesLeadRow } from './types';
 import { executeSalesTool, filterToolDefinitions } from './tools';
 import pool from '../../../../db/pool';
@@ -149,6 +150,7 @@ async function callDeepSeek(
   if (!config.DEEPSEEK_API_KEY) throw new Error('DEEPSEEK_API_KEY is required');
 
   const payload: Record<string, unknown> = {
+    // Tool-calling path needs a chat model that supports tools (same as technical support)
     model: 'deepseek-chat',
     messages,
     temperature: 0.45,
@@ -159,23 +161,46 @@ async function callDeepSeek(
     payload.tool_choice = 'auto';
   }
 
-  const response = await fetch(DEEPSEEK_URL, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${config.DEEPSEEK_API_KEY}`,
-    },
-    body: JSON.stringify(payload),
-  });
-  if (!response.ok) {
-    const errText = await response.text().catch(() => '');
-    throw new Error(`DeepSeek error ${response.status}: ${errText.slice(0, 400)}`);
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const response = await fetch(DEEPSEEK_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${config.DEEPSEEK_API_KEY}`,
+        },
+        body: JSON.stringify(payload),
+      });
+      if (!response.ok) {
+        const errText = await response.text().catch(() => '');
+        const msg = `DeepSeek error ${response.status}: ${errText.slice(0, 400)}`;
+        if ((response.status >= 500 || response.status === 429) && attempt < 3) {
+          await new Promise((r) => setTimeout(r, attempt * 600));
+          lastError = new Error(msg);
+          continue;
+        }
+        throw new Error(msg);
+      }
+      const data = (await response.json()) as {
+        choices?: Array<{ message?: { content?: string | null; tool_calls?: ToolCall[] } }>;
+      };
+      const message = data.choices?.[0]?.message;
+      return { content: message?.content ?? null, tool_calls: message?.tool_calls };
+    } catch (err) {
+      lastError = err;
+      const msg = err instanceof Error ? err.message : String(err);
+      const transient =
+        msg.includes('fetch failed') ||
+        msg.includes('ECONNRESET') ||
+        msg.includes('ETIMEDOUT') ||
+        msg.includes('other side closed');
+      if (!transient || attempt >= 3) break;
+      logger.warn({ attempt, err: msg }, 'sales DeepSeek call failed; retrying');
+      await new Promise((r) => setTimeout(r, attempt * 600));
+    }
   }
-  const data = (await response.json()) as {
-    choices?: Array<{ message?: { content?: string | null; tool_calls?: ToolCall[] } }>;
-  };
-  const message = data.choices?.[0]?.message;
-  return { content: message?.content ?? null, tool_calls: message?.tool_calls };
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
 }
 
 function extractReferral(ctx: InboundContext): Record<string, unknown> {
@@ -204,140 +229,172 @@ export async function runSalesAgent(opts: {
   const phone = ctx.fromPhone;
   const conversationId = ctx.conversation?.id ?? null;
 
-  let lead = await SalesLeadStore.upsertFromInbound({
-    sessionId: session.id,
-    phone,
-    conversationId,
-    contactName:
-      (typeof ctx.metadata?.push_name === 'string' && ctx.metadata.push_name) ||
-      (typeof ctx.metadata?.notify_name === 'string' && ctx.metadata.notify_name) ||
-      null,
-    referral: extractReferral(ctx),
-  });
-
-  if (!lead.ai_enabled) {
-    return {
-      reply: '',
-      escalate: false,
-      metadata: { skipped: true, reason: 'ai_disabled_for_lead' },
-    };
-  }
-
-  if (session.status === 'paused') {
-    return {
-      reply: '',
-      escalate: false,
-      metadata: { skipped: true, reason: 'session_paused' },
-    };
-  }
-
-  const userText = (opts.userText ?? ctx.body ?? '').trim();
-  const kbBrief = await SalesKnowledgeStore.buildContextBrief(session.id);
-  const tools = filterToolDefinitions(session);
-  const history = await loadHistory(conversationId);
-
-  const messages: ChatMessage[] = [
-    { role: 'system', content: buildSystemPrompt(session, lead, kbBrief) },
-    ...history,
-  ];
-  if (userText) {
-    messages.push({ role: 'user', content: userText });
-  } else if (ctx.mediaError) {
-    messages.push({
-      role: 'user',
-      content: `تعذر استلام مرفق من العميل: ${ctx.mediaError}. اطلب إعادة الإرسال بلطف.`,
-    });
-  } else {
-    messages.push({ role: 'user', content: '(رسالة بدون نص — رحّب باختصار واسأل كيف تساعد)' });
-  }
-
-  let escalate = false;
-  let finalReply = '';
-  let mediaUrlsToSend: string[] = [];
-
   try {
-    for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
-      const result = await callDeepSeek(messages, tools);
-      if (result.tool_calls?.length) {
-        messages.push({
-          role: 'assistant',
-          content: result.content,
-          tool_calls: result.tool_calls,
-        });
-        for (const call of result.tool_calls) {
-          const args = parseToolArgs(call.function.arguments);
-          const freshLead = (await SalesLeadStore.getById(lead.id, session.id)) || lead;
-          const toolResult = await executeSalesTool(call.function.name, args, {
-            session,
-            lead: freshLead,
-            conversationId,
-          });
-          if (toolResult.escalate) escalate = true;
-          if (typeof toolResult.data.message_to_include === 'string') {
-            mediaUrlsToSend.push(String(toolResult.data.message_to_include));
-          }
-          if (toolResult.data.url && call.function.name.startsWith('send_')) {
-            // keep url visible in tool output for the model
-          }
-          lead = (await SalesLeadStore.getById(lead.id, session.id)) || lead;
+    let lead = await SalesLeadStore.upsertFromInbound({
+      sessionId: session.id,
+      phone,
+      conversationId,
+      contactName:
+        (typeof ctx.metadata?.push_name === 'string' && ctx.metadata.push_name) ||
+        (typeof ctx.metadata?.notify_name === 'string' && ctx.metadata.notify_name) ||
+        null,
+      referral: extractReferral(ctx),
+    });
+
+    if (!lead.ai_enabled) {
+      return {
+        reply: '',
+        escalate: false,
+        metadata: { skipped: true, reason: 'ai_disabled_for_lead' },
+      };
+    }
+
+    if (session.status === 'paused') {
+      return {
+        reply: '',
+        escalate: false,
+        metadata: { skipped: true, reason: 'session_paused' },
+      };
+    }
+
+    const userText = (opts.userText ?? ctx.body ?? '').trim();
+    const kbBrief = await SalesKnowledgeStore.buildContextBrief(session.id);
+    const tools = filterToolDefinitions(session);
+    const history = await loadHistory(conversationId);
+
+    const messages: ChatMessage[] = [
+      { role: 'system', content: buildSystemPrompt(session, lead, kbBrief) },
+      ...history,
+    ];
+    if (userText) {
+      messages.push({ role: 'user', content: userText });
+    } else if (ctx.mediaError) {
+      messages.push({
+        role: 'user',
+        content: `تعذر استلام مرفق من العميل: ${ctx.mediaError}. اطلب إعادة الإرسال بلطف.`,
+      });
+    } else {
+      messages.push({
+        role: 'user',
+        content: '(رسالة بدون نص — رحّب باختصار واسأل كيف تساعد)',
+      });
+    }
+
+    let escalate = false;
+    let finalReply = '';
+    let mediaUrlsToSend: string[] = [];
+    let llmError: string | null = null;
+
+    try {
+      for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+        const result = await callDeepSeek(messages, tools);
+        if (result.tool_calls?.length) {
           messages.push({
-            role: 'tool',
-            tool_call_id: call.id,
-            name: call.function.name,
-            content: JSON.stringify(toolResult),
+            role: 'assistant',
+            content: result.content ?? '',
+            tool_calls: result.tool_calls,
           });
+          for (const call of result.tool_calls) {
+            const fnName = call?.function?.name || 'unknown';
+            const args = parseToolArgs(call?.function?.arguments || '{}');
+            const freshLead = (await SalesLeadStore.getById(lead.id, session.id)) || lead;
+            let toolResult: Awaited<ReturnType<typeof executeSalesTool>>;
+            try {
+              toolResult = await executeSalesTool(fnName, args, {
+                session,
+                lead: freshLead,
+                conversationId,
+              });
+            } catch (toolErr) {
+              toolResult = {
+                ok: false,
+                data: {
+                  error: toolErr instanceof Error ? toolErr.message : String(toolErr),
+                },
+              };
+            }
+            if (toolResult.escalate) escalate = true;
+            if (typeof toolResult.data.message_to_include === 'string') {
+              mediaUrlsToSend.push(String(toolResult.data.message_to_include));
+            }
+            lead = (await SalesLeadStore.getById(lead.id, session.id)) || lead;
+            messages.push({
+              role: 'tool',
+              tool_call_id: call.id,
+              name: fnName,
+              content: JSON.stringify(toolResult),
+            });
+          }
+          continue;
         }
-        continue;
+        finalReply = (result.content || '').trim();
+        break;
       }
-      finalReply = (result.content || '').trim();
-      break;
+    } catch (err) {
+      llmError = err instanceof Error ? err.message : String(err);
+      logger.error(
+        { err, sessionId: session.id, leadId: lead.id, llmError },
+        'sales agent LLM failed',
+      );
+      finalReply =
+        'حاضر، دقيقة لو سمحت… حصل تأخير بسيط. ابعتلي تاني طلبك وأنا معاك على طول.';
     }
+
+    if (!finalReply && mediaUrlsToSend.length) {
+      finalReply = mediaUrlsToSend.join('\n');
+    } else if (finalReply && mediaUrlsToSend.length) {
+      for (const extra of mediaUrlsToSend) {
+        if (!finalReply.includes(extra)) finalReply = `${finalReply}\n${extra}`;
+      }
+    }
+
+    if (!finalReply && escalate) {
+      finalReply = 'تمام، هحوّلك لحد من فريقنا يتابع معاك.';
+    }
+
+    if (!finalReply && !escalate) {
+      return {
+        reply: '',
+        escalate: false,
+        metadata: { skipped: true, reason: 'empty_reply', llm_error: llmError },
+      };
+    }
+
+    if (userText && finalReply) {
+      const summaryBits = [
+        lead.context_summary || '',
+        `آخر رسالة عميل: ${userText.slice(0, 160)}`,
+        `آخر رد: ${finalReply.slice(0, 160)}`,
+      ]
+        .filter(Boolean)
+        .join('\n')
+        .slice(0, 1800);
+      await SalesLeadStore.update(lead.id, session.id, {
+        context_summary: summaryBits,
+        last_contact_at: new Date().toISOString(),
+        stage: lead.stage === 'new' ? 'contacted' : lead.stage,
+      }).catch(() => undefined);
+    }
+
+    if (llmError) {
+      await SalesAgentSessionStore.update(session.id, {
+        last_error: llmError.slice(0, 500),
+      }).catch(() => undefined);
+    }
+
+    return {
+      reply: finalReply,
+      escalate,
+      metadata: {
+        sales_session_id: session.id,
+        lead_id: lead.id,
+        stage: lead.stage,
+        ...(llmError ? { llm_error: llmError.slice(0, 300) } : {}),
+      },
+    };
   } catch (err) {
-    logger.error({ err, sessionId: session.id, leadId: lead.id }, 'sales agent failed');
-    finalReply =
-      'حاضر، دقيقة لو سمحت… حصل تأخير بسيط. ابعتلي تاني طلبك وأنا معاك على طول.';
+    // Ensure unexpected DB/setup errors still surface a reply via handler
+    logger.error({ err, sessionId: session.id }, 'sales agent run failed');
+    throw err;
   }
-
-  if (!finalReply && mediaUrlsToSend.length) {
-    finalReply = mediaUrlsToSend.join('\n');
-  } else if (finalReply && mediaUrlsToSend.length) {
-    for (const extra of mediaUrlsToSend) {
-      if (!finalReply.includes(extra)) finalReply = `${finalReply}\n${extra}`;
-    }
-  }
-
-  if (!finalReply && escalate) {
-    finalReply = 'تمام، هحوّلك لحد من فريقنا يتابع معاك.';
-  }
-
-  if (!finalReply && !escalate) {
-    return { reply: '', escalate: false, metadata: { skipped: true, reason: 'empty_reply' } };
-  }
-
-  // Refresh rolling summary lightly when conversation grows
-  if (userText && finalReply) {
-    const summaryBits = [
-      lead.context_summary || '',
-      `آخر رسالة عميل: ${userText.slice(0, 160)}`,
-      `آخر رد: ${finalReply.slice(0, 160)}`,
-    ]
-      .filter(Boolean)
-      .join('\n')
-      .slice(0, 1800);
-    await SalesLeadStore.update(lead.id, session.id, {
-      context_summary: summaryBits,
-      last_contact_at: new Date().toISOString(),
-      stage: lead.stage === 'new' ? 'contacted' : lead.stage,
-    }).catch(() => undefined);
-  }
-
-  return {
-    reply: finalReply,
-    escalate,
-    metadata: {
-      sales_session_id: session.id,
-      lead_id: lead.id,
-      stage: lead.stage,
-    },
-  };
 }
