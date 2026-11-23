@@ -1,6 +1,7 @@
 import { config, logger } from '../../../../utils';
 import type { InboundContext } from '../types';
 import { SalesKnowledgeStore } from './knowledgeStore';
+import { applyLeadClassification } from './leadClassification';
 import { SalesLeadStore } from './leadStore';
 import { SalesAgentSessionStore } from './sessionStore';
 import type { SalesAgentSessionRow, SalesLeadRow } from './types';
@@ -96,7 +97,10 @@ function buildSystemPrompt(
     `## مقتطف من قاعدة المعرفة (هذه الجلسة فقط)`,
     kbBrief,
     '',
-    'بعد كل محادثة مهمة استخدم update_lead لتحديث الملخص والاحتياجات، واستخدم create_followup لو العميل هيتأخر.',
+    'بعد كل رد مهم: استدعِ update_lead (احتياج/ميزانية/ملخص/interest_score) و set_lead_stage حسب الواقع.',
+    'interest_score: 0-20 بارد، 21-50 مهتم مبدئي، 51-75 مؤهل، 76-100 جاهز للشراء/تجربة.',
+    'لو العميل محتاج تدخل بشري أو تفاوض خاص أو معلومة ناقصة: escalate_human مع استمرار مساعدتك.',
+    'استخدم create_followup لو العميل هيتأخر أو قال هفكر.',
   ]
     .filter(Boolean)
     .join('\n');
@@ -295,6 +299,7 @@ export async function runSalesAgent(opts: {
     let finalReply = '';
     let mediaUrlsToSend: string[] = [];
     let llmError: string | null = null;
+    const toolsUsed: string[] = [];
 
     try {
       for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
@@ -307,6 +312,7 @@ export async function runSalesAgent(opts: {
           });
           for (const call of result.tool_calls) {
             const fnName = call?.function?.name || 'unknown';
+            toolsUsed.push(fnName);
             const args = parseToolArgs(call?.function?.arguments || '{}');
             const freshLead = (await SalesLeadStore.getById(lead.id, session.id)) || lead;
             let toolResult: Awaited<ReturnType<typeof executeSalesTool>>;
@@ -383,8 +389,23 @@ export async function runSalesAgent(opts: {
       await SalesLeadStore.update(lead.id, session.id, {
         context_summary: summaryBits,
         last_contact_at: new Date().toISOString(),
-        stage: lead.stage === 'new' ? 'contacted' : lead.stage,
       }).catch(() => undefined);
+
+      lead = await applyLeadClassification({
+        lead: (await SalesLeadStore.getById(lead.id, session.id)) || lead,
+        sessionId: session.id,
+        userText,
+        escalate,
+        toolsUsed,
+      });
+    } else if (escalate) {
+      lead = await applyLeadClassification({
+        lead,
+        sessionId: session.id,
+        userText: userText || '',
+        escalate: true,
+        toolsUsed,
+      });
     }
 
     if (llmError) {
@@ -400,6 +421,8 @@ export async function runSalesAgent(opts: {
         sales_session_id: session.id,
         lead_id: lead.id,
         stage: lead.stage,
+        interest_score: lead.interest_score,
+        needs_human: Boolean(lead.memory?.needs_human),
         ...(llmError ? { llm_error: llmError.slice(0, 300) } : {}),
       },
     };

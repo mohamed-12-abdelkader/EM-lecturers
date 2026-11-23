@@ -107,12 +107,14 @@ export class SalesFollowupStore {
        JOIN wa_sales_leads l ON l.id = f.lead_id
        JOIN wa_sales_agent_sessions s ON s.id = f.session_id
        LEFT JOIN wa_services svc ON svc.key = 'ai_sales_agent'
+       LEFT JOIN wa_conversations c ON c.id = l.conversation_id
        WHERE f.status = 'pending'
          AND f.scheduled_at <= NOW()
          AND s.status = 'active'
          AND l.status = 'open'
          AND l.followups_stopped = FALSE
          AND l.ai_enabled = TRUE
+         AND (c.id IS NULL OR c.status = 'bot' OR c.status = 'waiting_human')
        ORDER BY f.scheduled_at ASC
        LIMIT $1`,
       [Math.min(50, Math.max(1, limit))],

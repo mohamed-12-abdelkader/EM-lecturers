@@ -347,6 +347,13 @@ export async function executeSalesTool(
       await SalesLeadStore.update(lead.id, session.id, {
         ai_enabled: true,
         last_action: 'escalate_human',
+        interest_score: Math.max(Number(lead.interest_score || 0), 60),
+        memory: {
+          ...(lead.memory || {}),
+          needs_human: true,
+          human_requested_at: new Date().toISOString(),
+          human_request_reason: args.reason || null,
+        },
         ai_notes: [
           lead.ai_notes || '',
           `${new Date().toISOString().slice(0, 16)}: طلب تحويل لفريق بشري${

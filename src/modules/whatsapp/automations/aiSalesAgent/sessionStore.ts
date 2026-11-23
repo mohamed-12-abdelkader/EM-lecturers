@@ -327,8 +327,25 @@ export class SalesAgentSessionStore {
         `SELECT
            COUNT(*)::int AS total_leads,
            COUNT(*) FILTER (WHERE status = 'open')::int AS open_leads,
-           COUNT(*) FILTER (WHERE stage = 'interested')::int AS interested,
+           COUNT(*) FILTER (
+             WHERE status = 'open'
+               AND stage NOT IN ('won','lost','not_interested')
+           )::int AS potential,
+           COUNT(*) FILTER (
+             WHERE status = 'open'
+               AND (
+                 interest_score >= 40
+                 OR stage IN ('interested','qualified','demo_requested','demo_completed','negotiation','follow_up')
+               )
+           )::int AS interested,
            COUNT(*) FILTER (WHERE stage IN ('qualified','demo_requested','demo_completed','negotiation'))::int AS qualified,
+           COUNT(*) FILTER (
+             WHERE status = 'open'
+               AND (
+                 last_action IN ('escalate_human','needs_human')
+                 OR COALESCE((memory->>'needs_human')::boolean, FALSE) = TRUE
+               )
+           )::int AS needs_human,
            COUNT(*) FILTER (WHERE status = 'won' OR stage = 'won')::int AS won,
            COUNT(*) FILTER (WHERE next_followup_at IS NOT NULL AND next_followup_at <= NOW() AND followups_stopped = FALSE AND status = 'open')::int AS followups_due
          FROM wa_sales_leads`,
@@ -355,8 +372,25 @@ export class SalesAgentSessionStore {
       `SELECT
          COUNT(*)::int AS total_leads,
          COUNT(*) FILTER (WHERE status = 'open')::int AS open_leads,
-         COUNT(*) FILTER (WHERE stage = 'interested')::int AS interested,
+         COUNT(*) FILTER (
+           WHERE status = 'open'
+             AND stage NOT IN ('won','lost','not_interested')
+         )::int AS potential,
+         COUNT(*) FILTER (
+           WHERE status = 'open'
+             AND (
+               interest_score >= 40
+               OR stage IN ('interested','qualified','demo_requested','demo_completed','negotiation','follow_up')
+             )
+         )::int AS interested,
          COUNT(*) FILTER (WHERE stage IN ('qualified','demo_requested','demo_completed','negotiation'))::int AS qualified,
+         COUNT(*) FILTER (
+           WHERE status = 'open'
+             AND (
+               last_action IN ('escalate_human','needs_human')
+               OR COALESCE((memory->>'needs_human')::boolean, FALSE) = TRUE
+             )
+         )::int AS needs_human,
          COUNT(*) FILTER (WHERE status = 'won' OR stage = 'won')::int AS won,
          COUNT(*) FILTER (WHERE status = 'lost' OR stage IN ('lost','not_interested'))::int AS lost,
          COUNT(*) FILTER (WHERE next_followup_at IS NOT NULL AND next_followup_at <= NOW() AND followups_stopped = FALSE AND status = 'open')::int AS followups_due,
