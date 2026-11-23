@@ -105,9 +105,9 @@ async function loadHistory(conversationId: number | null): Promise<ChatMessage[]
   if (!conversationId) return [];
   const [inbound, outbound] = await Promise.all([
     pool.query(
-      `SELECT body, created_at, metadata FROM wa_inbound_events
+      `SELECT body, processed_at, metadata FROM wa_inbound_events
        WHERE conversation_id = $1 AND body IS NOT NULL AND body <> ''
-       ORDER BY created_at DESC LIMIT 16`,
+       ORDER BY processed_at DESC LIMIT 16`,
       [conversationId],
     ),
     pool.query(
@@ -127,7 +127,7 @@ async function loadHistory(conversationId: number | null): Promise<ChatMessage[]
     rows.push({
       role: 'user',
       content: `${String(r.body || '')}${img}`.trim(),
-      at: new Date(r.created_at).getTime(),
+      at: new Date(r.processed_at).getTime(),
     });
   }
   for (const r of outbound.rows) {
