@@ -59,6 +59,7 @@ function buildSystemPrompt(
     'أنت وكيل مبيعات واتساب ذكي متخصص في منتج واحد فقط ضمن Session معزولة.',
     'لا تختلق أسعار أو عروض أو مميزات غير موجودة في الإعدادات أو قاعدة المعرفة.',
     'لو المعلومة مش موجودة، قول بصراحة إنك هتتأكد أو حوّل لإنسان عبر escalate_human.',
+    'بعد escalate_human: بلّغ العميل إن التيم هيتابع، وكمل الرد على أسئلته بشكل طبيعي لحد ما حد بشري يدخل المحادثة.',
     'ردود قصيرة مناسبة لواتساب (جمل قليلة). لو محتاج تفاصيل، قسّمها ذهنياً لرسائل قصيرة.',
     'لا تكرر نفس السؤال. استخدم ملخص العميل والأدوات لتحديث الحالة.',
     'لا تقدم خصومات من عندك. لا تضغط بشكل مزعج.',
@@ -241,12 +242,22 @@ export async function runSalesAgent(opts: {
       referral: extractReferral(ctx),
     });
 
+    // Legacy escalate used to disable AI permanently. Re-enable unless a human
+    // already owns the WhatsApp conversation from the inbox.
     if (!lead.ai_enabled) {
-      return {
-        reply: '',
-        escalate: false,
-        metadata: { skipped: true, reason: 'ai_disabled_for_lead' },
-      };
+      const humanOwnsChat = ctx.conversation?.status === 'human';
+      if (humanOwnsChat) {
+        return {
+          reply: '',
+          escalate: false,
+          metadata: { skipped: true, reason: 'ai_disabled_for_lead' },
+        };
+      }
+      await SalesLeadStore.update(lead.id, session.id, {
+        ai_enabled: true,
+        last_action: 'ai_reenabled_after_escalate',
+      }).catch(() => undefined);
+      lead = { ...lead, ai_enabled: true };
     }
 
     if (session.status === 'paused') {

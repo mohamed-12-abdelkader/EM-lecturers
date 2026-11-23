@@ -146,7 +146,8 @@ export const SALES_TOOL_DEFINITIONS = [
     type: 'function' as const,
     function: {
       name: 'escalate_human',
-      description: 'حوّل المحادثة لمسؤول بشري وأوقف ردود الـ AI مؤقتاً',
+      description:
+        'بلّغ فريق المبيعات للمتابعة البشرية. لا توقف الردود — كمل مساعدة العميل إلى أن يتدخل إنسان من لوحة التحكم',
       parameters: {
         type: 'object',
         properties: { reason: { type: 'string' } },
@@ -341,16 +342,27 @@ export async function executeSalesTool(
       return { ok: true, data: { won: true } };
     }
     case 'escalate_human': {
+      // Notify inbox (waiting_human) but keep AI enabled so the customer
+      // still gets answers until a human actually takes the chat.
       await SalesLeadStore.update(lead.id, session.id, {
-        ai_enabled: false,
+        ai_enabled: true,
         last_action: 'escalate_human',
+        ai_notes: [
+          lead.ai_notes || '',
+          `${new Date().toISOString().slice(0, 16)}: طلب تحويل لفريق بشري${
+            args.reason ? ` — ${String(args.reason)}` : ''
+          }`,
+        ]
+          .filter(Boolean)
+          .join('\n')
+          .slice(0, 4000),
       });
       await SalesLeadStore.logAction({
         sessionId: session.id,
         leadId: lead.id,
         conversationId: ctx.conversationId,
         actionType: 'escalate_human',
-        payload: { reason: args.reason || null },
+        payload: { reason: args.reason || null, ai_kept_active: true },
       });
       return {
         ok: true,
@@ -359,7 +371,7 @@ export async function executeSalesTool(
           escalated: true,
           reason: args.reason || null,
           user_message:
-            'تمام، هحوّلك لحد من فريقنا يتابع معاك. ممكن تكتب طلبك باختصار وأنا واصلهم.',
+            'تمام، بلّغت فريقنا وهيتابعوا معاك. ولو عندك أي سؤال كمان قولي وأنا معاك لحد ما حد من التيم يرد.',
         },
       };
     }

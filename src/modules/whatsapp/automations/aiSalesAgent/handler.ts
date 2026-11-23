@@ -28,10 +28,12 @@ function isVoiceOrAudioInbound(ctx: InboundContext): boolean {
 async function onInbound(ctx: InboundContext): Promise<HandlerResult> {
   if (!ctx.service?.is_enabled) return { handled: false };
 
-  if (ctx.conversation && ctx.conversation.status !== 'bot') {
+  // Only stop when a human actually owns the chat (inbox takeover).
+  // waiting_human = notified team, but AI should keep answering until then.
+  if (ctx.conversation && (ctx.conversation.status === 'human' || ctx.conversation.status === 'closed')) {
     logger.info(
       { conversationId: ctx.conversation.id, status: ctx.conversation.status },
-      'sales agent skipped (conversation not in bot mode)',
+      'sales agent skipped (human owns conversation)',
     );
     return { handled: true };
   }
@@ -91,12 +93,8 @@ async function onInbound(ctx: InboundContext): Promise<HandlerResult> {
       );
     }
 
-    if (result.escalate && ctx.conversation?.id) {
-      await SalesLeadStore.update(Number(result.metadata?.lead_id), salesSession.id, {
-        ai_enabled: false,
-      }).catch(() => undefined);
-    }
-
+    // escalate=true marks conversation waiting_human for the inbox,
+    // but we intentionally keep AI replies until a human takes over.
     return {
       handled: true,
       reply: result.reply || undefined,
