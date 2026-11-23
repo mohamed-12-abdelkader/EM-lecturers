@@ -22,6 +22,7 @@ import './modules/whatsapp/automations/teacherScientificSupport';
 import './modules/whatsapp/automations/teacherExamBuilder';
 import './modules/whatsapp/automations/parentsExamNotify';
 import './modules/whatsapp/automations/teachersManagement';
+import './modules/whatsapp/automations/aiSalesAgent';
 
 export const app = express();
 export const server = createServer(app);

@@ -195,6 +195,11 @@ const startServer = async () => {
     );
     startTeachersManagementSweeper();
 
+    const { startAiSalesFollowupSweeper } = await import(
+      './modules/whatsapp/automations/aiSalesAgent/index.js'
+    );
+    startAiSalesFollowupSweeper();
+
     const { startYoutubeUploadWorker } = await import('./workers/youtubeUploadWorker.js');
     startYoutubeUploadWorker();
 

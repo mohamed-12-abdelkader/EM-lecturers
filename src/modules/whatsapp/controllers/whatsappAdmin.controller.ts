@@ -804,3 +804,200 @@ whatsappAdminRouter.get(
     res.json({ success: true, data });
   }),
 );
+
+// ─── AI Sales Agent ─────────────────────────────────────────────────────────
+const salesKbUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 25 * 1024 * 1024 },
+});
+
+whatsappAdminRouter.get(
+  '/sales-agent/overview',
+  asyncWrapper(async (_req, res) => {
+    const { AiSalesAdminService } = await import('../automations/aiSalesAgent/adminService.js');
+    const data = await AiSalesAdminService.getOverview();
+    res.json({ success: true, data });
+  }),
+);
+
+whatsappAdminRouter.get(
+  '/sales-agent/sessions',
+  asyncWrapper(async (req, res) => {
+    const { AiSalesAdminService } = await import('../automations/aiSalesAgent/adminService.js');
+    const data = await AiSalesAdminService.listSessions({
+      status: typeof req.query.status === 'string' ? req.query.status : undefined,
+      search: typeof req.query.search === 'string' ? req.query.search : undefined,
+      limit: Number(req.query.limit) || 50,
+      offset: Number(req.query.offset) || 0,
+    });
+    res.json({ success: true, data });
+  }),
+);
+
+whatsappAdminRouter.post(
+  '/sales-agent/sessions',
+  asyncWrapper(async (req, res) => {
+    const { AiSalesAdminService } = await import('../automations/aiSalesAgent/adminService.js');
+    const data = await AiSalesAdminService.createSession(req.body, req.user?.id);
+    res.status(201).json({ success: true, data });
+  }),
+);
+
+whatsappAdminRouter.get(
+  '/sales-agent/sessions/:id',
+  asyncWrapper(async (req, res) => {
+    const id = Number(req.params.id);
+    if (!id) throw new HttpError(400, 'معرف الجلسة غير صحيح');
+    const { AiSalesAdminService } = await import('../automations/aiSalesAgent/adminService.js');
+    const data = await AiSalesAdminService.getSessionDashboard(id);
+    res.json({ success: true, data });
+  }),
+);
+
+whatsappAdminRouter.patch(
+  '/sales-agent/sessions/:id',
+  asyncWrapper(async (req, res) => {
+    const id = Number(req.params.id);
+    if (!id) throw new HttpError(400, 'معرف الجلسة غير صحيح');
+    const { AiSalesAdminService } = await import('../automations/aiSalesAgent/adminService.js');
+    const data = await AiSalesAdminService.updateSession(id, req.body);
+    res.json({ success: true, data });
+  }),
+);
+
+whatsappAdminRouter.post(
+  '/sales-agent/sessions/:id/status',
+  asyncWrapper(async (req, res) => {
+    const id = Number(req.params.id);
+    const status = String(req.body?.status || '');
+    if (!id) throw new HttpError(400, 'معرف الجلسة غير صحيح');
+    if (!['draft', 'active', 'paused', 'archived', 'error'].includes(status)) {
+      throw new HttpError(400, 'حالة غير صالحة');
+    }
+    const { AiSalesAdminService } = await import('../automations/aiSalesAgent/adminService.js');
+    const data = await AiSalesAdminService.setSessionStatus(id, status as any);
+    res.json({ success: true, data });
+  }),
+);
+
+whatsappAdminRouter.get(
+  '/sales-agent/sessions/:id/knowledge',
+  asyncWrapper(async (req, res) => {
+    const id = Number(req.params.id);
+    if (!id) throw new HttpError(400, 'معرف الجلسة غير صحيح');
+    const { AiSalesAdminService } = await import('../automations/aiSalesAgent/adminService.js');
+    const data = await AiSalesAdminService.listKnowledge(id);
+    res.json({ success: true, data });
+  }),
+);
+
+whatsappAdminRouter.post(
+  '/sales-agent/sessions/:id/knowledge',
+  asyncWrapper(async (req, res) => {
+    const id = Number(req.params.id);
+    if (!id) throw new HttpError(400, 'معرف الجلسة غير صحيح');
+    const { AiSalesAdminService } = await import('../automations/aiSalesAgent/adminService.js');
+    const data = await AiSalesAdminService.addKnowledge(id, req.body);
+    res.status(201).json({ success: true, data });
+  }),
+);
+
+whatsappAdminRouter.post(
+  '/sales-agent/sessions/:id/knowledge/upload',
+  salesKbUpload.single('file'),
+  asyncWrapper(async (req, res) => {
+    const id = Number(req.params.id);
+    if (!id) throw new HttpError(400, 'معرف الجلسة غير صحيح');
+    if (!req.file) throw new HttpError(400, 'الملف مطلوب');
+    const { AiSalesAdminService } = await import('../automations/aiSalesAgent/adminService.js');
+    const data = await AiSalesAdminService.uploadKnowledgeFile(id, req.file, {
+      title: typeof req.body?.title === 'string' ? req.body.title : undefined,
+      kind: typeof req.body?.kind === 'string' ? (req.body.kind as any) : undefined,
+    });
+    res.status(201).json({ success: true, data });
+  }),
+);
+
+whatsappAdminRouter.patch(
+  '/sales-agent/sessions/:id/knowledge/:docId',
+  asyncWrapper(async (req, res) => {
+    const id = Number(req.params.id);
+    const docId = Number(req.params.docId);
+    if (!id || !docId) throw new HttpError(400, 'معرف غير صحيح');
+    const { AiSalesAdminService } = await import('../automations/aiSalesAgent/adminService.js');
+    const data = await AiSalesAdminService.updateKnowledge(id, docId, req.body);
+    res.json({ success: true, data });
+  }),
+);
+
+whatsappAdminRouter.delete(
+  '/sales-agent/sessions/:id/knowledge/:docId',
+  asyncWrapper(async (req, res) => {
+    const id = Number(req.params.id);
+    const docId = Number(req.params.docId);
+    if (!id || !docId) throw new HttpError(400, 'معرف غير صحيح');
+    const { AiSalesAdminService } = await import('../automations/aiSalesAgent/adminService.js');
+    const data = await AiSalesAdminService.deleteKnowledge(id, docId);
+    res.json({ success: true, data });
+  }),
+);
+
+whatsappAdminRouter.get(
+  '/sales-agent/sessions/:id/leads',
+  asyncWrapper(async (req, res) => {
+    const id = Number(req.params.id);
+    if (!id) throw new HttpError(400, 'معرف الجلسة غير صحيح');
+    const { AiSalesAdminService } = await import('../automations/aiSalesAgent/adminService.js');
+    const data = await AiSalesAdminService.listLeads(id, req.query);
+    res.json({ success: true, data });
+  }),
+);
+
+whatsappAdminRouter.get(
+  '/sales-agent/sessions/:id/leads/:leadId',
+  asyncWrapper(async (req, res) => {
+    const id = Number(req.params.id);
+    const leadId = Number(req.params.leadId);
+    if (!id || !leadId) throw new HttpError(400, 'معرف غير صحيح');
+    const { AiSalesAdminService } = await import('../automations/aiSalesAgent/adminService.js');
+    const data = await AiSalesAdminService.getLead(id, leadId);
+    res.json({ success: true, data });
+  }),
+);
+
+whatsappAdminRouter.patch(
+  '/sales-agent/sessions/:id/leads/:leadId',
+  asyncWrapper(async (req, res) => {
+    const id = Number(req.params.id);
+    const leadId = Number(req.params.leadId);
+    if (!id || !leadId) throw new HttpError(400, 'معرف غير صحيح');
+    const { AiSalesAdminService } = await import('../automations/aiSalesAgent/adminService.js');
+    const data = await AiSalesAdminService.updateLead(id, leadId, req.body);
+    res.json({ success: true, data });
+  }),
+);
+
+whatsappAdminRouter.post(
+  '/sales-agent/sessions/:id/leads/:leadId/ai',
+  asyncWrapper(async (req, res) => {
+    const id = Number(req.params.id);
+    const leadId = Number(req.params.leadId);
+    if (!id || !leadId) throw new HttpError(400, 'معرف غير صحيح');
+    const enabled = req.body?.enabled !== false && req.body?.enabled !== 'false';
+    const { AiSalesAdminService } = await import('../automations/aiSalesAgent/adminService.js');
+    const data = await AiSalesAdminService.setLeadAi(id, leadId, Boolean(enabled));
+    res.json({ success: true, data });
+  }),
+);
+
+whatsappAdminRouter.post(
+  '/sales-agent/sessions/:id/leads/:leadId/followups',
+  asyncWrapper(async (req, res) => {
+    const id = Number(req.params.id);
+    const leadId = Number(req.params.leadId);
+    if (!id || !leadId) throw new HttpError(400, 'معرف غير صحيح');
+    const { AiSalesAdminService } = await import('../automations/aiSalesAgent/adminService.js');
+    const data = await AiSalesAdminService.createFollowup(id, leadId, req.body);
+    res.status(201).json({ success: true, data });
+  }),
+);
