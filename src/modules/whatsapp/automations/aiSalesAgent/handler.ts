@@ -48,7 +48,7 @@ async function onInbound(ctx: InboundContext): Promise<HandlerResult> {
     };
   }
 
-  const salesSession = await SalesAgentSessionStore.getByWaSessionSlug(ctx.sessionSlug);
+  const salesSession = await SalesAgentSessionStore.resolveForInbound(ctx.sessionSlug);
   if (!salesSession) {
     logger.warn(
       { sessionSlug: ctx.sessionSlug },

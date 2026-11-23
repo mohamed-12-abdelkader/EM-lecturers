@@ -20,12 +20,56 @@ export class AiSalesAdminService {
   static getSession = SalesAgentSessionStore.getById.bind(SalesAgentSessionStore);
   static getOverview = SalesAgentSessionStore.getOverview.bind(SalesAgentSessionStore);
 
+  /** Normalize UI value to canonical WA session slug (id/slug), never phone/label text. */
+  static async normalizeWaSessionSlug(raw: unknown): Promise<string | null> {
+    const value = String(raw || '').trim();
+    if (!value) return null;
+
+    const bySlug = await pool.query(
+      `SELECT slug FROM wa_sessions WHERE slug = $1 LIMIT 1`,
+      [value],
+    );
+    if (bySlug.rowCount) return String(bySlug.rows[0].slug);
+
+    const digits = value.replace(/\D/g, '');
+    if (digits.length >= 8) {
+      const byPhone = await pool.query(
+        `SELECT slug FROM wa_sessions
+         WHERE regexp_replace(COALESCE(phone_number, ''), '\\D', '', 'g') LIKE '%' || $1
+         ORDER BY updated_at DESC NULLS LAST
+         LIMIT 1`,
+        [digits.slice(-9)],
+      );
+      if (byPhone.rowCount) return String(byPhone.rows[0].slug);
+    }
+
+    // Extract slug token if UI sent "salse (2011…) — ready"
+    const token = value.split(/\s+/)[0]?.trim();
+    if (token && token !== value) {
+      const byToken = await pool.query(
+        `SELECT slug FROM wa_sessions WHERE slug = $1 LIMIT 1`,
+        [token],
+      );
+      if (byToken.rowCount) return String(byToken.rows[0].slug);
+    }
+
+    throw new HttpError(
+      400,
+      'اختَر session slug صحيح من قائمة أرقام واتساب (مثل salse) وليس رقم الهاتف فقط',
+    );
+  }
+
   static async createSession(body: any, userId?: number) {
     if (!body?.name || String(body.name).trim().length < 2) {
       throw new HttpError(400, 'اسم الجلسة مطلوب');
     }
+    const waSlug =
+      body.wa_session_slug != null && String(body.wa_session_slug).trim()
+        ? await this.normalizeWaSessionSlug(body.wa_session_slug)
+        : null;
     return SalesAgentSessionStore.create({
       ...body,
+      wa_session_slug: waSlug,
       created_by: userId ?? null,
     });
   }
@@ -33,19 +77,23 @@ export class AiSalesAdminService {
   static async updateSession(id: number, body: any) {
     const existing = await SalesAgentSessionStore.getById(id);
     if (!existing) throw new HttpError(404, 'الجلسة غير موجودة');
-    if (body.wa_session_slug) {
-      const clash = await pool.query(
-        `SELECT id FROM wa_sales_agent_sessions
-         WHERE wa_session_slug = $1 AND id <> $2
-           AND status IN ('active','paused','draft')
-         LIMIT 1`,
-        [body.wa_session_slug, id],
-      );
-      if (clash.rowCount) {
-        throw new HttpError(409, 'رقم واتساب ده مربوط بجلسة Sales أخرى');
+    const patch = { ...body };
+    if (patch.wa_session_slug !== undefined) {
+      patch.wa_session_slug = await this.normalizeWaSessionSlug(patch.wa_session_slug);
+      if (patch.wa_session_slug) {
+        const clash = await pool.query(
+          `SELECT id FROM wa_sales_agent_sessions
+           WHERE wa_session_slug = $1 AND id <> $2
+             AND status IN ('active','paused','draft')
+           LIMIT 1`,
+          [patch.wa_session_slug, id],
+        );
+        if (clash.rowCount) {
+          throw new HttpError(409, 'رقم واتساب ده مربوط بجلسة Sales أخرى');
+        }
       }
     }
-    const updated = await SalesAgentSessionStore.update(id, body);
+    const updated = await SalesAgentSessionStore.update(id, patch);
     if (!updated) throw new HttpError(404, 'الجلسة غير موجودة');
     return updated;
   }

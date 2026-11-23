@@ -93,6 +93,51 @@ export class SalesAgentSessionStore {
     return res.rowCount ? mapSalesSession(res.rows[0]) : null;
   }
 
+  /**
+   * Resolve Sales Session for an inbound WhatsApp session slug.
+   * Also heals common admin mistakes (saving phone / label instead of slug).
+   */
+  static async resolveForInbound(sessionSlug: string): Promise<SalesAgentSessionRow | null> {
+    const direct = await this.getByWaSessionSlug(sessionSlug);
+    if (direct) return direct;
+
+    const wa = await pool.query<{ slug: string; phone_number: string | null }>(
+      `SELECT slug, phone_number FROM wa_sessions WHERE slug = $1 LIMIT 1`,
+      [sessionSlug],
+    );
+    const phoneRaw = wa.rows[0]?.phone_number ? String(wa.rows[0].phone_number) : null;
+    const phoneDigits = phoneRaw ? phoneRaw.replace(/\D/g, '') : null;
+    const phoneTail =
+      phoneDigits && phoneDigits.length >= 8 ? phoneDigits.slice(-9) : phoneDigits;
+
+    const fuzzy = await pool.query(
+      `SELECT * FROM wa_sales_agent_sessions
+       WHERE status IN ('active', 'paused')
+         AND wa_session_slug IS NOT NULL
+         AND (
+           wa_session_slug = $1
+           OR wa_session_slug ILIKE '%' || $1 || '%'
+           OR ($2::text IS NOT NULL AND (
+             regexp_replace(wa_session_slug, '\\D', '', 'g') = $2
+             OR regexp_replace(wa_session_slug, '\\D', '', 'g') LIKE '%' || $3 || '%'
+           ))
+         )
+       ORDER BY CASE WHEN status = 'active' THEN 0 ELSE 1 END,
+                CASE WHEN wa_session_slug = $1 THEN 0 ELSE 1 END,
+                id ASC
+       LIMIT 1`,
+      [sessionSlug, phoneDigits, phoneTail],
+    );
+
+    if (!fuzzy.rowCount) return null;
+    const row = mapSalesSession(fuzzy.rows[0]);
+    if (row.wa_session_slug !== sessionSlug) {
+      await this.update(row.id, { wa_session_slug: sessionSlug });
+      row.wa_session_slug = sessionSlug;
+    }
+    return row;
+  }
+
   static async list(opts: {
     status?: string;
     search?: string;
