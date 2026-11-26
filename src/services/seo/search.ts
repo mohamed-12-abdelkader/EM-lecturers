@@ -95,7 +95,11 @@ export class SeoSearchService {
   ): Promise<SearchResultItem[]> {
     const params: unknown[] = [];
     let i = 1;
-    const where: string[] = ['t.is_active = TRUE', "t.subdomain <> 'default'"];
+    const where: string[] = [
+      't.is_active = TRUE',
+      "t.subdomain <> 'default'",
+      "t.subdomain NOT LIKE 'deleted-%'",
+    ];
 
     if (filters.tenant_id) {
       where.push(`t.id = $${i++}`);

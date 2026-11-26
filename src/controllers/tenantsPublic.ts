@@ -18,8 +18,55 @@ import { TenantRobotsService } from '../services/seo/robots';
 import { SeoSearchService } from '../services/seo/search';
 import { TenantSitemapService } from '../services/seo/sitemap';
 import { TenantSeoSettingsService } from '../services/seo/tenantSeoSettings';
+import { TenantPlatformSearchService } from '../services/tenantPlatformSearch';
 
 export const router = Router();
+
+/**
+ * GET /api/tenants/public/search?q=
+ * Alias of /api/tenants/search — must stay before /:subdomain routes.
+ */
+router.get(
+  '/search',
+  asyncWrapper(async (req, res) => {
+    const q = String(req.query.q ?? req.query.query ?? '').trim();
+    if (!q) {
+      return res.status(400).json({
+        success: false,
+        message: 'معامل البحث q مطلوب',
+        code: 'QUERY_REQUIRED',
+      });
+    }
+    if (q.length > 120) {
+      return res.status(400).json({
+        success: false,
+        message: 'نص البحث طويل جداً',
+        code: 'QUERY_TOO_LONG',
+      });
+    }
+    const result = await TenantPlatformSearchService.search(
+      q,
+      req.query.limit != null ? Number(req.query.limit) : undefined,
+    );
+    res.json({
+      success: true,
+      data: result.items.map((item) => ({
+        teacherName: item.teacherName,
+        subdomain: item.subdomain,
+        platformUrl: item.platformUrl,
+        ...(item.displayName && item.displayName !== item.teacherName
+          ? { displayName: item.displayName }
+          : {}),
+        ...(item.specialty ? { specialty: item.specialty } : {}),
+      })),
+      meta: {
+        total: result.total,
+        query: result.query,
+        limit: Math.min(Math.max(Number(req.query.limit) || 10, 1), 10),
+      },
+    });
+  }),
+);
 
 const signupLimiterOptions = {
   standardHeaders: true as const,

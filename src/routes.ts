@@ -2,6 +2,7 @@ import { Router } from 'express';
 
 import { router as authRouter } from './controllers/auth';
 import { router as tenantsPublicRouter } from './controllers/tenantsPublic';
+import { router as tenantsSearchRouter } from './controllers/tenantsSearch';
 import { router as tenantsSuperRouter } from './controllers/tenantsSuper';
 import { router as userRouter } from './controllers/user';
 import { router as teacherRouter } from './controllers/teacher';
@@ -124,6 +125,7 @@ router.post('/course-files/:fileId/view', ...courseFileViewHandlers);
 router.head('/course-files/:fileId/view', ...courseFileViewHandlers);
 
 router.use('/tenants/public', tenantsPublicRouter);
+router.use('/tenants/search', tenantsSearchRouter);
 router.use('/seo', seoPublicRouter);
 router.use('/super/tenants', tenantsSuperRouter);
 router.use('/', authRouter);
